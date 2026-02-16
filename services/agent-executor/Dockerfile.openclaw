@@ -1,0 +1,45 @@
+FROM node:22-slim
+
+# Image metadata
+LABEL org.openclaw.image.type="openclaw-agent"
+LABEL org.openclaw.image.description="OpenClaw agent in constrained execution environment"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install OpenClaw globally (much faster than building from source)
+RUN npm install -g openclaw@latest
+
+# Create Python venv for wrapper dependencies
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir httpx
+
+# Create workspace and agent user
+RUN mkdir -p /workspace /tmp/agent /root/.openclaw && \
+    if ! id -u 1000 > /dev/null 2>&1; then \
+        useradd -m -u 1000 -s /bin/bash agent; \
+    fi && \
+    chown -R 1000:1000 /workspace /tmp/agent
+
+# Copy wrapper scripts
+COPY openclaw-wrapper.py /opt/openclaw-wrapper.py
+COPY openclaw-wrapper.js /opt/openclaw-wrapper.js
+RUN chmod +x /opt/openclaw-wrapper.py /opt/openclaw-wrapper.js
+
+# Set up workspace
+WORKDIR /workspace
+
+# Environment configuration
+ENV NODE_ENV=production \
+    WORKSPACE=/workspace \
+    PYTHONUNBUFFERED=1
+
+# The Python wrapper configures OpenClaw and invokes it
+ENTRYPOINT ["python3", "/opt/openclaw-wrapper.py"]

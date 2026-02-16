@@ -1,0 +1,246 @@
+services:
+  # =============================================================================
+  # CONTROL PLANE — Core API
+  # =============================================================================
+  control-plane:
+    build:
+      context: ./services/control-plane
+      dockerfile: Dockerfile
+    container_name: openclaw-control-plane
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://openclaw:${POSTGRES_PASSWORD:-openclaw_pass}@postgres:5432/openclaw
+      - TEMPORAL_HOST=temporal:7233
+      - IMAGE_BUILDER_URL=http://image-builder:8002
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    networks:
+      - openclaw-network
+    volumes:
+      - ./workspaces:/workspaces
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # =============================================================================
+  # IMAGE BUILDER — Builds agent Docker images on capability approval
+  # =============================================================================
+  image-builder:
+    build:
+      context: ./services/image-builder
+      dockerfile: Dockerfile
+    container_name: openclaw-image-builder
+    privileged: true
+    environment:
+      - DOCKER_HOST=tcp://docker-dind:2375
+      - REGISTRY_URL=registry:5000
+      - DATABASE_URL=postgresql+asyncpg://openclaw:${POSTGRES_PASSWORD:-openclaw_pass}@postgres:5432/openclaw
+      - AGENT_IMAGES_DIR=/agent-images
+      - CONTROL_PLANE_URL=http://control-plane:8000
+    depends_on:
+      - docker-dind
+      - postgres
+      - registry
+    volumes:
+      - ./services/image-builder/templates:/app/templates
+      - ./services/agent-executor:/agent-executor:ro
+      - ./openclaw:/openclaw:ro
+      - ./agent-images:/agent-images
+      - ./workspaces:/workspaces
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # =============================================================================
+  # DOCKER-IN-DOCKER — Runs agent & deployment containers
+  # =============================================================================
+  docker-dind:
+    image: docker:24-dind
+    container_name: openclaw-docker-dind
+    privileged: true
+    command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock", "--tls=false"]
+    volumes:
+      - docker-data:/var/lib/docker
+      - ./docker-dind-daemon.json:/etc/docker/daemon.json:ro
+      - ./workspaces:/workspaces
+    ports:
+      - "9100-9120:9100-9120"
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # DOCKER REGISTRY — Stores built agent images
+  # =============================================================================
+  registry:
+    image: registry:2
+    container_name: openclaw-registry
+    volumes:
+      - registry-data:/var/lib/registry
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # TEMPORAL — Workflow orchestration
+  # =============================================================================
+  temporal-postgres:
+    image: postgres:13
+    container_name: openclaw-temporal-postgres
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - temporal-postgres-data:/var/lib/postgresql/data
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  temporal:
+    image: temporalio/auto-setup:1.22
+    container_name: openclaw-temporal
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+      - POSTGRES_DB=temporal
+      - POSTGRES_SEEDS=temporal-postgres
+    depends_on:
+      - temporal-postgres
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -ltn | grep ':7233' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  temporal-ui:
+    image: temporalio/ui:2.40.1
+    container_name: openclaw-temporal-ui
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_GRPC_ENDPOINT=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      temporal:
+        condition: service_healthy
+    ports:
+      - "8088:8080"
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # TEMPORAL WORKER — Executes task workflows
+  # =============================================================================
+  temporal-worker:
+    build:
+      context: ./services/temporal-worker
+      dockerfile: Dockerfile
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+      - DOCKER_HOST=tcp://docker-dind:2375
+      - DATABASE_URL=postgresql+asyncpg://openclaw:${POSTGRES_PASSWORD:-openclaw_pass}@postgres:5432/openclaw
+      - CONTROL_PLANE_URL=http://control-plane:8000
+      - IMAGE_BUILDER_URL=http://openclaw-image-builder:8002
+      - AGENT_IMAGES_DIR=/agent-images
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+    depends_on:
+      temporal:
+        condition: service_healthy
+      control-plane:
+        condition: service_healthy
+      docker-dind:
+        condition: service_started
+    volumes:
+      - ./workspaces:/workspaces
+      - ./agent-images:/agent-images
+    networks:
+      - openclaw-network
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+
+  # =============================================================================
+  # FRONTEND — Next.js dashboard
+  # =============================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: openclaw-frontend
+    environment:
+      - NEXT_PUBLIC_API_URL=${API_URL:-http://localhost:8000}
+    depends_on:
+      - control-plane
+    ports:
+      - "3000:3000"
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # POSTGRESQL — Primary database
+  # =============================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: openclaw-postgres
+    environment:
+      - POSTGRES_USER=openclaw
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-openclaw_pass}
+      - POSTGRES_DB=openclaw
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openclaw"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  openclaw-network:
+    driver: bridge
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  postgres-data:
+  temporal-postgres-data:
+  registry-data:
+  docker-data:

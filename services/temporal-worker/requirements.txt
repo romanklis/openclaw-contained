@@ -1,0 +1,6 @@
+temporalio==1.5.0
+pydantic==2.5.3
+docker==7.0.0
+httpx==0.26.0
+sqlalchemy==2.0.25
+asyncpg==0.29.0

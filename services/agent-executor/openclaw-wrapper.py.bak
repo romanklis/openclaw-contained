@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""
+OpenClaw Agent Wrapper
+Integrates OpenClaw agent runtime with the Temporal workflow orchestration.
+"""
+
+import os
+import sys
+import json
+import subprocess
+import httpx
+from typing import Dict, Any, Optional
+
+# Configuration from environment
+CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+TASK_ID = os.getenv("TASK_ID")
+ITERATION = os.getenv("ITERATION", "0")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:4b")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
+
+
+def fetch_task() -> Optional[Dict[str, Any]]:
+    """Fetch task details from control plane."""
+    if not TASK_ID:
+        print("ERROR: TASK_ID not set", file=sys.stderr)
+        return None
+    
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(f"{CONTROL_PLANE_URL}/api/tasks/{TASK_ID}")
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        print(f"ERROR fetching task: {e}", file=sys.stderr)
+        return None
+
+
+def update_task_status(status: str, result: Optional[str] = None, error: Optional[str] = None):
+    """Update task status in control plane."""
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            data = {"status": status}
+            if result:
+                data["result"] = result
+            if error:
+                data["error"] = error
+            
+            response = client.put(
+                f"{CONTROL_PLANE_URL}/api/tasks/{TASK_ID}",
+                json=data
+            )
+            response.raise_for_status()
+    except Exception as e:
+        print(f"ERROR updating task status: {e}", file=sys.stderr)
+
+
+def request_capability(capability_type: str, packages: list) -> bool:
+    """
+    Request a new capability from the control plane.
+    Returns True if approved, False otherwise.
+    """
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(
+                f"{CONTROL_PLANE_URL}/api/capabilities/request",
+                json={
+                    "task_id": TASK_ID,
+                    "capability_type": capability_type,
+                    "packages": packages,
+                    "justification": f"Required for task execution (iteration {ITERATION})"
+                }
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("approved", False)
+    except Exception as e:
+        print(f"ERROR requesting capability: {e}", file=sys.stderr)
+        return False
+
+
+def setup_openclaw_config():
+    """
+    Create OpenClaw configuration file to use Ollama.
+    OpenClaw --local mode looks for config in ~/.openclaw/openclaw.json
+    AND per-agent config in ~/.openclaw/agents/main/agent/
+    """
+    # Create .openclaw directory structure
+    openclaw_dir = os.path.expanduser("~/.openclaw")
+    agent_dir = os.path.join(openclaw_dir, "agents", "main", "agent")
+    os.makedirs(openclaw_dir, exist_ok=True)
+    os.makedirs(agent_dir, exist_ok=True)
+    
+    # Configure OpenClaw to use Ollama
+    # Based on: https://docs.openclaw.ai/concepts/model-providers
+    config = {
+        "agents": {
+            "defaults": {
+                "model": {
+                    "primary": f"ollama/{LLM_MODEL}"
+                }
+            }
+        },
+        "models": {
+            "mode": "merge",
+            "providers": {
+                "ollama": {
+                    "baseUrl": f"{OLLAMA_URL}/v1",
+                    "api": "openai-completions",
+                    "models": [
+                        {
+                            "id": LLM_MODEL,
+                            "name": LLM_MODEL,
+                            "reasoning": False,
+                            "input": ["text"],
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                            "contextWindow": 200000,
+                            "maxTokens": 8192
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    
+    # Write main config
+    config_path = os.path.join(openclaw_dir, "openclaw.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    
+    # Also write to agent-specific directory
+    agent_config_path = os.path.join(agent_dir, "openclaw.json")
+    with open(agent_config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    
+    # Create auth-profiles.json with Ollama provider (no real key needed)
+    auth_path = os.path.join(agent_dir, "auth-profiles.json")
+    auth_config = {
+        "ollama": {
+            "apiKey": "ollama-no-key-required"
+        }
+    }
+    with open(auth_path, "w") as f:
+        json.dump(auth_config, f)
+    
+    print(f"✅ Created OpenClaw config")
+    print(f"   Main config: {config_path}")
+    print(f"   Agent config: {agent_config_path}")
+    print(f"   Provider: ollama")
+    print(f"   Model: {LLM_MODEL}")
+    print(f"   Ollama URL: {OLLAMA_URL}")
+    
+    return config_path
+
+
+def invoke_openclaw_agent(prompt: str) -> tuple[str, int]:
+    """
+    Invoke OpenClaw agent with a prompt and return output.
+    Returns: (output_string, exit_code)
+    """
+    try:
+        # Setup OpenClaw configuration to use Ollama
+        print("🔧 Setting up OpenClaw configuration...")
+        setup_openclaw_config()
+        print("✅ Configuration setup complete")
+        
+        # Set up environment for OpenClaw with Ollama API key
+        # OpenClaw needs an API key even for Ollama (can be dummy value)
+        env = os.environ.copy()
+        env["OLLAMA_API_KEY"] = "ollama-local-no-auth-required"
+        env["OPENAI_API_KEY"] = "ollama-local-no-auth-required"  # Fallback
+        
+        # Invoke OpenClaw agent command in local mode
+        # --local: Run embedded agent locally without Gateway
+        # --session-id: Required to maintain session context
+        # --message: The task/prompt to execute
+        # --thinking: Control verbosity level
+        # --json: Get structured output
+        result = subprocess.run(
+            [
+                "node",
+                "/opt/openclaw/dist/index.js",
+                "agent",
+                "--local",  # Run embedded agent locally
+                "--session-id", TASK_ID,  # Use task ID as session ID
+                "--message", prompt,
+                "--thinking", "medium",
+                "--json"  # Get JSON output
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout
+            env=env
+        )
+        
+        return (result.stdout + result.stderr, result.returncode)
+    
+    except subprocess.TimeoutExpired:
+        return ("ERROR: Agent execution timed out after 5 minutes", 1)
+    except Exception as e:
+        import traceback
+        error_msg = f"ERROR invoking OpenClaw: {e}\n{traceback.format_exc()}"
+        print(error_msg)
+        return (error_msg, 1)
+
+
+def parse_capability_request(output: str) -> Optional[tuple[str, list]]:
+    """
+    Parse OpenClaw output for capability requests.
+    Returns (capability_type, packages) or None.
+    """
+    # OpenClaw might output tool requests or package errors
+    # Examples:
+    # - "ModuleNotFoundError: No module named 'pandas'"
+    # - "Tool request: python_packages=['pandas', 'numpy']"
+    
+    lines = output.lower()
+    
+    # Check for Python package requests
+    if "modulenotfounderror" in lines or "no module named" in lines:
+        # Extract package name
+        import re
+        match = re.search(r"no module named ['\"]([^'\"]+)['\"]", lines, re.IGNORECASE)
+        if match:
+            package = match.group(1)
+            return ("python_packages", [package])
+    
+    # Check for explicit tool/package requests
+    if "python_packages=" in lines:
+        import re
+        match = re.search(r"python_packages=\[([^\]]+)\]", lines)
+        if match:
+            packages_str = match.group(1)
+            packages = [p.strip().strip("'\"") for p in packages_str.split(",")]
+            return ("python_packages", packages)
+    
+    return None
+
+
+def main():
+    """Main execution flow."""
+    print("=" * 80)
+    print("🦞 OPENCLAW AGENT WRAPPER")
+    print("=" * 80)
+    print(f"📋 Task ID: {TASK_ID}")
+    print(f"🔄 Iteration: {ITERATION}")
+    print(f"🤖 Model: {LLM_MODEL}")
+    print(f"🌐 Control Plane: {CONTROL_PLANE_URL}")
+    print(f"🧠 Ollama: {OLLAMA_URL}")
+    print("=" * 80)
+    
+    # Fetch task
+    print(f"\n📥 Fetching task from control plane...")
+    task = fetch_task()
+    if not task:
+        print("❌ ERROR: Failed to fetch task", file=sys.stderr)
+        sys.exit(1)
+    
+    prompt = task.get("description", "") or task.get("prompt", "")
+    if not prompt:
+        print("❌ ERROR: No description or prompt in task", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"✅ Task fetched successfully")
+    print(f"📝 Task prompt: {prompt[:150]}...")
+    
+    # Execute with OpenClaw
+    print(f"\n🚀 Invoking OpenClaw agent...")
+    output, exit_code = invoke_openclaw_agent(prompt)
+    
+    print("\n" + "=" * 80)
+    print("📊 OPENCLAW OUTPUT")
+    print("=" * 80)
+    print(output)
+    print("=" * 80)
+    print(f"📤 Exit code: {exit_code}")
+    print("=" * 80)
+    
+    # Prepare result
+    result = {
+        "completed": False,
+        "capability_requested": False,
+        "output": output,
+        "agent_logs": output[:2000]
+    }
+    
+    # Check for capability requests
+    if exit_code != 0:
+        print(f"\n⚠️  OpenClaw exited with non-zero status: {exit_code}")
+        capability_request = parse_capability_request(output)
+        if capability_request:
+            capability_type, packages = capability_request
+            print(f"\n🔐 Capability requested: {capability_type} - {packages}")
+            
+            if request_capability(capability_type, packages):
+                print("✅ Capability approved - image rebuild required")
+                result["capability_requested"] = True
+                result["capability"] = {
+                    "type": capability_type,
+                    "resource": ",".join(packages),
+                    "justification": f"Required {capability_type}: {', '.join(packages)}"
+                }
+                # Write result file to /tmp (will be copied to /workspace)
+                print(f"\n💾 Writing result to /tmp/result.json")
+                with open("/tmp/result.json", "w") as f:
+                    json.dump(result, f)
+                # Also copy to /workspace if possible
+                try:
+                    import shutil
+                    shutil.copy("/tmp/result.json", "/workspace/result.json")
+                    print(f"💾 Copied result to /workspace/result.json")
+                except Exception as e:
+                    print(f"⚠️  Could not copy to /workspace: {e}")
+                print(f"✅ Exiting with success (capability request)")
+                sys.exit(0)  # Success with capability request
+            else:
+                print("❌ Capability denied")
+                result["error"] = "Required capability denied"
+                with open("/tmp/result.json", "w") as f:
+                    json.dump(result, f)
+                try:
+                    import shutil
+                    shutil.copy("/tmp/result.json", "/workspace/result.json")
+                except:
+                    pass
+                print(f"❌ Exiting with failure (capability denied)")
+                sys.exit(1)
+        else:
+            print(f"\n❌ OpenClaw failed but no capability request detected")
+            print(f"Output analysis: {output[:500]}")
+    
+    # Task completed
+    if exit_code == 0:
+        result["completed"] = True
+        result["message"] = "Task completed successfully"
+        print("\n✅ Task completed successfully")
+    else:
+        result["error"] = output
+        print(f"\n❌ Task failed with exit code {exit_code}")
+    
+    # Write result file to /tmp and try to copy to /workspace
+    print(f"\n💾 Writing final result to /tmp/result.json")
+    with open("/tmp/result.json", "w") as f:
+        json.dump(result, f)
+    print(f"✅ Result written: {result}")
+    
+    try:
+        import shutil
+        shutil.copy("/tmp/result.json", "/workspace/result.json")
+        print(f"💾 Copied result to /workspace/result.json")
+    except Exception as e:
+        print(f"⚠️  Could not copy to /workspace: {e}")
+    
+    print(f"\n🏁 Wrapper complete. Exiting with code {exit_code}")
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

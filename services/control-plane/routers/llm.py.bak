@@ -1,0 +1,143 @@
+"""
+LLM Integration Router - Test Ollama connectivity
+"""
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+import httpx
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/llm", tags=["llm"])
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+
+
+class ChatRequest(BaseModel):
+    prompt: str
+    model: str = "llama2"
+    stream: bool = False
+
+
+class ChatResponse(BaseModel):
+    model: str
+    response: str
+    done: bool
+    context: Optional[list] = None
+
+
+@router.get("/health")
+async def check_ollama_health():
+    """Check if Ollama service is accessible"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{OLLAMA_URL}/api/tags")
+            response.raise_for_status()
+            return {
+                "status": "healthy",
+                "ollama_url": OLLAMA_URL,
+                "models": response.json()
+            }
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to Ollama at {OLLAMA_URL}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ollama health check failed: {str(e)}"
+        )
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_with_llm(request: ChatRequest):
+    """Send chat request to Ollama"""
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": request.model,
+                    "prompt": request.prompt,
+                    "stream": False  # Always disable streaming for now
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            logger.info(f"Ollama response: {result}")
+            
+            return ChatResponse(
+                model=result.get("model", request.model),
+                response=result.get("response", ""),
+                done=result.get("done", True),
+                context=result.get("context")
+            )
+    except httpx.ConnectError as e:
+        logger.error(f"Connection error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to Ollama at {OLLAMA_URL}"
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error: {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Ollama API error: {e.response.text}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in chat: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"LLM chat failed: {str(e)}"
+        )
+
+
+@router.get("/models")
+async def list_models():
+    """List available Ollama models"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{OLLAMA_URL}/api/tags")
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list models: {str(e)}"
+        )
+
+
+@router.get("/providers")
+async def get_llm_providers():
+    """Get available LLM providers configuration"""
+    # Return configuration for both Ollama and external providers (Gemini, OpenAI, etc.)
+    return {
+        "providers": [
+            {
+                "name": "ollama",
+                "type": "ollama",
+                "url": OLLAMA_URL,
+                "available": True,
+                "models": []  # Will be populated dynamically
+            },
+            {
+                "name": "gemini",
+                "type": "gemini",
+                "url": "https://generativelanguage.googleapis.com",
+                "available": True,
+                "models": ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash"]
+            },
+            {
+                "name": "openai",
+                "type": "openai",
+                "url": "https://api.openai.com",
+                "available": False,
+                "models": ["gpt-4", "gpt-3.5-turbo"]
+            }
+        ],
+        "default_provider": "gemini"
+    }
