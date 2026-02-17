@@ -547,6 +547,26 @@ def main():
         write_result({"completed": False, "error": "No description in task and no TASK_DESCRIPTION env"})
         sys.exit(1)
 
+    # If this is a continuation, prepend follow-up instructions prominently
+    follow_up = os.getenv("FOLLOW_UP", "").strip()
+    if follow_up:
+        print(f"\n♻️  CONTINUATION — Follow-up instructions: {follow_up[:200]}")
+        # List existing workspace files so the agent knows what it has to work with
+        existing_files = []
+        for root, dirs, files in os.walk("/workspace"):
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), "/workspace")
+                if not rel.startswith(".") and rel != "result.json":
+                    existing_files.append(rel)
+        files_context = ", ".join(existing_files[:30]) if existing_files else "none"
+        prompt = (
+            f"CONTINUATION: The previous run of this task already completed and produced these files "
+            f"in /workspace: [{files_context}]. "
+            f"Your job now is to IMPROVE the existing code based on these follow-up instructions:\n\n"
+            f"{follow_up}\n\n"
+            f"--- Original task description for reference ---\n{prompt}"
+        )
+
     # Execute with OpenClaw
     print(f"\n🚀 Invoking OpenClaw agent...")
     output, exit_code = invoke_openclaw_agent(prompt)

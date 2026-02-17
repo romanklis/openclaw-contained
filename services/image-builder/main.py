@@ -558,20 +558,31 @@ async def build_deployment_image(
     for df_path in sorted(task_dir.glob("Dockerfile*")):
         content = df_path.read_text()
         
-        # Extract apt packages from "apt-get install -y pkg1 pkg2"
-        for m in re.finditer(r"apt-get install\s+-y\s+(.+?)(?:\s*&&|$)", content, re.MULTILINE):
-            for pkg in m.group(1).split():
-                pkg = pkg.strip().rstrip("\\")
-                if pkg and not pkg.startswith("-") and pkg not in apt_packages:
-                    apt_packages.append(pkg)
-        
-        # Extract pip packages from "pip install ... pkg1 pkg2"
-        for m in re.finditer(r"pip\d?\s+install\s+[^\\]*?([a-zA-Z0-9_-]+(?:\s+[a-zA-Z0-9_-]+)*)\s*[;\\]", content):
-            for pkg in m.group(1).split():
-                if pkg not in ("--no-cache-dir", "--break-system-packages") and not pkg.startswith("-"):
-                    if pkg not in pip_packages:
+        # ---- Parse LABEL capabilities (covers both pip and apt) ----
+        # Format: LABEL capabilities="pip_package:flask,pip_package:redis,apt_package:redis-server"
+        for m in re.finditer(r'capabilities="([^"]+)"', content):
+            for cap in m.group(1).split(","):
+                cap = cap.strip()
+                if cap.startswith("pip_package:"):
+                    pkg = cap[len("pip_package:"):]
+                    if pkg and pkg not in pip_packages:
                         pip_packages.append(pkg)
-        # Simpler: look for known packages after --no-cache-dir
+                elif cap.startswith("apt_package:"):
+                    pkg = cap[len("apt_package:"):]
+                    if pkg and pkg not in apt_packages:
+                        apt_packages.append(pkg)
+        
+        # ---- APT packages from RUN commands ----
+        # Handle multi-line: apt-get install -y \<newline>  pkg1 \<newline>  && rm ...
+        for m in re.finditer(r"apt-get install\s+-y\s+(.*?)(?:&&|$)", content, re.DOTALL):
+            block = m.group(1)
+            for token in block.split():
+                token = token.strip().rstrip("\\")
+                if token and not token.startswith("-") and token not in apt_packages:
+                    apt_packages.append(token)
+        
+        # ---- PIP packages from RUN commands ----
+        # Look for packages after --no-cache-dir
         for m in re.finditer(r"--no-cache-dir\s+(.+?)(?:\s*[;|]|$)", content):
             for pkg in m.group(1).split():
                 if not pkg.startswith("-") and pkg not in pip_packages:

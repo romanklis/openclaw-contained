@@ -9,9 +9,9 @@ import uuid
 from datetime import datetime
 
 from database import get_db
-from models import Task, TaskStatus, Policy
-from schemas import TaskCreate, TaskResponse, TaskDetail
-from temporal_client import start_task_workflow
+from models import Task, TaskStatus, Policy, TaskOutput
+from schemas import TaskCreate, TaskResponse, TaskDetail, TaskContinue
+from temporal_client import start_task_workflow, continue_task_workflow
 
 router = APIRouter()
 
@@ -225,6 +225,89 @@ async def resume_task(
     await db.commit()
     
     return {"task_id": task_id, "status": "resumed"}
+
+
+@router.post("/{task_id}/continue")
+async def continue_task(
+    task_id: str,
+    body: TaskContinue,
+    db: AsyncSession = Depends(get_db)
+):
+    """Continue iterating on a completed or failed task.
+
+    Starts a new Temporal workflow that picks up from the last image
+    and passes follow-up instructions to the agent.
+    """
+    result = await db.execute(
+        select(Task).where(Task.id == task_id)
+    )
+    task = result.scalar_one_or_none()
+
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found"
+        )
+
+    if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task must be completed or failed to continue (current: {task.status})"
+        )
+
+    # Determine the latest image used by looking at the last task output
+    latest_image = task.current_image or ""
+    if not latest_image:
+        outputs_result = await db.execute(
+            select(TaskOutput)
+            .where(TaskOutput.task_id == task_id)
+            .order_by(TaskOutput.iteration.desc())
+            .limit(1)
+        )
+        last_output = outputs_result.scalar_one_or_none()
+        if last_output and last_output.image_used:
+            latest_image = last_output.image_used
+
+    # Count existing continuations to generate unique workflow ID
+    existing_workflows = task.workflow_id or ""
+    cont_count = existing_workflows.count("-cont-") + 1 if "-cont-" in existing_workflows else 1
+
+    llm_model = body.llm_model or task.llm_model or "gemma3:4b"
+
+    # Append follow-up to description for context
+    separator = "\n\n--- Follow-up Instructions ---\n"
+    task.description = (task.description or "") + separator + body.follow_up
+
+    # Start continuation workflow
+    try:
+        workflow_id = await continue_task_workflow(
+            task_id=task_id,
+            llm_model=llm_model,
+            current_image=latest_image,
+            follow_up=body.follow_up,
+            continuation_number=cont_count,
+        )
+        task.status = TaskStatus.RUNNING
+        task.workflow_id = workflow_id
+        task.completed_at = None
+        await db.commit()
+        await db.refresh(task)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to continue task {task_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start continuation workflow: {e}"
+        )
+
+    return {
+        "task_id": task_id,
+        "workflow_id": workflow_id,
+        "status": "running",
+        "follow_up": body.follow_up,
+        "current_image": latest_image,
+        "continuation": cont_count,
+    }
 
 
 @router.post("/{task_id}/complete")

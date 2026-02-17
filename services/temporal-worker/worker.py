@@ -30,13 +30,33 @@ class AgentTaskWorkflow:
         self.capability_approved = False
         self.current_image = "localhost:5000/openclaw-agent:openclaw"  # Track current agent image
         self.llm_model = "gemma3:4b"  # Track LLM model
+        self.follow_up = ""  # Follow-up instructions for continuation
     
     @workflow.run
-    async def run(self, task_id: str, llm_model: str = "gemma3:4b") -> Dict[str, Any]:
-        """Execute agent task"""
+    async def run(
+        self,
+        task_id: str,
+        llm_model: str = "gemma3:4b",
+        current_image: str = "",
+        follow_up: str = "",
+    ) -> Dict[str, Any]:
+        """Execute agent task.
+
+        For first-run workflows ``current_image`` and ``follow_up`` are empty.
+        For continuation workflows they carry over state from the previous run:
+        - ``current_image``: the last built agent image (all packages installed)
+        - ``follow_up``: user's follow-up instructions
+        """
         
         self.llm_model = llm_model
-        logger.info(f"Starting workflow for task {task_id} with model {llm_model}")
+        self.follow_up = follow_up
+
+        # If continuing, pick up from the previous image instead of the base
+        if current_image:
+            self.current_image = current_image
+            logger.info(f"♻️  CONTINUATION workflow for task {task_id} | image={current_image} | follow_up={follow_up[:120]}...")
+        else:
+            logger.info(f"Starting workflow for task {task_id} with model {llm_model}")
         
         # Step 1: Initialize task
         await workflow.execute_activity(
@@ -45,9 +65,20 @@ class AgentTaskWorkflow:
             start_to_close_timeout=timedelta(seconds=30)
         )
         
+        # Determine starting iteration.
+        # For continuations, fetch the last iteration number so we don't overwrite.
+        start_iteration = 0
+        if current_image:  # this is a continuation
+            start_iteration = await workflow.execute_activity(
+                get_last_iteration,
+                args=[task_id],
+                start_to_close_timeout=timedelta(seconds=15)
+            )
+            logger.info(f"♻️  Continuing from iteration {start_iteration}")
+
         # Step 2: Agent execution loop
         max_iterations = 50
-        iteration = 0
+        iteration = start_iteration
         
         while iteration < max_iterations:
             iteration += 1
@@ -57,7 +88,7 @@ class AgentTaskWorkflow:
             # Execute agent step with current image
             result = await workflow.execute_activity(
                 run_agent_step,
-                args=[task_id, iteration, self.current_image, self.llm_model],
+                args=[task_id, iteration, self.current_image, self.llm_model, self.follow_up],
                 start_to_close_timeout=timedelta(minutes=30)
             )
 
@@ -185,9 +216,11 @@ async def initialize_task(task_id: str) -> Dict[str, Any]:
 
 
 @activity.defn
-async def run_agent_step(task_id: str, iteration: int, agent_image: str = "localhost:5000/openclaw-agent:openclaw", llm_model: str = "gemma3:4b") -> Dict[str, Any]:
+async def run_agent_step(task_id: str, iteration: int, agent_image: str = "localhost:5000/openclaw-agent:openclaw", llm_model: str = "gemma3:4b", follow_up: str = "") -> Dict[str, Any]:
     """Run one iteration of agent execution"""
     logger.info(f"🤖 AGENT_STEP | Task: {task_id} | Iteration: {iteration} | Image: {agent_image} | Model: {llm_model}")
+    if follow_up:
+        logger.info(f"   └─ Follow-up: {follow_up[:120]}...")
     logger.info(f"   └─ Starting agent execution in container...")
     
     import docker
@@ -201,18 +234,38 @@ async def run_agent_step(task_id: str, iteration: int, agent_image: str = "local
         # Use the provided agent image
         logger.info(f"🐳 Using agent image: {agent_image}")
         
-        # Check if image exists locally
-        try:
-            docker_client.images.get(agent_image)
-            logger.info(f"✅ Image found locally: {agent_image}")
-        except docker.errors.ImageNotFound:
+        # Check if image exists locally (try multiple name variants)
+        # Images in DinD may be tagged as registry:5000/..., openclaw-agent:...,
+        # or localhost:5000/... depending on who built/tagged them.
+        image_found = False
+        image_variants = [
+            agent_image,
+            agent_image.replace("localhost:5000/", "registry:5000/"),
+            agent_image.replace("localhost:5000/", ""),
+            agent_image.replace("registry:5000/", ""),
+        ]
+        # Deduplicate while preserving order
+        seen = set()
+        image_variants = [v for v in image_variants if v not in seen and not seen.add(v)]
+
+        for variant in image_variants:
+            try:
+                docker_client.images.get(variant)
+                logger.info(f"✅ Image found locally as: {variant}")
+                agent_image = variant
+                image_found = True
+                break
+            except docker.errors.ImageNotFound:
+                continue
+
+        if not image_found:
             logger.warning(f"⚠️ Image {agent_image} not found locally, pulling from registry...")
-            # Convert localhost:5000 to registry:5000 for docker-dind context
-            agent_image_fixed = agent_image.replace("localhost:5000", "registry:5000")
-            logger.info(f"📥 Pulling {agent_image_fixed} (converted from {agent_image})")
+            agent_image_fixed = agent_image.replace("localhost:5000/", "registry:5000/")
+            if not agent_image_fixed.startswith("registry:5000/"):
+                agent_image_fixed = f"registry:5000/{agent_image_fixed}"
+            logger.info(f"📥 Pulling {agent_image_fixed}")
             docker_client.images.pull(agent_image_fixed)
             logger.info(f"✅ Image pulled successfully")
-            # But we still reference it as localhost:5000 for container name
             agent_image = agent_image_fixed
         
         # Create workspace directory for this task (persistent across iterations)
@@ -279,6 +332,7 @@ async def run_agent_step(task_id: str, iteration: int, agent_image: str = "local
             "TASK_DESCRIPTION": task_description[:2000],  # Pass description directly
             "AGENT_IMAGE": agent_image,
             "AGENT_DOCKERFILE": agent_dockerfile[:4000],
+            "FOLLOW_UP": follow_up[:2000],  # Follow-up instructions for continuation
         }
         logger.info(f"🔧 Agent environment: CONTROL_PLANE={agent_env['CONTROL_PLANE_URL']}, LLM_ROUTER={agent_env['LLM_ROUTER_URL']}, MODEL={agent_env['LLM_MODEL']}")
         logger.info(f"   Task description: {task_description[:100]}...")
@@ -460,6 +514,28 @@ async def store_task_output(
     except Exception as e:
         logger.warning(f"⚠️ Failed to store output: {e}")
         return {"error": str(e)}
+
+
+@activity.defn
+async def get_last_iteration(task_id: str) -> int:
+    """Get the last iteration number for a task so continuations don't overlap."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
+            if resp.status_code == 200:
+                data = resp.json()
+                outputs = data.get("outputs", [])
+                if outputs:
+                    max_iter = max(o.get("iteration", 0) for o in outputs)
+                    logger.info(f"📊 Last iteration for {task_id}: {max_iter}")
+                    return max_iter
+    except Exception as e:
+        logger.warning(f"⚠️ Could not fetch last iteration: {e}")
+
+    return 0
 
 
 @activity.defn
@@ -963,6 +1039,7 @@ async def main():
             initialize_task,
             run_agent_step,
             store_task_output,
+            get_last_iteration,
             create_capability_request,
             build_agent_image,
             update_task_policy,

@@ -35,6 +35,9 @@ export default function TaskDetailPage() {
   const [showRawJson, setShowRawJson] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<'outputs' | 'timeline' | 'audit'>('outputs');
+  const [showContinue, setShowContinue] = useState(false);
+  const [followUp, setFollowUp] = useState('');
+  const [continuing, setContinuing] = useState(false);
 
   // --- Data fetching ---
   useEffect(() => {
@@ -63,6 +66,31 @@ export default function TaskDetailPage() {
     const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
   }, [taskId]);
+
+  // --- Continue task handler ---
+  const handleContinue = async () => {
+    if (!followUp.trim()) return;
+    setContinuing(true);
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/continue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ follow_up: followUp }),
+      });
+      if (res.ok) {
+        setShowContinue(false);
+        setFollowUp('');
+        // Data will refresh via the polling interval
+      } else {
+        const err = await res.json();
+        alert(`Failed to continue: ${err.detail || 'Unknown error'}`);
+      }
+    } catch (e) {
+      alert(`Failed to continue: ${e}`);
+    } finally {
+      setContinuing(false);
+    }
+  };
 
   // Auto-scroll chat
   // --- Helpers ---
@@ -144,7 +172,43 @@ export default function TaskDetailPage() {
                 Temporal UI &#x2197;
               </a>
             )}
+            {/* Continue button — shown for completed or failed tasks */}
+            {(timeline.task.status === 'completed' || timeline.task.status === 'failed') && (
+              <button
+                onClick={() => setShowContinue(!showContinue)}
+                className="ml-auto px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded transition-colors"
+              >
+                {showContinue ? 'Cancel' : '♻️ Continue / Iterate'}
+              </button>
+            )}
           </div>
+          {/* Continue panel */}
+          {showContinue && (
+            <div className="mt-4 bg-indigo-900/20 border border-indigo-500/30 rounded-lg p-4">
+              <label className="block text-sm font-medium text-indigo-300 mb-2">
+                Follow-up instructions
+              </label>
+              <textarea
+                value={followUp}
+                onChange={(e) => setFollowUp(e.target.value)}
+                placeholder="e.g. The chart doesn't auto-refresh. Add JavaScript polling to update the chart every 5 seconds without a page reload."
+                className="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-y"
+                rows={3}
+              />
+              <div className="flex items-center gap-3 mt-3">
+                <button
+                  onClick={handleContinue}
+                  disabled={continuing || !followUp.trim()}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-medium rounded transition-colors"
+                >
+                  {continuing ? 'Starting…' : '🚀 Continue Task'}
+                </button>
+                <span className="text-xs text-gray-500">
+                  The agent will resume with all previous deliverables and installed packages.
+                </span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Current State */}

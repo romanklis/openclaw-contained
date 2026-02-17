@@ -57,6 +57,12 @@ class TaskDetail(TaskResponse):
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
     llm_model: Optional[str]
+
+
+class TaskContinue(BaseModel):
+    """Follow-up instructions to continue iterating on a completed/failed task."""
+    follow_up: str = Field(..., min_length=1, description="Follow-up instructions for the agent")
+    llm_model: Optional[str] = None  # Override model if desired
     
 
 # Capability schemas
