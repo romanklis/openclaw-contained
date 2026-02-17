@@ -125,10 +125,11 @@ class AgentTaskWorkflow:
                 )
                 
                 if self.capability_approved:
-                    # Build new image with capability
+                    # Build new image with capability — use current_image as base
+                    # so each version layers on top of the previous (v1 → v2 → v3)
                     new_image = await workflow.execute_activity(
                         build_agent_image,
-                        args=[task_id, capability],
+                        args=[task_id, capability, self.current_image],
                         start_to_close_timeout=timedelta(minutes=10)
                     )
                     
@@ -499,9 +500,14 @@ async def create_capability_request(
 @activity.defn
 async def build_agent_image(
     task_id: str,
-    capability: Dict[str, Any]
+    capability: Dict[str, Any],
+    current_image: str = "localhost:5000/openclaw-agent:openclaw"
 ) -> str:
-    """Build new agent image with capability"""
+    """Build new agent image with capability.
+    
+    Uses current_image as the base so capabilities accumulate
+    incrementally: base → v1 (+ redis) → v2 (+ flask) → v3 ...
+    """
     import httpx
     
     cap_type = capability.get("type", "tool_install")
@@ -512,23 +518,31 @@ async def build_agent_image(
     
     try:
         # Map capability to build capability format
-        build_capability = {
-            "type": "pip_package" if cap_type == "tool_install" else cap_type,
-            "name": resource,
-            "version": None
-        }
+        # Split comma-separated resources into individual capabilities
+        resources = [r.strip() for r in resource.split(",") if r.strip()]
+        build_capabilities = [
+            {
+                "type": "pip_package" if cap_type == "tool_install" else cap_type,
+                "name": r,
+                "version": None
+            }
+            for r in resources
+        ]
         
-        logger.info(f"   └─ Submitting build request to image-builder...")
+        # Convert current_image to registry:5000 format for docker-dind
+        base_image = current_image.replace("localhost:5000/", "registry:5000/")
+        
+        logger.info(f"   └─ Building FROM {base_image} (incremental)")
+        logger.info(f"   └─ Adding: {resources}")
         
         # Call image builder service
-        # Note: Use registry:5000 for docker-dind to access base image
         async with httpx.AsyncClient(timeout=300.0) as client:
             response = await client.post(
                 f"{image_builder_url}/build",
                 json={
                     "task_id": task_id,
-                    "base_image": "registry:5000/openclaw-agent:openclaw",
-                    "capabilities": [build_capability]
+                    "base_image": base_image,
+                    "capabilities": build_capabilities
                 }
             )
             response.raise_for_status()

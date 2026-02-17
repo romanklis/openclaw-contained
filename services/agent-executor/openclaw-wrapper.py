@@ -418,10 +418,27 @@ def parse_deployment_request(output: str) -> Optional[Dict[str, Any]]:
 
     Format: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>
     Example: DEPLOYMENT_REQUEST:fibonacci-app:5000:python app.py
+    Also handles: DEPLOYMENT_REQUEST:app:8080:sh -c "redis-server && python app.py"
     """
-    match = re.search(r"DEPLOYMENT_REQUEST:([^:]+):(\d+):([^\n\"\\]+)", output)
+    # Match everything after port until end of line, including quoted strings
+    match = re.search(r"DEPLOYMENT_REQUEST:([^:]+):(\d+):(.+)", output)
     if match:
-        entrypoint = match.group(3).strip().rstrip(".,;\"'")
+        entrypoint = match.group(3).strip()
+        # Strip trailing punctuation and JSON artefacts (the marker is often
+        # embedded inside a JSON string so we may pick up a closing quote,
+        # comma, bracket, etc.)
+        entrypoint = entrypoint.rstrip(".,;\\]})")
+        # Strip trailing quotes only if they are unbalanced (JSON artefact)
+        while entrypoint and entrypoint[-1] in ('"', "'"):
+            # Count occurrences — if odd, the trailing quote is an artefact
+            q = entrypoint[-1]
+            if entrypoint.count(q) % 2 == 1:
+                entrypoint = entrypoint[:-1]
+            else:
+                break
+        # Remove wrapping quotes if the entire entrypoint is quoted
+        if entrypoint.startswith('"') and entrypoint.endswith('"'):
+            entrypoint = entrypoint[1:-1]
         return {
             "name": match.group(1).strip(),
             "port": int(match.group(2)),

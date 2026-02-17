@@ -9,6 +9,7 @@ from pathlib import Path
 from jinja2 import Template
 import logging
 import os
+import re
 import uuid
 import time
 
@@ -176,6 +177,15 @@ LABEL task_id="{{ task_id }}"
 
 WORKDIR /app
 
+{% if apt_packages %}
+# Install system packages
+RUN apt-get update && apt-get install -y \\
+{% for pkg in apt_packages %}
+    {{ pkg }} \\
+{% endfor %}
+    && rm -rf /var/lib/apt/lists/*
+{% endif %}
+
 {% if pip_packages %}
 # Install Python dependencies
 RUN pip install --no-cache-dir {{ pip_packages | join(' ') }}
@@ -183,6 +193,12 @@ RUN pip install --no-cache-dir {{ pip_packages | join(' ') }}
 
 # Copy application files
 COPY app/ /app/
+
+# Rewrite any /workspace/ references to /app/ inside copied files
+RUN find /app -type f \\( -name '*.py' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.toml' -o -name '*.cfg' -o -name '*.conf' -o -name '*.ini' -o -name '*.txt' -o -name '*.html' -o -name '*.js' \\) -exec sed -i 's|/workspace/|/app/|g; s|/workspace|/app|g' {} + 2>/dev/null || true
+
+# Make shell scripts executable
+RUN find /app -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
 
 EXPOSE {{ port }}
 
@@ -196,12 +212,30 @@ def generate_deployment_dockerfile(
     entrypoint: str,
     port: int,
     pip_packages: Optional[List[str]] = None,
+    apt_packages: Optional[List[str]] = None,
 ) -> str:
     """Generate a minimal Dockerfile for a deployment (no OpenClaw)."""
-    # Parse entrypoint into CMD JSON array form
-    parts = entrypoint.split()
+    # Rewrite /workspace/ paths to /app/ since deployment copies files to /app/
+    entrypoint = entrypoint.replace("/workspace/", "/app/")
+    entrypoint = entrypoint.replace("/workspace", "/app")
+    
+    # Strip wrapping quotes from sh -c "..." style entrypoints
     import json as json_mod
-    entrypoint_cmd = json_mod.dumps(parts)
+    if 'sh -c' in entrypoint:
+        # Extract the command after sh -c, stripping surrounding quotes
+        sh_match = re.search(r'sh\s+-c\s+["\']?(.+?)["\']?\s*$', entrypoint)
+        if sh_match:
+            inner_cmd = sh_match.group(1)
+            entrypoint_cmd = json_mod.dumps(["sh", "-c", inner_cmd])
+        else:
+            entrypoint_cmd = json_mod.dumps(["sh", "-c", entrypoint.split('sh -c', 1)[1].strip().strip('"\"')])
+    elif '&&' in entrypoint or '|' in entrypoint or ';' in entrypoint:
+        # Complex shell command — use shell form
+        entrypoint_cmd = json_mod.dumps(["sh", "-c", entrypoint])
+    else:
+        # Simple command — split into exec form
+        parts = entrypoint.split()
+        entrypoint_cmd = json_mod.dumps(parts)
 
     template = Template(DEPLOYMENT_DOCKERFILE_TEMPLATE)
     return template.render(
@@ -210,6 +244,7 @@ def generate_deployment_dockerfile(
         port=port,
         entrypoint_cmd=entrypoint_cmd,
         pip_packages=pip_packages or [],
+        apt_packages=apt_packages or [],
     )
 
 
@@ -413,23 +448,54 @@ async def build_image(
     
     build_id = str(uuid.uuid4())[:8]
     
-    # Get latest version for this task
-    existing_builds = [
+    # Get latest version for this task by counting previous successful builds
+    existing_versions = [
         b for b in builds.values()
-        if b.build_id.startswith(request.task_id)
+        if request.task_id in (b.image_tag or "") and b.status in ("success", "building", "pending")
     ]
-    version = len(existing_builds) + 1
+    version = len(existing_versions) + 1
     
     image_tag = f"openclaw-agent:{request.task_id}-v{version}"
+    logger.info(f"Version calculation: {len(existing_versions)} existing builds → v{version}")
     
     logger.info(f"Creating build {build_id} for task {request.task_id}")
+    
+    # Expand comma-separated capability names into individual entries
+    # and auto-detect system packages vs pip packages
+    KNOWN_APT_PACKAGES = {
+        "redis-server", "redis-tools", "postgresql", "postgresql-client",
+        "sqlite3", "libsqlite3-dev", "nginx", "apache2", "ffmpeg",
+        "imagemagick", "graphviz", "tesseract-ocr", "poppler-utils",
+        "wkhtmltopdf", "chromium", "chromium-browser", "libreoffice",
+        "gcc", "g++", "make", "cmake", "libffi-dev", "libssl-dev",
+        "libxml2-dev", "libxslt1-dev", "libjpeg-dev", "libpng-dev",
+        "zlib1g-dev", "libpq-dev", "default-libmysqlclient-dev",
+    }
+    expanded_capabilities = []
+    for cap in request.capabilities:
+        # Split comma-separated names
+        names = [n.strip() for n in cap.name.split(",") if n.strip()]
+        for name in names:
+            cap_type = cap.type
+            # Auto-detect: if it's a known system package, switch to apt_package
+            if name in KNOWN_APT_PACKAGES:
+                cap_type = "apt_package"
+                logger.info(f"Auto-detected {name} as APT system package")
+            elif cap_type == "pip_package" and name.startswith("lib"):
+                cap_type = "apt_package"  # lib* packages are typically system
+                logger.info(f"Auto-detected {name} as APT system package (lib* prefix)")
+            expanded_capabilities.append(
+                BuildCapability(type=cap_type, name=name, version=cap.version)
+            )
+    
+    logger.info(f"Expanded {len(request.capabilities)} capability entries → {len(expanded_capabilities)} individual packages")
     
     # Generate Dockerfile
     dockerfile = generate_dockerfile(
         request.task_id,
         build_id,
         request.base_image,
-        request.capabilities
+        expanded_capabilities
     )
     
     # Create build record
@@ -483,12 +549,22 @@ async def build_deployment_image(
 
     # Determine pip packages from task capabilities (approved ones)
     pip_packages = list(request.pip_packages or [])
-    # Also check if the task's agent image Dockerfile has pip installs
+    apt_packages = []
+    
+    # Also check if the task's agent image Dockerfile has pip/apt installs
     task_dir = AGENT_IMAGES_DIR / request.task_id
-    agent_df = task_dir / "Dockerfile"
-    if agent_df.exists():
-        import re
-        content = agent_df.read_text()
+    # Check ALL versioned Dockerfiles (Dockerfile.1, Dockerfile.2, etc.)
+    import re
+    for df_path in sorted(task_dir.glob("Dockerfile*")):
+        content = df_path.read_text()
+        
+        # Extract apt packages from "apt-get install -y pkg1 pkg2"
+        for m in re.finditer(r"apt-get install\s+-y\s+(.+?)(?:\s*&&|$)", content, re.MULTILINE):
+            for pkg in m.group(1).split():
+                pkg = pkg.strip().rstrip("\\")
+                if pkg and not pkg.startswith("-") and pkg not in apt_packages:
+                    apt_packages.append(pkg)
+        
         # Extract pip packages from "pip install ... pkg1 pkg2"
         for m in re.finditer(r"pip\d?\s+install\s+[^\\]*?([a-zA-Z0-9_-]+(?:\s+[a-zA-Z0-9_-]+)*)\s*[;\\]", content):
             for pkg in m.group(1).split():
@@ -500,6 +576,8 @@ async def build_deployment_image(
             for pkg in m.group(1).split():
                 if not pkg.startswith("-") and pkg not in pip_packages:
                     pip_packages.append(pkg)
+    
+    logger.info(f"Deployment packages — pip: {pip_packages}, apt: {apt_packages}")
 
     dockerfile = generate_deployment_dockerfile(
         deployment_id=request.deployment_id,
@@ -507,6 +585,7 @@ async def build_deployment_image(
         entrypoint=request.entrypoint,
         port=request.port,
         pip_packages=pip_packages if pip_packages else None,
+        apt_packages=apt_packages if apt_packages else None,
     )
 
     builds[build_id] = BuildStatus(
