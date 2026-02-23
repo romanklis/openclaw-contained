@@ -131,6 +131,62 @@ export default function TaskDetailPage() {
     return null;
   };
 
+  const isBinaryContent = (content: string) => content.startsWith('base64:');
+
+  const getMimeType = (filename: string): string => {
+    const ext = filename.split('.').pop()?.toLowerCase() || '';
+    const mimeMap: Record<string, string> = {
+      pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+      gif: 'image/gif', svg: 'image/svg+xml', webp: 'image/webp', bmp: 'image/bmp',
+      zip: 'application/zip', gz: 'application/gzip', csv: 'text/csv',
+      mp3: 'audio/mpeg', mp4: 'video/mp4', wav: 'audio/wav',
+    };
+    return mimeMap[ext] || 'application/octet-stream';
+  };
+
+  const getFileIcon = (filename: string, binary: boolean): string => {
+    if (!binary) return '\u{1F4C4}';
+    const ext = filename.split('.').pop()?.toLowerCase() || '';
+    if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'].includes(ext)) return '\u{1F5BC}';
+    if (ext === 'pdf') return '\u{1F4D1}';
+    if (['zip', 'tar', 'gz', '7z', 'rar'].includes(ext)) return '\u{1F4E6}';
+    return '\u{1F4CE}';
+  };
+
+  const formatFileSize = (content: string, binary: boolean): string => {
+    const bytes = binary ? Math.round((content.length - 7) * 0.75) : new Blob([content]).size;
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const downloadFile = (filename: string, content: string) => {
+    let blob: Blob;
+    if (isBinaryContent(content)) {
+      const b64 = content.slice(7); // strip "base64:" prefix
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      blob = new Blob([bytes], { type: getMimeType(filename) });
+    } else {
+      blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadAllDeliverables = (deliverables: Record<string, string>) => {
+    Object.entries(deliverables).forEach(([filename, content], i) => {
+      setTimeout(() => downloadFile(filename, content), i * 100);
+    });
+  };
+
   // --- Loading / Not found ---
   if (loading) {
     return (
@@ -380,26 +436,65 @@ export default function TaskDetailPage() {
                         {/* Deliverable Files */}
                         {o.deliverables && Object.keys(o.deliverables).length > 0 && (
                           <div>
-                            <div className="text-xs text-gray-500 uppercase font-medium mb-2">
-                              {'\u{1F4E6}'} Deliverable Files ({Object.keys(o.deliverables).length})
+                            <div className="flex items-center justify-between mb-2">
+                              <div className="text-xs text-gray-500 uppercase font-medium">
+                                {'\u{1F4E6}'} Deliverable Files ({Object.keys(o.deliverables).length})
+                              </div>
+                              {Object.keys(o.deliverables).length > 1 && (
+                                <button
+                                  onClick={() => downloadAllDeliverables(o.deliverables!)}
+                                  className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1 transition-colors"
+                                >
+                                  ⬇ Download All
+                                </button>
+                              )}
                             </div>
                             <div className="space-y-3">
-                              {Object.entries(o.deliverables).map(([filename, content]) => (
+                              {Object.entries(o.deliverables).map(([filename, content]) => {
+                                const binary = isBinaryContent(content);
+                                const isImage = binary && /\.(png|jpg|jpeg|gif|webp|bmp|svg)$/i.test(filename);
+                                return (
                                 <div key={filename} className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
                                   <div className="flex items-center justify-between px-3 py-2 bg-gray-800/80 border-b border-gray-700">
                                     <div className="flex items-center gap-2">
-                                      <span className="text-sm">{'\u{1F4C4}'}</span>
+                                      <span className="text-sm">{getFileIcon(filename, binary)}</span>
                                       <span className="text-sm font-mono text-emerald-400">{filename}</span>
                                     </div>
-                                    <span className="text-xs text-gray-500">
-                                      {content.split('\n').length} lines
-                                    </span>
+                                    <div className="flex items-center gap-3">
+                                      <span className="text-xs text-gray-500">
+                                        {binary ? formatFileSize(content, true) : `${content.split('\n').length} lines`}
+                                      </span>
+                                      <button
+                                        onClick={() => downloadFile(filename, content)}
+                                        className="text-xs px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 hover:text-white transition-colors flex items-center gap-1"
+                                        title={`Download ${filename}`}
+                                      >
+                                        ⬇ Download
+                                      </button>
+                                    </div>
                                   </div>
-                                  <pre className="p-3 text-xs text-gray-300 whitespace-pre-wrap overflow-x-auto max-h-64 overflow-y-auto font-mono">
-                                    {content}
-                                  </pre>
+                                  {binary ? (
+                                    isImage ? (
+                                      <div className="p-3 flex justify-center bg-gray-950">
+                                        <img
+                                          src={`data:${getMimeType(filename)};base64,${content.slice(7)}`}
+                                          alt={filename}
+                                          className="max-h-64 max-w-full rounded"
+                                        />
+                                      </div>
+                                    ) : (
+                                      <div className="p-3 text-xs text-gray-500 italic text-center">
+                                        Binary file — {formatFileSize(content, true)} — click Download to save
+                                      </div>
+                                    )
+                                  ) : (
+                                    <pre className="p-3 text-xs text-gray-300 whitespace-pre-wrap overflow-x-auto max-h-64 overflow-y-auto font-mono">
+                                      {content}
+                                    </pre>
+                                  )}
                                 </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           </div>
                         )}
@@ -702,24 +797,63 @@ export default function TaskDetailPage() {
                       {/* Deliverables */}
                       {o.deliverables && Object.keys(o.deliverables).length > 0 && (
                         <div>
-                          <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">
-                            Deliverables ({Object.keys(o.deliverables).length} files)
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="text-xs text-gray-500 uppercase font-medium tracking-wider">
+                              Deliverables ({Object.keys(o.deliverables).length} files)
+                            </div>
+                            {Object.keys(o.deliverables).length > 1 && (
+                              <button
+                                onClick={() => downloadAllDeliverables(o.deliverables!)}
+                                className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1 transition-colors"
+                              >
+                                ⬇ Download All
+                              </button>
+                            )}
                           </div>
                           <div className="space-y-2">
                             {Object.entries(o.deliverables).map(([filename, content]) => {
-                              const text = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+                              const raw = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+                              const binary = isBinaryContent(raw);
+                              const isImage = binary && /\.(png|jpg|jpeg|gif|webp|bmp|svg)$/i.test(filename);
                               return (
                               <div key={filename} className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
                                 <div className="flex items-center justify-between px-3 py-2 bg-gray-800/80 border-b border-gray-700">
                                   <div className="flex items-center gap-2">
-                                    <span className="text-sm">📄</span>
+                                    <span className="text-sm">{getFileIcon(filename, binary)}</span>
                                     <span className="text-xs font-mono text-emerald-400">{filename}</span>
                                   </div>
-                                  <span className="text-xs text-gray-500">{text.split('\n').length} lines</span>
+                                  <div className="flex items-center gap-3">
+                                    <span className="text-xs text-gray-500">
+                                      {binary ? formatFileSize(raw, true) : `${raw.split('\n').length} lines`}
+                                    </span>
+                                    <button
+                                      onClick={() => downloadFile(filename, raw)}
+                                      className="text-xs px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 hover:text-white transition-colors flex items-center gap-1"
+                                      title={`Download ${filename}`}
+                                    >
+                                      ⬇ Download
+                                    </button>
+                                  </div>
                                 </div>
-                                <pre className="p-3 text-xs text-gray-300 whitespace-pre-wrap overflow-x-auto max-h-48 overflow-y-auto font-mono">
-                                  {text}
-                                </pre>
+                                {binary ? (
+                                  isImage ? (
+                                    <div className="p-3 flex justify-center bg-gray-950">
+                                      <img
+                                        src={`data:${getMimeType(filename)};base64,${raw.slice(7)}`}
+                                        alt={filename}
+                                        className="max-h-48 max-w-full rounded"
+                                      />
+                                    </div>
+                                  ) : (
+                                    <div className="p-3 text-xs text-gray-500 italic text-center">
+                                      Binary file — {formatFileSize(raw, true)} — click Download to save
+                                    </div>
+                                  )
+                                ) : (
+                                  <pre className="p-3 text-xs text-gray-300 whitespace-pre-wrap overflow-x-auto max-h-48 overflow-y-auto font-mono">
+                                    {raw}
+                                  </pre>
+                                )}
                               </div>
                               );
                             })}

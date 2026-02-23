@@ -455,19 +455,49 @@ def parse_deployment_request(output: str) -> Optional[Dict[str, Any]]:
 RESULT_START = "===OPENCLAW_RESULT_JSON_START==="
 RESULT_END = "===OPENCLAW_RESULT_JSON_END==="
 
+# Binary file extensions that should be base64-encoded
+BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".pptx",
+    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+    ".whl", ".egg", ".so", ".dll", ".dylib",
+    ".mp3", ".mp4", ".wav", ".avi", ".mov",
+    ".ttf", ".otf", ".woff", ".woff2",
+    ".pyc", ".pyo", ".class",
+    ".sqlite", ".db",
+}
+
+
+def _is_binary_file(fpath: str) -> bool:
+    """Detect if a file is binary by extension or by content sampling."""
+    _, ext = os.path.splitext(fpath)
+    if ext.lower() in BINARY_EXTENSIONS:
+        return True
+    # Sample first 8KB for null bytes
+    try:
+        with open(fpath, "rb") as f:
+            chunk = f.read(8192)
+        return b"\x00" in chunk
+    except Exception:
+        return True
+
+
 def collect_workspace_files() -> Dict[str, str]:
     """Scan /workspace for files created/modified by the agent.
 
-    Returns a dict of {relative_path: content} for text files.
+    Returns a dict of {relative_path: content} for text files,
+    and {relative_path: "base64:<encoded>"} for binary files.
     Skips hidden dirs, node_modules, and common non-deliverable files.
     """
+    import base64
+
     workspace = "/workspace"
     SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm"}
     SKIP_FILES = {"result.json", "AGENTS.md", "SOUL.md", "TOOLS.md",
                   "IDENTITY.md", "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md",
                   "package-lock.json"}
-    MAX_FILE_SIZE = 50_000  # 50 KB per file
-    MAX_TOTAL = 200_000     # 200 KB total
+    MAX_FILE_SIZE = 500_000    # 500 KB per file
+    MAX_TOTAL = 2_000_000     # 2 MB total (base64 inflates ~33%)
     collected: Dict[str, str] = {}
     total_size = 0
 
@@ -477,7 +507,7 @@ def collect_workspace_files() -> Dict[str, str]:
     for root, dirs, files in os.walk(workspace):
         # Prune skip dirs
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
-        for fname in files:
+        for fname in sorted(files):  # sorted for deterministic order
             if fname in SKIP_FILES:
                 continue
             fpath = os.path.join(root, fname)
@@ -485,15 +515,25 @@ def collect_workspace_files() -> Dict[str, str]:
             try:
                 size = os.path.getsize(fpath)
                 if size == 0 or size > MAX_FILE_SIZE:
+                    print(f"  ⏭️  Skipping {relpath}: {size} bytes (max {MAX_FILE_SIZE})")
                     continue
-                if total_size + size > MAX_TOTAL:
-                    break
-                with open(fpath, "r", errors="replace") as f:
-                    content = f.read()
+                # Estimate base64 size for binary files
+                estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
+                if total_size + estimated_size > MAX_TOTAL:
+                    print(f"  ⏭️  Skipping {relpath}: would exceed total limit")
+                    continue
+                if _is_binary_file(fpath):
+                    with open(fpath, "rb") as f:
+                        raw = f.read()
+                    content = "base64:" + base64.b64encode(raw).decode("ascii")
+                    total_size += len(content)
+                else:
+                    with open(fpath, "r", errors="replace") as f:
+                        content = f.read()
+                    total_size += size
                 collected[relpath] = content
-                total_size += size
-            except Exception:
-                pass  # binary file or unreadable
+            except Exception as e:
+                print(f"  ⚠️  Could not read {relpath}: {e}")
     return collected
 
 
