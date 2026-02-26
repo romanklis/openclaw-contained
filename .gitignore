@@ -109,3 +109,5 @@ htmlcov/
 # Temporal
 .temporal/
 /venture/
+agent-images/task-*
+agent-images/deployments/*
