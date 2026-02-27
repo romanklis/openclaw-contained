@@ -13,6 +13,7 @@ from sqlalchemy import select
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import os
+import json
 import logging
 
 from database import get_db
@@ -425,4 +426,246 @@ async def get_task_current_state(
         "total_capabilities": len(latest_requests),
         "workflow_running": task.status == TaskStatus.RUNNING,
         "last_activity": task.updated_at.isoformat() if task.updated_at else task.created_at.isoformat()
+    }
+
+
+# ---------------------------------------------------------------------------
+# Audit turns — fetches per-turn data from Temporal child workflows
+# ---------------------------------------------------------------------------
+
+async def _fetch_child_workflow_turns(workflow_id: str, run_id: str = "") -> List[Dict[str, Any]]:
+    """Fetch record_agent_turn activity results from a Temporal child workflow.
+
+    Each AgentStepWorkflow child invokes record_agent_turn activities.
+    We walk the event history and extract the input payloads (which contain
+    the full turn data: provider, tokens, tool_calls, etc.) and the
+    output payloads.
+    """
+    import httpx
+    from config import settings
+
+    temporal_http = os.getenv("TEMPORAL_HTTP_URL", "http://temporal-ui:8080")
+    namespace = "default"
+
+    # Build URL — if we have a run_id, include it
+    url = f"{temporal_http}/api/v1/namespaces/{namespace}/workflows/{workflow_id}/history"
+    params = {"maximumPageSize": 500}
+
+    turns: List[Dict[str, Any]] = []
+    # Temporary maps: scheduled_event_id → activity_type, started_event_id → scheduled_id
+    scheduled_map: Dict[int, Dict] = {}
+
+    try:
+        next_token = ""
+        while True:
+            req_params = {**params}
+            if next_token:
+                req_params["nextPageToken"] = next_token
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, params=req_params)
+                if resp.status_code != 200:
+                    logger.warning(f"Temporal history API returned {resp.status_code} for {workflow_id}")
+                    break
+                data = resp.json()
+
+            for event in data.get("history", {}).get("events", []) or data.get("events", []):
+                event_type = event.get("eventType", "")
+                attrs = None
+
+                # Track scheduled activities (name + input)
+                if event_type == "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED":
+                    attrs = event.get("activityTaskScheduledEventAttributes", {})
+                    activity_type = attrs.get("activityType", {}).get("name", "")
+                    event_id = int(event.get("eventId", 0))
+                    scheduled_map[event_id] = {
+                        "type": activity_type,
+                        "input": attrs.get("input", {}),
+                    }
+
+                # Track completed activities (output)
+                elif event_type == "EVENT_TYPE_ACTIVITY_TASK_COMPLETED":
+                    attrs = event.get("activityTaskCompletedEventAttributes", {})
+                    scheduled_id = int(attrs.get("scheduledEventId", 0))
+                    sched = scheduled_map.get(scheduled_id, {})
+
+                    if sched.get("type") in ("record_agent_turn",):
+                        # Extract input payloads
+                        turn_data = _decode_temporal_payloads(sched.get("input", {}))
+                        result_data = _decode_temporal_payloads(attrs.get("result", {}))
+                        
+                        # turn_data is [task_id, iteration, turn_number, turn_payload]
+                        turn_payload = turn_data[3] if len(turn_data) > 3 else {}
+                        turn_result = result_data[0] if result_data else {}
+                        
+                        turns.append({
+                            "turn_number": turn_data[2] if len(turn_data) > 2 else 0,
+                            "iteration": turn_data[1] if len(turn_data) > 1 else 0,
+                            "data": turn_payload,
+                            "result": turn_result,
+                        })
+
+                    elif sched.get("type") in ("start_agent_container", "collect_agent_result", "poll_agent_turns"):
+                        # Also include these as structural events
+                        result_data = _decode_temporal_payloads(attrs.get("result", {}))
+                        turns.append({
+                            "turn_number": 0,
+                            "iteration": 0,
+                            "activity_type": sched["type"],
+                            "result": result_data[0] if result_data else {},
+                        })
+
+            next_token = data.get("nextPageToken", "")
+            if not next_token:
+                break
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch child workflow history for {workflow_id}: {e}")
+
+    return turns
+
+
+def _decode_temporal_payloads(payload_container: Dict) -> List[Any]:
+    """Decode Temporal payloads from the HTTP API format.
+
+    Temporal's HTTP API returns payloads as:
+    {"payloads": [{"metadata": {"encoding": "..."}, "data": "<base64>"}]}
+    """
+    import base64
+
+    payloads = payload_container.get("payloads", [])
+    results = []
+    for p in payloads:
+        data_b64 = p.get("data", "")
+        if not data_b64:
+            results.append(None)
+            continue
+        try:
+            raw = base64.b64decode(data_b64)
+            # Try JSON parse first
+            try:
+                results.append(json.loads(raw))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Might be a plain string or number
+                results.append(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            results.append(None)
+    return results
+
+
+@router.get("/{task_id}/audit-turns")
+async def get_audit_turns(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """Get per-turn audit data for a task.
+
+    Queries Temporal for all AgentStepWorkflow child workflows associated
+    with this task and extracts the record_agent_turn activities from each.
+    Returns a structured list of iterations with their individual LLM turns.
+    """
+    import httpx
+
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    temporal_http = os.getenv("TEMPORAL_HTTP_URL", "http://temporal-ui:8080")
+    namespace = "default"
+
+    # Find all child workflows for this task
+    # They are named: agent-step-{task_id}-iter-{N}
+    # Also check continuation workflows: task-workflow-{task_id}-cont-{N}
+    workflow_ids_to_check = []
+
+    # Primary workflow
+    primary_wf_id = f"task-workflow-{task_id}"
+    workflow_ids_to_check.append(primary_wf_id)
+
+    # Find continuations (cont-1, cont-2, etc.)
+    for cont_num in range(1, 20):
+        cont_wf_id = f"task-workflow-{task_id}-cont-{cont_num}"
+        workflow_ids_to_check.append(cont_wf_id)
+
+    # For each parent workflow, find the child AgentStepWorkflow IDs
+    child_workflows: List[Dict[str, Any]] = []
+
+    for parent_wf_id in workflow_ids_to_check:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{temporal_http}/api/v1/namespaces/{namespace}/workflows/{parent_wf_id}/history",
+                    params={"maximumPageSize": 500},
+                )
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+
+            for event in data.get("history", {}).get("events", []) or data.get("events", []):
+                event_type = event.get("eventType", "")
+                if event_type == "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED":
+                    attrs = event.get("startChildWorkflowExecutionInitiatedEventAttributes", {})
+                    child_wf_id = attrs.get("workflowId", "")
+                    child_wf_type = attrs.get("workflowType", {}).get("name", "")
+                    if child_wf_type == "AgentStepWorkflow" and child_wf_id:
+                        # Extract iteration from input payloads
+                        input_payloads = _decode_temporal_payloads(attrs.get("input", {}))
+                        iteration = input_payloads[1] if len(input_payloads) > 1 else 0
+                        child_workflows.append({
+                            "workflow_id": child_wf_id,
+                            "iteration": iteration,
+                            "parent": parent_wf_id,
+                        })
+        except Exception as e:
+            logger.debug(f"Could not fetch history for {parent_wf_id}: {e}")
+            continue
+
+    # Now fetch turns from each child workflow
+    iterations_data: List[Dict[str, Any]] = []
+
+    for child in child_workflows:
+        raw_events = await _fetch_child_workflow_turns(child["workflow_id"])
+
+        # Separate turn activities from structural activities
+        turns = []
+        container_info = {}
+        for ev in raw_events:
+            if ev.get("activity_type") == "start_agent_container":
+                container_info = ev.get("result", {})
+            elif ev.get("activity_type") == "collect_agent_result":
+                # Could enrich with final result data
+                pass
+            elif ev.get("data"):
+                turns.append(ev)
+
+        iterations_data.append({
+            "iteration": child["iteration"],
+            "workflow_id": child["workflow_id"],
+            "parent_workflow": child["parent"],
+            "container": container_info,
+            "turns": turns,
+            "turn_count": len(turns),
+        })
+
+    # Sort by iteration
+    iterations_data.sort(key=lambda x: x["iteration"])
+
+    # Compute totals
+    total_turns = sum(it["turn_count"] for it in iterations_data)
+    total_input_tokens = 0
+    total_output_tokens = 0
+    for it in iterations_data:
+        for t in it["turns"]:
+            usage = t.get("data", {}).get("response", {}).get("usage", {})
+            total_input_tokens += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+            total_output_tokens += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+
+    return {
+        "task_id": task_id,
+        "iterations": iterations_data,
+        "total_iterations": len(iterations_data),
+        "total_turns": total_turns,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
     }

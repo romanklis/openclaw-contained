@@ -1301,16 +1301,23 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 # -------------------------------------------------------------------
 
 @router.get("/interactions/{task_id}")
-async def get_task_interactions(task_id: str):
-    """Get all recorded LLM interactions for a task.
+async def get_task_interactions(task_id: str, since: int = 0):
+    """Get recorded LLM interactions for a task.
     
     Returns the full trace of every LLM turn: what tool results came in,
     what tool calls the LLM made, text responses, usage stats.
-    Called by the worker after the agent container finishes.
+
+    Query params:
+        since: 0-based index — return only interactions[since:].
+               Useful for polling: the worker remembers the last index
+               it saw and only fetches new turns.
     """
-    interactions = _task_interactions.get(task_id, [])
+    all_interactions = _task_interactions.get(task_id, [])
+    interactions = all_interactions[since:]
     return {
         "task_id": task_id,
+        "total": len(all_interactions),
+        "since": since,
         "count": len(interactions),
         "interactions": interactions,
     }

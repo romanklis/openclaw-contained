@@ -85,11 +85,12 @@ class AgentTaskWorkflow:
             
             logger.info(f"Task {task_id} iteration {iteration} with image {self.current_image}")
             
-            # Execute agent step with current image
-            result = await workflow.execute_activity(
-                run_agent_step,
+            # Execute agent step as a child workflow so every LLM turn
+            # inside it is visible as a separate activity in Temporal UI.
+            result = await workflow.execute_child_workflow(
+                AgentStepWorkflow.run,
                 args=[task_id, iteration, self.current_image, self.llm_model, self.follow_up],
-                start_to_close_timeout=timedelta(minutes=30)
+                id=f"agent-step-{task_id}-iter-{iteration}",
             )
 
             # Store output in the control-plane database (fire-and-forget, don't block workflow)
@@ -200,6 +201,108 @@ class AgentTaskWorkflow:
 
 
 # =============================================================================
+# AgentStepWorkflow — child workflow that breaks a single agent iteration
+# into individually visible activities in Temporal UI.
+#
+# Instead of one monolithic "run_agent_step" activity, the workflow:
+#   1. start_agent_container  — launches the container (detached)
+#   2. poll_agent_turns       — polls the LLM router for new turns while
+#                               the container runs, recording each as a
+#                               record_agent_turn activity
+#   3. collect_agent_result   — reads the final result after container exits
+# =============================================================================
+
+@workflow.defn
+class AgentStepWorkflow:
+    """Child workflow that provides per-turn visibility into an agent step."""
+
+    @workflow.run
+    async def run(
+        self,
+        task_id: str,
+        iteration: int,
+        agent_image: str = "localhost:5000/openclaw-agent:openclaw",
+        llm_model: str = "gemma3:4b",
+        follow_up: str = "",
+    ) -> Dict[str, Any]:
+        logger.info(
+            f"🔬 AgentStepWorkflow | Task: {task_id} | Iteration: {iteration} | "
+            f"Image: {agent_image} | Model: {llm_model}"
+        )
+
+        # 1. Launch the container (returns container_id + workspace info)
+        launch_info = await workflow.execute_activity(
+            start_agent_container,
+            args=[task_id, iteration, agent_image, llm_model, follow_up],
+            start_to_close_timeout=timedelta(minutes=5),
+        )
+
+        if launch_info.get("error"):
+            return {
+                "completed": False,
+                "agent_failed": True,
+                "error": launch_info["error"],
+            }
+
+        container_id = launch_info["container_id"]
+        workspace_dir = launch_info["workspace_dir"]
+        turns_seen = 0
+
+        # 2. Poll loop — keep checking for new LLM turns until container exits
+        container_done = False
+        while not container_done:
+            poll_result = await workflow.execute_activity(
+                poll_agent_turns,
+                args=[task_id, container_id, turns_seen],
+                start_to_close_timeout=timedelta(minutes=31),
+                heartbeat_timeout=timedelta(seconds=60),
+            )
+
+            container_done = poll_result["container_done"]
+            new_turns = poll_result.get("new_turns", [])
+
+            # Record each new turn as its own activity
+            for turn_data in new_turns:
+                turns_seen += 1
+                try:
+                    await workflow.execute_activity(
+                        record_agent_turn,
+                        args=[task_id, iteration, turns_seen, turn_data],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                except Exception:
+                    pass  # non-critical
+
+        # 3. Collect the final result from the container
+        result = await workflow.execute_activity(
+            collect_agent_result,
+            args=[task_id, iteration, container_id, workspace_dir, agent_image, llm_model],
+            start_to_close_timeout=timedelta(minutes=2),
+        )
+
+        # Record any remaining turns that arrived between last poll and container exit.
+        # _remaining_turns contains ALL interactions; skip the ones already recorded.
+        all_turns = result.pop("_remaining_turns", [])
+        remaining_turns = all_turns[turns_seen:]
+        for turn_data in remaining_turns:
+            turns_seen += 1
+            try:
+                await workflow.execute_activity(
+                    record_agent_turn,
+                    args=[task_id, iteration, turns_seen, turn_data],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+            except Exception:
+                pass
+
+        logger.info(
+            f"🔬 AgentStepWorkflow done | Task: {task_id} | Iteration: {iteration} | "
+            f"Turns: {turns_seen} | Completed: {result.get('completed')}"
+        )
+        return result
+
+
+# =============================================================================
 # Activities
 # =============================================================================
 
@@ -216,27 +319,27 @@ async def initialize_task(task_id: str) -> Dict[str, Any]:
 
 
 @activity.defn
-async def run_agent_step(task_id: str, iteration: int, agent_image: str = "localhost:5000/openclaw-agent:openclaw", llm_model: str = "gemma3:4b", follow_up: str = "") -> Dict[str, Any]:
-    """Run one iteration of agent execution"""
-    logger.info(f"🤖 AGENT_STEP | Task: {task_id} | Iteration: {iteration} | Image: {agent_image} | Model: {llm_model}")
-    if follow_up:
-        logger.info(f"   └─ Follow-up: {follow_up[:120]}...")
-    logger.info(f"   └─ Starting agent execution in container...")
-    
+async def start_agent_container(
+    task_id: str,
+    iteration: int,
+    agent_image: str = "localhost:5000/openclaw-agent:openclaw",
+    llm_model: str = "gemma3:4b",
+    follow_up: str = "",
+) -> Dict[str, Any]:
+    """Launch the agent container (detached) and return container_id + workspace_dir.
+
+    This replaces the first half of the old monolithic ``run_agent_step``:
+    image resolution, workspace setup, environment, and ``docker run``.
+    The container is started in detached mode so control returns immediately.
+    """
+    logger.info(f"🚀 START_CONTAINER | Task: {task_id} | Iter: {iteration} | Image: {agent_image} | Model: {llm_model}")
+
     import docker
-    import tempfile
-    import json as json_lib
-    
+
     try:
-        # Connect to Docker
         docker_client = docker.from_env()
-        
-        # Use the provided agent image
-        logger.info(f"🐳 Using agent image: {agent_image}")
-        
-        # Check if image exists locally (try multiple name variants)
-        # Images in DinD may be tagged as registry:5000/..., openclaw-agent:...,
-        # or localhost:5000/... depending on who built/tagged them.
+
+        # --- resolve image (try name variants) ---
         image_found = False
         image_variants = [
             agent_image,
@@ -244,7 +347,6 @@ async def run_agent_step(task_id: str, iteration: int, agent_image: str = "local
             agent_image.replace("localhost:5000/", ""),
             agent_image.replace("registry:5000/", ""),
         ]
-        # Deduplicate while preserving order
         seen = set()
         image_variants = [v for v in image_variants if v not in seen and not seen.add(v)]
 
@@ -259,19 +361,17 @@ async def run_agent_step(task_id: str, iteration: int, agent_image: str = "local
                 continue
 
         if not image_found:
-            logger.warning(f"⚠️ Image {agent_image} not found locally, pulling from registry...")
             agent_image_fixed = agent_image.replace("localhost:5000/", "registry:5000/")
             if not agent_image_fixed.startswith("registry:5000/"):
                 agent_image_fixed = f"registry:5000/{agent_image_fixed}"
             logger.info(f"📥 Pulling {agent_image_fixed}")
             docker_client.images.pull(agent_image_fixed)
-            logger.info(f"✅ Image pulled successfully")
             agent_image = agent_image_fixed
-        
-        # Create workspace directory for this task (persistent across iterations)
+
+        # --- workspace ---
         workspaces_root = "/workspaces"
-        # Get workspace_id from task data
         workspace_id = ""
+        task_description = ""
         try:
             import httpx as _httpx
             _cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
@@ -290,27 +390,19 @@ async def run_agent_step(task_id: str, iteration: int, agent_image: str = "local
         workspace_dir = os.path.join(workspaces_root, workspace_id)
         os.makedirs(workspace_dir, exist_ok=True)
         os.chmod(workspace_dir, 0o777)
-        result_file = f"{workspace_dir}/result.json"
-        
-        # Resolve control-plane IP dynamically for agent containers
-        # Agent containers run inside DinD and can reach compose services by IP
-        # (DinD shares the compose network subnet)
+
+        # --- control-plane IP ---
         control_plane_ip = os.getenv("CONTROL_PLANE_IP", "")
         if not control_plane_ip:
             import socket
             try:
                 control_plane_ip = socket.gethostbyname("control-plane")
             except socket.gaierror:
-                control_plane_ip = "control-plane"  # fallback to DNS name
-        logger.info(f"🌐 Using control plane IP: {control_plane_ip}")
-        
-        # Control plane URL for the agent container
-        # Agent containers run inside DinD which shares the compose network
-        # They can reach control-plane via its resolved IP on that network
+                control_plane_ip = "control-plane"
         cp_url_for_agent = f"http://{control_plane_ip}:8000"
         llm_router_url = f"{cp_url_for_agent}/api/llm"
 
-        # Read the Dockerfile for this task image (if it exists)
+        # --- Dockerfile injection ---
         agent_dockerfile = ""
         agent_images_dir = os.getenv("AGENT_IMAGES_DIR", "/agent-images")
         dockerfile_path = os.path.join(agent_images_dir, task_id, "Dockerfile")
@@ -318,7 +410,6 @@ async def run_agent_step(task_id: str, iteration: int, agent_image: str = "local
             try:
                 with open(dockerfile_path, "r") as _df:
                     agent_dockerfile = _df.read()
-                logger.info(f"📄 Injecting Dockerfile ({len(agent_dockerfile)} chars) into agent env")
             except Exception:
                 pass
 
@@ -329,137 +420,309 @@ async def run_agent_step(task_id: str, iteration: int, agent_image: str = "local
             "LLM_ROUTER_URL": llm_router_url,
             "OLLAMA_URL": os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"),
             "LLM_MODEL": llm_model,
-            "TASK_DESCRIPTION": task_description[:2000],  # Pass description directly
+            "TASK_DESCRIPTION": task_description[:2000],
             "AGENT_IMAGE": agent_image,
             "AGENT_DOCKERFILE": agent_dockerfile[:4000],
-            "FOLLOW_UP": follow_up[:2000],  # Follow-up instructions for continuation
+            "FOLLOW_UP": follow_up[:2000],
         }
-        logger.info(f"🔧 Agent environment: CONTROL_PLANE={agent_env['CONTROL_PLANE_URL']}, LLM_ROUTER={agent_env['LLM_ROUTER_URL']}, MODEL={agent_env['LLM_MODEL']}")
-        logger.info(f"   Task description: {task_description[:100]}...")
-        
-        logger.info(f"🚀 Starting container execution...")
+
+        logger.info(f"🚀 Launching container (detached)...")
         container = docker_client.containers.run(
             agent_image,
             environment=agent_env,
-            volumes={
-                workspace_dir: {"bind": "/workspace", "mode": "rw"}
-            },
-            tmpfs={"/tmp": "size=100m,mode=1777"},  # tmpfs for /tmp (writable by all)
-            network_mode="host",  # Use host network to reach control-plane
-            detach=True,  # detach so we can get logs even on non-zero exit
+            volumes={workspace_dir: {"bind": "/workspace", "mode": "rw"}},
+            tmpfs={"/tmp": "size=100m,mode=1777"},
+            network_mode="host",
+            detach=True,
         )
 
-        # Wait for the container to finish (timeout 30 min)
-        exit_info = container.wait(timeout=1800)
+        logger.info(f"✅ Container started: {container.short_id}")
+        return {
+            "container_id": container.id,
+            "workspace_dir": workspace_dir,
+            "agent_image": agent_image,
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Failed to start agent container: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+@activity.defn
+async def poll_agent_turns(
+    task_id: str,
+    container_id: str,
+    turns_seen: int,
+) -> Dict[str, Any]:
+    """Poll the LLM router for new agent turns and check if the container is still running.
+
+    Returns ``{"container_done": bool, "new_turns": [...]}``.
+    The workflow calls this in a loop, recording each turn via ``record_agent_turn``.
+    """
+    import docker
+    import httpx
+
+    docker_client = docker.from_env()
+    cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    new_turns = []
+    container_done = False
+
+    # Poll until the container exits, sending heartbeats to keep the activity alive.
+    # Each poll cycle is ~3 seconds; we return to the workflow as soon as we have
+    # new turns OR the container finishes.
+    max_polls = 600  # ~30 min at 3s intervals
+    for _ in range(max_polls):
+        activity.heartbeat(f"turns_seen={turns_seen + len(new_turns)}")
+
+        # Check for new interactions from the LLM router
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{cp_url}/api/llm/interactions/{task_id}",
+                    params={"since": turns_seen + len(new_turns)},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    batch = data.get("interactions", [])
+                    if batch:
+                        new_turns.extend(batch)
+                        logger.info(f"📡 Got {len(batch)} new turn(s) for {task_id} (total seen: {turns_seen + len(new_turns)})")
+        except Exception as e:
+            logger.warning(f"⚠️ Poll interactions failed: {e}")
+
+        # Check container status
+        try:
+            container = docker_client.containers.get(container_id)
+            status = container.status  # "running", "exited", "created", etc.
+            if status != "running":
+                container_done = True
+                logger.info(f"🏁 Container {container_id[:12]} status: {status}")
+        except docker.errors.NotFound:
+            container_done = True
+            logger.info(f"🏁 Container {container_id[:12]} not found (already removed)")
+        except Exception as e:
+            logger.warning(f"⚠️ Container status check failed: {e}")
+
+        # Return to workflow if we have new turns to record or container is done
+        if new_turns or container_done:
+            break
+
+        await asyncio.sleep(3)
+
+    return {
+        "container_done": container_done,
+        "new_turns": new_turns,
+    }
+
+
+@activity.defn
+async def collect_agent_result(
+    task_id: str,
+    iteration: int,
+    container_id: str,
+    workspace_dir: str,
+    agent_image: str,
+    llm_model: str,
+) -> Dict[str, Any]:
+    """Collect the final result from the stopped agent container.
+
+    Reads the result from stdout markers or result.json, fetches any
+    remaining LLM interactions, and cleans up the container.
+    """
+    import docker
+    import json as json_lib
+    import httpx
+
+    logger.info(f"📦 COLLECT_RESULT | Task: {task_id} | Iter: {iteration}")
+
+    docker_client = docker.from_env()
+    cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    try:
+        container = docker_client.containers.get(container_id)
+
+        # Wait for exit (should already be done, but just in case)
+        exit_info = container.wait(timeout=120)
         exit_code = exit_info.get("StatusCode", -1)
 
-        # Grab stdout+stderr regardless of exit code
         container_output = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
-        logger.info(f"📄 Container exited with code {exit_code}, output ({len(container_output)} bytes):")
+        logger.info(f"📄 Container exited with code {exit_code}, output ({len(container_output)} bytes)")
 
-        # Clean up the stopped container
+        # Clean up
         try:
             container.remove(force=True)
         except Exception:
             pass
-        for line in container_output.split('\n')[:50]:  # First 50 lines
-            if line.strip():
-                logger.info(f"   {line}")
 
-        # --------------- Extract result ---------------
-        # Primary: parse the delimited JSON marker from container stdout
-        # Fallback: read result.json file (works when volumes are visible)
-        RESULT_START = "===OPENCLAW_RESULT_JSON_START==="
-        RESULT_END   = "===OPENCLAW_RESULT_JSON_END==="
-
-        result = None
-
-        # Method 1: Delimited JSON in stdout (always works across DinD)
-        if RESULT_START in container_output:
-            try:
-                start_idx = container_output.index(RESULT_START) + len(RESULT_START)
-                end_idx = container_output.index(RESULT_END, start_idx)
-                result_str = container_output[start_idx:end_idx].strip()
-                result = json_lib.loads(result_str)
-                logger.info(f"✅ Parsed result from stdout markers")
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to parse stdout markers: {e}")
-
-        # Method 2: result.json file (may work if volumes align)
-        if result is None and os.path.exists(result_file):
-            try:
-                with open(result_file, 'r') as f:
-                    result = json_lib.load(f)
-                logger.info(f"✅ Read result from file: {result_file}")
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to read result file: {e}")
-
-        if result is not None:
-            if result.get("capability_requested"):
-                cap = result.get("capability", {})
-                logger.info(f"🔐 CAPABILITY | Task: {task_id} | Type: {cap.get('type')} | Resource: {cap.get('resource')}")
-                logger.info(f"   └─ Justification: {cap.get('justification', 'N/A')[:80]}...")
-            elif result.get("completed"):
-                logger.info(f"✅ COMPLETED | Task: {task_id} | Agent reported task completion")
-            else:
-                logger.info(f"⏭️  CONTINUE | Task: {task_id} | Agent step completed, continuing...")
-
-            # Fetch LLM interaction log from the control plane
-            try:
-                import httpx as _httpx
-                _cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-                async with _httpx.AsyncClient(timeout=10.0) as _client:
-                    _resp = await _client.get(f"{_cp_url}/api/llm/interactions/{task_id}")
-                    if _resp.status_code == 200:
-                        interactions_data = _resp.json()
-                        interactions = interactions_data.get("interactions", [])
-                        if interactions:
-                            result["llm_interactions"] = interactions
-                            logger.info(f"📝 Attached {len(interactions)} LLM interaction(s) to result")
-                            # Clear after fetching so next iteration starts fresh
-                            await _client.delete(f"{_cp_url}/api/llm/interactions/{task_id}")
-            except Exception as _e:
-                logger.warning(f"⚠️ Could not fetch LLM interactions: {_e}")
-
-            result["agent_logs"] = container_output[:50000]
-            result["_temporal_metadata"] = {
-                "task_id": task_id,
-                "iteration": iteration,
-                "image": agent_image,
-                "timestamp": str(datetime.now())
-            }
-            return result
-
-        # Method 3: Best-effort parse of raw stdout (last resort)
-        logger.warning("⚠️ No result markers or file found, attempting raw parse")
-        error_msg = None
-        if "ERROR:" in container_output or "Traceback" in container_output:
-            lines = container_output.split('\n')
-            for i, line in enumerate(lines):
-                if "ERROR:" in line or "raise" in line:
-                    error_msg = '\n'.join(lines[i:min(i+10, len(lines))])
-                    break
-
-        return {
-            "completed": False,
-            "capability_requested": False,
-            "output": container_output[:50000],
-            "agent_logs": container_output[:50000],
-            "parse_error": True,
-            "error": error_msg[:500] if error_msg else "No result from agent (no markers, no file)"
-        }
-
+    except docker.errors.NotFound:
+        logger.warning(f"Container {container_id[:12]} already removed, reading result from file")
+        container_output = ""
+        exit_code = -1
     except Exception as e:
-        logger.error(f"Agent execution failed: {e}", exc_info=True)
-        # Extract useful info from container error output
-        error_detail = str(e)
-        # docker ContainerError includes the container's stderr in the message
-        return {
-            "completed": False,
-            "capability_requested": False,
-            "error": error_detail[:2000],
-            "agent_failed": True,
+        logger.error(f"❌ Failed to collect container: {e}")
+        return {"completed": False, "agent_failed": True, "error": str(e)}
+
+    for line in container_output.split('\n')[:50]:
+        if line.strip():
+            logger.info(f"   {line}")
+
+    # --- Extract result ---
+    RESULT_START = "===OPENCLAW_RESULT_JSON_START==="
+    RESULT_END = "===OPENCLAW_RESULT_JSON_END==="
+    result = None
+
+    if RESULT_START in container_output:
+        try:
+            start_idx = container_output.index(RESULT_START) + len(RESULT_START)
+            end_idx = container_output.index(RESULT_END, start_idx)
+            result_str = container_output[start_idx:end_idx].strip()
+            result = json_lib.loads(result_str)
+            logger.info("✅ Parsed result from stdout markers")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to parse stdout markers: {e}")
+
+    result_file = f"{workspace_dir}/result.json"
+    if result is None and os.path.exists(result_file):
+        try:
+            with open(result_file, "r") as f:
+                result = json_lib.load(f)
+            logger.info(f"✅ Read result from file: {result_file}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to read result file: {e}")
+
+    if result is not None:
+        if result.get("capability_requested"):
+            cap = result.get("capability", {})
+            logger.info(f"🔐 CAPABILITY | Task: {task_id} | Type: {cap.get('type')} | Resource: {cap.get('resource')}")
+        elif result.get("completed"):
+            logger.info(f"✅ COMPLETED | Task: {task_id}")
+        else:
+            logger.info(f"⏭️  CONTINUE | Task: {task_id}")
+
+        # Fetch any remaining LLM interactions not yet seen by poll loop
+        remaining_turns = []
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{cp_url}/api/llm/interactions/{task_id}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    all_interactions = data.get("interactions", [])
+                    # The workflow knows how many it already recorded via turns_seen;
+                    # we return ALL interactions and let the workflow diff.
+                    remaining_turns = all_interactions
+                    # Clear after fetching
+                    await client.delete(f"{cp_url}/api/llm/interactions/{task_id}")
+        except Exception as _e:
+            logger.warning(f"⚠️ Could not fetch remaining interactions: {_e}")
+
+        result["agent_logs"] = container_output[:50000]
+        result["_temporal_metadata"] = {
+            "task_id": task_id,
+            "iteration": iteration,
+            "image": agent_image,
+            "timestamp": str(datetime.now()),
         }
+        result["_remaining_turns"] = remaining_turns
+        return result
+
+    # Fallback: no structured result
+    logger.warning("⚠️ No result markers or file found, attempting raw parse")
+    error_msg = None
+    if "ERROR:" in container_output or "Traceback" in container_output:
+        lines = container_output.split('\n')
+        for i, line in enumerate(lines):
+            if "ERROR:" in line or "raise" in line:
+                error_msg = '\n'.join(lines[i:min(i + 10, len(lines))])
+                break
+
+    return {
+        "completed": False,
+        "capability_requested": False,
+        "output": container_output[:50000],
+        "agent_logs": container_output[:50000],
+        "parse_error": True,
+        "error": error_msg[:500] if error_msg else "No result from agent (no markers, no file)",
+    }
+
+
+@activity.defn
+async def record_agent_turn(
+    task_id: str,
+    iteration: int,
+    turn_number: int,
+    turn_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Record a single LLM turn as a visible Temporal activity.
+
+    Each invocation appears as its own activity inside the ``AgentStepWorkflow``
+    child workflow, giving operators per-turn visibility.
+    """
+    provider = turn_data.get("provider", "unknown")
+    timestamp = turn_data.get("timestamp", "")
+
+    req = turn_data.get("request", {})
+    resp = turn_data.get("response", {})
+
+    msg_count = req.get("msg_count", 0)
+    tool_results_in = req.get("tool_results", [])
+
+    finish_reason = resp.get("finish_reason", "")
+    tool_calls = resp.get("tool_calls", [])
+    usage = resp.get("usage", {})
+    content_preview = (resp.get("content") or "")[:300]
+
+    tool_names = [tc.get("name", "?") for tc in tool_calls]
+    if tool_calls:
+        action_desc = f"Tool calls: {', '.join(tool_names)}"
+    elif content_preview:
+        action_desc = f"Response: {content_preview[:120]}..."
+    else:
+        action_desc = f"Finish: {finish_reason}"
+
+    logger.info(
+        f"📋 TURN {turn_number} | Task: {task_id} | Iter: {iteration} | "
+        f"Provider: {provider} | Msgs: {msg_count} | "
+        f"Tool results in: {len(tool_results_in)} | "
+        f"Tool calls out: {len(tool_calls)} | {action_desc[:100]}"
+    )
+
+    if usage:
+        logger.info(
+            f"   └─ Tokens: in={usage.get('input_tokens', '?')} "
+            f"out={usage.get('output_tokens', '?')} "
+            f"total={usage.get('total_tokens', '?')}"
+        )
+
+    for tc in tool_calls:
+        args = tc.get("arguments", {})
+        name = tc.get("name", "?")
+        if isinstance(args, dict):
+            if name.lower() in ("write", "write_file", "writefile"):
+                fpath = args.get("file_path", args.get("path", "?"))
+                size = len(args.get("content", args.get("file_text", "")))
+                logger.info(f"   └─ 📝 Write: {fpath} ({size} chars)")
+            elif name.lower() in ("exec", "bash", "execute", "run"):
+                cmd = str(args.get("command", args.get("cmd", "?")))
+                logger.info(f"   └─ ⚡ Exec: {cmd[:120]}")
+            elif name.lower() in ("read", "read_file", "readfile"):
+                fpath = args.get("file_path", args.get("path", "?"))
+                logger.info(f"   └─ 📖 Read: {fpath}")
+            else:
+                logger.info(f"   └─ 🔧 {name}: {str(args)[:120]}")
+
+    return {
+        "task_id": task_id,
+        "iteration": iteration,
+        "turn": turn_number,
+        "provider": provider,
+        "finish_reason": finish_reason,
+        "tool_calls": tool_names,
+        "tool_results_received": len(tool_results_in),
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "timestamp": timestamp,
+    }
 
 
 @activity.defn
@@ -1034,10 +1297,13 @@ async def main():
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[AgentTaskWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow],
+        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow],
         activities=[
             initialize_task,
-            run_agent_step,
+            start_agent_container,
+            poll_agent_turns,
+            collect_agent_result,
+            record_agent_turn,
             store_task_output,
             get_last_iteration,
             create_capability_request,

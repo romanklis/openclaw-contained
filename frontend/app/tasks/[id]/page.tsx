@@ -38,6 +38,8 @@ export default function TaskDetailPage() {
   const [showContinue, setShowContinue] = useState(false);
   const [followUp, setFollowUp] = useState('');
   const [continuing, setContinuing] = useState(false);
+  const [auditTurns, setAuditTurns] = useState<any>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
 
   // --- Data fetching ---
   useEffect(() => {
@@ -66,6 +68,30 @@ export default function TaskDetailPage() {
     const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
   }, [taskId]);
+
+  // --- Audit turns fetching (from Temporal child workflows) ---
+  useEffect(() => {
+    if (activeTab !== 'audit') return;
+
+    const fetchAuditTurns = async () => {
+      setAuditLoading(true);
+      try {
+        const res = await fetch(`${API}/api/tasks/${taskId}/audit-turns`);
+        if (res.ok) {
+          const data = await res.json();
+          setAuditTurns(data);
+        }
+      } catch (error) {
+        console.error('Error fetching audit turns:', error);
+      } finally {
+        setAuditLoading(false);
+      }
+    };
+
+    fetchAuditTurns();
+    const interval = setInterval(fetchAuditTurns, 8000);
+    return () => clearInterval(interval);
+  }, [taskId, activeTab]);
 
   // --- Continue task handler ---
   const handleContinue = async () => {
@@ -525,394 +551,239 @@ export default function TaskDetailPage() {
         {/* TAB: Audit Log */}
         {activeTab === 'audit' && (
           <div className="space-y-6">
-            {outputs.length === 0 ? (
+            {auditLoading && !auditTurns ? (
+              <div className="bg-gray-800/40 rounded-lg p-8 text-center text-gray-500">
+                <div className="text-4xl mb-3 animate-pulse">⏳</div>
+                <p>Loading audit data from Temporal...</p>
+              </div>
+            ) : !auditTurns || auditTurns.total_iterations === 0 ? (
               <div className="bg-gray-800/40 rounded-lg p-8 text-center text-gray-500">
                 <div className="text-4xl mb-3">{'\u{1F50D}'}</div>
                 <p>No audit data yet. Start the task to see detailed execution logs.</p>
               </div>
             ) : (
-              outputs.map((o) => {
-                const raw = o.raw_result || {};
-                const interactions = raw.llm_interactions || [];
-                const meta = raw._temporal_metadata || {};
-                const capability = raw.capability || null;
-                const isDone = o.completed === 'true';
-                const hasCap = o.capability_requested === 'true';
-                const hasError = !!o.error;
+              <>
+                {auditTurns.iterations.map((iter: any) => {
+                  const iterTurns = iter.turns || [];
+                  const iterTokens = iterTurns.reduce((sum: number, t: any) => {
+                    const usage = t.data?.response?.usage || {};
+                    return sum + (usage.total_tokens || 0);
+                  }, 0);
 
-                // Parse wrapper log into steps
-                const parseWrapperSteps = (logs: string | null): string[] => {
-                  if (!logs) return [];
-                  const steps: string[] = [];
-                  for (const line of logs.split('\n')) {
-                    const trimmed = line.trim();
-                    if (!trimmed || trimmed.startsWith('=') || trimmed.startsWith('{') || trimmed.startsWith('"')) continue;
-                    if (trimmed.startsWith('📋') || trimmed.startsWith('🔄') || trimmed.startsWith('🤖') ||
-                        trimmed.startsWith('🌐') || trimmed.startsWith('🔀') || trimmed.startsWith('📥') ||
-                        trimmed.startsWith('✅') || trimmed.startsWith('🚀') || trimmed.startsWith('❌') ||
-                        trimmed.startsWith('🔑') || trimmed.startsWith('📦') || trimmed.startsWith('📤') ||
-                        trimmed.startsWith('🦞') || trimmed.startsWith('📊') || trimmed.startsWith('⚠️')) {
-                      steps.push(trimmed);
-                    } else if (trimmed.startsWith('Router URL:') || trimmed.startsWith('Model:') ||
-                               trimmed.startsWith('Config:') || trimmed.startsWith('Binary:')) {
-                      steps.push('   ' + trimmed);
-                    }
-                  }
-                  return steps;
-                };
-
-                const wrapperSteps = parseWrapperSteps(o.agent_logs);
-
-                // Calculate total tokens across all interactions
-                const totalTokens = interactions.reduce((sum: number, inter: any) => {
-                  return sum + (inter.response?.usage?.total_tokens || 0);
-                }, 0);
-
-                return (
-                  <div key={o.id} className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
-                    {/* Iteration header */}
-                    <div className={`px-5 py-3 border-b border-gray-700 flex items-center justify-between ${
-                      hasError ? 'bg-red-900/15' : isDone ? 'bg-emerald-900/15' : hasCap ? 'bg-amber-900/15' : 'bg-blue-900/15'
-                    }`}>
-                      <div className="flex items-center gap-3">
-                        <span className="text-lg">
-                          {hasError ? '❌' : isDone ? '✅' : hasCap ? '🔐' : '🤖'}
-                        </span>
-                        <div>
-                          <span className="font-semibold text-white">Iteration {o.iteration}</span>
-                          <span className="text-sm text-gray-400 ml-3">
-                            {hasError ? 'Failed' : isDone ? 'Completed' : hasCap ? 'Capability Requested' : 'Running'}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-4 text-xs text-gray-500">
-                        {o.model_used && <span className="bg-gray-700 px-2 py-0.5 rounded text-gray-300">{o.model_used}</span>}
-                        {o.duration_ms && <span>{(o.duration_ms / 1000).toFixed(1)}s</span>}
-                        {totalTokens > 0 && <span>{totalTokens.toLocaleString()} tokens</span>}
-                        {o.created_at && <span>{new Date(o.created_at).toLocaleTimeString()}</span>}
-                      </div>
-                    </div>
-
-                    <div className="p-5 space-y-5">
-                      {/* Metadata */}
-                      {meta.image && (
-                        <div>
-                          <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">Container Environment</div>
-                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                            <div className="bg-gray-900/50 rounded-lg p-2.5">
-                              <div className="text-xs text-gray-600">Image</div>
-                              <div className="text-xs font-mono text-gray-300 truncate">{meta.image}</div>
-                            </div>
-                            <div className="bg-gray-900/50 rounded-lg p-2.5">
-                              <div className="text-xs text-gray-600">Model</div>
-                              <div className="text-xs font-mono text-gray-300">{o.model_used || '—'}</div>
-                            </div>
-                            <div className="bg-gray-900/50 rounded-lg p-2.5">
-                              <div className="text-xs text-gray-600">Duration</div>
-                              <div className="text-xs font-mono text-gray-300">{o.duration_ms ? `${(o.duration_ms / 1000).toFixed(1)}s` : '—'}</div>
-                            </div>
-                            <div className="bg-gray-900/50 rounded-lg p-2.5">
-                              <div className="text-xs text-gray-600">Timestamp</div>
-                              <div className="text-xs font-mono text-gray-300">{meta.timestamp || '—'}</div>
-                            </div>
+                  return (
+                    <div key={iter.workflow_id} className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
+                      {/* Iteration header */}
+                      <div className="px-5 py-3 border-b border-gray-700 flex items-center justify-between bg-blue-900/15">
+                        <div className="flex items-center gap-3">
+                          <span className="text-lg">🤖</span>
+                          <div>
+                            <span className="font-semibold text-white">Iteration {iter.iteration}</span>
+                            <span className="text-sm text-gray-400 ml-3">
+                              {iterTurns.length} turn{iterTurns.length !== 1 ? 's' : ''}
+                            </span>
                           </div>
                         </div>
-                      )}
+                        <div className="flex items-center gap-4 text-xs text-gray-500">
+                          {iterTokens > 0 && <span>{iterTokens.toLocaleString()} tokens</span>}
+                          <a
+                            href={`http://localhost:8088/namespaces/default/workflows/${iter.workflow_id}`}
+                            target="_blank"
+                            className="text-blue-400 hover:underline"
+                          >
+                            Temporal ↗
+                          </a>
+                        </div>
+                      </div>
 
-                      {/* Agent Wrapper Steps */}
-                      {wrapperSteps.length > 0 && (
-                        <div>
-                          <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">Agent Wrapper Execution</div>
-                          <div className="bg-gray-900 rounded-lg border border-gray-700 p-3 space-y-0.5">
-                            {wrapperSteps.map((step, i) => (
-                              <div key={i} className={`text-xs font-mono ${
-                                step.trim().startsWith('✅') ? 'text-emerald-400' :
-                                step.trim().startsWith('❌') ? 'text-red-400' :
-                                step.trim().startsWith('⚠️') ? 'text-amber-400' :
-                                step.trim().startsWith('🚀') ? 'text-blue-400' :
-                                step.trim().startsWith('📦') ? 'text-purple-400' :
-                                step.startsWith('   ') ? 'text-gray-600 pl-4' :
-                                'text-gray-400'
-                              }`}>
-                                {step}
+                      <div className="p-5 space-y-5">
+                        {/* Container metadata */}
+                        {iter.container && iter.container.container_id && (
+                          <div>
+                            <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">Container Environment</div>
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                              <div className="bg-gray-900/50 rounded-lg p-2.5">
+                                <div className="text-xs text-gray-600">Container</div>
+                                <div className="text-xs font-mono text-gray-300 truncate">{iter.container.container_id?.substring(0, 12) || '—'}</div>
                               </div>
-                            ))}
+                              <div className="bg-gray-900/50 rounded-lg p-2.5">
+                                <div className="text-xs text-gray-600">Image</div>
+                                <div className="text-xs font-mono text-gray-300 truncate">{iter.container.image || '—'}</div>
+                              </div>
+                              <div className="bg-gray-900/50 rounded-lg p-2.5">
+                                <div className="text-xs text-gray-600">Status</div>
+                                <div className="text-xs font-mono text-gray-300">{iter.container.status || '—'}</div>
+                              </div>
+                              <div className="bg-gray-900/50 rounded-lg p-2.5">
+                                <div className="text-xs text-gray-600">Turns</div>
+                                <div className="text-xs font-mono text-gray-300">{iter.turn_count}</div>
+                              </div>
+                            </div>
                           </div>
-                        </div>
-                      )}
+                        )}
 
-                      {/* LLM Interactions */}
-                      {interactions.length > 0 && (
-                        <div>
-                          <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">
-                            LLM Interactions ({interactions.length} turn{interactions.length > 1 ? 's' : ''})
-                          </div>
-                          <div className="space-y-3">
-                            {interactions.map((inter: any, idx: number) => {
-                              const resp = inter.response || {};
-                              const toolCalls = resp.tool_calls || [];
-                              const usage = resp.usage || {};
-                              const reqInfo = inter.request || {};
-                              return (
-                                <div key={idx} className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
-                                  {/* Turn header */}
-                                  <div className="flex items-center justify-between px-4 py-2.5 bg-gray-800/50 border-b border-gray-700">
-                                    <div className="flex items-center gap-2">
-                                      <span className="text-xs font-bold text-indigo-400">Turn {inter.turn || idx + 1}</span>
-                                      <span className="text-xs text-gray-600">via {inter.provider || 'unknown'}</span>
-                                      {inter.streaming && <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">streaming</span>}
-                                    </div>
-                                    <div className="flex items-center gap-3 text-xs text-gray-500">
-                                      {usage.prompt_tokens && <span>in: {usage.prompt_tokens.toLocaleString()}</span>}
-                                      {usage.completion_tokens && <span>out: {usage.completion_tokens.toLocaleString()}</span>}
-                                      {usage.total_tokens && <span className="text-gray-400 font-medium">Σ {usage.total_tokens.toLocaleString()}</span>}
-                                      {inter.timestamp && <span>{new Date(inter.timestamp).toLocaleTimeString()}</span>}
-                                    </div>
-                                  </div>
+                        {/* LLM Turns */}
+                        {iterTurns.length > 0 && (
+                          <div>
+                            <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">
+                              LLM Interactions ({iterTurns.length} turn{iterTurns.length > 1 ? 's' : ''})
+                            </div>
+                            <div className="space-y-3">
+                              {iterTurns.map((turn: any, idx: number) => {
+                                const turnData = turn.data || {};
+                                const resp = turnData.response || {};
+                                const reqInfo = turnData.request || {};
+                                const toolCalls = resp.tool_calls || [];
+                                const usage = resp.usage || {};
+                                const turnResult = turn.result || {};
 
-                                  {/* Request info */}
-                                  <div className="px-4 py-2 border-b border-gray-800">
-                                    <div className="flex items-center gap-2 text-xs">
-                                      <span className="text-gray-600">Request:</span>
-                                      <span className="text-gray-400">{reqInfo.msg_count || '?'} messages</span>
-                                      {reqInfo.roles && (
-                                        <span className="text-gray-600">
-                                          [{reqInfo.roles.join(' → ')}]
-                                        </span>
-                                      )}
-                                      {reqInfo.tool_results && reqInfo.tool_results.length > 0 && (
-                                        <span className="text-purple-400">
-                                          + {reqInfo.tool_results.length} tool result{reqInfo.tool_results.length > 1 ? 's' : ''}
-                                        </span>
-                                      )}
+                                return (
+                                  <div key={idx} className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
+                                    {/* Turn header */}
+                                    <div className="flex items-center justify-between px-4 py-2.5 bg-gray-800/50 border-b border-gray-700">
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-xs font-bold text-indigo-400">Turn {turn.turn_number || idx + 1}</span>
+                                        <span className="text-xs text-gray-600">via {turnData.provider || turnResult.provider || 'unknown'}</span>
+                                        {turnData.streaming && <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">streaming</span>}
+                                      </div>
+                                      <div className="flex items-center gap-3 text-xs text-gray-500">
+                                        {(usage.prompt_tokens || usage.input_tokens) && (
+                                          <span>in: {(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()}</span>
+                                        )}
+                                        {(usage.completion_tokens || usage.output_tokens) && (
+                                          <span>out: {(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()}</span>
+                                        )}
+                                        {usage.total_tokens && (
+                                          <span className="text-gray-400 font-medium">Σ {usage.total_tokens.toLocaleString()}</span>
+                                        )}
+                                        {turnData.timestamp && <span>{new Date(turnData.timestamp).toLocaleTimeString()}</span>}
+                                      </div>
                                     </div>
-                                  </div>
 
-                                  {/* Tool calls */}
-                                  {toolCalls.length > 0 && (
-                                    <div className="px-4 py-2.5">
-                                      <div className="text-xs text-gray-600 mb-2">Tool Calls:</div>
-                                      <div className="space-y-2">
-                                        {toolCalls.map((tc: any, tci: number) => {
-                                          let argsPreview = '';
-                                          try {
-                                            const parsed = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
-                                            if (parsed && typeof parsed === 'object') {
-                                              if (parsed.file_path) argsPreview = parsed.file_path;
-                                              else if (parsed.command) argsPreview = parsed.command;
-                                              else argsPreview = Object.keys(parsed).join(', ');
-                                            } else {
+                                    {/* Request info */}
+                                    <div className="px-4 py-2 border-b border-gray-800">
+                                      <div className="flex items-center gap-2 text-xs">
+                                        <span className="text-gray-600">Request:</span>
+                                        <span className="text-gray-400">{reqInfo.msg_count || '?'} messages</span>
+                                        {reqInfo.roles && (
+                                          <span className="text-gray-600">
+                                            [{reqInfo.roles.join(' → ')}]
+                                          </span>
+                                        )}
+                                        {reqInfo.tool_results && reqInfo.tool_results.length > 0 && (
+                                          <span className="text-purple-400">
+                                            + {reqInfo.tool_results.length} tool result{reqInfo.tool_results.length > 1 ? 's' : ''}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+
+                                    {/* Tool calls */}
+                                    {toolCalls.length > 0 && (
+                                      <div className="px-4 py-2.5">
+                                        <div className="text-xs text-gray-600 mb-2">Tool Calls:</div>
+                                        <div className="space-y-2">
+                                          {toolCalls.map((tc: any, tci: number) => {
+                                            let argsPreview = '';
+                                            try {
+                                              const parsed = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
+                                              if (parsed && typeof parsed === 'object') {
+                                                if (parsed.file_path) argsPreview = parsed.file_path;
+                                                else if (parsed.command) argsPreview = parsed.command;
+                                                else argsPreview = Object.keys(parsed).join(', ');
+                                              } else {
+                                                argsPreview = String(tc.arguments || '').substring(0, 80);
+                                              }
+                                            } catch {
                                               argsPreview = String(tc.arguments || '').substring(0, 80);
                                             }
-                                          } catch {
-                                            argsPreview = String(tc.arguments || '').substring(0, 80);
-                                          }
-                                          return (
-                                            <div key={tci} className="flex items-start gap-2">
-                                              <span className="text-xs font-mono bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded shrink-0">
-                                                {tc.name}
-                                              </span>
-                                              <span className="text-xs text-gray-500 font-mono truncate">
-                                                {argsPreview}
-                                              </span>
-                                            </div>
-                                          );
-                                        })}
+                                            return (
+                                              <div key={tci} className="flex items-start gap-2">
+                                                <span className="text-xs font-mono bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded shrink-0">
+                                                  {tc.name}
+                                                </span>
+                                                <span className="text-xs text-gray-500 font-mono truncate">
+                                                  {argsPreview}
+                                                </span>
+                                              </div>
+                                            );
+                                          })}
+                                        </div>
                                       </div>
-                                    </div>
-                                  )}
+                                    )}
 
-                                  {/* Tool results from request */}
-                                  {reqInfo.tool_results && reqInfo.tool_results.length > 0 && (
-                                    <div className="px-4 py-2.5 border-t border-gray-800">
-                                      <div className="text-xs text-gray-600 mb-2">Tool Results:</div>
-                                      <div className="space-y-1.5">
-                                        {reqInfo.tool_results.map((tr: any, tri: number) => (
-                                          <div key={tri} className="text-xs">
-                                            <span className="font-mono text-gray-500">{tr.tool_call_id?.substring(0, 20)}...</span>
-                                            <div className="bg-gray-950 rounded p-2 mt-1 text-gray-400 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto">
-                                              {String(tr.content || '').substring(0, 300)}{String(tr.content || '').length > 300 ? '...' : ''}
+                                    {/* Tool results from request */}
+                                    {reqInfo.tool_results && reqInfo.tool_results.length > 0 && (
+                                      <div className="px-4 py-2.5 border-t border-gray-800">
+                                        <div className="text-xs text-gray-600 mb-2">Tool Results:</div>
+                                        <div className="space-y-1.5">
+                                          {reqInfo.tool_results.map((tr: any, tri: number) => (
+                                            <div key={tri} className="text-xs">
+                                              <span className="font-mono text-gray-500">{tr.tool_call_id?.substring(0, 20)}...</span>
+                                              <div className="bg-gray-950 rounded p-2 mt-1 text-gray-400 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto">
+                                                {String(tr.content || '').substring(0, 300)}{String(tr.content || '').length > 300 ? '...' : ''}
+                                              </div>
                                             </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {/* Finish reason */}
+                                    {resp.finish_reason && toolCalls.length === 0 && (
+                                      <div className="px-4 py-2 border-t border-gray-800">
+                                        <span className="text-xs text-gray-600">Response: </span>
+                                        <span className={`text-xs ${resp.finish_reason === 'stop' || resp.finish_reason === 'end_turn' ? 'text-emerald-400' : 'text-amber-400'}`}>
+                                          {resp.finish_reason}
+                                        </span>
+                                        {resp.content && (
+                                          <div className="mt-2 bg-gray-950 rounded p-2 text-xs text-gray-300 whitespace-pre-wrap max-h-32 overflow-y-auto">
+                                            {resp.content.substring(0, 500)}{resp.content.length > 500 ? '...' : ''}
                                           </div>
-                                        ))}
+                                        )}
                                       </div>
-                                    </div>
-                                  )}
-
-                                  {/* Finish reason */}
-                                  {resp.finish_reason && toolCalls.length === 0 && (
-                                    <div className="px-4 py-2 border-t border-gray-800">
-                                      <span className="text-xs text-gray-600">Response: </span>
-                                      <span className={`text-xs ${resp.finish_reason === 'stop' ? 'text-emerald-400' : 'text-amber-400'}`}>
-                                        {resp.finish_reason}
-                                      </span>
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* OpenClaw Agent Meta (fallback when no llm_interactions) */}
-                      {interactions.length === 0 && raw.meta?.agentMeta && (
-                        <div>
-                          <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">Agent Execution Summary</div>
-                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                            <div className="bg-gray-900/50 rounded-lg p-2.5">
-                              <div className="text-xs text-gray-600">Provider</div>
-                              <div className="text-xs font-mono text-gray-300">{raw.meta.agentMeta.provider || '—'}</div>
-                            </div>
-                            <div className="bg-gray-900/50 rounded-lg p-2.5">
-                              <div className="text-xs text-gray-600">Model</div>
-                              <div className="text-xs font-mono text-gray-300">{raw.meta.agentMeta.model || '—'}</div>
-                            </div>
-                            <div className="bg-gray-900/50 rounded-lg p-2.5">
-                              <div className="text-xs text-gray-600">Input Tokens</div>
-                              <div className="text-xs font-mono text-indigo-400">{(raw.meta.agentMeta.usage?.input || 0).toLocaleString()}</div>
-                            </div>
-                            <div className="bg-gray-900/50 rounded-lg p-2.5">
-                              <div className="text-xs text-gray-600">Output Tokens</div>
-                              <div className="text-xs font-mono text-emerald-400">{(raw.meta.agentMeta.usage?.output || 0).toLocaleString()}</div>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Capability Request */}
-                      {capability && (
-                        <div>
-                          <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">Capability Request</div>
-                          <div className="bg-amber-900/10 border border-amber-500/20 rounded-lg p-3">
-                            <div className="flex items-center gap-3 mb-1">
-                              <span className="text-xs font-mono bg-amber-500/15 text-amber-400 px-2 py-0.5 rounded">{capability.type}</span>
-                              <span className="text-sm text-white font-medium">{capability.resource}</span>
-                            </div>
-                            <p className="text-xs text-gray-400">{capability.justification}</p>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Deliverables */}
-                      {o.deliverables && Object.keys(o.deliverables).length > 0 && (
-                        <div>
-                          <div className="flex items-center justify-between mb-2">
-                            <div className="text-xs text-gray-500 uppercase font-medium tracking-wider">
-                              Deliverables ({Object.keys(o.deliverables).length} files)
-                            </div>
-                            {Object.keys(o.deliverables).length > 1 && (
-                              <button
-                                onClick={() => downloadAllDeliverables(o.deliverables!)}
-                                className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1 transition-colors"
-                              >
-                                ⬇ Download All
-                              </button>
-                            )}
-                          </div>
-                          <div className="space-y-2">
-                            {Object.entries(o.deliverables).map(([filename, content]) => {
-                              const raw = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
-                              const binary = isBinaryContent(raw);
-                              const isImage = binary && /\.(png|jpg|jpeg|gif|webp|bmp|svg)$/i.test(filename);
-                              return (
-                              <div key={filename} className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
-                                <div className="flex items-center justify-between px-3 py-2 bg-gray-800/80 border-b border-gray-700">
-                                  <div className="flex items-center gap-2">
-                                    <span className="text-sm">{getFileIcon(filename, binary)}</span>
-                                    <span className="text-xs font-mono text-emerald-400">{filename}</span>
+                                    )}
                                   </div>
-                                  <div className="flex items-center gap-3">
-                                    <span className="text-xs text-gray-500">
-                                      {binary ? formatFileSize(raw, true) : `${raw.split('\n').length} lines`}
-                                    </span>
-                                    <button
-                                      onClick={() => downloadFile(filename, raw)}
-                                      className="text-xs px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 hover:text-white transition-colors flex items-center gap-1"
-                                      title={`Download ${filename}`}
-                                    >
-                                      ⬇ Download
-                                    </button>
-                                  </div>
-                                </div>
-                                {binary ? (
-                                  isImage ? (
-                                    <div className="p-3 flex justify-center bg-gray-950">
-                                      <img
-                                        src={`data:${getMimeType(filename)};base64,${raw.slice(7)}`}
-                                        alt={filename}
-                                        className="max-h-48 max-w-full rounded"
-                                      />
-                                    </div>
-                                  ) : (
-                                    <div className="p-3 text-xs text-gray-500 italic text-center">
-                                      Binary file — {formatFileSize(raw, true)} — click Download to save
-                                    </div>
-                                  )
-                                ) : (
-                                  <pre className="p-3 text-xs text-gray-300 whitespace-pre-wrap overflow-x-auto max-h-48 overflow-y-auto font-mono">
-                                    {raw}
-                                  </pre>
-                                )}
-                              </div>
-                              );
-                            })}
+                                );
+                              })}
+                            </div>
                           </div>
-                        </div>
-                      )}
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
 
-                      {/* Error */}
-                      {o.error && (
-                        <div>
-                          <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">Error</div>
-                          <pre className="bg-red-900/20 border border-red-500/30 rounded-lg p-3 text-xs text-red-300 font-mono whitespace-pre-wrap">
-                            {o.error}
-                          </pre>
-                        </div>
-                      )}
+                {/* Token Usage Summary */}
+                <div className="rounded-xl border border-gray-700 bg-gray-800/30 p-5">
+                  <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-3">Token Usage Summary</div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <div className="bg-gray-900/50 rounded-lg p-3 text-center">
+                      <div className="text-lg font-bold text-white">
+                        {auditTurns.total_turns}
+                      </div>
+                      <div className="text-xs text-gray-500">Total LLM Calls</div>
                     </div>
-                  </div>
-                );
-              })
-            )}
-
-            {/* Token Usage Summary */}
-            {outputs.length > 0 && (
-              <div className="rounded-xl border border-gray-700 bg-gray-800/30 p-5">
-                <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-3">Token Usage Summary</div>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                  <div className="bg-gray-900/50 rounded-lg p-3 text-center">
-                    <div className="text-lg font-bold text-white">
-                      {outputs.reduce((sum, o) => sum + (o.raw_result?.llm_interactions || []).length, 0)}
+                    <div className="bg-gray-900/50 rounded-lg p-3 text-center">
+                      <div className="text-lg font-bold text-indigo-400">
+                        {auditTurns.total_input_tokens.toLocaleString()}
+                      </div>
+                      <div className="text-xs text-gray-500">Input Tokens</div>
                     </div>
-                    <div className="text-xs text-gray-500">Total LLM Calls</div>
-                  </div>
-                  <div className="bg-gray-900/50 rounded-lg p-3 text-center">
-                    <div className="text-lg font-bold text-indigo-400">
-                      {outputs.reduce((sum, o) => {
-                        return sum + (o.raw_result?.llm_interactions || []).reduce((s: number, i: any) => s + (i.response?.usage?.prompt_tokens || 0), 0);
-                      }, 0).toLocaleString()}
+                    <div className="bg-gray-900/50 rounded-lg p-3 text-center">
+                      <div className="text-lg font-bold text-emerald-400">
+                        {auditTurns.total_output_tokens.toLocaleString()}
+                      </div>
+                      <div className="text-xs text-gray-500">Output Tokens</div>
                     </div>
-                    <div className="text-xs text-gray-500">Input Tokens</div>
-                  </div>
-                  <div className="bg-gray-900/50 rounded-lg p-3 text-center">
-                    <div className="text-lg font-bold text-emerald-400">
-                      {outputs.reduce((sum, o) => {
-                        return sum + (o.raw_result?.llm_interactions || []).reduce((s: number, i: any) => s + (i.response?.usage?.completion_tokens || 0), 0);
-                      }, 0).toLocaleString()}
+                    <div className="bg-gray-900/50 rounded-lg p-3 text-center">
+                      <div className="text-lg font-bold text-amber-400">
+                        {auditTurns.total_iterations}
+                      </div>
+                      <div className="text-xs text-gray-500">Iterations</div>
                     </div>
-                    <div className="text-xs text-gray-500">Output Tokens</div>
-                  </div>
-                  <div className="bg-gray-900/50 rounded-lg p-3 text-center">
-                    <div className="text-lg font-bold text-amber-400">
-                      {outputs.reduce((sum, o) => sum + (o.duration_ms || 0), 0) > 0
-                        ? `${(outputs.reduce((sum, o) => sum + (o.duration_ms || 0), 0) / 1000).toFixed(1)}s`
-                        : '—'}
-                    </div>
-                    <div className="text-xs text-gray-500">Total Duration</div>
                   </div>
                 </div>
-              </div>
+              </>
             )}
           </div>
         )}
