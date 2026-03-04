@@ -16,6 +16,88 @@ logger = logging.getLogger(__name__)
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal:7233")
 TASK_QUEUE = os.getenv("TEMPORAL_TASK_QUEUE", "openclaw-tasks")
 
+# =============================================================================
+# Agent Sandbox Configuration
+# =============================================================================
+AGENT_SANDBOX_MODE = os.getenv("AGENT_SANDBOX_MODE", "insecure-dind")
+
+if AGENT_SANDBOX_MODE == "insecure-dind":
+    logger.warning(
+        "⚠️  CRITICAL SECURITY RISK: Agent sandbox is running in 'insecure-dind' mode. "
+        "Agents execute in privileged containers with potential host-root access. "
+        "Set AGENT_SANDBOX_MODE=gvisor in your .env for production deployments."
+    )
+elif AGENT_SANDBOX_MODE == "gvisor":
+    logger.info("✅ Agent sandbox configured securely with gVisor (runsc).")
+else:
+    logger.error(f"❌ Unknown AGENT_SANDBOX_MODE='{AGENT_SANDBOX_MODE}'. Valid values: gvisor, insecure-dind")
+
+
+# Cached Docker client — created once, reused for all activities.
+# By passing an explicit ``version`` we skip the ``/version`` round-trip
+# that ``docker.from_env()`` does on every call.  DinD 24.0.9 → API 1.43.
+_docker_client = None
+_docker_client_lock = __import__("threading").Lock()
+
+DIND_API_VERSION = "1.43"
+
+
+def get_docker_client():
+    """Return a cached Docker client connected to the DinD daemon.
+
+    Both ``gvisor`` and ``insecure-dind`` modes use the same DinD sidecar
+    (``DOCKER_HOST=tcp://docker-dind:2375``).  In gVisor mode the DinD
+    daemon has ``runsc`` installed and registered as a runtime, so
+    ``runtime='runsc'`` is passed at container-creation time.
+
+    The client is created lazily on the first call with an explicit API
+    version so no ``/version`` request is made.  If the connection was
+    broken (e.g. DinD restarted) we detect the stale client and rebuild it.
+    """
+    import docker
+
+    global _docker_client
+
+    # Fast path — reuse existing client and verify it's alive with a
+    # lightweight ping (/_ping returns "OK" and is cheaper than /version).
+    if _docker_client is not None:
+        try:
+            _docker_client.ping()
+            return _docker_client
+        except Exception:
+            logger.warning("⚠️ Cached Docker client stale — reconnecting")
+            _docker_client = None
+
+    with _docker_client_lock:
+        # Double-check after acquiring lock
+        if _docker_client is not None:
+            return _docker_client
+
+        import time as _time
+        retries, backoff = 5, 3.0
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                _docker_client = docker.DockerClient(
+                    base_url=os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock"),
+                    timeout=300,
+                    version=DIND_API_VERSION,
+                )
+                _docker_client.ping()
+                logger.info("✅ Docker client connected (API %s)", DIND_API_VERSION)
+                return _docker_client
+            except Exception as exc:
+                last_err = exc
+                _docker_client = None
+                if attempt < retries:
+                    wait = backoff * attempt
+                    logger.warning(
+                        f"⚠️ DinD not ready (attempt {attempt}/{retries}): {exc} "
+                        f"— retrying in {wait:.0f}s"
+                    )
+                    _time.sleep(wait)
+        raise last_err  # type: ignore[misc]
+
 
 # =============================================================================
 # Workflows
@@ -337,7 +419,7 @@ async def start_agent_container(
     import docker
 
     try:
-        docker_client = docker.from_env()
+        docker_client = get_docker_client()
 
         # --- resolve image (try name variants) ---
         image_found = False
@@ -391,14 +473,27 @@ async def start_agent_container(
         os.makedirs(workspace_dir, exist_ok=True)
         os.chmod(workspace_dir, 0o777)
 
-        # --- control-plane IP ---
-        control_plane_ip = os.getenv("CONTROL_PLANE_IP", "")
-        if not control_plane_ip:
-            import socket
+        # --- service discovery for the agent container ---
+        # Agent containers run on DinD's default bridge network with their own
+        # network namespace — NOT network_mode="host".  They reach Compose
+        # services via DinD's NAT (docker0 → eth0 → Compose bridge).
+        #
+        # We resolve all service endpoints here (the worker IS on the Compose
+        # network) and inject them as explicit IP-based URLs.  This is the
+        # same pattern used in distributed / cloud deployments where agents
+        # discover services through injected configuration rather than
+        # shared network namespaces.
+        import socket as _socket
+
+        def _resolve(name: str, fallback: str = "") -> str:
+            """Resolve a Compose service name to an IP address."""
             try:
-                control_plane_ip = socket.gethostbyname("control-plane")
-            except socket.gaierror:
-                control_plane_ip = "control-plane"
+                return _socket.gethostbyname(name)
+            except _socket.gaierror:
+                logger.warning(f"⚠️ Could not resolve '{name}', using fallback '{fallback}'")
+                return fallback or name
+
+        control_plane_ip = os.getenv("CONTROL_PLANE_IP", "") or _resolve("control-plane")
         cp_url_for_agent = f"http://{control_plane_ip}:8000"
         llm_router_url = f"{cp_url_for_agent}/api/llm"
 
@@ -426,21 +521,49 @@ async def start_agent_container(
             "FOLLOW_UP": follow_up[:2000],
         }
 
-        logger.info(f"🚀 Launching container (detached)...")
-        container = docker_client.containers.run(
-            agent_image,
+
+        container_kwargs = dict(
+            image=agent_image,
             environment=agent_env,
             volumes={workspace_dir: {"bind": "/workspace", "mode": "rw"}},
             tmpfs={"/tmp": "size=100m,mode=1777"},
-            network_mode="host",
             detach=True,
         )
+
+        if AGENT_SANDBOX_MODE == "gvisor":
+            container_kwargs["runtime"] = "runsc"
+            container_kwargs["privileged"] = False
+            # Agent gets its own isolated network namespace on DinD's default
+            # bridge (docker0).  Outbound traffic is NATed through DinD's
+            # eth0 to the Compose network.  All service endpoints are
+            # pre-resolved IPs — no DNS dependency inside the sandbox.
+            # This pattern ports directly to VM / cloud isolation later.
+        elif AGENT_SANDBOX_MODE == "insecure-dind":
+            container_kwargs["privileged"] = True
+            container_kwargs["network_mode"] = "host"
+        else:
+            raise ValueError(f"Unknown AGENT_SANDBOX_MODE: {AGENT_SANDBOX_MODE}")
+
+        logger.info(f"🚀 Launching container (detached) with sandbox mode: {AGENT_SANDBOX_MODE} ...")
+        try:
+            container = docker_client.containers.run(**container_kwargs)
+        except docker.errors.APIError as api_err:
+            if "unknown or invalid runtime name: runsc" in str(api_err):
+                logger.error(
+                    "❌ gVisor runtime 'runsc' is not registered with Docker. "
+                    "Install gVisor on the host — see docs/GVISOR_SETUP.md — "
+                    "or set AGENT_SANDBOX_MODE=insecure-dind in your .env file."
+                )
+            raise
 
         logger.info(f"✅ Container started: {container.short_id}")
         return {
             "container_id": container.id,
             "workspace_dir": workspace_dir,
             "agent_image": agent_image,
+            "image": agent_image,
+            "status": "running",
+            "sandbox_mode": AGENT_SANDBOX_MODE,
         }
 
     except Exception as e:
@@ -462,7 +585,7 @@ async def poll_agent_turns(
     import docker
     import httpx
 
-    docker_client = docker.from_env()
+    docker_client = get_docker_client()
     cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
     new_turns = []
@@ -536,7 +659,7 @@ async def collect_agent_result(
 
     logger.info(f"📦 COLLECT_RESULT | Task: {task_id} | Iter: {iteration}")
 
-    docker_client = docker.from_env()
+    docker_client = get_docker_client()
     cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
     try:
@@ -1108,7 +1231,7 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
         if not image_tag:
             raise Exception("No image_tag on deployment — not built yet?")
         
-        docker_client = docker.from_env()
+        docker_client = get_docker_client()
         
         # Pull image if needed
         try:
@@ -1205,7 +1328,7 @@ async def stop_deployment_container(deployment_id: str) -> Dict[str, Any]:
         if not container_id:
             raise Exception("No container_id — deployment not running?")
         
-        docker_client = docker.from_env()
+        docker_client = get_docker_client()
         
         try:
             container = docker_client.containers.get(container_id)

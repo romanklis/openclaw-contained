@@ -22,6 +22,25 @@ help: ## Show this help
 
 up: ## Start all services (first run auto-builds base agent image)
 	@mkdir -p workspaces
+	@SANDBOX=$$(grep -s '^AGENT_SANDBOX_MODE=' .env 2>/dev/null | cut -d= -f2); \
+	 SANDBOX=$${SANDBOX:-insecure-dind}; \
+	 if [ "$$SANDBOX" = "insecure-dind" ]; then \
+	   echo ""; \
+	   echo "  \033[0;31m======================================================================\033[0m"; \
+	   echo "  \033[1;31m ⚠️  SECURITY WARNING: RUNNING IN INSECURE DIND MODE ⚠️ \033[0m"; \
+	   echo "  \033[0;31m======================================================================\033[0m"; \
+	   echo "  AGENT_SANDBOX_MODE=insecure-dind"; \
+	   echo "  AI agents will execute in privileged containers with host-root access."; \
+	   echo "  For production, install gVisor and set AGENT_SANDBOX_MODE=gvisor"; \
+	   echo "  in your .env file.  See: docs/GVISOR_SETUP.md"; \
+	   echo "  \033[0;31m======================================================================\033[0m"; \
+	   echo ""; \
+	   sleep 3; \
+	 elif [ "$$SANDBOX" = "gvisor" ]; then \
+	   echo ""; \
+	   echo "  \033[0;32m✅ Security: gVisor sandbox mode enabled. Agents are isolated.\033[0m"; \
+	   echo ""; \
+	 fi
 	docker-compose up -d
 	@echo ""
 	@echo "  ✅  TaskForge is starting (10 services)"

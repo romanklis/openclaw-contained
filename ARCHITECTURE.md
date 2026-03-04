@@ -28,7 +28,8 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 │  :3000                                                              │
 │  ┌────────────┐ ┌─────────────┐ ┌──────────┐ ┌───────────────────┐ │
 │  │ Dashboard  │ │ Task Detail │ │Approvals │ │ LLM Providers    │ │
-│  │            │ │  + Audit    │ │          │ │ + Deployments    │ │
+│  │ + Security │ │ + Audit Log │ │          │ │ + Deployments    │ │
+│  │   Banner   │ │   (turns)   │ │          │ │                  │ │
 │  └────────────┘ └─────────────┘ └──────────┘ └───────────────────┘ │
 └────────────────────────┬─────────────────────────────────────────────┘
                          │ HTTP (REST)
@@ -40,7 +41,7 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 │  ┌──────────────┐ ┌────────────────┐ ┌────────────────────────────┐ │
 │  │ Task CRUD    │ │ Capability     │ │ LLM Router / Proxy         │ │
 │  │ + Lifecycle  │ │ Approval       │ │ (Ollama, Gemini,           │ │
-│  │              │ │ + Policy Mgmt  │ │  Anthropic, OpenAI)        │ │
+│  │ + System Info│ │ + Policy Mgmt  │ │  Anthropic, OpenAI)        │ │
 │  └──────┬───────┘ └───────┬────────┘ └──────────────┬─────────────┘ │
 │         │                 │                          │               │
 │  ┌──────┴─────────────────┴──────────────────────────┴─────────────┐ │
@@ -53,46 +54,50 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 │                     TEMPORAL.IO (Workflow Engine)                     │
 │  :7233 (internal)   UI :8088                                         │
 │                                                                      │
-│  ┌─────────────────────────┐                                        │
-│  │ AgentTaskWorkflow       │ ← main loop (up to 50 iterations)      │
-│  │  • initialize_task      │                                        │
-│  │  • run_agent_step       │ ── runs container in DinD ──┐          │
-│  │  • request_capability   │                              │          │
-│  │  • wait for approval    │                              │          │
-│  │  • build_agent_image    │ ── calls Image Builder ──┐   │          │
-│  │  • finalize_task        │                          │   │          │
-│  ├─────────────────────────┤                          │   │          │
-│  │ DeploymentBuildWorkflow │                          │   │          │
-│  │ DeploymentRunWorkflow   │                          │   │          │
-│  └─────────────────────────┘                          │   │          │
-└───────────────────────────────────────────────────────┼───┼──────────┘
+│  ┌─────────────────────────────┐                                    │
+│  │ AgentTaskWorkflow           │ ← main loop (up to 50 iterations)  │
+│  │  • initialize_task          │                                    │
+│  │  • AgentStepWorkflow (child)│ ── runs container in DinD ──┐      │
+│  │     ├ start_agent_container │                              │      │
+│  │     ├ poll_agent_turns      │                              │      │
+│  │     ├ record_agent_turn ×N  │                              │      │
+│  │     └ collect_agent_result  │                              │      │
+│  │  • request_capability       │                              │      │
+│  │  • wait for approval        │                              │      │
+│  │  • build_agent_image        │ ── calls Image Builder ──┐   │      │
+│  │  • finalize_task            │                          │   │      │
+│  ├─────────────────────────────┤                          │   │      │
+│  │ DeploymentBuildWorkflow     │                          │   │      │
+│  │ DeploymentRunWorkflow       │                          │   │      │
+│  └─────────────────────────────┘                          │   │      │
+└───────────────────────────────────────────────────────────┼───┼──────┘
                                                         │   │
                ┌────────────────────────────────────────┘   │
                ▼                                            ▼
 ┌──────────────────────────┐    ┌───────────────────────────────────┐
-│  IMAGE BUILDER (FastAPI) │    │     DOCKER-IN-DOCKER (DinD)       │
-│  :8002 (internal)        │    │                                   │
-│                          │    │  ┌─────────────────────────────┐  │
-│  • Auto-bootstraps base  │    │  │  Agent Container            │  │
-│    openclaw-agent image   │    │  │  (openclaw-agent:task-X-vY) │  │
-│    on startup            │    │  │                             │  │
-│  • Builds agent images   │    │  │  • Runs openclaw CLI        │  │
-│    with approved caps    │    │  │  • Calls LLM Router         │  │
-│  • Builds deployment     │    │  │  • Writes deliverables      │  │
-│    images from workspace │    │  │  • Reports output to API    │  │
-│                          │    │  └─────────────────────────────┘  │
-│  Uses Jinja2 templates   │    │                                   │
-│  Pushes to Registry ─────┼──→ │  ┌─────────────────────────────┐  │
-│                          │    │  │  Deployment Container       │  │
-└──────────────────────────┘    │  │  (ports 9100-9120)          │  │
-                                │  └─────────────────────────────┘  │
-┌──────────────────────────┐    └───────────────────────────────────┘
-│  DOCKER REGISTRY (v2)    │
-│  :5000 (internal)        │
-│                          │
-│  Stores built images:    │
-│  • openclaw-agent:openclaw (base)
-│  • openclaw-agent:task-X-vY (per-task)
+│  IMAGE BUILDER (FastAPI) │    │   DOCKER-IN-DOCKER (Custom DinD)  │
+│  :8002 (internal)        │    │   + gVisor (runsc)                │
+│                          │    │                                   │
+│  • Auto-bootstraps base  │    │  ┌ ─ ─ docker0 bridge ─ ─ ─ ─ ┐  │
+│    openclaw-agent image   │    │  │ ┌─────────────────────────┐ │  │
+│    on startup            │    │  │ │  Agent Container        │ │  │
+│  • Builds agent images   │    │    │  runtime=runsc (gVisor)  │    │
+│    with approved caps    │    │  │ │  (openclaw-agent:X-vY)  │ │  │
+│  • Builds deployment     │    │    │                          │    │
+│    images from workspace │    │  │ │  • Runs openclaw CLI    │ │  │
+│                          │    │    │  • Calls LLM via IP     │    │
+│  Uses Jinja2 templates   │    │  │ │  • Writes deliverables  │ │  │
+│  Pushes to Registry ─────┼──→ │    └─────────────────────────┘    │
+│                          │    │  │                               │  │
+└──────────────────────────┘    │    ┌─────────────────────────┐    │
+                                │  │ │  Deployment Container   │ │  │
+┌──────────────────────────┐    │    │  (ports 9100-9120)      │    │
+│  DOCKER REGISTRY (v2)    │    │  │ └─────────────────────────┘ │  │
+│  :5000                   │    │  └ ─ ─ NAT via eth0 ─ ─ ─ ─ ─ ┘  │
+│                          │    │                                   │
+│  Stores built images:    │    │  IP watchdog: entrypoint-wrapper  │
+│  • openclaw-agent:openclaw│   │  guards eth0 + docker0 addresses  │
+│  • openclaw-agent:X-vY   │    └───────────────────────────────────┘
 └──────────────────────────┘
 ```
 
@@ -110,8 +115,8 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 | **temporal** | `temporalio/auto-setup:1.22` | — (7233 internal) | Workflow engine |
 | **temporal-postgres** | `postgres:13` | — | Temporal's own database |
 | **temporal-ui** | `temporalio/ui:2.40.1` | 8088 | Temporal workflow inspector |
-| **docker-dind** | `docker:24-dind` | 9100-9120 | Docker-in-Docker for agent/deployment containers |
-| **registry** | `registry:2` | — (5000 internal) | Internal Docker image registry |
+| **docker-dind** | `./docker-dind` (custom) | 9100-9120 | Docker-in-Docker with gVisor/runsc for sandboxed agent containers |
+| **registry** | `registry:2` | 5000 | Internal Docker image registry |
 
 **Total: 10 services** in `docker-compose.yml`.
 
@@ -129,7 +134,8 @@ The central API server. Handles all external and internal communication.
 |--------|--------|---------------|
 | `auth` | `/api/auth` | `POST /login` (dev: accepts any credentials), `GET /me` |
 | `tasks` | `/api/tasks` | CRUD, start, pause, resume, complete, fail, logs |
-| `tasks_extended` | `/api/tasks` | Dockerfiles, execution-timeline, outputs, messages, current-state |
+| `tasks_extended` | `/api/tasks` | Dockerfiles, execution-timeline, outputs, messages, current-state, audit-turns |
+| *(root)* | `/api/system/info` | Sandbox mode, security posture, version (used by SecurityBanner) |
 | `capabilities` | `/api/capabilities` | List requests, create, review (approve/deny/suggest alternative) |
 | `policies` | `/api/policies` | List, get, create version, get current for task |
 | `llm` | `/api/llm` | Chat completions proxy, provider config, model listing |
@@ -182,12 +188,15 @@ Connects to Temporal and registers workflows + activities.
 | `DeploymentBuildWorkflow` | Build a deployment image after approval |
 | `DeploymentRunWorkflow` | Start or stop a deployment container |
 
-**Activities (11 total):**
+**Activities (13 total):**
 
 | Activity | Status | Description |
 |----------|--------|-------------|
 | `initialize_task` | Stub | Returns True; workspace setup is a TODO |
-| `run_agent_step` | ✅ | Runs agent container in DinD, extracts result from stdout markers, fetches LLM interaction logs |
+| `start_agent_container` | ✅ | Launches agent container in DinD (detached); applies `runtime=runsc` for gVisor or `privileged=true` for insecure-dind. Returns container_id, image, status, sandbox_mode |
+| `poll_agent_turns` | ✅ | Polls LLM router for new turn data while agent container runs |
+| `record_agent_turn` | ✅ | Records a single LLM turn as a separate Temporal activity (visible in UI) |
+| `collect_agent_result` | ✅ | Reads final result from container stdout after exit |
 | `store_agent_output` | ✅ | POSTs iteration output to control plane |
 | `request_capability` | ✅ | Creates capability request via control plane |
 | `build_agent_image` | ✅ | Calls image builder, polls until complete |
@@ -195,8 +204,23 @@ Connects to Temporal and registers workflows + activities.
 | `finalize_task` | ✅ | Marks task complete or failed |
 | `create_deployment` | ✅ | Creates deployment record |
 | `build_deployment_image` | ✅ | Calls image builder for deployments |
-| `start_deployment` | ✅ | Runs container, allocates host port 9100-9120 |
-| `stop_deployment` | ✅ | Stops and removes container |
+| `start_deployment_container` | ✅ | Runs deployment container, allocates host port 9100-9120 |
+| `stop_deployment_container` | ✅ | Stops and removes deployment container |
+
+**Cached Docker Client:**
+
+The worker uses a module-level cached Docker client (`get_docker_client()`) connected to DinD
+via `DOCKER_HOST=tcp://docker-dind:2375`. The client pins API version 1.43 to skip the
+`/version` round-trip, reconnects automatically on stale connections, and retries with
+exponential backoff if DinD is not yet ready.
+
+**Service Discovery for Agent Containers:**
+
+Agent containers run on DinD's internal `docker0` bridge in their own network namespace —
+not `network_mode="host"`. They reach Compose services (control-plane, LLM router) via
+NAT through DinD's `eth0`. The worker pre-resolves all service DNS names to IP addresses
+using a `_resolve()` helper and injects them as environment variables, eliminating any DNS
+dependency inside the sandbox.
 
 ### 4. Agent Runtime (runs inside agent containers)
 
@@ -254,17 +278,24 @@ which routes to the configured provider.
 3. Temporal Worker picks up workflow
       │
       ▼
-4. run_agent_step activity:
-   a. Pulls agent image from internal registry
-   b. Runs container in DinD with task ID, API URLs, workspace mount
+4. AgentStepWorkflow (child workflow) per iteration:
+   a. start_agent_container:
+      - Resolves service IPs via _resolve() (service discovery)
+      - Launches container in DinD with runtime=runsc (gVisor)
+        or privileged=true (insecure-dind)
+      - Agent runs on docker0 bridge, NAT via eth0
+   b. poll_agent_turns → record_agent_turn (per turn):
+      - Polls LLM router for new interactions
+      - Each turn recorded as a separate Temporal activity
    c. openclaw-wrapper.py inside container:
-      • Fetches task details from Control Plane
+      • Fetches task details from Control Plane (via IP)
       • Invokes OpenClaw CLI with configured model
-      • OpenClaw calls LLM Router for inference
+      • OpenClaw calls LLM Router for inference (via IP)
       • LLM Router proxies to configured provider
       • Agent writes deliverables to /workspace
       • Outputs result JSON via stdout markers
-   d. Worker extracts result, fetches LLM interaction log
+   d. collect_agent_result:
+      - Reads container exit, extracts stdout result
    e. Stores output via Control Plane API
       │
       ▼
@@ -315,6 +346,7 @@ Human sees request in Approvals UI
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `AGENT_SANDBOX_MODE` | `gvisor` | Agent container isolation: `gvisor` (recommended) or `insecure-dind` |
 | `POSTGRES_PASSWORD` | `openclaw_pass` | PostgreSQL password |
 | `JWT_SECRET` | `change-me-in-production` | JWT signing secret |
 | `OLLAMA_URL` | `http://host.docker.internal:11434` | Ollama endpoint |
@@ -327,16 +359,27 @@ Human sees request in Approvals UI
 
 ## Security Model
 
+### Sandbox Modes
+
+| Mode | Runtime | `privileged` | Security | Use Case |
+|------|---------|-------------|----------|----------|
+| **`gvisor`** | `runsc` | `false` | ✅ Strong | Production & shared hosts |
+| `insecure-dind` | runc (DinD) | `true` | ⚠️ Weak | Local development only |
+| `dedicated-vm` | *(future)* | — | 🔒 Strongest | Firecracker microVMs |
+
 ### Current Implementation
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Container isolation** | Each agent runs in a separate Docker container inside DinD |
+| **gVisor kernel isolation** | Each agent runs under `runtime=runsc` — a user-space kernel that intercepts syscalls and delivers VM-level isolation at container speed. No privileged mode required. |
+| **Bridge network isolation** | Agent containers run on DinD's `docker0` bridge with NAT, not `network_mode="host"`. Each gets its own network namespace. |
+| **Service discovery** | The worker pre-resolves Compose DNS names to IPs via `_resolve()` and injects them as env vars. No DNS dependency inside the sandbox. |
+| **DinD network watchdog** | `entrypoint-wrapper.sh` snapshots eth0 and docker0 IPv4 addresses and restores them if flushed by dockerd or gVisor container launches. |
 | **Capability gating** | Agents start with base image only; new packages require human approval + image rebuild |
-| **Network isolation** | Agent containers are on the DinD internal network; no direct internet access by default |
 | **Filesystem isolation** | Each task gets its own workspace directory |
 | **LLM audit trail** | Every LLM call logged with full request/response, token counts, provider info |
 | **Temporal history** | Complete workflow execution history, replayable and immutable |
+| **Multi-layer insecure-mode warnings** | `make up` red banner, worker startup WARNING log, frontend SecurityBanner, `.env.example` comments |
 
 ### Not Yet Implemented
 
@@ -371,6 +414,11 @@ openclaw-contained/
 ├── Makefile                    # Build, start, stop, health checks
 ├── .env.example                # Environment variable template
 │
+├── docker-dind/                # Custom DinD image with gVisor
+│   ├── Dockerfile              # docker:24-dind + runsc + iproute2
+│   └── entrypoint-wrapper.sh   # Network watchdog (eth0/docker0 IP guard)
+├── docker-dind-daemon.json     # DinD daemon config (insecure registry + runsc)
+│
 ├── services/
 │   ├── control-plane/          # FastAPI API server
 │   │   ├── main.py             # App entry, CORS, health, startup
@@ -392,7 +440,7 @@ openclaw-contained/
 │   │   └── templates/          # Jinja2 Dockerfile templates
 │   │
 │   ├── temporal-worker/        # Temporal workflow worker
-│   │   └── worker.py           # 3 workflows, 11 activities
+│   │   └── worker.py           # 3 workflows, 13 activities, cached Docker client
 │   │
 │   └── agent-executor/         # Code that runs INSIDE agent containers
 │       ├── openclaw-wrapper.py # Primary agent entrypoint
@@ -409,13 +457,22 @@ openclaw-contained/
 │
 ├── frontend/                   # Next.js 14 dashboard
 │   ├── app/
+│   │   ├── layout.tsx          # Root layout (includes SecurityBanner)
 │   │   ├── page.tsx            # Dashboard
 │   │   ├── tasks/page.tsx      # Task list
-│   │   ├── tasks/[id]/page.tsx # Task detail (outputs, audit, timeline)
+│   │   ├── tasks/[id]/page.tsx # Task detail (outputs, audit w/ sandbox badge, timeline)
 │   │   ├── approvals/page.tsx  # Capability approvals
 │   │   ├── deployments/        # Deployment management
-│   │   └── llm-providers/      # LLM provider config
+│   │   ├── llm-providers/      # LLM provider config
+│   │   ├── components/
+│   │   │   └── SecurityBanner.tsx  # Amber warning when insecure-dind active
+│   │   └── lib/api.ts          # API base URL helper
 │   └── Dockerfile              # Multi-stage Next.js build
+│
+├── docs/
+│   ├── GVISOR_SETUP.md         # gVisor installation & configuration guide
+│   ├── DEPLOYMENT.md           # Deployment guide
+│   └── POLICY_SCHEMA.md        # Policy schema reference
 │
 ├── openclaw/                   # OpenClaw CLI (mounted into agent images)
 ├── workspaces/                 # Per-task workspace directories
@@ -436,3 +493,4 @@ openclaw-contained/
 6. **No API gateway** — control plane is exposed directly on port 8000
 7. **Base image is ~1.8GB** — first boot takes several minutes to build and push
 8. **Docker Compose v1** — uses `docker-compose` (v1.29); may hit `ContainerConfig` KeyError on image rebuilds — workaround is to `docker rm -f` the container and re-run
+9. **Docker SDK pinned to 6.1.3** — `docker==7.0.0` breaks with `requests>=2.32` (`urllib3` incompatibility). Worker pins `docker==6.1.3`, `requests<2.32.0`, `urllib3<2`

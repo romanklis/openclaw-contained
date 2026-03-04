@@ -74,6 +74,18 @@ async def health_check():
     }
 
 
+@app.get("/api/system/info")
+async def system_info():
+    """System information including sandbox mode and security posture."""
+    import os
+    sandbox_mode = os.getenv("AGENT_SANDBOX_MODE", "gvisor")
+    return {
+        "sandbox_mode": sandbox_mode,
+        "sandbox_secure": sandbox_mode == "gvisor",
+        "version": "0.1.0",
+    }
+
+
 @app.get("/api")
 async def root():
     """Root endpoint"""

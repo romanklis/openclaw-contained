@@ -1,3 +1,8 @@
 {
-  "insecure-registries": ["registry:5000"]
+  "insecure-registries": ["registry:5000"],
+  "runtimes": {
+    "runsc": {
+      "path": "/usr/local/bin/runsc"
+    }
+  }
 }

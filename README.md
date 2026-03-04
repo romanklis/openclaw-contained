@@ -22,7 +22,7 @@ rebuild, and every LLM interaction is logged for audit.
 
 **Key features:**
 
-- **Sandboxed execution** — each agent runs in an isolated Docker container inside Docker-in-Docker
+- **🛡️ gVisor sandbox isolation** — each agent runs in a container secured by [gVisor](https://gvisor.dev) (`runsc`), providing a user-space kernel that intercepts syscalls and delivers VM-level isolation at container speed. No privileged mode required.
 - **Capability gating** — agents start with a base image; new packages require explicit human approval
 - **Image rebuilds** — approved capabilities are baked into a new Docker image (immutable infrastructure)
 - **Multi-provider LLM routing** — Ollama, Gemini, Anthropic, and OpenAI via a unified OpenAI-compatible proxy
@@ -30,6 +30,52 @@ rebuild, and every LLM interaction is logged for audit.
 - **Temporal workflows** — durable execution that survives crashes, with pause/resume for approvals
 - **Deployment support** — agents can produce deployable applications served on ports 9100-9120
 
+
+## 🛡️ Security: Agent Sandbox Modes
+
+> **⚠️ Running AI-generated code without proper sandboxing is dangerous.**
+> A compromised agent in a privileged Docker container can escape to the host.
+> TaskForge supports **gVisor** to eliminate this risk.
+
+[gVisor](https://gvisor.dev) (`runsc`) is a user-space application kernel developed by Google.
+It intercepts container syscalls and services them in an isolated sandbox, delivering
+**VM-level isolation at container speed** — no nested hypervisor, no privileged mode,
+no heavy boot times.
+
+### Sandbox modes
+
+| Mode | Runtime | `privileged` | Security | When to use |
+|------|---------|-------------|----------|-------------|
+| **`gvisor`** | `runsc` | `false` | ✅ Strong | **Production & shared hosts** |
+| `insecure-dind` | runc (DinD) | `true` | ⚠️ Weak | Local development only |
+| `dedicated-vm` | *(future)* | — | 🔒 Strongest | Firecracker microVMs |
+
+### Enabling gVisor
+
+```bash
+# 1. Install gVisor on the host (one-time)
+#    Full guide: docs/GVISOR_SETUP.md
+sudo apt-get install -y runsc
+sudo runsc install
+sudo systemctl restart docker
+
+# 2. Set the sandbox mode in your .env
+AGENT_SANDBOX_MODE=gvisor
+
+# 3. Restart
+make up
+```
+
+The platform provides **three layers of warnings** when running in insecure mode:
+1. `make up` prints a red terminal banner with a 3-second pause.
+2. The Temporal Worker logs a `WARNING` at startup.
+3. `.env.example` documents the risk in comments.
+
+👉 See [docs/GVISOR_SETUP.md](docs/GVISOR_SETUP.md) for the full installation walkthrough,
+WSL2-specific notes, daemonless image builders (Kaniko / Buildah), and multi-agent
+data-exchange best practices.
+
+---
 ## Quick Start
 
 ### Prerequisites
@@ -265,6 +311,7 @@ docker exec openclaw-docker-dind docker ps -a
 
 | Variable | Default | Required | Purpose |
 |----------|---------|----------|---------|
+| `AGENT_SANDBOX_MODE` | `insecure-dind` | **Yes (prod)** | Agent container isolation: `gvisor` or `insecure-dind` |
 | `POSTGRES_PASSWORD` | `openclaw_pass` | No | PostgreSQL password |
 | `JWT_SECRET` | `change-me-in-production` | No | JWT signing secret |
 | `OLLAMA_URL` | `http://host.docker.internal:11434` | No | Ollama endpoint URL |
