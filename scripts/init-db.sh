@@ -79,6 +79,18 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS sboms (
+        id SERIAL PRIMARY KEY,
+        task_id VARCHAR NOT NULL REFERENCES tasks(id),
+        image_tag VARCHAR NOT NULL,
+        image_version INTEGER NOT NULL,
+        format VARCHAR NOT NULL,
+        document JSONB NOT NULL,
+        packages JSONB NOT NULL DEFAULT '[]',
+        generator VARCHAR DEFAULT 'trivy',
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     -- Create indexes
     CREATE INDEX idx_tasks_status ON tasks(status);
     CREATE INDEX idx_tasks_created_at ON tasks(created_at);
@@ -86,4 +98,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE INDEX idx_capability_requests_status ON capability_requests(status);
     CREATE INDEX idx_audit_logs_task_id ON audit_logs(task_id);
     CREATE INDEX idx_audit_logs_timestamp ON audit_logs(timestamp);
+    CREATE INDEX idx_sboms_task_id ON sboms(task_id);
+    CREATE INDEX idx_sboms_task_version ON sboms(task_id, image_version);
 EOSQL

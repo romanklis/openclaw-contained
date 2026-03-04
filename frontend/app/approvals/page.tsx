@@ -16,6 +16,22 @@ interface CapabilityRequest {
   reviewed_by?: string
   decision?: string
   alternative_suggestion?: string
+  details?: {
+    packages?: string[]
+    original_type?: string
+    iteration?: string
+    reason?: string
+    versions?: Record<string, string>
+    task_description?: string
+    [key: string]: any
+  }
+}
+
+interface TaskInfo {
+  id: string
+  name?: string
+  description?: string
+  status?: string
 }
 
 export default function ApprovalsPage() {
@@ -27,6 +43,21 @@ export default function ApprovalsPage() {
   const [reviewComment, setReviewComment] = useState('')
   const [altSuggestion, setAltSuggestion] = useState('')
   const [actionLoading, setActionLoading] = useState<number | null>(null)
+  const [taskCache, setTaskCache] = useState<Record<string, TaskInfo>>({})
+
+  const fetchTaskInfo = async (taskId: string): Promise<TaskInfo | null> => {
+    if (taskCache[taskId]) return taskCache[taskId]
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}`)
+      if (res.ok) {
+        const data = await res.json()
+        const info: TaskInfo = { id: data.id, name: data.name, description: data.description, status: data.status }
+        setTaskCache(prev => ({ ...prev, [taskId]: info }))
+        return info
+      }
+    } catch {}
+    return null
+  }
 
   const fetchRequests = async () => {
     try {
@@ -34,8 +65,13 @@ export default function ApprovalsPage() {
         fetch(`${API}/api/capabilities/requests?status_filter=pending`).then((r) => r.json()),
         fetch(`${API}/api/capabilities/requests`).then((r) => r.json()).catch(() => []),
       ])
-      setRequests(Array.isArray(pendingRes) ? pendingRes : [])
-      setAllRequests(Array.isArray(allRes) ? allRes : [])
+      const pending = Array.isArray(pendingRes) ? pendingRes : []
+      const all = Array.isArray(allRes) ? allRes : []
+      setRequests(pending)
+      setAllRequests(all)
+      // Pre-fetch task info for all unique task_ids
+      const taskIds = Array.from(new Set([...pending, ...all].map(r => r.task_id)))
+      taskIds.forEach(id => fetchTaskInfo(id))
       setLoading(false)
     } catch (error) {
       console.error('Failed to fetch requests:', error)
@@ -157,6 +193,12 @@ export default function ApprovalsPage() {
             requests.map((req) => {
               const isExpanded = expandedId === req.id
               const isLoading = actionLoading === req.id
+              const task = taskCache[req.task_id]
+              const packages = req.details?.packages || req.resource_name.split(',').map(s => s.trim())
+              const versions = req.details?.versions || {}
+              const iteration = req.details?.iteration || null
+              const detailedReason = req.details?.reason || null
+
               return (
                 <div key={req.id} className="card animate-fade-in">
                   <div className="p-5">
@@ -164,21 +206,80 @@ export default function ApprovalsPage() {
                       <div className="flex items-start gap-3 min-w-0 flex-1">
                         <span className="text-xl mt-0.5">{capTypeIcon(req.capability_type)}</span>
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 mb-1">
+                          {/* Package name + type badge */}
+                          <div className="flex items-center gap-2 mb-1 flex-wrap">
                             <span className="font-medium text-white">{req.resource_name}</span>
                             <span className="text-xs bg-[#12121a] border border-[#232333] text-gray-400 px-2 py-0.5 rounded capitalize">
                               {req.capability_type.replace(/_/g, ' ')}
                             </span>
+                            {iteration && (
+                              <span className="text-xs bg-blue-500/10 border border-blue-500/20 text-blue-400 px-2 py-0.5 rounded">
+                                Iteration {iteration}
+                              </span>
+                            )}
                           </div>
-                          <div className="text-xs text-gray-600 mb-2">
+
+                          {/* Task link + timestamp */}
+                          <div className="text-xs text-gray-600 mb-3">
                             <Link href={`/tasks/${req.task_id}`} className="text-indigo-500 hover:text-indigo-400">
                               Task: {req.task_id}
                             </Link>
                             <span className="ml-3">{new Date(req.requested_at).toLocaleString()}</span>
                           </div>
-                          <div className="bg-[#12121a] border border-[#1a1a2a] rounded-lg p-3 text-sm text-gray-300">
-                            <span className="text-xs text-gray-500 block mb-1">Justification:</span>
-                            {req.justification}
+
+                          {/* Task context */}
+                          {task && task.description && (
+                            <div className="bg-indigo-500/5 border border-indigo-500/15 rounded-lg p-3 mb-3">
+                              <div className="text-xs text-indigo-400 font-medium mb-1">📋 Task Description</div>
+                              <div className="text-sm text-gray-300">{task.description}</div>
+                            </div>
+                          )}
+
+                          {/* Package details with versions */}
+                          <div className="bg-[#12121a] border border-[#1a1a2a] rounded-lg p-3 mb-3">
+                            <div className="text-xs text-gray-500 font-medium mb-2">📦 Requested Packages</div>
+                            <div className="space-y-1.5">
+                              {packages.map((pkg: string) => {
+                                const version = versions[pkg]
+                                const pkgType = req.details?.original_type || req.capability_type
+                                return (
+                                  <div key={pkg} className="flex items-center gap-2">
+                                    <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${
+                                      pkgType.includes('python') || pkgType.includes('pip') ? 'bg-blue-900/40 text-blue-300' :
+                                      pkgType.includes('npm') ? 'bg-green-900/40 text-green-300' :
+                                      pkgType.includes('apt') || pkgType.includes('system') ? 'bg-orange-900/40 text-orange-300' :
+                                      'bg-gray-700 text-gray-300'
+                                    }`}>
+                                      {pkgType.includes('python') || pkgType.includes('pip') ? 'pip' :
+                                       pkgType.includes('npm') ? 'npm' :
+                                       pkgType.includes('apt') || pkgType.includes('system') ? 'apt' : 'pkg'}
+                                    </span>
+                                    <span className="font-mono text-sm text-white font-medium">{pkg}</span>
+                                    {version ? (
+                                      <span className="font-mono text-xs text-emerald-400">
+                                        =={version}
+                                      </span>
+                                    ) : (
+                                      <span className="text-xs text-amber-400/70 italic">
+                                        (latest)
+                                      </span>
+                                    )}
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+
+                          {/* Justification */}
+                          <div className="bg-[#12121a] border border-[#1a1a2a] rounded-lg p-3">
+                            <div className="text-xs text-gray-500 font-medium mb-1">💬 Justification</div>
+                            <div className="text-sm text-gray-300 whitespace-pre-wrap">{req.justification}</div>
+                            {detailedReason && detailedReason !== req.justification && (
+                              <div className="mt-2 pt-2 border-t border-[#232333]">
+                                <div className="text-xs text-gray-500 font-medium mb-1">🔍 Detection Detail</div>
+                                <div className="text-xs text-gray-400 font-mono whitespace-pre-wrap">{detailedReason}</div>
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>

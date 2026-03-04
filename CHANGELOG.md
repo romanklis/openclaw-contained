@@ -9,6 +9,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Dockerfile preview in Audit tab** — each iteration in the audit log now has a
+  "🐳 View Dockerfile" button that expands an inline syntax-highlighted view of the
+  exact Dockerfile used to build that iteration's agent image.
+  - Iteration 1 always shows the base image description (no custom Dockerfile).
+  - Iteration N shows `Dockerfile.(N-1)` — the image built after the (N-1)th
+    capability approval.
+  - The control-plane container now mounts `./agent-images` read-only so it can
+    serve Dockerfile content via the new `GET /api/tasks/{id}/dockerfiles` endpoint.
+  - `docker-compose.yml`: added `./agent-images:/agent-images:ro` volume and
+    `AGENT_IMAGES_DIR` env var to the control-plane service.
+
+- **Rich capability-approval justifications** — the approvals queue now shows
+  structured context for every capability request.
+  - The `openclaw-wrapper.py` agent now captures the agent's own reason text from
+    `CAPABILITY_REQUEST` markers and attaches error context when a package import
+    failure triggered the request.
+  - `_resolve_package_versions()` queries `pip index versions` / `npm view` to
+    resolve the latest available version of each requested package at request time.
+  - Task description is fetched from the control-plane API and embedded in the
+    justification string.
+  - `CapabilityRequestResponse` schema gained `details: Optional[Dict]` and
+    `alternative_suggestion: Optional[str]` fields.
+  - The approvals page now displays: task description, package type badges, resolved
+    version strings, agent's justification text, and detection detail.
+
+- **Software Bill of Materials (SBOM) generation & tracking** — each agent container
+  image now gets a machine-readable inventory of every installed component.
+  - Trivy installed in the image-builder container; generates both **SPDX JSON** and
+    **CycloneDX JSON** SBOMs automatically after every image build.
+  - New `sboms` database table stores full SBOM documents with a denormalised package
+    list for fast cross-task searching.
+  - **API endpoints**:
+    - `POST /api/sbom` — ingest endpoint (called by image-builder).
+    - `GET /api/tasks/{id}/sbom` — latest SBOM for a task (with optional `?version=N`
+      and `?format=` filters).
+    - `GET /api/tasks/{id}/sbom/all` — list all SBOM versions.
+    - `GET /api/tasks/{id}/sbom/diff?from_version=1&to_version=2` — package diff
+      between two image versions (added / removed / changed).
+    - `GET /api/sbom/search?package=flask&version=3.0.0` — find all tasks using a
+      specific package (CVE triage).
+  - **Frontend "Software Inventory" tab** on the task detail page showing packages,
+    versions, types (pip/apt/npm), and licenses with filtering, sorting, version
+    selector, inter-version diff view, and raw SBOM download.
+  - Image-builder exposes `POST /scan/vulnerabilities` (Trivy JSON vuln report) and
+    `POST /scan/sbom` (on-demand SBOM generation for existing images).
+  - SBOM generation is non-blocking — a build is marked successful before the scan
+    runs, so failures in Trivy never break the build pipeline.
+
 - **gVisor-inside-DinD architecture** — agent containers run under gVisor's `runsc`
   runtime *inside* the Docker-in-Docker sidecar. A custom DinD image
   (`docker-dind/Dockerfile`) extends `docker:24-dind` with `runsc`, `iproute2`,
@@ -36,8 +84,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   when `AGENT_SANDBOX_MODE` is not `gvisor`. Fetches `/api/system/info`, dismissible
   per session, links to `docs/GVISOR_SETUP.md`.
 - **Audit log sandbox metadata** — container environment section in the audit tab now
-  shows image name, colored status indicator (● running / ✓ completed), and a
-  sandbox mode badge (🛡️ gVisor or ⚠️ insecure-dind).
+  shows image name (full-width, selectable, wraps long hashes), colored status
+  indicator (● running / ✓ completed), and a sandbox mode badge (🛡️ gVisor or
+  ⚠️ insecure-dind). Previously the image name was truncated in a narrow grid column.
 - **Preflight security warning in Makefile** — `make up` prints a colour-coded
   terminal banner: red warning for `insecure-dind`, green confirmation for `gvisor`.
 - **Startup-time sandbox log in Temporal Worker** — the worker logs the active

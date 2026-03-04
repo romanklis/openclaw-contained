@@ -51,7 +51,51 @@ def fetch_task() -> Optional[Dict[str, Any]]:
         return None
 
 
-def request_capability(capability_type: str, packages: List[str]) -> bool:
+def _resolve_package_versions(packages: List[str], capability_type: str) -> Dict[str, str]:
+    """Resolve exact latest versions for packages using pip/npm."""
+    versions: Dict[str, str] = {}
+
+    if capability_type in ("python_packages", "pip_package", "tool_install"):
+        for pkg in packages:
+            try:
+                result = subprocess.run(
+                    ["python3", "-m", "pip", "index", "versions", pkg],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0:
+                    # Output: "package (X.Y.Z)\n  Available versions: ..."
+                    match = re.search(r'\(([^)]+)\)', result.stdout)
+                    if match:
+                        versions[pkg] = match.group(1)
+                        continue
+                # Fallback: try pip show for already-known metadata
+                result2 = subprocess.run(
+                    ["python3", "-m", "pip", "show", pkg],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result2.returncode == 0:
+                    match = re.search(r'^Version:\s*(.+)$', result2.stdout, re.MULTILINE)
+                    if match:
+                        versions[pkg] = match.group(1).strip()
+            except Exception:
+                pass
+
+    elif capability_type in ("npm_packages",):
+        for pkg in packages:
+            try:
+                result = subprocess.run(
+                    ["npm", "view", pkg, "version"],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    versions[pkg] = result.stdout.strip()
+            except Exception:
+                pass
+
+    return versions
+
+
+def request_capability(capability_type: str, packages: List[str], justification: str = "") -> bool:
     """Request a new capability from the control plane."""
     # Map wrapper-internal capability types to API enum values
     # API expects: tool_install, network_access, filesystem_access, database_access
@@ -67,6 +111,47 @@ def request_capability(capability_type: str, packages: List[str]) -> bool:
     }
     api_type = TYPE_MAP.get(capability_type, "tool_install")
 
+    # Build a detailed justification if not already provided
+    if not justification:
+        justification = f"Required {capability_type}: {', '.join(packages)}"
+
+    # Resolve exact versions for the requested packages
+    versions = _resolve_package_versions(packages, capability_type)
+    if versions:
+        version_str = ", ".join(f"{p}=={v}" for p, v in versions.items())
+        print(f"   📌 Resolved versions: {version_str}")
+
+    # Fetch task description for context
+    task_desc = ""
+    task_name = ""
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(f"{CONTROL_PLANE_URL}/api/tasks/{TASK_ID}")
+            if resp.status_code == 200:
+                task_data = resp.json()
+                task_desc = task_data.get("description", "")
+                task_name = task_data.get("name", "")
+    except Exception:
+        pass
+
+    # Compose the full justification with all context
+    parts = [f"[Iteration {ITERATION}] {justification}"]
+    if versions:
+        version_list = ", ".join(f"{p}=={v}" for p, v in versions.items())
+        parts.append(f"\nRequested versions: {version_list}")
+    if task_desc:
+        parts.append(f"\nTask: {task_name or 'N/A'} — {task_desc[:300]}")
+    full_justification = "".join(parts)
+
+    # Build the resource name with versions
+    resource_parts = []
+    for pkg in packages:
+        if pkg in versions:
+            resource_parts.append(f"{pkg}=={versions[pkg]}")
+        else:
+            resource_parts.append(pkg)
+    resource_name = ",".join(resource_parts)
+
     try:
         with httpx.Client(timeout=30.0) as client:
             response = client.post(
@@ -74,9 +159,16 @@ def request_capability(capability_type: str, packages: List[str]) -> bool:
                 json={
                     "task_id": TASK_ID,
                     "capability_type": api_type,
-                    "resource_name": ",".join(packages),
-                    "justification": f"Required for task execution (iteration {ITERATION})",
-                    "details": {"packages": packages, "original_type": capability_type},
+                    "resource_name": resource_name,
+                    "justification": full_justification,
+                    "details": {
+                        "packages": packages,
+                        "original_type": capability_type,
+                        "iteration": ITERATION,
+                        "reason": justification,
+                        "versions": versions,
+                        "task_description": task_desc[:500] if task_desc else None,
+                    },
                 },
             )
             response.raise_for_status()
@@ -227,7 +319,20 @@ Already available — do NOT request these:
 **ONLY** if `python3 -c "import <package>"` fails with `ModuleNotFoundError`:
 
 ```
-CAPABILITY_REQUEST:tool_install:<package_name>:<reason>
+CAPABILITY_REQUEST:tool_install:<package_name>:<detailed reason why this package is needed>
+```
+
+The `<detailed reason>` MUST explain:
+- What functionality the package provides (e.g., "HTTP request handling", "data frame manipulation")
+- Why it's needed for the current task (e.g., "to parse CSV data and compute statistics")
+- What will fail without it (e.g., "cannot read Excel files without openpyxl")
+- If a specific version is required, state so (e.g., "Flask>=2.0 needed for async route support")
+
+Examples:
+```
+CAPABILITY_REQUEST:tool_install:pandas:Data analysis library required to read CSV files and compute statistical aggregations for the summary report
+CAPABILITY_REQUEST:tool_install:flask:Web microframework needed to build the HTTP API server that serves the calculator endpoints on port 5000
+CAPABILITY_REQUEST:tool_install:matplotlib:Plotting library needed to generate PNG charts of the equation results as requested by the task
 ```
 
 After this line, STOP. The system will rebuild your container with the package
@@ -630,8 +735,9 @@ def main():
     # Check for capability requests ALWAYS (agent may emit markers even on success)
     cap = parse_capability_request(output)
     if cap:
-        cap_type, packages = cap
-        print(f"\n🔐 Capability needed: {cap_type} → {packages}")
+        cap_type, packages, cap_reason = cap
+        print(f"\n\U0001f510 Capability needed: {cap_type} \u2192 {packages}")
+        print(f"   \u2514\u2500 Reason: {cap_reason}")
 
         # Verify packages are actually missing before requesting
         if cap_type in ("tool_install", "python_packages", "pip_package"):
@@ -661,13 +767,13 @@ def main():
                 print(f"\n📦 Actually missing packages: {packages}")
 
     if cap:
-        if request_capability(cap_type, packages):
-            print("✅ Capability requested — image rebuild required")
+        if request_capability(cap_type, packages, justification=cap_reason):
+            print("\u2705 Capability requested \u2014 image rebuild required")
             result["capability_requested"] = True
             result["capability"] = {
                 "type": "pip_package" if cap_type == "python_packages" else cap_type,
                 "resource": ",".join(packages),
-                "justification": f"Required {cap_type}: {', '.join(packages)}",
+                "justification": cap_reason,
             }
             write_result(result)
             sys.exit(0)

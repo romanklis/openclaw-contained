@@ -12,6 +12,9 @@ import os
 import re
 import uuid
 import time
+import json
+import subprocess
+import asyncio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,6 +27,7 @@ docker_client = None
 REGISTRY_URL = os.getenv("REGISTRY_URL", "localhost:5000")
 BASE_IMAGE = f"{REGISTRY_URL}/openclaw-agent:openclaw"
 AGENT_IMAGES_DIR = Path(os.getenv("AGENT_IMAGES_DIR", "/app/agent-images"))
+CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
 
 # =============================================================================
@@ -256,6 +260,175 @@ def generate_deployment_dockerfile(
 builds: Dict[str, BuildStatus] = {}
 
 
+# =============================================================================
+# SBOM Generation (Trivy)
+# =============================================================================
+
+def _trivy_available() -> bool:
+    """Check if the trivy binary is on PATH."""
+    try:
+        subprocess.run(["trivy", "--version"], capture_output=True, timeout=10)
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _generate_sbom_trivy(image_ref: str, fmt: str = "spdx-json") -> Optional[Dict[str, Any]]:
+    """Run `trivy image --format <fmt>` and return the parsed JSON document.
+
+    Supports 'spdx-json' and 'cyclonedx' (CycloneDX JSON).
+    Returns None on failure (non-fatal — the build still succeeds).
+    """
+    trivy_fmt = fmt  # trivy accepts 'spdx-json' and 'cyclonedx'
+    try:
+        result = subprocess.run(
+            [
+                "trivy", "image",
+                "--format", trivy_fmt,
+                "--quiet",
+                "--skip-db-update",      # use cached DB; updated on startup
+                "--skip-java-db-update",
+                image_ref,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            # Retry once *with* DB update in case cache is stale
+            result = subprocess.run(
+                [
+                    "trivy", "image",
+                    "--format", trivy_fmt,
+                    "--quiet",
+                    image_ref,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+        logger.warning("Trivy SBOM generation returned non-zero or empty: rc=%s stderr=%s",
+                        result.returncode, result.stderr[:500])
+    except subprocess.TimeoutExpired:
+        logger.warning("Trivy SBOM generation timed out for %s", image_ref)
+    except Exception as e:
+        logger.warning("Trivy SBOM generation failed for %s: %s", image_ref, e)
+    return None
+
+
+def _extract_packages_spdx(doc: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Extract a flat package list from an SPDX JSON document."""
+    packages = []
+    for pkg in doc.get("packages", []):
+        name = pkg.get("name", "")
+        if not name or name == doc.get("name"):
+            continue  # skip the root document element
+        # Determine type from externalRefs or purl
+        pkg_type = ""
+        version = pkg.get("versionInfo", "")
+        for ref in pkg.get("externalRefs", []):
+            purl = ref.get("referenceLocator", "")
+            if purl.startswith("pkg:pypi/"):
+                pkg_type = "pip"
+            elif purl.startswith("pkg:deb/"):
+                pkg_type = "apt"
+            elif purl.startswith("pkg:npm/"):
+                pkg_type = "npm"
+            elif purl.startswith("pkg:golang/"):
+                pkg_type = "go"
+            elif purl.startswith("pkg:"):
+                pkg_type = purl.split(":")[1].split("/")[0]
+        license_info = pkg.get("licenseConcluded", pkg.get("licenseDeclared", ""))
+        if license_info == "NOASSERTION":
+            license_info = ""
+        packages.append({
+            "name": name,
+            "version": version,
+            "type": pkg_type,
+            "license": license_info,
+        })
+    return packages
+
+
+def _extract_packages_cyclonedx(doc: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Extract a flat package list from a CycloneDX JSON document."""
+    packages = []
+    for comp in doc.get("components", []):
+        name = comp.get("name", "")
+        version = comp.get("version", "")
+        pkg_type = ""
+        purl = comp.get("purl", "")
+        if purl.startswith("pkg:pypi/"):
+            pkg_type = "pip"
+        elif purl.startswith("pkg:deb/"):
+            pkg_type = "apt"
+        elif purl.startswith("pkg:npm/"):
+            pkg_type = "npm"
+        elif purl.startswith("pkg:golang/"):
+            pkg_type = "go"
+        elif purl.startswith("pkg:"):
+            pkg_type = purl.split(":")[1].split("/")[0]
+
+        license_info = ""
+        for lic in comp.get("licenses", []):
+            lid = lic.get("license", {})
+            license_info = lid.get("id", lid.get("name", ""))
+            if license_info:
+                break
+        packages.append({
+            "name": name,
+            "version": version,
+            "type": pkg_type,
+            "license": license_info,
+        })
+    return packages
+
+
+async def _generate_and_store_sbom(
+    image_ref: str,
+    task_id: str,
+    image_tag: str,
+    image_version: int,
+):
+    """Generate SPDX + CycloneDX SBOMs via Trivy and POST them to the control plane."""
+    if not _trivy_available():
+        logger.info("Trivy not installed — skipping SBOM generation")
+        return
+
+    import httpx
+
+    for fmt, extractor in [
+        ("spdx-json", _extract_packages_spdx),
+        ("cyclonedx", _extract_packages_cyclonedx),
+    ]:
+        doc = _generate_sbom_trivy(image_ref, fmt)
+        if doc is None:
+            continue
+
+        packages = extractor(doc)
+        payload = {
+            "task_id": task_id,
+            "image_tag": image_tag,
+            "image_version": image_version,
+            "format": "spdx-json" if fmt == "spdx-json" else "cyclonedx-json",
+            "document": doc,
+            "packages": packages,
+            "generator": "trivy",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(f"{CONTROL_PLANE_URL}/api/sbom", json=payload)
+                if resp.status_code == 201:
+                    logger.info("Stored %s SBOM for %s v%s (%d packages)",
+                                fmt, task_id, image_version, len(packages))
+                else:
+                    logger.warning("Failed to store SBOM: %s %s", resp.status_code, resp.text[:300])
+        except Exception as e:
+            logger.warning("Failed to POST SBOM to control plane: %s", e)
+
+
 async def build_image_task(
     build_id: str,
     task_id: str,
@@ -320,6 +493,18 @@ async def build_image_task(
         builds[build_id].digest = image.id
         
         logger.info(f"Build {build_id} completed successfully")
+
+        # Generate SBOM (non-blocking — build is already marked success)
+        version_num = int(version) if version.isdigit() else 1
+        try:
+            await _generate_and_store_sbom(
+                image_ref=image_tag,
+                task_id=task_id,
+                image_tag=registry_tag,
+                image_version=version_num,
+            )
+        except Exception as sbom_err:
+            logger.warning(f"SBOM generation failed (non-fatal): {sbom_err}")
         
     except Exception as e:
         logger.error(f"Build {build_id} failed: {e}")
@@ -636,6 +821,123 @@ async def get_build_logs(build_id: str):
     return {
         "build_id": build_id,
         "logs": builds[build_id].logs or ""
+    }
+
+
+# =============================================================================
+# SBOM & Vulnerability Scan Endpoints
+# =============================================================================
+
+class ScanRequest(BaseModel):
+    """Request to scan an image for vulnerabilities."""
+    image_ref: str  # e.g. "registry:5000/openclaw-agent:task-xxx-v1"
+    task_id: str
+
+
+@app.post("/scan/vulnerabilities")
+async def scan_vulnerabilities(request: ScanRequest):
+    """Run Trivy vulnerability scan against an image.
+
+    Returns a JSON report of CVEs found, cross-referenced with the
+    SBOM packages if available.
+    """
+    if not _trivy_available():
+        raise HTTPException(503, "Trivy is not installed — vulnerability scanning unavailable")
+
+    try:
+        result = subprocess.run(
+            [
+                "trivy", "image",
+                "--format", "json",
+                "--quiet",
+                "--skip-db-update",
+                request.image_ref,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            # Retry with DB update
+            result = subprocess.run(
+                [
+                    "trivy", "image",
+                    "--format", "json",
+                    "--quiet",
+                    request.image_ref,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+        if result.returncode != 0:
+            return {
+                "status": "error",
+                "error": result.stderr[:1000],
+                "task_id": request.task_id,
+            }
+
+        report = json.loads(result.stdout) if result.stdout.strip() else {}
+
+        # Flatten vulnerabilities for easier consumption
+        vulns = []
+        for target in report.get("Results", []):
+            for vuln in target.get("Vulnerabilities", []):
+                vulns.append({
+                    "id": vuln.get("VulnerabilityID"),
+                    "package": vuln.get("PkgName"),
+                    "installed_version": vuln.get("InstalledVersion"),
+                    "fixed_version": vuln.get("FixedVersion"),
+                    "severity": vuln.get("Severity"),
+                    "title": vuln.get("Title", ""),
+                    "description": vuln.get("Description", "")[:300],
+                    "target": target.get("Target"),
+                })
+
+        return {
+            "status": "ok",
+            "task_id": request.task_id,
+            "image_ref": request.image_ref,
+            "vulnerability_count": len(vulns),
+            "vulnerabilities": vulns,
+            "raw_report": report,
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Vulnerability scan timed out")
+    except Exception as e:
+        raise HTTPException(500, f"Scan failed: {e}")
+
+
+@app.post("/scan/sbom")
+async def generate_sbom_on_demand(request: ScanRequest):
+    """Generate SBOM for an image on demand (outside the build pipeline).
+
+    Useful for scanning existing images that were built before SBOM
+    generation was enabled.
+    """
+    if not _trivy_available():
+        raise HTTPException(503, "Trivy is not installed — SBOM generation unavailable")
+
+    # Extract version from image tag
+    tag = request.image_ref.split(":")[-1] if ":" in request.image_ref else "v1"
+    version_match = re.search(r"v(\d+)", tag)
+    version_num = int(version_match.group(1)) if version_match else 1
+
+    await _generate_and_store_sbom(
+        image_ref=request.image_ref,
+        task_id=request.task_id,
+        image_tag=request.image_ref,
+        image_version=version_num,
+    )
+
+    return {
+        "status": "ok",
+        "task_id": request.task_id,
+        "image_ref": request.image_ref,
+        "image_version": version_num,
+        "message": "SBOM generation triggered",
     }
 
 

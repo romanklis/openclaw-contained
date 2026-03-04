@@ -17,6 +17,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
       - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-gvisor}
+      - AGENT_IMAGES_DIR=/agent-images
     depends_on:
       postgres:
         condition: service_healthy
@@ -28,6 +29,7 @@ services:
       - openclaw-network
     volumes:
       - ./workspaces:/workspaces
+      - ./agent-images:/agent-images:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
