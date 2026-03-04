@@ -16,6 +16,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-gvisor}
     depends_on:
       postgres:
         condition: service_healthy
@@ -76,7 +77,9 @@ services:
   # DOCKER-IN-DOCKER — Runs agent & deployment containers
   # =============================================================================
   docker-dind:
-    image: docker:24-dind
+    build:
+      context: ./docker-dind
+      dockerfile: Dockerfile
     container_name: openclaw-docker-dind
     privileged: true
     command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock", "--tls=false"]
@@ -88,6 +91,12 @@ services:
       - "9100-9120:9100-9120"
     networks:
       - openclaw-network
+    healthcheck:
+      test: ["CMD", "docker", "version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   # =============================================================================
@@ -96,6 +105,8 @@ services:
   registry:
     image: registry:2
     container_name: openclaw-registry
+    ports:
+      - "5000:5000"
     volumes:
       - registry-data:/var/lib/registry
     networks:
@@ -171,13 +182,14 @@ services:
       - IMAGE_BUILDER_URL=http://openclaw-image-builder:8002
       - AGENT_IMAGES_DIR=/agent-images
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-insecure-dind}
     depends_on:
       temporal:
         condition: service_healthy
       control-plane:
         condition: service_healthy
       docker-dind:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./workspaces:/workspaces
       - ./agent-images:/agent-images

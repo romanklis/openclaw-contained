@@ -632,10 +632,21 @@ async def get_audit_turns(
         container_info = {}
         for ev in raw_events:
             if ev.get("activity_type") == "start_agent_container":
-                container_info = ev.get("result", {})
+                raw_ci = ev.get("result", {})
+                # Normalize field names for the frontend:
+                # - worker returns "agent_image"; frontend expects "image"
+                # - worker may or may not include "status"
+                container_info = {
+                    "container_id": raw_ci.get("container_id", ""),
+                    "image": raw_ci.get("image") or raw_ci.get("agent_image", ""),
+                    "status": raw_ci.get("status", "completed"),
+                    "sandbox_mode": raw_ci.get("sandbox_mode", ""),
+                    "workspace_dir": raw_ci.get("workspace_dir", ""),
+                }
             elif ev.get("activity_type") == "collect_agent_result":
-                # Could enrich with final result data
-                pass
+                # Mark container as completed once result is collected
+                if container_info:
+                    container_info["status"] = "completed"
             elif ev.get("data"):
                 turns.append(ev)
 

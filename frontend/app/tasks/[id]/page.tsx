@@ -607,17 +607,38 @@ export default function TaskDetailPage() {
                               </div>
                               <div className="bg-gray-900/50 rounded-lg p-2.5">
                                 <div className="text-xs text-gray-600">Image</div>
-                                <div className="text-xs font-mono text-gray-300 truncate">{iter.container.image || '—'}</div>
+                                <div className="text-xs font-mono text-gray-300 truncate">{iter.container.image || iter.container.agent_image || '—'}</div>
                               </div>
                               <div className="bg-gray-900/50 rounded-lg p-2.5">
                                 <div className="text-xs text-gray-600">Status</div>
-                                <div className="text-xs font-mono text-gray-300">{iter.container.status || '—'}</div>
+                                <div className="text-xs font-mono text-gray-300">
+                                  {iter.container.status === 'running' ? (
+                                    <span className="text-blue-400">● running</span>
+                                  ) : iter.container.status === 'completed' ? (
+                                    <span className="text-emerald-400">✓ completed</span>
+                                  ) : (
+                                    iter.container.status || '—'
+                                  )}
+                                </div>
                               </div>
                               <div className="bg-gray-900/50 rounded-lg p-2.5">
                                 <div className="text-xs text-gray-600">Turns</div>
                                 <div className="text-xs font-mono text-gray-300">{iter.turn_count}</div>
                               </div>
                             </div>
+                            {iter.container.sandbox_mode && (
+                              <div className="mt-2">
+                                {iter.container.sandbox_mode === 'gvisor' ? (
+                                  <span className="inline-flex items-center gap-1 text-xs bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/20">
+                                    🛡️ gVisor (runsc)
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 text-xs bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded border border-amber-500/20">
+                                    ⚠️ insecure-dind (privileged)
+                                  </span>
+                                )}
+                              </div>
+                            )}
                           </div>
                         )}
 
