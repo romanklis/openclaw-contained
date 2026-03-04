@@ -228,3 +228,38 @@ class AuditLog(Base):
     details = Column(JSON)
     
     timestamp = Column(DateTime, server_default=func.now())
+
+
+class SBOMFormat(str, enum.Enum):
+    """SBOM output format"""
+    SPDX_JSON = "spdx-json"
+    CYCLONEDX_JSON = "cyclonedx-json"
+
+
+class SBOM(Base):
+    """Software Bill of Materials for agent container images.
+
+    Each row stores a complete SBOM document (SPDX or CycloneDX) generated
+    during the image-build step.  The `packages` column is a denormalised
+    list of {name, version, type, license} dicts for fast searching.
+    """
+    __tablename__ = "sboms"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False, index=True)
+    image_tag = Column(String, nullable=False)
+    image_version = Column(Integer, nullable=False)  # matches v1, v2, …
+    format = Column(SQLEnum(SBOMFormat), nullable=False)
+
+    # Full SBOM document (SPDX / CycloneDX JSON)
+    document = Column(JSON, nullable=False)
+
+    # Denormalised package list for search
+    # [{"name": "flask", "version": "3.0.0", "type": "pip", "license": "BSD-3"}]
+    packages = Column(JSON, nullable=False, default=list)
+
+    # Generation metadata
+    generator = Column(String, default="trivy")  # trivy / syft
+    generated_at = Column(DateTime, server_default=func.now())
+
+    task = relationship("Task", backref="sboms")

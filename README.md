@@ -29,6 +29,7 @@ rebuild, and every LLM interaction is logged for audit.
 - **Full audit trail** — every LLM call logged with request/response, token counts, and provider info
 - **Temporal workflows** — durable execution that survives crashes, with pause/resume for approvals
 - **Deployment support** — agents can produce deployable applications served on ports 9100-9120
+- **📦 SBOM generation** — automatic Software Bill of Materials generation via [Trivy](https://trivy.dev) for every agent image build, with SPDX and CycloneDX output, package search, version diff, and vulnerability scanning
 
 
 ## 🛡️ Security: Agent Sandbox Modes
@@ -179,12 +180,35 @@ Every LLM interaction, tool call, and agent step is logged with full detail.
 
 ![Task Execution Traceability](docs/images/task-execution-tracebility.png)
 
+### Software Bill of Materials (SBOM)
+
+Every agent image build automatically generates an SBOM in both **SPDX JSON** and **CycloneDX JSON** formats using [Trivy](https://trivy.dev). SBOMs are stored in PostgreSQL and exposed through the control plane API.
+
+**Capabilities:**
+
+- **Automatic generation** — Trivy scans every newly built agent image and produces both SPDX and CycloneDX SBOMs
+- **Package inventory** — full list of all packages (pip, apt, npm, Go) with versions and licenses
+- **Version diff** — compare packages between image versions to see what was added, removed, or changed
+- **Cross-task search** — find which tasks use a specific package/version (useful for CVE triage)
+- **Vulnerability scanning** — on-demand Trivy vulnerability scan for any agent image
+- **Frontend tab** — "📦 Software Inventory" tab on the task detail page with filtering, sorting, and raw SBOM download
+
+**API Endpoints:**
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/sbom` | POST | Ingest SBOM (called by image-builder after build) |
+| `/api/tasks/{id}/sbom` | GET | Latest SBOM for a task (filterable by version/format) |
+| `/api/tasks/{id}/sbom/all` | GET | List all SBOM versions |
+| `/api/tasks/{id}/sbom/diff` | GET | Package diff between two image versions |
+| `/api/sbom/search` | GET | Search packages across all tasks |
+
 ### Services at a Glance
 
 | Service | Port | Description |
 |---------|------|-------------|
 | **control-plane** | 8000 | FastAPI — tasks, policies, capabilities, LLM proxy |
-| **image-builder** | *(internal)* | Builds agent Docker images, auto-bootstraps base image |
+| **image-builder** | *(internal)* | Builds agent Docker images, auto-bootstraps base image, generates SBOMs via Trivy |
 | **temporal-worker** | *(internal)* | Executes Temporal workflows (3 workflows, 11 activities) |
 | **frontend** | 3000 | Next.js 14 dashboard |
 | **postgres** | 5432 | Primary database (PostgreSQL 15) |
@@ -261,7 +285,7 @@ uvicorn main:app --reload --port 8000
 
 ### Database
 
-PostgreSQL 15 with 9 tables. Schema is auto-created by SQLAlchemy on startup.
+PostgreSQL 15 with 10 tables. Schema is auto-created by SQLAlchemy on startup.
 Connection: `postgresql://openclaw:openclaw_pass@localhost:5432/openclaw`
 
 ---

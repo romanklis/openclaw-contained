@@ -17,6 +17,7 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 3. **Immutable Infrastructure** — container images rebuilt when capabilities change
 4. **Audit Everything** — complete history via Temporal workflows and LLM interaction logs
 5. **Fail-Safe Defaults** — agents start maximally restricted, expand only when approved
+6. **Supply-Chain Transparency** — every agent image gets an automatic SBOM (Software Bill of Materials) for full package visibility
 
 ---
 
@@ -140,6 +141,7 @@ The central API server. Handles all external and internal communication.
 | `policies` | `/api/policies` | List, get, create version, get current for task |
 | `llm` | `/api/llm` | Chat completions proxy, provider config, model listing |
 | deployments | `/api/deployments` | Create, list, approve, start, stop |
+| `sbom` | `/api/sbom`, `/api/tasks/{id}/sbom` | SBOM ingest, retrieval, version listing, diff, cross-task package search |
 
 **LLM Router / Proxy:**
 
@@ -175,6 +177,13 @@ FastAPI service that builds Docker images inside DinD.
 - **Deployment image builds:** `POST /api/deployments/build` — builds minimal Python images
   from workspace files for running deployed applications.
 - **Build status polling:** `GET /api/build/{build_id}` — returns build status and logs.
+- **SBOM generation:** After every successful image build, [Trivy](https://trivy.dev) scans the image
+  and generates SBOMs in both **SPDX JSON** and **CycloneDX JSON** formats. The SBOMs are POSTed
+  to the control plane for storage. Trivy is installed directly in the image-builder container
+  with a pre-cached vulnerability database.
+- **Vulnerability scanning:** `POST /scan/vulnerabilities` — on-demand Trivy vulnerability scan
+  for any image in the registry. Returns a flat list of CVEs with severity, package, and fix version.
+- **On-demand SBOM:** `POST /scan/sbom` — generate an SBOM for any existing image without rebuilding.
 
 ### 3. Temporal Worker
 
@@ -241,14 +250,14 @@ which routes to the configured provider.
 |-------|-------------|
 | `/` | Dashboard — task/deployment counts, pending approvals, recent activity |
 | `/tasks` | Task list with status badges |
-| `/tasks/[id]` | Task detail with 3 tabs: **Outputs** (deliverables, logs), **Audit Log** (LLM interactions, tool calls, token usage), **Timeline** (execution history) |
+| `/tasks/[id]` | Task detail with 4 tabs: **Outputs** (deliverables, logs), **Audit Log** (LLM interactions, tool calls, token usage), **📦 Software Inventory** (SBOM packages, version diff, license info, raw download), **Timeline** (execution history) |
 | `/approvals` | Capability approval queue |
 | `/deployments` | Deployment management |
 | `/llm-providers` | LLM provider configuration (API keys, Ollama URL) |
 
 ### 6. Database (PostgreSQL 15)
 
-**9 tables:**
+**10 tables:**
 
 | Table | Purpose |
 |-------|---------|
@@ -259,6 +268,7 @@ which routes to the configured provider.
 | `task_messages` | Conversation messages (agent/user/system roles) |
 | `llm_provider_config` | Key-value store for LLM API keys and URLs |
 | `deployments` | Deployment records with image, port, container_id, status |
+| `sboms` | Software Bill of Materials per image version — SPDX/CycloneDX JSON documents, denormalized package list, generator info. Indexed by `task_id` and `(task_id, image_version)` |
 | `audit_logs` | Action audit trail (table exists, not yet populated by code) |
 
 ---
@@ -305,6 +315,8 @@ which routes to the configured provider.
    c. Human reviews in Approvals UI
    d. On approve: Image Builder creates new image
       with approved packages, pushes to Registry
+   d'. Trivy generates SPDX + CycloneDX SBOMs for the
+       new image → POSTed to Control Plane → stored in DB
    e. Workflow resumes with new image → back to step 4
       │
       ▼
@@ -332,6 +344,10 @@ Human sees request in Approvals UI
 │   Builds → tags as openclaw-agent:task-X-v2
 │     ↓
 │   Pushes to internal registry
+│     ↓
+│   Trivy scans image → generates SPDX + CycloneDX SBOMs
+│     ↓
+│   SBOMs POSTed to Control Plane (stored in sboms table)
 │     ↓
 │   Workflow resumes with new image
 │
@@ -379,6 +395,7 @@ Human sees request in Approvals UI
 | **Filesystem isolation** | Each task gets its own workspace directory |
 | **LLM audit trail** | Every LLM call logged with full request/response, token counts, provider info |
 | **Temporal history** | Complete workflow execution history, replayable and immutable |
+| **SBOM supply-chain transparency** | Every agent image automatically scanned by Trivy; SPDX + CycloneDX SBOMs stored with denormalized package lists; cross-task package search enables rapid CVE triage; version diffs track what changed between builds |
 | **Multi-layer insecure-mode warnings** | `make up` red banner, worker startup WARNING log, frontend SecurityBanner, `.env.example` comments |
 
 ### Not Yet Implemented
@@ -422,7 +439,7 @@ openclaw-contained/
 ├── services/
 │   ├── control-plane/          # FastAPI API server
 │   │   ├── main.py             # App entry, CORS, health, startup
-│   │   ├── models.py           # SQLAlchemy models (9 tables)
+│   │   ├── models.py           # SQLAlchemy models (10 tables)
 │   │   ├── schemas.py          # Pydantic request/response schemas
 │   │   ├── database.py         # Async PostgreSQL session
 │   │   ├── config.py           # Environment configuration
@@ -433,10 +450,11 @@ openclaw-contained/
 │   │       ├── tasks_extended.py # Outputs, timeline, messages
 │   │       ├── capabilities.py # Capability requests + review
 │   │       ├── policies.py     # Policy versioning
+│   │       ├── sbom.py         # SBOM ingest, retrieval, diff, search
 │   │       └── llm.py          # LLM router (~1500 lines)
 │   │
-│   ├── image-builder/          # Docker image builder
-│   │   ├── main.py             # Build API + auto-bootstrap
+│   ├── image-builder/          # Docker image builder + SBOM generator
+│   │   ├── main.py             # Build API + auto-bootstrap + Trivy SBOM/vuln scanning
 │   │   └── templates/          # Jinja2 Dockerfile templates
 │   │
 │   ├── temporal-worker/        # Temporal workflow worker
@@ -460,7 +478,7 @@ openclaw-contained/
 │   │   ├── layout.tsx          # Root layout (includes SecurityBanner)
 │   │   ├── page.tsx            # Dashboard
 │   │   ├── tasks/page.tsx      # Task list
-│   │   ├── tasks/[id]/page.tsx # Task detail (outputs, audit w/ sandbox badge, timeline)
+│   │   ├── tasks/[id]/page.tsx # Task detail (outputs, audit, SBOM inventory, timeline)
 │   │   ├── approvals/page.tsx  # Capability approvals
 │   │   ├── deployments/        # Deployment management
 │   │   ├── llm-providers/      # LLM provider config

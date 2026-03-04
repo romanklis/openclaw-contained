@@ -99,6 +99,8 @@ class CapabilityRequestResponse(BaseModel):
     decided_at: Optional[datetime]
     decided_by: Optional[str]
     decision_notes: Optional[str]
+    details: Optional[Dict[str, Any]] = None
+    alternative_suggestion: Optional[str] = None
     
     class Config:
         from_attributes = True
@@ -258,3 +260,63 @@ class DeploymentResponse(BaseModel):
 class DeploymentDecision(BaseModel):
     approved: bool
     notes: Optional[str] = None
+
+
+# SBOM schemas
+
+class SBOMPackage(BaseModel):
+    """Single package entry inside an SBOM."""
+    name: str
+    version: Optional[str] = None
+    type: Optional[str] = None  # pip, apt, npm, go, etc.
+    license: Optional[str] = None
+
+
+class SBOMResponse(BaseModel):
+    """Response for a single SBOM document."""
+    id: int
+    task_id: str
+    image_tag: str
+    image_version: int
+    format: str
+    packages: List[SBOMPackage]
+    generator: Optional[str] = None
+    generated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SBOMDetailResponse(SBOMResponse):
+    """Full SBOM including the raw SPDX / CycloneDX document."""
+    document: Dict[str, Any]
+
+
+class SBOMSearchResult(BaseModel):
+    """One hit when searching SBOMs for a specific package."""
+    sbom_id: int
+    task_id: str
+    image_tag: str
+    image_version: int
+    package_name: str
+    package_version: Optional[str] = None
+    package_type: Optional[str] = None
+    package_license: Optional[str] = None
+    generated_at: datetime
+
+
+class SBOMDiffEntry(BaseModel):
+    """One change between two SBOM versions."""
+    change: str  # added, removed, changed
+    name: str
+    type: Optional[str] = None
+    old_version: Optional[str] = None
+    new_version: Optional[str] = None
+
+
+class SBOMDiffResponse(BaseModel):
+    """Diff between two SBOM versions of the same task."""
+    task_id: str
+    from_version: int
+    to_version: int
+    changes: List[SBOMDiffEntry]
