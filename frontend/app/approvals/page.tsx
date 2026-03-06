@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Suspense } from 'react'
+import { useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { API } from '../lib/api'
 
@@ -35,6 +36,23 @@ interface TaskInfo {
 }
 
 export default function ApprovalsPage() {
+  return (
+    <Suspense fallback={
+      <div className="p-8 max-w-5xl mx-auto">
+        <div className="flex items-center justify-center h-64">
+          <div className="text-gray-500 text-sm">Loading approval requests...</div>
+        </div>
+      </div>
+    }>
+      <ApprovalsContent />
+    </Suspense>
+  )
+}
+
+function ApprovalsContent() {
+  const searchParams = useSearchParams()
+  const filterTaskId = searchParams.get('task_id')
+
   const [requests, setRequests] = useState<CapabilityRequest[]>([])
   const [allRequests, setAllRequests] = useState<CapabilityRequest[]>([])
   const [loading, setLoading] = useState(true)
@@ -72,6 +90,11 @@ export default function ApprovalsPage() {
       // Pre-fetch task info for all unique task_ids
       const taskIds = Array.from(new Set([...pending, ...all].map(r => r.task_id)))
       taskIds.forEach(id => fetchTaskInfo(id))
+      // Auto-expand the first matching request when filtered by task_id
+      if (filterTaskId && expandedId === null) {
+        const match = pending.find(r => r.task_id === filterTaskId)
+        if (match) setExpandedId(match.id)
+      }
       setLoading(false)
     } catch (error) {
       console.error('Failed to fetch requests:', error)
@@ -137,6 +160,14 @@ export default function ApprovalsPage() {
 
   const reviewedHistory = allRequests.filter((r) => r.status !== 'pending')
 
+  // Apply task_id filter from URL when present
+  const displayedPending = filterTaskId
+    ? requests.filter(r => r.task_id === filterTaskId)
+    : requests
+  const displayedHistory = filterTaskId
+    ? reviewedHistory.filter(r => r.task_id === filterTaskId)
+    : reviewedHistory
+
   if (loading) {
     return (
       <div className="p-8 max-w-5xl mx-auto">
@@ -157,6 +188,21 @@ export default function ApprovalsPage() {
         </p>
       </div>
 
+      {/* Task filter banner */}
+      {filterTaskId && (
+        <div className="mb-4 flex items-center gap-2 bg-indigo-500/10 border border-indigo-500/20 rounded-lg px-4 py-2">
+          <span className="text-indigo-400 text-sm">
+            Showing requests for task <code className="font-mono text-indigo-300">{filterTaskId}</code>
+          </span>
+          <Link
+            href="/approvals"
+            className="ml-auto text-xs text-gray-400 hover:text-gray-200 underline"
+          >
+            Show all
+          </Link>
+        </div>
+      )}
+
       {/* Tabs */}
       <div className="flex gap-1 mb-5 bg-[#12121a] rounded-lg p-1 w-fit">
         <button
@@ -165,9 +211,9 @@ export default function ApprovalsPage() {
             tab === 'pending' ? 'bg-[#232333] text-white' : 'text-gray-500 hover:text-gray-300'
           }`}
         >
-          Pending {requests.length > 0 && (
+          Pending {displayedPending.length > 0 && (
             <span className="ml-1.5 bg-yellow-500/20 text-yellow-400 px-1.5 py-0.5 rounded-full text-xs">
-              {requests.length}
+              {displayedPending.length}
             </span>
           )}
         </button>
@@ -177,20 +223,20 @@ export default function ApprovalsPage() {
             tab === 'history' ? 'bg-[#232333] text-white' : 'text-gray-500 hover:text-gray-300'
           }`}
         >
-          History ({reviewedHistory.length})
+          History ({displayedHistory.length})
         </button>
       </div>
 
       {/* Pending */}
       {tab === 'pending' && (
         <div className="space-y-3">
-          {requests.length === 0 ? (
+          {displayedPending.length === 0 ? (
             <div className="card p-12 text-center">
               <div className="text-4xl mb-3">✅</div>
-              <p className="text-gray-500 text-sm">All caught up — no pending approvals</p>
+              <p className="text-gray-500 text-sm">{filterTaskId ? 'No pending approvals for this task' : 'All caught up — no pending approvals'}</p>
             </div>
           ) : (
-            requests.map((req) => {
+            displayedPending.map((req) => {
               const isExpanded = expandedId === req.id
               const isLoading = actionLoading === req.id
               const task = taskCache[req.task_id]
@@ -200,7 +246,7 @@ export default function ApprovalsPage() {
               const detailedReason = req.details?.reason || null
 
               return (
-                <div key={req.id} className="card animate-fade-in">
+                <div key={req.id} className={`card animate-fade-in ${filterTaskId && req.task_id === filterTaskId ? 'ring-1 ring-indigo-500/50' : ''}`}>
                   <div className="p-5">
                     <div className="flex items-start justify-between gap-4">
                       <div className="flex items-start gap-3 min-w-0 flex-1">
@@ -369,12 +415,12 @@ export default function ApprovalsPage() {
       {/* History */}
       {tab === 'history' && (
         <div className="space-y-2">
-          {reviewedHistory.length === 0 ? (
+          {displayedHistory.length === 0 ? (
             <div className="card p-12 text-center">
               <p className="text-gray-500 text-sm">No review history yet</p>
             </div>
           ) : (
-            reviewedHistory.map((req) => (
+            displayedHistory.map((req) => (
               <div key={req.id} className="card p-4">
                 <div className="flex items-center gap-3">
                   <span className="text-lg">{capTypeIcon(req.capability_type)}</span>

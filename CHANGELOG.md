@@ -5,7 +5,112 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased] — 2026-03-04
+## [0.6.0] — 2026-03-06
+
+### Added
+
+- **OpenAI-Compatible API Gateway** (`services/api-gateway/`) — a new FastAPI service
+  (port 8080) that translates stateless OpenAI `/v1/chat/completions` requests into
+  stateful Temporal Workflow operations. Any OpenAI-compatible client (Open WebUI,
+  LibreChat, Chainlit, curl) can now drive TaskForge tasks through a standard chat
+  interface.
+  - **`main.py`** — SSE streaming engine, session management, fast-path detection for
+    lightweight LLM-only meta-requests (title/tag/follow-up generation), file download
+    endpoint for deliverables.
+  - **`config.py`** — Pydantic-based settings with env vars for control-plane URL,
+    Redis URL, default LLM model, polling intervals, stream timeout, CORS, dashboard URL.
+  - **`schemas.py`** — OpenAI-compatible Pydantic models: `ChatCompletionRequest`,
+    `ChatCompletionResponse`, `ChatMessage` (with vision content-part support),
+    `ModelCard`, `ModelList`.
+  - **`control_plane_client.py`** — async HTTP client wrapping all control-plane and
+    image-builder API calls: tasks CRUD, task outputs, capabilities, deployments,
+    LLM interactions, LLM models, build status, direct LLM chat completions.
+  - **`session_manager.py`** — Redis-backed (optional, falls back to in-memory)
+    session store. Deterministic conversation ID derivation from
+    `model + system_prompt + first_user_message` so browser refreshes reconnect to
+    the same Temporal workflow.
+  - **`Dockerfile`** — Python 3.11-slim image, uvicorn server.
+  - **`requirements.txt`** — FastAPI, uvicorn, pydantic-settings, httpx, redis.
+
+- **Open WebUI integration** — added `open-webui` service to `docker-compose.yml`
+  (port 3001), pre-wired to the API Gateway. On first launch: create an account,
+  select a model, and start chatting — tasks are created and streamed automatically.
+
+- **Redis service** — lightweight in-memory session store for the API Gateway
+  (`redis:7-alpine`, no persistence).
+
+- **Real-time turn-by-turn streaming** — the API Gateway polls the control-plane's
+  LLM interaction endpoint and streams each agent tool call to the user as it happens,
+  with descriptive icons:
+  - ⚡ exec / bash commands, 📝 write_file, 📖 read_file, ✏️ edit_file,
+    🌐 browser, 🔄 process, 🧩 nodes, 🎨 canvas, 🔧 generic.
+  - Iteration headers with model and image info.
+  - Compact post-turn summaries (duration, deliverables, capability/deployment requests).
+
+- **Capability lifecycle streaming** — when an agent requests packages, the chat stream
+  surfaces the full approval lifecycle in real-time:
+  - 🔒 Capability request with package badges and dashboard approval link.
+  - ✅ Approval confirmation + build progress indicator.
+  - ✅ New image built confirmation when the agent resumes.
+
+- **Fast-path LLM proxy** — Open WebUI meta-requests (title generation, tag generation,
+  follow-up suggestions) are detected by pattern matching and proxied directly through
+  the LLM router (~2s) instead of spawning full TaskForge tasks (~30s+).
+
+- **Model catalogue** — `GET /v1/models` fetches real model names from all configured
+  LLM providers (Ollama, Gemini, Anthropic, OpenAI) plus two meta-models
+  (`taskforge-iterator`, `taskforge-oneshot`).
+
+- **File download endpoint** — `GET /v1/files/{task_id}/{iteration}/{filename}` serves
+  deliverable files (including base64-decoded binaries) with proper MIME types.
+
+- **Approvals page deep-linking** — `?task_id=` URL parameter filters the approvals
+  page to a specific task. The API Gateway embeds these links in the chat stream so
+  users can click through directly.
+
+### Fixed
+
+- **Image tag fallback bug** — `build_agent_image()` in `worker.py` previously fell
+  back to `localhost:5000/openclaw-agent:base` (which doesn't exist) on build failure.
+  Now falls back to `current_image` (the image the task was already using).
+
+- **Agent container stuck after kill** — `openclaw-wrapper.py` used `proc.kill()` which
+  only killed the direct child process. Spawned grandchildren (Flask servers, etc.)
+  held stdout open, causing `proc.communicate()` to hang forever. Fixed by:
+  - Using `start_new_session=True` on `subprocess.Popen` to create a new process group.
+  - New `_kill_process_tree()` helper uses `os.killpg()` to SIGKILL the entire tree.
+  - Applied to all 3 kill paths: CAPABILITY_REQUEST grace expired, soft marker
+    deadline, and timeout.
+
+- **Transient build failures** — added retry logic (2 attempts with 2s backoff) for
+  `httpx.ConnectError`, `ReadError`, `WriteError`, `PoolTimeout` on the image-builder
+  `/build` POST.
+
+- **CAPABILITY_REQUEST multi-line parsing** — `parse_capability_request()` now
+  normalises JSON-escaped `\n` to real newlines, collects ALL CAPABILITY_REQUEST
+  markers (not just the first), deduplicates packages, and skips template placeholders
+  like `<package_name>`.
+
+- **Empty exception logging** — `build_agent_image()` now logs `repr(e)` + full
+  traceback instead of just `str(e)` (which was empty for some httpx exceptions).
+
+### Changed
+
+- **`docker-compose.yml`** — added 3 new services: `api-gateway` (port 8080),
+  `open-webui` (port 3001), `redis`. Total: **13 services**.
+- **`services/agent-executor/openclaw-wrapper.py`** — major rewrite of
+  `invoke_openclaw_agent()`: replaced `subprocess.run()` with `Popen` + background
+  monitor thread that polls LLM interactions for CAPABILITY_REQUEST markers.
+  Process group kill, grace periods for multi-package requests, soft marker
+  detection (ModuleNotFoundError).
+- **`services/temporal-worker/worker.py`** — `build_agent_image()` retry logic,
+  proper fallback image, improved error logging.
+- **`frontend/app/approvals/page.tsx`** — added `?task_id=` URL filter support,
+  `useSearchParams` with Suspense boundary, auto-expand matching request.
+
+---
+
+## [0.5.0] — 2026-03-04
 
 ### Added
 
