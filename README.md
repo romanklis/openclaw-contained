@@ -30,6 +30,9 @@ rebuild, and every LLM interaction is logged for audit.
 - **Temporal workflows** — durable execution that survives crashes, with pause/resume for approvals
 - **Deployment support** — agents can produce deployable applications served on ports 9100-9120
 - **📦 SBOM generation** — automatic Software Bill of Materials generation via [Trivy](https://trivy.dev) for every agent image build, with SPDX and CycloneDX output, package search, version diff, and vulnerability scanning
+- **💬 OpenAI-Compatible API Gateway** — `POST /v1/chat/completions` with SSE streaming, so any OpenAI-compatible client (Open WebUI, LibreChat, Chainlit, curl) can drive tasks through a standard chat interface
+- **🔄 Real-time turn-by-turn streaming** — see every tool call (⚡📝📖✏️🌐) as the agent works, plus capability approval lifecycle updates and deployment status
+- **🌐 Open WebUI integration** — pre-wired chat UI at port 3001; create an account and start chatting
 
 
 ## 🛡️ Security: Agent Sandbox Modes
@@ -111,9 +114,9 @@ OPENAI_API_KEY=your-key-here
 make up
 ```
 
-This starts all 10 services. On first boot, the **image-builder** will automatically build
+This starts all 13 services. On first boot, the **image-builder** will automatically build
 and push the base agent image (`openclaw-agent:openclaw`) to the internal registry. This takes
-several minutes on the first run (~1.8GB image).
+several minutes on the first run (~2.3GB image).
 
 ### 3. Verify everything is running
 
@@ -125,11 +128,32 @@ make health
 
 | Service | URL | Purpose |
 |---------|-----|---------|
+| **Open WebUI** | http://localhost:3001 | 💬 Chat interface — talk to TaskForge like ChatGPT |
 | **Frontend** | http://localhost:3000 | Dashboard, tasks, approvals, LLM config |
+| **API Gateway** | http://localhost:8080 | OpenAI-compatible API (`/v1/chat/completions`) |
 | **Control Plane API** | http://localhost:8000 | REST API (FastAPI auto-docs at `/docs`) |
 | **Temporal UI** | http://localhost:8088 | Workflow inspector |
 
-### 5. Create and run a task
+### 5. Chat with TaskForge (Open WebUI)
+
+Open http://localhost:3001 and create a local account. Select a model from the
+dropdown (e.g. `gemini-2.5-flash` or `taskforge-iterator`) and start chatting.
+TaskForge will create tasks, stream agent progress in real-time, surface
+capability approval links, and deliver results — all through a familiar chat UI.
+
+You can also use **any OpenAI-compatible client** (LibreChat, Chainlit, curl):
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-2.5-flash",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Build a Flask hello-world app"}]
+  }'
+```
+
+### 6. Create and run a task (Dashboard)
 
 ![Task Dashboard](docs/images/task-forge-task-dashboard.png)
 
@@ -217,6 +241,9 @@ Every agent image build automatically generates an SBOM in both **SPDX JSON** an
 | **temporal-ui** | 8088 | Temporal workflow inspector |
 | **docker-dind** | 9100-9120 | Docker-in-Docker for agent and deployment containers |
 | **registry** | *(internal)* | Docker Registry v2 for built agent images |
+| **api-gateway** | 8080 | OpenAI-compatible chat completions gateway (SSE streaming) |
+| **open-webui** | 3001 | Chat UI wired to the API Gateway |
+| **redis** | *(internal)* | Session store for API Gateway |
 
 ### Deliverables
 
@@ -343,6 +370,8 @@ docker exec openclaw-docker-dind docker ps -a
 | `ANTHROPIC_API_KEY` | — | No | Anthropic Claude API key |
 | `OPENAI_API_KEY` | — | No | OpenAI API key |
 | `API_URL` | `http://localhost:8000` | No | Frontend → API URL |
+| `DEFAULT_LLM_MODEL` | `gemini-2.0-flash-exp` | No | Default LLM for API Gateway tasks |
+| `WEBUI_SECRET_KEY` | `change-me-open-webui-secret` | No | Open WebUI session secret |
 
 At least one LLM provider must be configured for agents to function.
 

@@ -220,6 +220,87 @@ services:
     restart: unless-stopped
 
   # =============================================================================
+  # REDIS — Lightweight session store for the API Gateway
+  # =============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: openclaw-redis
+    command: redis-server --save "" --appendonly no
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # API GATEWAY — OpenAI-Compatible Chat Completions Gateway
+  # Maps stateless OpenAI requests to stateful Temporal Workflows.
+  # POST /v1/chat/completions  →  create / continue TaskForge tasks.
+  # =============================================================================
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: openclaw-api-gateway
+    environment:
+      - CONTROL_PLANE_URL=http://control-plane:8000
+      - REDIS_URL=redis://redis:6379/1
+      - DEFAULT_LLM_MODEL=${DEFAULT_LLM_MODEL:-gemini-2.0-flash-exp}
+      - SESSION_TTL_SECONDS=86400
+      - POLL_INTERVAL_SECONDS=1.5
+      - STREAM_TIMEOUT_SECONDS=1800
+      - LOG_LEVEL=INFO
+      - DASHBOARD_URL=http://localhost:3000
+      - IMAGE_BUILDER_URL=http://openclaw-image-builder:8002
+    volumes:
+      - ./services/api-gateway:/app          # live-reload during development
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # =============================================================================
+  # OPEN WEBUI — Chat UI wired to the OpenAI-Compatible API Gateway
+  # Access at http://localhost:3001
+  # On first launch: create an account (stored locally), select
+  # the "taskforge-iterator" model, and start chatting.
+  # =============================================================================
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openclaw-open-webui
+    environment:
+      # Point Open WebUI exclusively at our gateway (disable Ollama direct access)
+      - OPENAI_API_BASE_URL=http://api-gateway:8080/v1
+      - OPENAI_API_BASE_URLS=http://api-gateway:8080/v1
+      - OPENAI_API_KEY=sk-openclaw-gateway
+      - OLLAMA_BASE_URL=
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-open-webui-secret}
+      - WEBUI_NAME=OpenClaw Chat
+      - DEFAULT_MODELS=taskforge-iterator
+      - ENABLE_COMMUNITY_SHARING=false
+      - ENABLE_MESSAGE_RATING=false
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    ports:
+      - "3001:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  # =============================================================================
   # POSTGRESQL — Primary database
   # =============================================================================
   postgres:
@@ -258,3 +339,4 @@ volumes:
   temporal-postgres-data:
   registry-data:
   docker-data:
+  open-webui-data:

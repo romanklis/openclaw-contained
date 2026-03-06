@@ -442,17 +442,175 @@ def invoke_openclaw_agent(prompt: str) -> Tuple[str, int]:
             "--json",
         ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            env=env,
-        )
-        return (result.stdout + result.stderr, result.returncode)
+        # The OpenClaw agent with --json buffers ALL stdout until it exits,
+        # so line-by-line reading won't see CAPABILITY_REQUEST markers until
+        # the process finishes (possibly after a 10-minute timeout).
+        #
+        # Instead, we run a background monitor that polls the LLM router's
+        # interaction log for this task.  When the LLM response contains a
+        # CAPABILITY_REQUEST marker (or tool results show ModuleNotFoundError),
+        # we kill the agent immediately.
+        import threading, time as _time
+        import urllib.request, urllib.error
 
-    except subprocess.TimeoutExpired:
-        return ("ERROR: Agent execution timed out after 10 minutes", 1)
+        TIMEOUT_SECONDS = 600
+        _IMMEDIATE_MARKERS = ["CAPABILITY_REQUEST:"]
+        _SOFT_MARKERS = [
+            "ModuleNotFoundError:",
+            "ImportError: No module named",
+            "No module named '",
+        ]
+        # After a CAPABILITY_REQUEST is seen, wait this long for MORE
+        # CAPABILITY_REQUEST lines (the agent often emits one per package
+        # across consecutive turns).
+        CAP_REQ_GRACE_SECONDS = 10
+        # After a soft marker (ModuleNotFoundError), wait for the agent
+        # to emit an authoritative CAPABILITY_REQUEST.
+        SOFT_GRACE_SECONDS = 30
+        POLL_INTERVAL = 3         # seconds between interaction polls
+
+        def _kill_process_tree(p):
+            """Kill the process and its entire process group.
+
+            The agent may spawn long-running children (Flask servers, etc.)
+            that inherit stdout.  Using os.killpg ensures communicate()
+            won't hang waiting for grandchildren to close the pipe.
+            """
+            import os as _os, signal as _signal
+            try:
+                _os.killpg(_os.getpgid(p.pid), _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            # Fallback in case killpg missed anything
+            try:
+                p.kill()
+            except (ProcessLookupError, OSError):
+                pass
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,  # new process group so we can kill the whole tree
+        )
+
+        # Shared state between monitor thread and main thread
+        _kill_reason: str | None = None      # set by monitor when marker found
+        _detected_content: str | None = None # LLM response text with marker
+
+        def _monitor_interactions():
+            """Poll LLM router interactions for this task and detect markers."""
+            nonlocal _kill_reason, _detected_content
+            interactions_url = f"{CONTROL_PLANE_URL}/api/llm/interactions/{TASK_ID or 'unknown'}"
+            seen = 0
+            soft_deadline: float | None = None
+            cap_req_deadline: float | None = None
+
+            while proc.poll() is None and _kill_reason is None:
+                _time.sleep(POLL_INTERVAL)
+                try:
+                    req = urllib.request.Request(f"{interactions_url}?since={seen}")
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        import json as _json
+                        data = _json.loads(resp.read())
+                except Exception:
+                    continue
+
+                interactions = data.get("interactions", [])
+                for ix in interactions:
+                    seen += 1
+                    # Check response content
+                    resp_data = ix.get("response", {})
+                    content = resp_data.get("content", "") or ""
+
+                    # Also check tool results in the request (ModuleNotFoundError
+                    # from exec tool calls)
+                    req_data = ix.get("request", {})
+                    tool_results = req_data.get("tool_results", [])
+                    tool_text = " ".join(
+                        tr.get("content", "") for tr in tool_results if tr.get("content")
+                    )
+
+                    combined_text = content + " " + tool_text
+
+                    # Check for immediate markers (CAPABILITY_REQUEST in LLM response)
+                    if any(m in combined_text for m in _IMMEDIATE_MARKERS):
+                        # Accumulate detected content
+                        _detected_content = (_detected_content or "") + "\n" + combined_text
+                        # Start (or extend) a short grace period so we can
+                        # capture CAPABILITY_REQUEST for additional packages
+                        # that the agent may emit in subsequent turns.
+                        if cap_req_deadline is None:
+                            cap_req_deadline = _time.monotonic() + CAP_REQ_GRACE_SECONDS
+                            print(f"   ⚡ CAPABILITY_REQUEST detected (turn {ix.get('turn', '?')}) — "
+                                  f"waiting {CAP_REQ_GRACE_SECONDS}s for more")
+                        else:
+                            # Saw another one — extend grace
+                            cap_req_deadline = _time.monotonic() + CAP_REQ_GRACE_SECONDS
+                            print(f"   ⚡ Additional CAPABILITY_REQUEST (turn {ix.get('turn', '?')}) — extending grace")
+                        # Also cancel the soft deadline — we have an authoritative marker now
+                        soft_deadline = None
+                        continue
+
+                    # Check for soft markers (ModuleNotFoundError in tool results)
+                    if soft_deadline is None and cap_req_deadline is None and any(m in combined_text for m in _SOFT_MARKERS):
+                        soft_deadline = _time.monotonic() + SOFT_GRACE_SECONDS
+                        print(f"   ⚡ Soft marker detected (turn {ix.get('turn', '?')}) — "
+                              f"waiting {SOFT_GRACE_SECONDS}s for CAPABILITY_REQUEST")
+
+                # Check CAPABILITY_REQUEST grace deadline
+                if cap_req_deadline is not None and _time.monotonic() > cap_req_deadline:
+                    _kill_reason = "CAPABILITY_REQUEST detected in LLM response"
+                    print(f"   ⚡ {_kill_reason}, stopping agent after grace period")
+                    _kill_process_tree(proc)
+                    return
+
+                # Check soft deadline
+                if soft_deadline is not None and _time.monotonic() > soft_deadline:
+                    _kill_reason = "ModuleNotFoundError grace period expired"
+                    _detected_content = _detected_content or ""
+                    print(f"   ⏱️  {_kill_reason}, stopping agent")
+                    _kill_process_tree(proc)
+                    return
+
+        monitor = threading.Thread(target=_monitor_interactions, daemon=True)
+        monitor.start()
+
+        # Wait for the process to finish (or be killed by the monitor)
+        try:
+            stdout, stderr = proc.communicate(timeout=TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            stdout, stderr = proc.communicate()
+            _kill_reason = _kill_reason or "timeout"
+
+        monitor.join(timeout=2)
+
+        combined = (stdout or "") + (stderr or "")
+
+        # If the monitor detected a marker and killed the proc, inject the
+        # detected LLM content into the output so parse_capability_request()
+        # can find it — the --json stdout may be empty/truncated since the
+        # agent was killed mid-execution.
+        if _kill_reason and _kill_reason != "timeout":
+            if _detected_content and "CAPABILITY_REQUEST" not in combined:
+                combined = combined + "\n" + _detected_content
+            print(f"   ⚡ Early stop ({_kill_reason}) — {len(combined)} chars of output")
+            rc = proc.returncode if proc.returncode is not None else 1
+            return (combined, rc)
+
+        rc = proc.returncode if proc.returncode is not None else 1
+
+        if _kill_reason == "timeout":
+            timeout_msg = f"ERROR: Agent execution timed out after {TIMEOUT_SECONDS // 60} minutes"
+            if combined:
+                print(f"   ⏱️  Timeout — preserved {len(combined)} chars of partial output")
+                return (combined + "\n\n" + timeout_msg, rc)
+            return (timeout_msg, rc)
+
+        return (combined, rc)
     except Exception as e:
         import traceback
         return (f"ERROR invoking OpenClaw: {e}\n{traceback.format_exc()}", 1)
@@ -462,8 +620,10 @@ def invoke_openclaw_agent(prompt: str) -> Tuple[str, int]:
 # Capability detection
 # ---------------------------------------------------------------------------
 
-def parse_capability_request(output: str) -> Optional[Tuple[str, List[str]]]:
+def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]]:
     """Parse OpenClaw output for missing package errors / capability requests.
+
+    Returns (cap_type, packages, reason) or None.
 
     Checks for (in order of priority):
     1. Explicit CAPABILITY_REQUEST marker from agent (preferred)
@@ -473,23 +633,46 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str]]]:
     5. python_packages=[...] pattern
     """
     # 1. Explicit capability request from agent (highest priority)
-    match = re.search(r"CAPABILITY_REQUEST:(\w+):([^:\n]+):(.+)", output)
-    if match:
-        cap_type = match.group(1)
-        packages = [p.strip() for p in match.group(2).split(",")]
-        return (cap_type, packages)
+    #    Collect ALL valid matches — the agent may emit multiple
+    #    CAPABILITY_REQUEST lines (one per package) across turns.
+    #    The output may contain JSON-escaped newlines (\\n) inside "text"
+    #    fields — normalise them so the regex can treat each
+    #    CAPABILITY_REQUEST as a separate line.
+    normalised = output.replace("\\n", "\n").replace("\\r", "\r")
+    all_packages: list[str] = []
+    all_reasons: list[str] = []
+    cap_type_found: str | None = None
+    for m in re.finditer(r"CAPABILITY_REQUEST:(\w+):([^:\n]+):(.+)", normalised):
+        packages_raw = m.group(2).strip()
+        # Skip template placeholders like <package_name>, <reason>, etc.
+        if re.fullmatch(r"<[^>]+>", packages_raw):
+            continue
+        cap_type_found = m.group(1)
+        for p in packages_raw.split(","):
+            p = p.strip()
+            if p and p not in all_packages:
+                all_packages.append(p)
+        reason = m.group(3).strip()
+        # Clean up reason — remove trailing JSON artefacts / quotes
+        reason = reason.rstrip('"\',}] ')
+        if reason and reason not in all_reasons:
+            all_reasons.append(reason)
+
+    if all_packages and cap_type_found:
+        combined_reason = "; ".join(all_reasons) if all_reasons else "Required for task execution"
+        return (cap_type_found, all_packages, combined_reason)
 
     # 2. Python ModuleNotFoundError / ImportError
     matches = re.findall(
         r"(?:ModuleNotFoundError|ImportError):.*?no module named ['\"]?([a-zA-Z0-9_]+)",
-        output, re.IGNORECASE,
+        normalised, re.IGNORECASE,
     )
     if not matches:
-        matches = re.findall(r"no module named ['\"]([^'\"]+)['\"]", output, re.IGNORECASE)
+        matches = re.findall(r"no module named ['\"]([^'\"]+)['\"]", normalised, re.IGNORECASE)
     if matches:
         # Deduplicate, take root package name
         packages = list(dict.fromkeys(m.split(".")[0] for m in matches))
-        return ("python_packages", packages)
+        return ("python_packages", packages, "ModuleNotFoundError detected")
 
     # 3. pip install failures — extract package name from the command
     pip_patterns = [
@@ -498,22 +681,22 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str]]]:
         r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*failed",
     ]
     for pattern in pip_patterns:
-        match = re.search(pattern, output, re.IGNORECASE)
+        match = re.search(pattern, normalised, re.IGNORECASE)
         if match:
-            return ("python_packages", [match.group(1)])
+            return ("python_packages", [match.group(1)], "pip install failure detected")
 
     # 4. npm module not found — only match actual package names, not paths
-    match = re.search(r"cannot find module ['\"]([^'\"]+)['\"]", output, re.IGNORECASE)
+    match = re.search(r"cannot find module ['\"]([^'\"]+)['\"]", normalised, re.IGNORECASE)
     if match:
         mod = match.group(1)
         if not mod.startswith("/") and not mod.startswith("."):
-            return ("npm_packages", [mod])
+            return ("npm_packages", [mod], "npm module not found")
 
     # 5. python_packages=[...] pattern
-    match = re.search(r"python_packages=\[([^\]]+)\]", output)
+    match = re.search(r"python_packages=\[([^\]]+)\]", normalised)
     if match:
         packages = [p.strip().strip("'\"") for p in match.group(1).split(",")]
-        return ("python_packages", packages)
+        return ("python_packages", packages, "python_packages pattern detected")
 
     return None
 

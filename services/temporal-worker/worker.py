@@ -997,18 +997,31 @@ async def build_agent_image(
         logger.info(f"   └─ Building FROM {base_image} (incremental)")
         logger.info(f"   └─ Adding: {resources}")
         
-        # Call image builder service
+        # Call image builder service — retry once on transient network errors
         async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.post(
-                f"{image_builder_url}/build",
-                json={
-                    "task_id": task_id,
-                    "base_image": base_image,
-                    "capabilities": build_capabilities
-                }
-            )
-            response.raise_for_status()
-            result = response.json()
+            last_err = None
+            for attempt in range(2):
+                try:
+                    response = await client.post(
+                        f"{image_builder_url}/build",
+                        json={
+                            "task_id": task_id,
+                            "base_image": base_image,
+                            "capabilities": build_capabilities
+                        }
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    break  # success
+                except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.PoolTimeout) as net_err:
+                    last_err = net_err
+                    if attempt == 0:
+                        logger.warning(f"   └─ POST /build failed ({type(net_err).__name__}), retrying in 2s...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise
+            else:
+                raise last_err  # type: ignore[misc]
             
             build_id = result["build_id"]
             expected_tag = result["image_tag"]
@@ -1045,10 +1058,12 @@ async def build_agent_image(
             raise Exception("Build timeout after 10 minutes")
             
     except Exception as e:
-        logger.error(f"❌ BUILD_ERROR | Task: {task_id} | {e}")
-        logger.warning(f"⚠️  FALLBACK | Task: {task_id} | Continuing with base image")
-        # Fall back to base image
-        return "localhost:5000/openclaw-agent:base"
+        import traceback
+        logger.error(f"❌ BUILD_ERROR | Task: {task_id} | {type(e).__name__}: {repr(e)}")
+        logger.error(f"   └─ Traceback:\n{traceback.format_exc()}")
+        logger.warning(f"⚠️  FALLBACK | Task: {task_id} | Continuing with previous image: {current_image}")
+        # Fall back to the image we already had (NOT a non-existent "base" tag)
+        return current_image
 
 
 @activity.defn

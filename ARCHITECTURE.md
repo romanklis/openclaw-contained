@@ -24,17 +24,26 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 ## System Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          FRONTEND (Next.js)                         │
-│  :3000                                                              │
-│  ┌────────────┐ ┌─────────────┐ ┌──────────┐ ┌───────────────────┐ │
-│  │ Dashboard  │ │ Task Detail │ │Approvals │ │ LLM Providers    │ │
-│  │ + Security │ │ + Audit Log │ │          │ │ + Deployments    │ │
-│  │   Banner   │ │   (turns)   │ │          │ │                  │ │
-│  └────────────┘ └─────────────┘ └──────────┘ └───────────────────┘ │
-└────────────────────────┬─────────────────────────────────────────────┘
-                         │ HTTP (REST)
-                         ▼
+┌─────────────────────────────────┐  ┌──────────────────────────────────┐
+│    OPEN WEBUI (Chat UI)         │  │       FRONTEND (Next.js)         │
+│    :3001                        │  │       :3000                      │
+│  Any OpenAI-compatible client   │  │  Dashboard, Tasks, Approvals,    │
+│  (Open WebUI, LibreChat, curl)  │  │  Audit, SBOM, Deployments        │
+└───────────────┬─────────────────┘  └──────────────┬───────────────────┘
+                │ OpenAI API                         │ HTTP (REST)
+                ▼                                    │
+┌──────────────────────────────────┐                 │
+│  API GATEWAY (FastAPI)           │                 │
+│  :8080                           │                 │
+│  POST /v1/chat/completions (SSE) │                 │
+│  GET  /v1/models                 │                 │
+│  GET  /v1/files/{task}/{iter}/.. │                 │
+│  Session mgmt (Redis / in-mem)   │                 │
+│  Fast-path LLM proxy             │                 │
+│  Turn-by-turn streaming          │                 │
+└───────────────┬──────────────────┘                 │
+                │ HTTP (REST)            ┌───────────┘
+                ▼                        ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                     CONTROL PLANE (FastAPI)                          │
 │  :8000                                                              │
@@ -118,8 +127,11 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 | **temporal-ui** | `temporalio/ui:2.40.1` | 8088 | Temporal workflow inspector |
 | **docker-dind** | `./docker-dind` (custom) | 9100-9120 | Docker-in-Docker with gVisor/runsc for sandboxed agent containers |
 | **registry** | `registry:2` | 5000 | Internal Docker image registry |
+| **api-gateway** | `./services/api-gateway` | 8080 | OpenAI-compatible chat completions gateway (SSE streaming) |
+| **open-webui** | `ghcr.io/open-webui/open-webui` | 3001 | Chat UI wired to the API Gateway |
+| **redis** | `redis:7-alpine` | — (6379 internal) | Session store for API Gateway |
 
-**Total: 10 services** in `docker-compose.yml`.
+**Total: 13 services** in `docker-compose.yml`.
 
 ---
 
@@ -255,7 +267,40 @@ which routes to the configured provider.
 | `/deployments` | Deployment management |
 | `/llm-providers` | LLM provider configuration (API keys, Ollama URL) |
 
-### 6. Database (PostgreSQL 15)
+### 6. API Gateway (FastAPI)
+
+OpenAI-compatible chat completions gateway that bridges stateless HTTP clients
+(Open WebUI, LibreChat, curl) with TaskForge's stateful Temporal workflows.
+
+**Key files:**
+- `main.py` — SSE streaming engine, session resolution, fast-path detection
+- `control_plane_client.py` — async HTTP client for all control-plane APIs
+- `session_manager.py` — Redis-backed session store with deterministic ID derivation
+- `schemas.py` — OpenAI-format Pydantic models
+- `config.py` — Pydantic-settings configuration
+
+**Endpoints:**
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/v1/chat/completions` | POST | Main chat endpoint — creates/continues tasks, streams SSE |
+| `/v1/models` | GET | Lists all LLM models + meta-models |
+| `/v1/files/{task_id}/{iter}/{file}` | GET | Download deliverable files |
+| `/v1/sessions/{id}` | GET/DELETE | Session inspection / reset |
+| `/health` | GET | Health check |
+
+**Streaming features:**
+- Turn-by-turn progress with tool-call icons (⚡📝📖✏️🌐🔧)
+- Capability approval lifecycle (request → approve → build → resume)
+- Deployment status summary at task completion
+- Fast-path proxy for Open WebUI meta-requests (title/tag/follow-up generation)
+
+**Session management:**
+- Deterministic conversation ID from `model + system_prompt + first_user_message`
+- Browser refresh reconnects to the same Temporal workflow
+- Redis backend (optional, falls back to in-memory)
+
+### 7. Database (PostgreSQL 15)
 
 **10 tables:**
 
@@ -460,6 +505,15 @@ openclaw-contained/
 │   ├── temporal-worker/        # Temporal workflow worker
 │   │   └── worker.py           # 3 workflows, 13 activities, cached Docker client
 │   │
+│   ├── api-gateway/            # OpenAI-compatible API Gateway
+│   │   ├── main.py             # SSE streaming, session mgmt, fast-path
+│   │   ├── control_plane_client.py # Async HTTP client
+│   │   ├── session_manager.py  # Redis / in-memory session store
+│   │   ├── schemas.py          # OpenAI-format Pydantic models
+│   │   ├── config.py           # Pydantic-settings configuration
+│   │   ├── Dockerfile          # Python 3.11-slim + uvicorn
+│   │   └── requirements.txt    # FastAPI, httpx, redis, etc.
+│   │
 │   └── agent-executor/         # Code that runs INSIDE agent containers
 │       ├── openclaw-wrapper.py # Primary agent entrypoint
 │       ├── openclaw-wrapper.js # Alternative JS executor
@@ -508,7 +562,6 @@ openclaw-contained/
 3. **`update_task_policy` is a stub** — returns `{"updated": True}`
 4. **`audit_logs` table exists but no code writes to it** — audit is via Temporal history + task_outputs
 5. **`agent-images/base/agent_runtime.py`** is an unused prototype — the real agent code is `services/agent-executor/openclaw-wrapper.py`
-6. **No API gateway** — control plane is exposed directly on port 8000
-7. **Base image is ~1.8GB** — first boot takes several minutes to build and push
+6. **Base image is ~2.3GB** — first boot takes several minutes to build and push
 8. **Docker Compose v1** — uses `docker-compose` (v1.29); may hit `ContainerConfig` KeyError on image rebuilds — workaround is to `docker rm -f` the container and re-run
 9. **Docker SDK pinned to 6.1.3** — `docker==7.0.0` breaks with `requests>=2.32` (`urllib3` incompatibility). Worker pins `docker==6.1.3`, `requests<2.32.0`, `urllib3<2`
