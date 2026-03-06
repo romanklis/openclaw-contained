@@ -34,6 +34,21 @@ rebuild, and every LLM interaction is logged for audit.
 - **🔄 Real-time turn-by-turn streaming** — see every tool call (⚡📝📖✏️🌐) as the agent works, plus capability approval lifecycle updates and deployment status
 - **🌐 Open WebUI integration** — pre-wired chat UI at port 3001; create an account and start chatting
 
+### 💬 From Chat to Deployed App — in One Prompt
+
+TaskForge ships with [Open WebUI](https://github.com/open-webui/open-webui) pre-wired to the API Gateway.
+Type a prompt, and the agent builds, tests, and deploys a full application — streamed turn-by-turn in real time.
+
+![Open WebUI → TaskForge Integration](docs/images/0.6.0/webUI%20integration.png)
+
+> **Example:** *"Build a Bitcoin portfolio tracker with live price charts"* — the agent scaffolds a Flask app,
+> installs dependencies (via capability approval), fetches live BTC data, and deploys it on a local port.
+> The result is a running application you can open in your browser:
+
+![Example: BTC Portfolio Tracker — deployed locally by an agent](docs/images/0.6.0/app-example-local-deployment-btc-profile-view.png)
+
+All of this happens through a familiar chat interface — no dashboard clicks, no YAML, no manual deploys.
+
 
 ## 🛡️ Security: Agent Sandbox Modes
 
@@ -155,6 +170,10 @@ curl -N http://localhost:8080/v1/chat/completions \
 
 ### 6. Create and run a task (Dashboard)
 
+> 💡 **Prefer the chat?** You can skip the dashboard entirely — just type your task in
+> Open WebUI (step 5) and the agent handles everything. The dashboard is great for
+> monitoring, approvals, and audit.
+
 ![Task Dashboard](docs/images/task-forge-task-dashboard.png)
 
 Via the Frontend at http://localhost:3000/tasks, or via API:
@@ -185,11 +204,18 @@ a capability request will appear in the **Approvals** tab at http://localhost:30
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system design, including:
-- 10-service Docker Compose topology
+- 13-service Docker Compose topology
 - Data flow diagrams
 - Database schema
 - Temporal workflow details
 - Security model
+
+### Temporal Workflow Backend
+
+Every task is a durable Temporal workflow — surviving crashes, restarts, and long-running
+capability approval cycles. The Temporal UI at `:8088` gives full visibility into workflow state.
+
+![Temporal Workflow Backend](docs/images/0.6.0/temporal_backend.png)
 
 ### Capability Approval & Image Rebuild
 
@@ -200,9 +226,14 @@ On approval, the image builder creates a new Docker image with the approved pack
 
 ### Execution Traceability
 
-Every LLM interaction, tool call, and agent step is logged with full detail.
+Every LLM interaction, tool call, and agent step is logged with full detail —
+whether the task was started from the dashboard or from a chat message in Open WebUI.
 
 ![Task Execution Traceability](docs/images/task-execution-tracebility.png)
+
+![Audit Logs — Turn-by-Turn Detail](docs/images/0.6.0/TaskForge-audit-logs.png)
+
+![Audit Logs — Continued](docs/images/0.6.0/TaskForge-audit-logs-page2.png)
 
 ### Software Bill of Materials (SBOM)
 
