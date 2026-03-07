@@ -166,6 +166,9 @@ async def get_execution_timeline(
             "id": task.id,
             "description": task.description,
             "status": task.status,
+            "llm_model": task.llm_model,
+            "current_image": task.current_image,
+            "agent_profile": task.agent_profile,
             "created_at": task.created_at.isoformat(),
             "started_at": task.started_at.isoformat() if task.started_at else None,
             "completed_at": task.completed_at.isoformat() if task.completed_at else None,
@@ -417,6 +420,8 @@ async def get_task_current_state(
     return {
         "task_id": task_id,
         "status": task.status.value,
+        "agent_profile": task.agent_profile,
+        "llm_model": task.llm_model,
         "current_iteration": 0,  # TODO: Track in database
         "max_iterations": 15,  # TODO: Get from task config
         "current_image": current_image,

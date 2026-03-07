@@ -80,6 +80,13 @@ class DeploymentBuildRequest(BaseModel):
 # Dockerfile Generation
 # =============================================================================
 
+# Per-image-type install strategies
+# ─────────────────────────────────
+#  openclaw  : Debian + /opt/venv/bin/pip + npm + apt-get
+#  nanobot   : Alpine + /usr/local/bin/pip + apk (no npm)
+#  picoclaw  : Alpine + apk only (no Python, no npm)
+#  zeroclaw  : Debian + /usr/bin/pip3 --break-system-packages + apt-get (no npm)
+
 DOCKERFILE_TEMPLATE = """
 FROM {{ base_image }}
 
@@ -87,32 +94,70 @@ FROM {{ base_image }}
 LABEL task_id="{{ task_id }}"
 LABEL build_id="{{ build_id }}"
 LABEL capabilities="{{ capabilities }}"
+LABEL image_type="{{ image_type }}"
 
-{% if apt_packages %}
-# Install APT packages
+{% if system_packages %}
+# Install system packages ({{ pkg_manager }})
 USER root
+{% if pkg_manager == 'apk' %}
+RUN apk add --no-cache \\
+{% for pkg in system_packages %}
+    {{ pkg }}{{ ' \\\\' if not loop.last else '' }}
+{% endfor %}
+{% else %}
 RUN apt-get update && apt-get install -y \\
-{% for pkg in apt_packages %}
+{% for pkg in system_packages %}
     {{ pkg }} \\
 {% endfor %}
     && rm -rf /var/lib/apt/lists/*
 {% endif %}
+{% endif %}
 
 {% if pip_packages %}
-# Install Python packages into both venv and system python
-# Use absolute paths to ensure we install into BOTH interpreters
+{% if image_type == 'picoclaw' %}
+# ⚠ PicoClaw has no Python — cannot install pip packages
+# Requested: {{ pip_packages | join(', ') }}
+RUN echo "ERROR: pip packages requested but PicoClaw has no Python runtime" >&2 && exit 1
+{% elif image_type == 'openclaw' %}
+# Install Python packages into venv (OpenClaw)
 USER root
-RUN /opt/venv/bin/pip install --no-cache-dir {{ pip_packages | join(' ') }} ; /usr/bin/pip3 install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }} || /usr/bin/pip3 install --no-cache-dir {{ pip_packages | join(' ') }} || true
+RUN /opt/venv/bin/pip install --no-cache-dir {{ pip_packages | join(' ') }}
+{% elif image_type == 'nanobot' %}
+# Install Python packages (NanoBot — Alpine Python)
+USER root
+RUN pip install --no-cache-dir {{ pip_packages | join(' ') }}
+{% elif image_type == 'zeroclaw' %}
+# Install Python packages (ZeroClaw — Debian system Python)
+USER root
+RUN pip3 install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
+{% else %}
+# Install Python packages (generic — auto-detect pip)
+USER root
+RUN set -e; \\
+    PIP=""; \\
+    for p in /opt/venv/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip /usr/bin/pip3; do \\
+        if [ -x "$p" ]; then PIP="$p"; break; fi; \\
+    done; \\
+    if [ -z "$PIP" ]; then echo "ERROR: no pip found" >&2; exit 1; fi; \\
+    echo "Using pip: $PIP"; \\
+    $PIP install --no-cache-dir {{ pip_packages | join(' ') }} || \\
+    $PIP install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
+{% endif %}
 {% endif %}
 
 {% if npm_packages %}
-# Install NPM packages globally
+{% if image_type == 'openclaw' %}
+# Install NPM packages globally (OpenClaw only)
 USER root
 RUN npm install -g \\
 {% for pkg in npm_packages %}
     {{ pkg }} \\
 {% endfor %}
     && npm list -g --depth=0
+{% else %}
+# ⚠ npm packages requested but {{ image_type }} has no Node.js
+RUN echo "WARNING: npm packages not available on {{ image_type }}" >&2
+{% endif %}
 {% endif %}
 
 {% if tools %}
@@ -126,8 +171,51 @@ RUN chmod +x /usr/local/bin/{{ tool }}
 WORKDIR /workspace
 
 # Verify installation
-RUN echo "Image built successfully for task {{ task_id }}"
+RUN echo "Image built successfully for task {{ task_id }} ({{ image_type }})"
 """
+
+
+def _detect_image_type(base_image: str) -> str:
+    """Detect the image type from a base image tag.
+
+    Strategy (in order):
+      1. Direct tag match: openclaw-agent:nanobot → nanobot
+      2. Docker image labels: org.openclaw.image.type
+      3. Docker image env vars: OPENCLAW_IMAGE_TYPE=...
+      4. Fallback: 'openclaw'
+    """
+    KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
+    tag = base_image.rsplit(":", 1)[-1] if ":" in base_image else ""
+
+    # 1. Direct base image tags
+    if tag in KNOWN_TYPES:
+        return tag
+
+    # 2 & 3. Inspect the image via Docker SDK
+    try:
+        image = docker_client.images.get(base_image)
+        # Check labels
+        labels = image.labels or {}
+        label_type = labels.get("image_type") or labels.get("org.openclaw.image.type", "")
+        if label_type in KNOWN_TYPES:
+            return label_type
+        # Map base-agent label to openclaw
+        if label_type == "base-agent":
+            return "openclaw"
+
+        # Check env vars
+        env_list = image.attrs.get("Config", {}).get("Env", []) or []
+        for entry in env_list:
+            if entry.startswith("OPENCLAW_IMAGE_TYPE="):
+                val = entry.split("=", 1)[1].strip()
+                if val in KNOWN_TYPES:
+                    return val
+    except Exception as e:
+        logger.warning(f"   └─ Could not inspect image {base_image}: {e}")
+
+    # 4. Fallback
+    logger.warning(f"   └─ Falling back to 'openclaw' for image {base_image}")
+    return "openclaw"
 
 
 def generate_dockerfile(
@@ -136,8 +224,14 @@ def generate_dockerfile(
     base_image: str,
     capabilities: List[BuildCapability]
 ) -> str:
-    """Generate Dockerfile from capabilities"""
-    
+    """Generate Dockerfile from capabilities, tailored to the base image type."""
+
+    image_type = _detect_image_type(base_image)
+    logger.info(f"   └─ Detected image type: {image_type}")
+
+    # Choose the right system package manager
+    pkg_manager = "apk" if image_type in ("nanobot", "picoclaw") else "apt"
+
     apt_packages = []
     pip_packages = []
     npm_packages = []
@@ -162,14 +256,125 @@ def generate_dockerfile(
         base_image=base_image,
         task_id=task_id,
         build_id=build_id,
+        image_type=image_type,
+        pkg_manager=pkg_manager,
         capabilities=",".join([f"{c.type}:{c.name}" for c in capabilities]),
-        apt_packages=apt_packages,
+        system_packages=apt_packages,
         pip_packages=pip_packages,
         npm_packages=npm_packages,
         tools=tools
     )
     
     return dockerfile
+
+
+# =============================================================================
+# Import scanning — auto-detect third-party packages from app source files
+# =============================================================================
+
+# Standard library modules (Python 3.11) — imports of these do NOT need pip
+_STDLIB_MODULES = {
+    "abc", "aifc", "argparse", "array", "ast", "asynchat", "asyncio",
+    "asyncore", "atexit", "audioop", "base64", "bdb", "binascii",
+    "binhex", "bisect", "builtins", "bz2", "calendar", "cgi", "cgitb",
+    "chunk", "cmath", "cmd", "code", "codecs", "codeop", "collections",
+    "colorsys", "compileall", "concurrent", "configparser", "contextlib",
+    "contextvars", "copy", "copyreg", "cProfile", "crypt", "csv",
+    "ctypes", "curses", "dataclasses", "datetime", "dbm", "decimal",
+    "difflib", "dis", "distutils", "doctest", "email", "encodings",
+    "enum", "errno", "faulthandler", "fcntl", "filecmp", "fileinput",
+    "fnmatch", "fractions", "ftplib", "functools", "gc", "getopt",
+    "getpass", "gettext", "glob", "graphlib", "grp", "gzip", "hashlib",
+    "heapq", "hmac", "html", "http", "idlelib", "imaplib", "imghdr",
+    "imp", "importlib", "inspect", "io", "ipaddress", "itertools",
+    "json", "keyword", "lib2to3", "linecache", "locale", "logging",
+    "lzma", "mailbox", "mailcap", "marshal", "math", "mimetypes",
+    "mmap", "modulefinder", "multiprocessing", "netrc", "nis", "nntplib",
+    "numbers", "operator", "optparse", "os", "ossaudiodev", "pathlib",
+    "pdb", "pickle", "pickletools", "pipes", "pkgutil", "platform",
+    "plistlib", "poplib", "posix", "posixpath", "pprint", "profile",
+    "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc",
+    "queue", "quopri", "random", "re", "readline", "reprlib",
+    "resource", "rlcompleter", "runpy", "sched", "secrets", "select",
+    "selectors", "shelve", "shlex", "shutil", "signal", "site",
+    "smtpd", "smtplib", "sndhdr", "socket", "socketserver", "spwd",
+    "sqlite3", "sre_compile", "sre_constants", "sre_parse", "ssl",
+    "stat", "statistics", "string", "stringprep", "struct", "subprocess",
+    "sunau", "symtable", "sys", "sysconfig", "syslog", "tabnanny",
+    "tarfile", "telnetlib", "tempfile", "termios", "test", "textwrap",
+    "threading", "time", "timeit", "tkinter", "token", "tokenize",
+    "tomllib", "trace", "traceback", "tracemalloc", "tty", "turtle",
+    "turtledemo", "types", "typing", "unicodedata", "unittest", "urllib",
+    "uu", "uuid", "venv", "warnings", "wave", "weakref", "webbrowser",
+    "winreg", "winsound", "wsgiref", "xdrlib", "xml", "xmlrpc",
+    "zipapp", "zipfile", "zipimport", "zlib",
+    # Also underscore-prefixed internal modules
+    "_thread", "__future__", "_abc", "_collections_abc",
+}
+
+# Map of import names that differ from pip package names
+_IMPORT_TO_PIP = {
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "dateutil": "python-dateutil",
+    "dotenv": "python-dotenv",
+    "gi": "PyGObject",
+    "google": "google-api-python-client",
+    "jose": "python-jose",
+    "lxml": "lxml",
+    "magic": "python-magic",
+    "PIL": "Pillow",
+    "serial": "pyserial",
+    "skimage": "scikit-image",
+    "sklearn": "scikit-learn",
+    "usb": "pyusb",
+    "yaml": "pyyaml",
+    "attr": "attrs",
+    "wx": "wxPython",
+}
+
+
+def _scan_imports_for_pip_packages(app_dir: Path) -> List[str]:
+    """Scan Python files in *app_dir* for import statements and return a list
+    of pip package names for any third-party modules detected.
+
+    Uses simple regex-based parsing (no AST) so it works even on files with
+    syntax errors.  Only top-level module names are considered.
+    """
+    import_re = re.compile(
+        r'^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)'
+    )
+
+    top_level_imports: set[str] = set()
+
+    for py_file in app_dir.rglob("*.py"):
+        try:
+            text = py_file.read_text(errors="replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            m = import_re.match(line)
+            if m:
+                top_level_imports.add(m.group(1))
+
+    # Determine which are relative (local) — any module name that corresponds
+    # to a file/dir inside app_dir is local, not third-party.
+    local_modules: set[str] = set()
+    for item in app_dir.iterdir():
+        if item.is_dir() and (item / "__init__.py").exists():
+            local_modules.add(item.name)
+        elif item.suffix == ".py":
+            local_modules.add(item.stem)
+
+    third_party = top_level_imports - _STDLIB_MODULES - local_modules
+
+    # Map import names → pip package names
+    pip_packages: list[str] = []
+    for mod in sorted(third_party):
+        pip_name = _IMPORT_TO_PIP.get(mod, mod)
+        pip_packages.append(pip_name)
+
+    return pip_packages
 
 
 # Deployment image Dockerfile template (minimal — no OpenClaw)
@@ -773,7 +978,36 @@ async def build_deployment_image(
                 if not pkg.startswith("-") and pkg not in pip_packages:
                     pip_packages.append(pkg)
     
-    logger.info(f"Deployment packages — pip: {pip_packages}, apt: {apt_packages}")
+    logger.info(f"Deployment packages from capabilities — pip: {pip_packages}, apt: {apt_packages}")
+
+    # ---- Also scan app source files for third-party imports ----
+    # This catches packages that were pre-installed in the agent base image
+    # (e.g. `requests` in ZeroClaw) but never explicitly requested as a capability.
+    workspace_path = Path("/workspaces")
+    try:
+        control_plane_url_env = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+        import httpx as _httpx
+        import asyncio as _aio
+        loop = _aio.get_event_loop()
+        # We're already in an async context from FastAPI, but we can do sync fetch
+        # Actually, we're in the request handler — use sync httpx
+        import httpx as _httpx_sync
+        with _httpx_sync.Client(timeout=10.0) as _client:
+            _resp = _client.get(f"{control_plane_url_env}/api/tasks/{request.task_id}")
+            if _resp.status_code == 200:
+                _task_data = _resp.json()
+                _ws_id = _task_data.get("workspace_id", "")
+                _ws_path = workspace_path / _ws_id
+                if _ws_path.exists():
+                    scanned = _scan_imports_for_pip_packages(_ws_path)
+                    for pkg in scanned:
+                        if pkg.lower() not in {p.lower() for p in pip_packages}:
+                            pip_packages.append(pkg)
+                    logger.info(f"Import scan found additional packages: {scanned}")
+    except Exception as _scan_err:
+        logger.warning(f"Import scanning failed (non-fatal): {_scan_err}")
+
+    logger.info(f"Final deployment packages — pip: {pip_packages}, apt: {apt_packages}")
 
     dockerfile = generate_deployment_dockerfile(
         deployment_id=request.deployment_id,

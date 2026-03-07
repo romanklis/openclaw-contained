@@ -2,7 +2,7 @@
 # Auditable Agent Orchestration for OpenClaw
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
-        backup restore scale-workers build-base
+        backup restore scale-workers build-base build-nanobot build-picoclaw build-zeroclaw build-all-images
 
 # ─────────────────────────────────────────────────────────
 # Help
@@ -93,6 +93,43 @@ build-base: ## Force rebuild the base agent image (openclaw-agent:openclaw)
 check-base: ## Check if base agent image exists in internal registry
 	@docker exec openclaw-docker-dind docker images registry:5000/openclaw-agent:openclaw --format "{{.Repository}}:{{.Tag}}  {{.Size}}  {{.CreatedAt}}" 2>/dev/null \
 		|| echo "  ❌ Base image not found. It will be auto-built on next startup."
+
+build-nanobot: ## Build the NanoBot agent image and push to registry
+	@echo "Building NanoBot agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/nanobot/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:nanobot \
+		-f /agent-images/nanobot/Dockerfile \
+		/agent-images/nanobot/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:nanobot
+	@echo "  ✅  openclaw-agent:nanobot built & pushed"
+
+build-picoclaw: ## Build the PicoClaw agent image and push to registry
+	@echo "Building PicoClaw agent image inside DinD..."
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:picoclaw \
+		-f /agent-images/picoclaw/Dockerfile \
+		/agent-images/picoclaw/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:picoclaw
+	@echo "  ✅  openclaw-agent:picoclaw built & pushed"
+
+build-zeroclaw: ## Build the ZeroClaw agent image and push to registry
+	@echo "Building ZeroClaw agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/zeroclaw/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:zeroclaw \
+		-f /agent-images/zeroclaw/Dockerfile \
+		/agent-images/zeroclaw/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:zeroclaw
+	@echo "  ✅  openclaw-agent:zeroclaw built & pushed"
+
+build-all-images: build-base build-nanobot build-picoclaw build-zeroclaw ## Build all 4 agent base images
+	@echo ""
+	@echo "  ✅  All agent base images built & pushed to registry:"
+	@echo "      openclaw-agent:openclaw  (Full Python)"
+	@echo "      openclaw-agent:nanobot   (Alpine Python)"
+	@echo "      openclaw-agent:picoclaw  (Shell)"
+	@echo "      openclaw-agent:zeroclaw  (Rust)"
 
 # ─────────────────────────────────────────────────────────
 # Logs & Status

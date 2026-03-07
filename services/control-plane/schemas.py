@@ -25,6 +25,8 @@ class TaskCreate(BaseModel):
     initial_policy: Optional[Dict[str, Any]] = None
     llm_model: Optional[str] = None
     model: Optional[str] = None  # alias for llm_model (from curl/CLI)
+    base_image: Optional[str] = None  # agent base image key (e.g. "zeroclaw")
+    agent_profile: Optional[str] = None  # agent profile ID for display
 
     @property
     def effective_description(self) -> Optional[str]:
@@ -36,6 +38,12 @@ class TaskCreate(BaseModel):
         """Return llm_model or model (whichever is set), defaulting to gemma3:4b."""
         return self.llm_model or self.model or "gemma3:4b"
 
+    @property
+    def effective_base_image_tag(self) -> str:
+        """Return the full registry image tag for the selected base image."""
+        key = self.base_image or "openclaw"
+        return f"localhost:5000/openclaw-agent:{key}"
+
 
 class TaskResponse(BaseModel):
     id: str
@@ -44,6 +52,7 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     workspace_id: str
     workflow_id: Optional[str]
+    agent_profile: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime]
     

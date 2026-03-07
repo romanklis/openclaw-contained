@@ -62,6 +62,7 @@ class Task(Base):
     current_image = Column(String)
     current_policy_id = Column(Integer, ForeignKey("policies.id"))
     llm_model = Column(String, default="gemma3:4b")
+    agent_profile = Column(String)  # agent profile ID (e.g. 'performance-agent')
     
     # Temporal workflow
     workflow_id = Column(String, unique=True)

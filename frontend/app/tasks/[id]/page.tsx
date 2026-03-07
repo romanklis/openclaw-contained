@@ -516,6 +516,27 @@ export default function TaskDetailPage() {
           )}
         </div>
 
+        {/* Agent Profile Banner */}
+        {(timeline?.task?.agent_profile || currentState?.agent_profile) && (
+          <div className="bg-gradient-to-r from-indigo-900/20 to-violet-900/20 border border-indigo-500/20 rounded-lg p-4 mb-4 flex items-center gap-3">
+            <span className="text-lg">🤖</span>
+            <div>
+              <div className="text-xs text-gray-500 uppercase tracking-wider">Agent Profile</div>
+              <div className="text-sm font-semibold text-indigo-300">
+                {timeline?.task?.agent_profile || currentState?.agent_profile}
+              </div>
+            </div>
+            {timeline?.task?.current_image && (
+              <div className="ml-auto text-right">
+                <div className="text-xs text-gray-500 uppercase tracking-wider">Base Image</div>
+                <div className="text-sm font-mono text-purple-400">
+                  {timeline.task.current_image.split(':').pop() || 'openclaw'}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Current State */}
         {currentState && (
           <div className="bg-gradient-to-r from-blue-900/20 to-purple-900/20 border border-blue-500/30 rounded-lg p-5 mb-6">
@@ -539,7 +560,7 @@ export default function TaskDetailPage() {
               <div className="bg-gray-800/50 rounded p-3">
                 <div className="text-xs text-gray-500 uppercase tracking-wider">Model</div>
                 <div className="text-sm font-medium text-green-400 mt-1 truncate">
-                  {outputs[0]?.model_used || '---'}
+                  {currentState?.llm_model || timeline?.task?.llm_model || outputs[0]?.model_used || '---'}
                 </div>
               </div>
             </div>

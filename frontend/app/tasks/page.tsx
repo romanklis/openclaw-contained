@@ -3,7 +3,8 @@
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { StatusDot, StatusBadge } from '../components/StatusComponents'
-import { API } from '../lib/api'
+import { AgentProfileBadge } from '../components/AgentProfileBadge'
+import { API, API_GATEWAY } from '../lib/api'
 
 interface Task {
   id: string
@@ -25,6 +26,18 @@ interface Deployment {
   url: string | null
 }
 
+interface AgentProfile {
+  id: string
+  profile_name?: string
+  profile_description?: string
+  base_image?: string
+  llm_model?: string
+  runtime?: string
+  icon?: string
+  tags?: string[]
+  strengths?: string[]
+}
+
 export default function TasksPage() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [deployments, setDeployments] = useState<Record<string, Deployment[]>>({})
@@ -36,19 +49,31 @@ export default function TasksPage() {
   // Form state
   const [taskName, setTaskName] = useState('')
   const [taskDescription, setTaskDescription] = useState('')
-  const [llmModel, setLlmModel] = useState('gemini-flash-latest')
+  const [selectedProfile, setSelectedProfile] = useState('')
   const [maxIterations, setMaxIterations] = useState(10)
-  const [availableModels, setAvailableModels] = useState<{ id: string; provider: string }[]>([])
+  const [availableProfiles, setAvailableProfiles] = useState<AgentProfile[]>([])
+
+  const currentProfile = availableProfiles.find(p => p.id === selectedProfile) || null
 
   useEffect(() => {
-    fetch(`${API}/api/llm/models`)
+    fetch(`${API_GATEWAY}/v1/agent-profiles`)
       .then((r) => r.json())
       .then((data) => {
-        const models = data.models || []
-        setAvailableModels(models)
-        if (models.length > 0) setLlmModel(models[0].id)
+        const profiles = data.profiles || []
+        setAvailableProfiles(profiles)
+        if (profiles.length > 0) setSelectedProfile(profiles[0].id)
       })
-      .catch(() => {})
+      .catch(() => {
+        // Fallback: try the /v1/models endpoint
+        fetch(`${API_GATEWAY}/v1/models`)
+          .then((r) => r.json())
+          .then((data) => {
+            const models = (data.data || []).filter((m: any) => m.base_image)
+            setAvailableProfiles(models)
+            if (models.length > 0) setSelectedProfile(models[0].id)
+          })
+          .catch(() => {})
+      })
   }, [])
 
   const fetchTasks = async () => {
@@ -88,7 +113,9 @@ export default function TasksPage() {
         body: JSON.stringify({
           name: taskName,
           description: taskDescription,
-          model: llmModel,
+          llm_model: currentProfile?.llm_model || selectedProfile,
+          base_image: currentProfile?.base_image || 'openclaw',
+          agent_profile: selectedProfile,
           agent_config: { max_iterations: maxIterations, timeout: 600 },
         }),
       })
@@ -160,19 +187,19 @@ export default function TasksPage() {
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">LLM Model</label>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">Agent Profile</label>
                 <select
-                  value={llmModel}
-                  onChange={(e) => setLlmModel(e.target.value)}
+                  value={selectedProfile}
+                  onChange={(e) => setSelectedProfile(e.target.value)}
                   className="input-field"
                 >
-                  {availableModels.map((m) => (
-                    <option key={`${m.provider}-${m.id}`} value={m.id}>
-                      {m.id} ({m.provider})
+                  {availableProfiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.icon || '🤖'} {p.profile_name || p.id}
                     </option>
                   ))}
-                  {availableModels.length === 0 && (
-                    <option value="gemini-flash-latest">gemini-flash-latest</option>
+                  {availableProfiles.length === 0 && (
+                    <option value="general-assistant">🤖 General Assistant</option>
                   )}
                 </select>
               </div>
@@ -188,6 +215,11 @@ export default function TasksPage() {
                 />
               </div>
             </div>
+
+            {/* Agent Profile Details */}
+            {currentProfile && (
+              <AgentProfileBadge profile={currentProfile} />
+            )}
             {error && (
               <div className="bg-red-500/10 border border-red-500/20 text-red-400 text-sm rounded-lg p-3">
                 {error}

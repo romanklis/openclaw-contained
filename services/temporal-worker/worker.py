@@ -110,7 +110,7 @@ class AgentTaskWorkflow:
     def __init__(self):
         self.approval_received = False
         self.capability_approved = False
-        self.current_image = "localhost:5000/openclaw-agent:openclaw"  # Track current agent image
+        self.current_image = "localhost:5000/openclaw-agent:openclaw"  # Track current agent image (default)
         self.llm_model = "gemma3:4b"  # Track LLM model
         self.follow_up = ""  # Follow-up instructions for continuation
     
@@ -124,8 +124,10 @@ class AgentTaskWorkflow:
     ) -> Dict[str, Any]:
         """Execute agent task.
 
-        For first-run workflows ``current_image`` and ``follow_up`` are empty.
-        For continuation workflows they carry over state from the previous run:
+        For first-run workflows ``current_image`` can be a base image tag
+        (e.g. ``localhost:5000/openclaw-agent:zeroclaw``) or empty for the
+        default openclaw image.
+        For continuation workflows it carries over from the previous run:
         - ``current_image``: the last built agent image (all packages installed)
         - ``follow_up``: user's follow-up instructions
         """
@@ -133,12 +135,15 @@ class AgentTaskWorkflow:
         self.llm_model = llm_model
         self.follow_up = follow_up
 
-        # If continuing, pick up from the previous image instead of the base
+        # Use the provided base image for both first-run and continuation
         if current_image:
             self.current_image = current_image
-            logger.info(f"♻️  CONTINUATION workflow for task {task_id} | image={current_image} | follow_up={follow_up[:120]}...")
+            if follow_up:
+                logger.info(f"♻️  CONTINUATION workflow for task {task_id} | image={current_image} | follow_up={follow_up[:120]}...")
+            else:
+                logger.info(f"Starting workflow for task {task_id} with model {llm_model}, base image {current_image}")
         else:
-            logger.info(f"Starting workflow for task {task_id} with model {llm_model}")
+            logger.info(f"Starting workflow for task {task_id} with model {llm_model} (default openclaw image)")
         
         # Step 1: Initialize task
         await workflow.execute_activity(
@@ -150,7 +155,7 @@ class AgentTaskWorkflow:
         # Determine starting iteration.
         # For continuations, fetch the last iteration number so we don't overwrite.
         start_iteration = 0
-        if current_image:  # this is a continuation
+        if follow_up:  # this is a continuation (has follow-up instructions)
             start_iteration = await workflow.execute_activity(
                 get_last_iteration,
                 args=[task_id],
@@ -1072,13 +1077,29 @@ async def update_task_policy(
     capability: Dict[str, Any],
     new_image: str
 ) -> Dict[str, Any]:
-    """Update task policy with new capability"""
-    logger.info(f"Updating policy for task {task_id}")
-    
-    # TODO: Call control plane to update policy
-    # TODO: Update task with new image reference
-    
-    return {"updated": True}
+    """Update task policy and persist the new image tag in the DB.
+
+    After a capability build, the rebuilt image (e.g. task-xxx-v2) must be
+    persisted so that continuation workflows pick it up instead of falling
+    back to the bare base image.
+    """
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    # Persist the new image on the task record
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(
+                f"{control_plane_url}/api/tasks/{task_id}/image",
+                json={"current_image": new_image},
+            )
+            resp.raise_for_status()
+            logger.info(f"✅ TASK_IMAGE_UPDATED | Task: {task_id} | Image: {new_image}")
+    except Exception as e:
+        logger.error(f"❌ Failed to persist image for task {task_id}: {e}")
+
+    return {"updated": True, "new_image": new_image}
 
 
 @activity.defn

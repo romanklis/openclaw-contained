@@ -1,0 +1,176 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# TaskForge Agent Profiles Registry  (auto-generated — edits via API)
+# ═══════════════════════════════════════════════════════════════════════════
+
+profiles:
+- id: general-assistant
+  name: General Assistant
+  description: Versatile agent for a wide range of coding and automation tasks.
+  base_image: openclaw
+  llm_model: gemini-flash-latest
+  tags:
+  - general
+  - coding
+  - default
+  icon: 🤖
+  metadata:
+    runtime: Python 3.11 (Debian)
+    strengths:
+    - Full Python ecosystem
+    - Build tools (gcc, make)
+    - Git & networking utilities
+- id: general-assistant-claude
+  name: General Assistant (Claude)
+  description: General-purpose agent powered by Claude for nuanced reasoning.
+  base_image: openclaw
+  llm_model: claude-sonnet-4-20250514
+  tags:
+  - general
+  - coding
+  - reasoning
+  icon: 🧠
+  metadata:
+    runtime: Python 3.11 (Debian)
+    strengths:
+    - Strong reasoning and analysis
+    - Full Python ecosystem
+    - Careful, detailed outputs
+- id: quick-scripter
+  name: Quick Scripter
+  description: Fast, lightweight agent for quick Python scripts and data transforms.
+  base_image: nanobot
+  llm_model: gemini-flash-latest
+  tags:
+  - fast
+  - scripts
+  - data
+  icon: ⚡
+  metadata:
+    runtime: Python 3.11 (Alpine)
+    strengths:
+    - Sub-second startup
+    - Low memory footprint (~50 MB)
+    - Ideal for one-shot scripts
+- id: data-wrangler
+  name: Data Wrangler
+  description: Lightweight agent optimised for data cleaning and transformation.
+  base_image: nanobot
+  llm_model: gemini-flash-latest
+  tags:
+  - data
+  - etl
+  - fast
+  icon: 📊
+  metadata:
+    runtime: Python 3.11 (Alpine)
+    strengths:
+    - Fast CSV/JSON processing
+    - Minimal dependencies
+    - Quick iteration cycles
+- id: shell-operator
+  name: Shell Operator
+  description: Minimal shell agent for file manipulation and CLI automation.
+  base_image: picoclaw
+  llm_model: gemini-flash-latest
+  tags:
+  - shell
+  - devops
+  - minimal
+  icon: 🐚
+  metadata:
+    runtime: Shell (Alpine)
+    strengths:
+    - Tiny image (~15 MB)
+    - POSIX-compliant shell
+    - jq, yq, awk, sed, grep
+- id: devops-runner
+  name: DevOps Runner
+  description: Shell-based agent for CI/CD scripts, deploys, and infrastructure tasks.
+  base_image: picoclaw
+  llm_model: claude-sonnet-4-20250514
+  tags:
+  - devops
+  - ci-cd
+  - infra
+  icon: 🔧
+  metadata:
+    runtime: Shell (Alpine)
+    strengths:
+    - Git operations
+    - SSH & curl
+    - Infrastructure scripting
+- id: senior-reviewer
+  name: Senior Reviewer
+  description: High-security Rust runtime with Claude for thorough code review and
+    auditing.
+  base_image: zeroclaw
+  llm_model: gemini-flash-latest
+  tags:
+  - security
+  - review
+  - audit
+  icon: 🛡️
+  metadata:
+    runtime: Rust (Debian)
+    strengths:
+    - Memory-safe execution
+    - Tamper-resistant runtime
+    - Deep code analysis
+- id: crypto-agent
+  name: Crypto Agent
+  description: Rust-based agent for cryptographic operations and security-sensitive
+    workloads.
+  base_image: zeroclaw
+  llm_model: gpt-4o
+  tags:
+  - security
+  - crypto
+  - performance
+  icon: 🔐
+  metadata:
+    runtime: Rust (Debian)
+    strengths:
+    - High-performance crypto
+    - Sandboxed execution
+    - Zero-copy data handling
+- id: performance-agent
+  name: Performance Agent
+  description: Rust runtime optimised for compute-heavy and latency-sensitive tasks.
+  base_image: zeroclaw
+  llm_model: gemini-flash-latest
+  tags:
+  - performance
+  - compute
+  - fast
+  icon: 🚀
+  metadata:
+    runtime: Rust (Debian)
+    strengths:
+    - Native-speed execution
+    - Minimal overhead
+    - Parallel workloads
+base_images:
+  openclaw:
+    dockerfile: agent-images/base/Dockerfile
+    tag: openclaw-agent:openclaw
+    runtime: Python 3.11 (Debian)
+    description: Full Python environment with build tools and networking.
+    size_estimate: ~450 MB
+  nanobot:
+    dockerfile: agent-images/nanobot/Dockerfile
+    tag: openclaw-agent:nanobot
+    runtime: Python 3.11 (Alpine)
+    description: Lightweight Alpine Python for fast scripts.
+    size_estimate: ~80 MB
+  picoclaw:
+    dockerfile: agent-images/picoclaw/Dockerfile
+    tag: openclaw-agent:picoclaw
+    runtime: Shell (Alpine)
+    description: Minimal shell environment for simple tasks.
+    size_estimate: ~15 MB
+  zeroclaw:
+    dockerfile: agent-images/zeroclaw/Dockerfile
+    tag: openclaw-agent:zeroclaw
+    runtime: Rust (Debian)
+    description: Rust-based runtime for high-security/performance.
+    size_estimate: ~120 MB

@@ -1,0 +1,11 @@
+# NanoBot — Minimal Python dependencies
+# Kept lean for fast installs and small image size
+
+# HTTP client
+httpx==0.27.0
+
+# Data validation
+pydantic==2.6.0
+
+# Structured logging
+structlog==24.1.0
