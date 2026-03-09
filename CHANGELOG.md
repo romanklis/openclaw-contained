@@ -5,6 +5,102 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.0] — 2026-03-09
+
+### Added
+
+- **Supply-chain governance** (`config/supply-chain.yaml`) — per-image-type package
+  allowlists gate every capability request before it reaches the image builder.
+  - Separate allowlists for `openclaw`, `nanobot`, `picoclaw`, and `zeroclaw` image
+    types covering pip, apt, npm, and apk packages.
+  - Denied packages are stripped from the build and the agent receives one-shot
+    actionable feedback explaining what was blocked and why.
+  - Debian↔Alpine package alias translation (e.g. `python3-dev` ↔ `python3-dev`
+    alpine equivalent) so agents don't need to know the base OS.
+  - Hot-reload: editing `supply-chain.yaml` takes effect on the next build without
+    restarting any service.
+  - Image-builder endpoints: `GET /supply-chain/policy` (current policy),
+    `POST /supply-chain/validate` (dry-run validation).
+
+- **Multi-image agent diversity** — four base image types, each with a purpose-built
+  native adapter:
+  - **OpenClaw** — full Debian + Python venv + Node.js; `openclaw-wrapper.py` adapter.
+  - **NanoBot** — minimal Alpine Python; `taskforge-adapter.py` adapter.
+  - **PicoClaw** — ultra-minimal Alpine shell-only (bash + curl + jq);
+    `picoclaw-adapter.sh` adapter.
+  - **ZeroClaw** — Debian Python + Rust toolchain; `taskforge-adapter.py` adapter.
+  - Base image Dockerfiles in `agent-images/base/`, auto-bootstrapped on first build.
+
+- **Agent Profiles** (`agent-images/profiles.yaml`) — pre-defined combinations of a
+  base image ("body") and an LLM model ("brain"), selectable from the Open WebUI model
+  dropdown.
+  - CRUD API: `GET/POST /v1/profiles`, `GET/PUT/DELETE /v1/profiles/{id}`.
+  - Profiles appear as models in `GET /v1/models` alongside raw LLM model names.
+  - YAML registry with hot-reload.
+
+- **Temporal workflow link in streaming** — every SSE stream now starts with a
+  clickable link to the Temporal UI workflow page, and terminal-state footers
+  (completed / failed / cancelled) include the link again.
+  - `TEMPORAL_UI_URL` environment variable (default `http://localhost:8088`).
+
+- **Deployment links in streaming** — running deployments show an `[Open App]` link
+  with `localhost:{host_port}`; pending deployments link to the dashboard approvals
+  page.
+
+- **Streaming resume after capability rebuild** — the SSE stream now correctly
+  continues after an image rebuild. Capability lifecycle check runs before turn
+  polling, and LLM turn probing during the build phase detects agent resume
+  immediately instead of waiting for the next poll cycle.
+
+### Fixed
+
+- **PicoClaw adapter `exec` tool** — the shell adapter wrote the command file with
+  a trailing newline that broke `read`-based parsing. Fixed newline handling in
+  `picoclaw-adapter.sh`.
+
+- **Process tree killing in native adapters** — `taskforge-adapter.py` now kills the
+  entire process group on timeout/capability-request, preventing orphaned child
+  processes from holding stdout open.
+
+- **DinD cached stale images** — continuation builds could pick up a stale cached
+  image from a previous iteration. Build now uses `--no-cache` when the base image
+  has changed.
+
+- **Deployment base image mismatch** — deployment Dockerfile `FROM` line used the
+  wrong image tag for non-openclaw base images. Fixed to use the task's actual
+  current image.
+
+### Changed
+
+- **`services/image-builder/`** — supply-chain validation integrated into `/build`
+  endpoint; returns `{image, feedback, denied}` dict. New `/supply-chain/*` endpoints.
+  Multi-image Dockerfile generation handles all 4 base image types with appropriate
+  package managers (pip/apk/apt/npm).
+
+- **`services/temporal-worker/worker.py`** — `build_agent_image` activity returns
+  structured dict with feedback; one-shot `_capability_feedback` injection sends
+  denied-package explanation to the agent on next turn. `update_task_policy` activity
+  now fully implemented (was a stub).
+
+- **`services/api-gateway/main.py`** — capability lifecycle check moved before turn
+  polling loop. Added LLM turn probing during build phase. Temporal workflow link
+  emitted at stream start and in terminal footer. Deployment links with port info.
+  Agent profiles integration in model listing and task creation.
+
+- **`services/api-gateway/config.py`** — added `TEMPORAL_UI_URL` setting.
+
+- **`docker-compose.yml`** — `TEMPORAL_UI_URL` environment variable passed to
+  api-gateway service. Image-builder now exposes port 8002.
+
+- **`ARCHITECTURE.md`** — comprehensive update: supply-chain governance, 4 base image
+  types, agent profiles, native adapters, updated service descriptions, security model,
+  and project structure.
+
+- **`README.md`** — updated key features, services table, architecture overview,
+  project structure, and environment variables to reflect 0.7.0 changes.
+
+---
+
 ## [0.6.0] — 2026-03-06
 
 ### Added

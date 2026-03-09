@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/thumbnail-taskforge-platform.png" alt="TaskForge Platform" width="720" />
+  <img src="docs/images/0.7.0/main image.png" alt="TaskForge Platform" width="720" />
 </p>
 
 # TaskForge
