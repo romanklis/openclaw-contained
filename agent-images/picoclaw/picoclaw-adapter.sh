@@ -259,9 +259,13 @@ execute_tool() {
             # (prevents orphaned grandchildren like nc -lk from hanging)
             local tmpout="/tmp/exec_out.$$"
             local pidfile="/tmp/exec_pid.$$"
+            local cmdfile="/tmp/exec_cmd.$$"
+            # Write command to a temp script to avoid shell quoting issues
+            printf '#!/bin/sh\n%s\n' "$command" > "$cmdfile"
+            chmod +x "$cmdfile"
             setsid sh -c '
                 echo $$ > '"$pidfile"'
-                exec sh -c '"'"'$command'"'"'
+                exec sh '"$cmdfile"'
             ' >"$tmpout" 2>&1 &
             local wrapper_pid=$!
             # Wait up to TOOL_TIMEOUT for the command
@@ -277,7 +281,7 @@ execute_tool() {
                     result=$(head -c 50000 "$tmpout" 2>/dev/null)
                     result="${result}
 ERROR: Command timed out after ${TOOL_TIMEOUT}s (process tree killed)"
-                    rm -f "$tmpout" "$pidfile"
+                    rm -f "$tmpout" "$pidfile" "$cmdfile"
                     break
                 fi
                 sleep 1
@@ -295,7 +299,7 @@ ERROR: Command timed out after ${TOOL_TIMEOUT}s (process tree killed)"
                     result="${result}
 (exit code ${rc})"
                 fi
-                rm -f "$tmpout" "$pidfile"
+                rm -f "$tmpout" "$pidfile" "$cmdfile"
             fi
             [ -z "$result" ] && result="(no output)"
             ;;

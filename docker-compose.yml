@@ -65,6 +65,9 @@ services:
       - ./openclaw:/openclaw:ro
       - ./agent-images:/agent-images
       - ./workspaces:/workspaces
+      - ./config/supply-chain.yaml:/config/supply-chain.yaml:ro
+    ports:
+      - "8002:8002"
     networks:
       - openclaw-network
     healthcheck:

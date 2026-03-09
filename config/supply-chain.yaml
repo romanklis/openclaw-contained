@@ -1,0 +1,395 @@
+# =============================================================================
+# OpenClaw Supply Chain — Approved Packages per Image Type
+# =============================================================================
+#
+# Every package an agent can request MUST be listed here. This file is the
+# single source of truth for what is installable in each base image type.
+#
+# Structure:
+#   <image_type>:
+#     pip:   [ ... ]        # Python packages (pip install)
+#     apt:   [ ... ]        # Debian system packages (apt-get install)
+#     apk:   [ ... ]        # Alpine system packages (apk add)
+#     npm:   [ ... ]        # Node.js packages (npm install -g)
+#     notes: "..."          # Auditor-facing description
+#
+# Package names use the NATIVE package manager name for each distro.
+# Aliases (Debian → Alpine mappings) are in the `aliases` section.
+#
+# To add a new package:
+#   1. Verify it exists in the target repo (apt/apk/pypi)
+#   2. Add it below under the correct image type and category
+#   3. Commit this file — the git log IS the audit trail
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Debian ↔ Alpine package name mapping
+# When an agent requests a Debian name on Alpine (or vice-versa), the image
+# builder will transparently substitute.
+# ---------------------------------------------------------------------------
+aliases:
+  apt_to_apk:
+    # networking
+    netcat-openbsd: netcat-openbsd
+    iputils-ping: iputils
+    dnsutils: bind-tools
+    # libs & dev
+    libffi-dev: libffi-dev
+    libssl-dev: openssl-dev
+    libxml2-dev: libxml2-dev
+    libxslt1-dev: libxslt-dev
+    libjpeg-dev: libjpeg-turbo-dev
+    libpng-dev: libpng-dev
+    zlib1g-dev: zlib-dev
+    libpq-dev: libpq-dev
+    default-libmysqlclient-dev: mariadb-dev
+    # tools
+    wkhtmltopdf: wkhtmltopdf
+    chromium-browser: chromium
+    chromium: chromium
+    imagemagick: imagemagick
+    graphviz: graphviz
+    tesseract-ocr: tesseract-ocr
+    poppler-utils: poppler-utils
+    ffmpeg: ffmpeg
+    gcc: gcc
+    g++: g++
+    make: make
+    cmake: cmake
+    sqlite3: sqlite
+    # shells / utils
+    bash: bash
+    coreutils: coreutils
+    jq: jq
+    curl: curl
+    wget: wget
+    git: git
+
+  apk_to_apt:
+    # reverse mappings for completeness
+    openssl-dev: libssl-dev
+    libxslt-dev: libxslt1-dev
+    libjpeg-turbo-dev: libjpeg-dev
+    zlib-dev: zlib1g-dev
+    mariadb-dev: default-libmysqlclient-dev
+    bind-tools: dnsutils
+    iputils: iputils-ping
+    sqlite: sqlite3
+
+# ---------------------------------------------------------------------------
+# openclaw — Full-featured Debian + Python venv + Node.js
+# ---------------------------------------------------------------------------
+openclaw:
+  notes: >
+    Full agent image. Debian-based with Python 3.11 venv, Node.js, and
+    common system tools pre-installed.
+  pip:
+    # Web frameworks
+    - flask
+    - fastapi
+    - uvicorn
+    - django
+    - bottle
+    - starlette
+    # HTTP clients
+    - requests
+    - httpx
+    - aiohttp
+    - urllib3
+    # Data
+    - pandas
+    - numpy
+    - scipy
+    - matplotlib
+    - seaborn
+    - plotly
+    - pillow
+    # Databases
+    - sqlalchemy
+    - psycopg2-binary
+    - pymongo
+    - redis
+    - sqlite-utils
+    - aiosqlite
+    # Utilities
+    - pyyaml
+    - toml
+    - python-dotenv
+    - click
+    - rich
+    - jinja2
+    - pydantic
+    - marshmallow
+    # PDF / document
+    - reportlab
+    - fpdf2
+    - weasyprint
+    - pdfkit
+    - python-docx
+    - openpyxl
+    # Crypto / auth
+    - cryptography
+    - pyjwt
+    - bcrypt
+    - passlib
+    # Testing
+    - pytest
+    - coverage
+    # Scraping / parsing
+    - beautifulsoup4
+    - lxml
+    - html5lib
+    - scrapy
+    # ML (lightweight)
+    - scikit-learn
+    - joblib
+    # Misc
+    - celery
+    - boto3
+    - google-cloud-storage
+    - paramiko
+    - websockets
+
+  apt:
+    - redis-server
+    - redis-tools
+    - postgresql-client
+    - sqlite3
+    - libsqlite3-dev
+    - nginx
+    - ffmpeg
+    - imagemagick
+    - graphviz
+    - tesseract-ocr
+    - poppler-utils
+    - wkhtmltopdf
+    - chromium
+    - gcc
+    - g++
+    - make
+    - cmake
+    - libffi-dev
+    - libssl-dev
+    - libxml2-dev
+    - libxslt1-dev
+    - libjpeg-dev
+    - libpng-dev
+    - zlib1g-dev
+    - libpq-dev
+    - default-libmysqlclient-dev
+    - curl
+    - wget
+    - git
+    - jq
+    - zip
+    - unzip
+
+  npm:
+    - express
+    - typescript
+    - ts-node
+    - prettier
+    - eslint
+    - webpack
+    - vite
+    - tailwindcss
+    - postcss
+    - autoprefixer
+
+# ---------------------------------------------------------------------------
+# nanobot — Lightweight Alpine + Python
+# ---------------------------------------------------------------------------
+nanobot:
+  notes: >
+    Lightweight Alpine-based Python agent. No Node.js. Good for pure
+    Python tasks that don't need heavy system dependencies.
+  pip:
+    - flask
+    - fastapi
+    - uvicorn
+    - bottle
+    - requests
+    - httpx
+    - aiohttp
+    - pyyaml
+    - toml
+    - click
+    - rich
+    - jinja2
+    - pydantic
+    - sqlalchemy
+    - redis
+    - sqlite-utils
+    - beautifulsoup4
+    - lxml
+    - pillow
+    - reportlab
+    - fpdf2
+    - pdfkit
+    - cryptography
+    - pyjwt
+    - bcrypt
+    - pytest
+    - pandas
+    - numpy
+    - matplotlib
+
+  apk:
+    - bash
+    - coreutils
+    - curl
+    - wget
+    - git
+    - jq
+    - gcc
+    - g++
+    - make
+    - libffi-dev
+    - openssl-dev
+    - libxml2-dev
+    - libxslt-dev
+    - libjpeg-turbo-dev
+    - libpng-dev
+    - zlib-dev
+    - libpq-dev
+    - sqlite
+    - redis
+    - imagemagick
+    - graphviz
+    - ffmpeg
+    # wkhtmltopdf — NOT available in Alpine repos
+    - chromium
+    - poppler-utils
+    - tesseract-ocr
+
+  npm: []
+
+# ---------------------------------------------------------------------------
+# picoclaw — Minimal Alpine shell-only (no Python, no Node.js)
+# ---------------------------------------------------------------------------
+picoclaw:
+  notes: >
+    Ultra-minimal shell-only agent. Alpine with BusyBox + essential CLI tools.
+    No Python or Node.js runtime. Agents must use shell scripts, awk, sed, etc.
+    Only system packages (apk) are available.
+  pip: []   # NOT AVAILABLE — no Python runtime
+  npm: []   # NOT AVAILABLE — no Node.js runtime
+  apk:
+    - bash
+    - coreutils
+    - curl
+    - wget
+    - git
+    - jq
+    - sed
+    - gawk
+    - grep
+    - findutils
+    - tar
+    - gzip
+    - bzip2
+    - xz
+    - zip
+    - unzip
+    - file
+    - tree
+    - ncurses
+    - less
+    - openssh-client
+    - rsync
+    - socat
+    - netcat-openbsd
+    - bind-tools
+    - iputils
+    - openssl
+    - ca-certificates
+    # wkhtmltopdf — NOT available in Alpine repos
+    - chromium
+    - imagemagick
+    - graphviz
+    - ffmpeg
+    - poppler-utils
+    - tesseract-ocr
+    - sqlite
+
+# ---------------------------------------------------------------------------
+# zeroclaw — Debian + system Python + Rust toolchain
+# ---------------------------------------------------------------------------
+zeroclaw:
+  notes: >
+    Debian-based with system Python 3.11 and Rust toolchain. Good for
+    tasks that need compiled extensions or Rust interop.
+  pip:
+    - flask
+    - fastapi
+    - uvicorn
+    - django
+    - requests
+    - httpx
+    - aiohttp
+    - pyyaml
+    - toml
+    - click
+    - rich
+    - jinja2
+    - pydantic
+    - sqlalchemy
+    - psycopg2-binary
+    - redis
+    - sqlite-utils
+    - beautifulsoup4
+    - lxml
+    - pillow
+    - reportlab
+    - fpdf2
+    - pdfkit
+    - weasyprint
+    - cryptography
+    - pyjwt
+    - bcrypt
+    - pandas
+    - numpy
+    - scipy
+    - matplotlib
+    - scikit-learn
+    - pytest
+    - maturin
+    - pyo3
+
+  apt:
+    - redis-server
+    - redis-tools
+    - postgresql-client
+    - sqlite3
+    - libsqlite3-dev
+    - nginx
+    - ffmpeg
+    - imagemagick
+    - graphviz
+    - tesseract-ocr
+    - poppler-utils
+    - wkhtmltopdf
+    - chromium
+    - gcc
+    - g++
+    - make
+    - cmake
+    - pkg-config
+    - libffi-dev
+    - libssl-dev
+    - libxml2-dev
+    - libxslt1-dev
+    - libjpeg-dev
+    - libpng-dev
+    - zlib1g-dev
+    - libpq-dev
+    - default-libmysqlclient-dev
+    - curl
+    - wget
+    - git
+    - jq
+    - zip
+    - unzip
+
+  npm: []
