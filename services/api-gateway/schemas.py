@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializeAsAny
 
 
 # ---------------------------------------------------------------------------
@@ -57,9 +57,23 @@ class ModelCard(BaseModel):
     parent: Optional[str] = None
 
 
+class AgentProfileCard(ModelCard):
+    """Extended model card that exposes agent profile metadata."""
+
+    # ── Agent profile extensions ──────────────────────────────────
+    profile_name: Optional[str] = None
+    profile_description: Optional[str] = None
+    base_image: Optional[str] = None
+    llm_model: Optional[str] = None
+    runtime: Optional[str] = None
+    icon: Optional[str] = None
+    tags: List[str] = []
+    strengths: List[str] = []
+
+
 class ModelList(BaseModel):
     object: str = "list"
-    data: List[ModelCard]
+    data: List[SerializeAsAny[ModelCard]]
 
 
 # ---------------------------------------------------------------------------

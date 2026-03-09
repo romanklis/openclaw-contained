@@ -44,12 +44,23 @@ class ControlPlaneClient:
         name: str,
         description: str,
         llm_model: str,
+        base_image: str | None = None,
+        agent_profile: str | None = None,
     ) -> Dict[str, Any]:
         """POST /api/tasks — creates and auto-starts a new workflow."""
+        payload: Dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "llm_model": llm_model,
+        }
+        if base_image:
+            payload["base_image"] = base_image
+        if agent_profile:
+            payload["agent_profile"] = agent_profile
         async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
             r = await c.post(
                 f"{self.base_url}/api/tasks",
-                json={"name": name, "description": description, "llm_model": llm_model},
+                json=payload,
             )
             r.raise_for_status()
             return r.json()

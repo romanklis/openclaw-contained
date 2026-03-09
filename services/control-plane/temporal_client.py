@@ -14,21 +14,22 @@ async def get_temporal_client() -> Client:
     return client
 
 
-async def start_task_workflow(task_id: str, llm_model: str = "gemma3:4b") -> str:
+async def start_task_workflow(task_id: str, llm_model: str = "gemma3:4b", base_image: str = "") -> str:
     """Start a task workflow"""
     client = await get_temporal_client()
     
     workflow_id = f"task-workflow-{task_id}"
     
-    # Start the workflow with task_id and llm_model as args list
+    # Start the workflow with task_id, llm_model, and base_image as args list
+    # base_image maps to the current_image parameter in the workflow
     handle = await client.start_workflow(
         "AgentTaskWorkflow",
-        args=[task_id, llm_model],
+        args=[task_id, llm_model, base_image],
         id=workflow_id,
         task_queue=settings.TEMPORAL_TASK_QUEUE,
     )
     
-    logger.info(f"Started workflow {workflow_id} for task {task_id} with model {llm_model}")
+    logger.info(f"Started workflow {workflow_id} for task {task_id} with model {llm_model}, image {base_image}")
     
     return workflow_id
 

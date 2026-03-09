@@ -18,6 +18,8 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 4. **Audit Everything** — complete history via Temporal workflows and LLM interaction logs
 5. **Fail-Safe Defaults** — agents start maximally restricted, expand only when approved
 6. **Supply-Chain Transparency** — every agent image gets an automatic SBOM (Software Bill of Materials) for full package visibility
+7. **Supply-Chain Governance** — per-image-type package allowlists gate every capability request; denied packages are stripped before build and the agent receives actionable feedback
+8. **Agent Diversity** — four base image types (OpenClaw, NanoBot, PicoClaw, ZeroClaw) with native adapters, selectable via Agent Profiles
 
 ---
 
@@ -86,15 +88,15 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
                ▼                                            ▼
 ┌──────────────────────────┐    ┌───────────────────────────────────┐
 │  IMAGE BUILDER (FastAPI) │    │   DOCKER-IN-DOCKER (Custom DinD)  │
-│  :8002 (internal)        │    │   + gVisor (runsc)                │
+│  :8002                   │    │   + gVisor (runsc)                │
 │                          │    │                                   │
 │  • Auto-bootstraps base  │    │  ┌ ─ ─ docker0 bridge ─ ─ ─ ─ ┐  │
 │    openclaw-agent image   │    │  │ ┌─────────────────────────┐ │  │
 │    on startup            │    │  │ │  Agent Container        │ │  │
 │  • Builds agent images   │    │    │  runtime=runsc (gVisor)  │    │
 │    with approved caps    │    │  │ │  (openclaw-agent:X-vY)  │ │  │
-│  • Builds deployment     │    │    │                          │    │
-│    images from workspace │    │  │ │  • Runs openclaw CLI    │ │  │
+│  • Supply-chain gate     │    │    │                          │    │
+│  • Builds deployment     │    │  │ │  • Runs native adapter  │ │  │
 │                          │    │    │  • Calls LLM via IP     │    │
 │  Uses Jinja2 templates   │    │  │ │  • Writes deliverables  │ │  │
 │  Pushes to Registry ─────┼──→ │    └─────────────────────────┘    │
@@ -118,7 +120,7 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 | Service | Image / Build | Port (Host) | Purpose |
 |---------|---------------|-------------|---------|
 | **control-plane** | `./services/control-plane` | 8000 | Central API — tasks, policies, capabilities, LLM proxy |
-| **image-builder** | `./services/image-builder` | — (8002 internal) | Builds agent & deployment Docker images |
+| **image-builder** | `./services/image-builder` | 8002 | Builds agent & deployment Docker images, supply-chain validation |
 | **temporal-worker** | `./services/temporal-worker` | — | Executes Temporal workflows & activities |
 | **frontend** | `./frontend` | 3000 | Next.js dashboard UI |
 | **postgres** | `postgres:15-alpine` | 5432 | Primary database |
@@ -132,6 +134,15 @@ Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 | **redis** | `redis:7-alpine` | — (6379 internal) | Session store for API Gateway |
 
 **Total: 13 services** in `docker-compose.yml`.
+
+**Base Image Types:**
+
+| Image | Base | Runtime | Package Managers | Adapter |
+|-------|------|---------|------------------|---------|
+| **openclaw** | Debian + Python 3.11 venv + Node.js | Full | pip, apt, npm | `openclaw-wrapper.py` |
+| **nanobot** | Alpine + Python 3.11 | Lightweight | pip, apk | `taskforge-adapter.py` |
+| **picoclaw** | Alpine (BusyBox) | Shell-only | apk | `picoclaw-adapter.sh` |
+| **zeroclaw** | Debian + Python 3.11 + Rust | Compiled | pip, apt | `taskforge-adapter.py` |
 
 ---
 
@@ -184,11 +195,20 @@ FastAPI service that builds Docker images inside DinD.
   internal registry. If not, builds it from `agent-images/base/Dockerfile` and pushes it. This
   makes the platform fully self-contained — no external image pulls needed after first boot.
   First build takes several minutes (~1.8GB image).
-- **Agent image builds:** `POST /api/build` — generates a Dockerfile from Jinja2 templates that
-  layers approved capabilities (pip, apt, npm packages) on top of the base image.
-- **Deployment image builds:** `POST /api/deployments/build` — builds minimal Python images
-  from workspace files for running deployed applications.
-- **Build status polling:** `GET /api/build/{build_id}` — returns build status and logs.
+- **Multi-image support:** builds and pushes four base image types — `openclaw` (Debian+Python venv+Node),
+  `nanobot` (Alpine+Python), `picoclaw` (Alpine shell-only), and `zeroclaw` (Debian+Python+Rust).
+- **Agent image builds:** `POST /build` — generates a Dockerfile from Jinja2 templates that
+  layers approved capabilities (pip, apt/apk, npm packages) on top of the base image.
+  Image-type-aware: uses `apk` for Alpine-based images, `apt-get` for Debian-based.
+- **Supply-chain validation:** Before building, every requested capability is checked against
+  a per-image-type allowlist (`config/supply-chain.yaml`). Denied packages are stripped;
+  if all are denied the build is skipped entirely. Includes Debian↔Alpine package alias
+  translation (e.g. `libssl-dev` → `openssl-dev`) and feedback messages for the agent.
+- **Deployment image builds:** `POST /deployments/build` — builds minimal deployment images
+  from workspace files. Base image is chosen per image type (Alpine for picoclaw/nanobot,
+  `python:3.11-slim` for openclaw/zeroclaw). Import scanning detects third-party Python
+  packages from the workspace source files.
+- **Build status polling:** `GET /builds/{build_id}` — returns build status and logs.
 - **SBOM generation:** After every successful image build, [Trivy](https://trivy.dev) scans the image
   and generates SBOMs in both **SPDX JSON** and **CycloneDX JSON** formats. The SBOMs are POSTed
   to the control plane for storage. Trivy is installed directly in the image-builder container
@@ -196,6 +216,31 @@ FastAPI service that builds Docker images inside DinD.
 - **Vulnerability scanning:** `POST /scan/vulnerabilities` — on-demand Trivy vulnerability scan
   for any image in the registry. Returns a flat list of CVEs with severity, package, and fix version.
 - **On-demand SBOM:** `POST /scan/sbom` — generate an SBOM for any existing image without rebuilding.
+
+**Supply-chain endpoints:**
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/supply-chain/check` | POST | Pre-flight validation — check if capabilities would pass before building |
+| `/supply-chain/config` | GET | Return the full allowlist config (for audit UI) |
+| `/supply-chain/reload` | POST | Hot-reload `supply-chain.yaml` from disk without restart |
+
+**Supply-chain config (`config/supply-chain.yaml`):**
+
+The single source of truth for what packages agents can install. Structure:
+
+```yaml
+aliases:
+  apt_to_apk: { libssl-dev: openssl-dev, ... }  # Debian→Alpine translation
+  apk_to_apt: { openssl-dev: libssl-dev, ... }  # Alpine→Debian translation
+openclaw:   { pip: [...], apt: [...], npm: [...] }
+nanobot:    { pip: [...], apk: [...] }
+picoclaw:   { apk: [...] }  # no pip, no npm
+zeroclaw:   { pip: [...], apt: [...] }
+```
+
+The git log of this file IS the audit trail. To add a new package: verify it
+exists in the target repo, add it under the correct image type, and commit.
 
 ### 3. Temporal Worker
 
@@ -214,19 +259,27 @@ Connects to Temporal and registers workflows + activities.
 | Activity | Status | Description |
 |----------|--------|-------------|
 | `initialize_task` | Stub | Returns True; workspace setup is a TODO |
-| `start_agent_container` | ✅ | Launches agent container in DinD (detached); applies `runtime=runsc` for gVisor or `privileged=true` for insecure-dind. Returns container_id, image, status, sandbox_mode |
+| `start_agent_container` | ✅ | Launches agent container in DinD (detached); applies `runtime=runsc` for gVisor or `privileged=true` for insecure-dind. Always pulls mutable base image tags; caches versioned (`-vN`) tags. Returns container_id, image, status, sandbox_mode |
 | `poll_agent_turns` | ✅ | Polls LLM router for new turn data while agent container runs |
 | `record_agent_turn` | ✅ | Records a single LLM turn as a separate Temporal activity (visible in UI) |
 | `collect_agent_result` | ✅ | Reads final result from container stdout after exit |
 | `store_agent_output` | ✅ | POSTs iteration output to control plane |
 | `request_capability` | ✅ | Creates capability request via control plane |
-| `build_agent_image` | ✅ | Calls image builder, polls until complete |
-| `update_task_policy` | Stub | Returns `{"updated": True}`; policy update is a TODO |
+| `build_agent_image` | ✅ | Calls image builder, polls until complete. Returns `{image, feedback, denied}` dict. Supply-chain feedback is injected into the agent's follow-up as a one-shot `SYSTEM NOTICE` |
+| `update_task_policy` | ✅ | PATCHes the task's `current_image` on the control plane |
 | `finalize_task` | ✅ | Marks task complete or failed |
 | `create_deployment` | ✅ | Creates deployment record |
 | `build_deployment_image` | ✅ | Calls image builder for deployments |
 | `start_deployment_container` | ✅ | Runs deployment container, allocates host port 9100-9120 |
 | `stop_deployment_container` | ✅ | Stops and removes deployment container |
+
+**Supply-chain feedback loop:**
+
+When the image builder denies packages (supply-chain violation) or a build fails,
+the worker injects a one-shot feedback message into the agent's next iteration
+via `_capability_feedback`. The agent sees a `--- SYSTEM NOTICE ---` block
+telling it exactly which packages were denied and why, so it can adapt its
+approach. This also fires when the user manually denies a capability request.
 
 **Cached Docker Client:**
 
@@ -245,16 +298,30 @@ dependency inside the sandbox.
 
 ### 4. Agent Runtime (runs inside agent containers)
 
-The code that runs **inside** agent containers spawned by DinD:
+The code that runs **inside** agent containers spawned by DinD. Each base image type
+has its own native adapter that speaks the same protocol:
 
-- **`openclaw-wrapper.py`** (primary entrypoint) — fetches task details from control plane,
-  configures the LLM router URL as the model endpoint, invokes the OpenClaw CLI, intercepts
-  capability requests, writes deliverables, and outputs structured result JSON via stdout markers.
-- **`openclaw-wrapper.js`** — alternative JavaScript executor.
-- **`agent.py`** — fallback executor class.
+**Adapters (per base image):**
 
-The agent calls the control plane's LLM proxy at `POST /api/llm/v1/chat/completions`,
-which routes to the configured provider.
+| Image Type | Adapter | Language | Notes |
+|------------|---------|----------|-------|
+| **openclaw** | `openclaw-wrapper.py` | Python | Full-featured — invokes OpenClaw CLI |
+| **nanobot** | `taskforge-adapter.py` | Python | Lightweight — direct LLM tool loop, `Popen` + `os.killpg()` for exec |
+| **picoclaw** | `picoclaw-adapter.sh` | Shell | Zero-Python — pure bash/curl/jq, `setsid` + cmdfile for exec |
+| **zeroclaw** | `taskforge-adapter.py` | Python | Same as nanobot adapter, shared codebase |
+
+**Common protocol (all adapters):**
+
+- Reads `TASK_ID`, `LLM_MODEL`, `LLM_ROUTER_URL`, `CONTROL_PLANE_URL` from environment
+- Calls the LLM router at `POST /api/llm/v1/chat/completions` with tool_calls
+- Executes tool calls locally: `write`, `read`, `exec`, `edit`
+- Detects `CAPABILITY_REQUEST` / `DEPLOYMENT_REQUEST` markers
+- Writes result JSON with `===OPENCLAW_RESULT_JSON_START===` markers
+- Collects workspace deliverables
+
+**Process tree management:**
+- Python adapters: `subprocess.Popen(start_new_session=True)` + `os.killpg()` for clean exec timeout kills
+- Shell adapter: `setsid` + writes command to a cmdfile to avoid quoting issues, kills process group via `kill -KILL -$pgid`
 
 ### 5. Frontend (Next.js 14)
 
@@ -292,8 +359,18 @@ OpenAI-compatible chat completions gateway that bridges stateless HTTP clients
 **Streaming features:**
 - Turn-by-turn progress with tool-call icons (⚡📝📖✏️🌐🔧)
 - Capability approval lifecycle (request → approve → build → resume)
-- Deployment status summary at task completion
+- **Streaming resumes after capability rebuild** — LLM turn probing detects agent resume immediately, so the user sees the new iteration's progress in real-time
+- **Temporal workflow link** — clickable `[Track in Temporal UI]` link emitted at stream start
+- **Deployment links** — running deployments show `[Open App]` with `localhost:{host_port}` URL; pending ones link to the dashboard for approval
+- **Dashboard + Temporal links in footer** — terminal-state message includes `[Dashboard]` and `[Temporal]` links
+- Deployment status summary at task completion with `[Manage Deployments]` link
 - Fast-path proxy for Open WebUI meta-requests (title/tag/follow-up generation)
+
+**Agent Profile support:**
+- `GET /v1/models` returns Agent Profiles (not raw LLM models) — each profile combines a base image with an LLM model
+- `GET/POST/PUT/DELETE /v1/agent-profiles` — CRUD for the agent profiles registry (`agent-images/profiles.yaml`)
+- Profile metadata includes icon, tags, strengths, runtime environment
+- Profile resolution at chat time: model field → profile ID → base_image + llm_model
 
 **Session management:**
 - Deterministic conversation ID from `model + system_prompt + first_user_message`
@@ -441,6 +518,7 @@ Human sees request in Approvals UI
 | **LLM audit trail** | Every LLM call logged with full request/response, token counts, provider info |
 | **Temporal history** | Complete workflow execution history, replayable and immutable |
 | **SBOM supply-chain transparency** | Every agent image automatically scanned by Trivy; SPDX + CycloneDX SBOMs stored with denormalized package lists; cross-task package search enables rapid CVE triage; version diffs track what changed between builds |
+| **Supply-chain allowlists** | Per-image-type package allowlists in `config/supply-chain.yaml` gate every capability request. Denied packages are stripped before build; the agent receives actionable feedback via `SYSTEM NOTICE`. Debian↔Alpine alias translation handles cross-distro package names. The git log of the config file serves as the audit trail |
 | **Multi-layer insecure-mode warnings** | `make up` red banner, worker startup WARNING log, frontend SecurityBanner, `.env.example` comments |
 
 ### Not Yet Implemented
@@ -520,11 +598,19 @@ openclaw-contained/
 │       ├── agent.py            # Fallback executor class
 │       └── Dockerfile.openclaw # Base agent image definition
 │
+├── config/
+│   └── supply-chain.yaml       # Per-image-type package allowlists (the supply-chain source of truth)
+│
 ├── agent-images/
-│   ├── base/                   # Base agent runtime files
-│   │   ├── Dockerfile          # Base image build definition
-│   │   ├── agent_runtime.py    # Agent runtime (early prototype, unused)
-│   │   └── config.py           # Agent config
+│   ├── profiles.yaml           # Agent Profiles registry (name, base_image, llm_model, tags, etc.)
+│   ├── base/                   # Base agent runtime files (4 image types)
+│   │   ├── Dockerfile          # openclaw (Debian + Python venv + Node.js)
+│   │   ├── Dockerfile.nanobot  # nanobot (Alpine + Python)
+│   │   ├── Dockerfile.picoclaw # picoclaw (Alpine, shell-only — no Python)
+│   │   ├── Dockerfile.zeroclaw # zeroclaw (Debian + Python + Rust)
+│   │   └── taskforge-adapter.py # Native Python adapter (nanobot, zeroclaw)
+│   ├── picoclaw/
+│   │   └── picoclaw-adapter.sh # Native shell adapter (bash/curl/jq — no Python)
 │   └── task-*/                 # Generated Dockerfiles per task
 │
 ├── frontend/                   # Next.js 14 dashboard
@@ -559,8 +645,7 @@ openclaw-contained/
 
 1. **Auth is dev-mode only** — `POST /api/auth/login` accepts any credentials
 2. **`initialize_task` is a stub** — returns True without workspace setup
-3. **`update_task_policy` is a stub** — returns `{"updated": True}`
-4. **`audit_logs` table exists but no code writes to it** — audit is via Temporal history + task_outputs
+3. **`audit_logs` table exists but no code writes to it** — audit is via Temporal history + task_outputs
 5. **`agent-images/base/agent_runtime.py`** is an unused prototype — the real agent code is `services/agent-executor/openclaw-wrapper.py`
 6. **Base image is ~2.3GB** — first boot takes several minutes to build and push
 8. **Docker Compose v1** — uses `docker-compose` (v1.29); may hit `ContainerConfig` KeyError on image rebuilds — workaround is to `docker rm -f` the container and re-run

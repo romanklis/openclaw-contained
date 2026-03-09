@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/thumbnail-taskforge-platform.png" alt="TaskForge Platform" width="720" />
+  <img src="docs/images/0.7.0/main image.png" alt="TaskForge Platform" width="720" />
 </p>
 
 # TaskForge
@@ -30,8 +30,11 @@ rebuild, and every LLM interaction is logged for audit.
 - **Temporal workflows** — durable execution that survives crashes, with pause/resume for approvals
 - **Deployment support** — agents can produce deployable applications served on ports 9100-9120
 - **📦 SBOM generation** — automatic Software Bill of Materials generation via [Trivy](https://trivy.dev) for every agent image build, with SPDX and CycloneDX output, package search, version diff, and vulnerability scanning
+- **�️ Supply-chain governance** — per-image-type package allowlists (`config/supply-chain.yaml`) gate every capability request. Denied packages are stripped before build and the agent receives actionable feedback so it can adapt. Includes Debian↔Alpine alias translation and hot-reload without restart
+- **🤖 Multi-image agent diversity** — four base image types (OpenClaw, NanoBot, PicoClaw, ZeroClaw) with native adapters, from full-featured Debian+Python+Node to ultra-minimal Alpine shell-only
+- **🎭 Agent Profiles** — pre-defined combinations of a base image (“body”) and an LLM (“brain”), selectable from the Open WebUI model dropdown. CRUD API + YAML registry
 - **💬 OpenAI-Compatible API Gateway** — `POST /v1/chat/completions` with SSE streaming, so any OpenAI-compatible client (Open WebUI, LibreChat, Chainlit, curl) can drive tasks through a standard chat interface
-- **🔄 Real-time turn-by-turn streaming** — see every tool call (⚡📝📖✏️🌐) as the agent works, plus capability approval lifecycle updates and deployment status
+- **🔄 Real-time turn-by-turn streaming** — see every tool call (⚡📝📖✏️🌐) as the agent works, plus capability approval lifecycle updates, deployment status, and clickable links to Temporal UI and the dashboard
 - **🌐 Open WebUI integration** — pre-wired chat UI at port 3001; create an account and start chatting
 
 ### 💬 From Chat to Deployed App — in One Prompt
@@ -205,6 +208,9 @@ a capability request will appear in the **Approvals** tab at http://localhost:30
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system design, including:
 - 13-service Docker Compose topology
+- 4 base image types with native adapters
+- Supply-chain governance (per-image-type allowlists)
+- Agent Profiles registry
 - Data flow diagrams
 - Database schema
 - Temporal workflow details
@@ -263,8 +269,8 @@ Every agent image build automatically generates an SBOM in both **SPDX JSON** an
 | Service | Port | Description |
 |---------|------|-------------|
 | **control-plane** | 8000 | FastAPI — tasks, policies, capabilities, LLM proxy |
-| **image-builder** | *(internal)* | Builds agent Docker images, auto-bootstraps base image, generates SBOMs via Trivy |
-| **temporal-worker** | *(internal)* | Executes Temporal workflows (3 workflows, 11 activities) |
+| **image-builder** | 8002 | Builds agent Docker images, supply-chain validation, auto-bootstraps base images, generates SBOMs via Trivy |
+| **temporal-worker** | *(internal)* | Executes Temporal workflows (3 workflows, 15 activities) |
 | **frontend** | 3000 | Next.js 14 dashboard |
 | **postgres** | 5432 | Primary database (PostgreSQL 15) |
 | **temporal** | *(internal)* | Temporal workflow engine |
@@ -323,12 +329,18 @@ make scale-workers   Scale temporal workers (WORKERS=5)
 ```
 services/
 ├── control-plane/      # FastAPI API server (tasks, policies, LLM router)
-├── image-builder/      # Docker image builder + auto-bootstrap
+├── image-builder/      # Docker image builder + supply-chain validation + SBOM
 ├── temporal-worker/    # Temporal workflows & activities
+├── api-gateway/        # OpenAI-compatible gateway + agent profiles
 └── agent-executor/     # Code that runs INSIDE agent containers
 
 frontend/               # Next.js 14 dashboard (6 routes)
-agent-images/base/      # Base agent image definition
+agent-images/
+  profiles.yaml         # Agent Profiles registry (body + brain combos)
+  base/                 # 4 base image Dockerfiles + native adapters
+  picoclaw/             # Shell-only adapter (bash/curl/jq)
+config/
+  supply-chain.yaml     # Per-image-type package allowlists
 openclaw/               # OpenClaw CLI (mounted into agents)
 workspaces/             # Per-task workspace directories
 ```
@@ -402,6 +414,7 @@ docker exec openclaw-docker-dind docker ps -a
 | `OPENAI_API_KEY` | — | No | OpenAI API key |
 | `API_URL` | `http://localhost:8000` | No | Frontend → API URL |
 | `DEFAULT_LLM_MODEL` | `gemini-2.0-flash-exp` | No | Default LLM for API Gateway tasks |
+| `TEMPORAL_UI_URL` | `http://localhost:8088` | No | Temporal UI base URL (for workflow links in streaming) |
 | `WEBUI_SECRET_KEY` | `change-me-open-webui-secret` | No | Open WebUI session secret |
 
 At least one LLM provider must be configured for agents to function.

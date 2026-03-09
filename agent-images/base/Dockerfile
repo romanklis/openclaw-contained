@@ -51,7 +51,8 @@ USER agent
 ENV PYTHONUNBUFFERED=1 \
     OPENCLAW_WORKSPACE=/workspace \
     OPENCLAW_OUTPUT=/workspace/output \
-    OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001
+    OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001 \
+    OPENCLAW_IMAGE_TYPE=openclaw
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \

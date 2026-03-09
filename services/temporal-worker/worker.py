@@ -3,6 +3,7 @@ Temporal Worker - Executes workflows and activities
 """
 import asyncio
 import logging
+import re
 from temporalio import workflow, activity
 from temporalio.client import Client
 from temporalio.worker import Worker
@@ -110,9 +111,10 @@ class AgentTaskWorkflow:
     def __init__(self):
         self.approval_received = False
         self.capability_approved = False
-        self.current_image = "localhost:5000/openclaw-agent:openclaw"  # Track current agent image
+        self.current_image = "localhost:5000/openclaw-agent:openclaw"  # Track current agent image (default)
         self.llm_model = "gemma3:4b"  # Track LLM model
         self.follow_up = ""  # Follow-up instructions for continuation
+        self._capability_feedback = ""  # one-shot feedback after a build (cleared after use)
     
     @workflow.run
     async def run(
@@ -124,8 +126,10 @@ class AgentTaskWorkflow:
     ) -> Dict[str, Any]:
         """Execute agent task.
 
-        For first-run workflows ``current_image`` and ``follow_up`` are empty.
-        For continuation workflows they carry over state from the previous run:
+        For first-run workflows ``current_image`` can be a base image tag
+        (e.g. ``localhost:5000/openclaw-agent:zeroclaw``) or empty for the
+        default openclaw image.
+        For continuation workflows it carries over from the previous run:
         - ``current_image``: the last built agent image (all packages installed)
         - ``follow_up``: user's follow-up instructions
         """
@@ -133,12 +137,15 @@ class AgentTaskWorkflow:
         self.llm_model = llm_model
         self.follow_up = follow_up
 
-        # If continuing, pick up from the previous image instead of the base
+        # Use the provided base image for both first-run and continuation
         if current_image:
             self.current_image = current_image
-            logger.info(f"♻️  CONTINUATION workflow for task {task_id} | image={current_image} | follow_up={follow_up[:120]}...")
+            if follow_up:
+                logger.info(f"♻️  CONTINUATION workflow for task {task_id} | image={current_image} | follow_up={follow_up[:120]}...")
+            else:
+                logger.info(f"Starting workflow for task {task_id} with model {llm_model}, base image {current_image}")
         else:
-            logger.info(f"Starting workflow for task {task_id} with model {llm_model}")
+            logger.info(f"Starting workflow for task {task_id} with model {llm_model} (default openclaw image)")
         
         # Step 1: Initialize task
         await workflow.execute_activity(
@@ -150,7 +157,7 @@ class AgentTaskWorkflow:
         # Determine starting iteration.
         # For continuations, fetch the last iteration number so we don't overwrite.
         start_iteration = 0
-        if current_image:  # this is a continuation
+        if follow_up:  # this is a continuation (has follow-up instructions)
             start_iteration = await workflow.execute_activity(
                 get_last_iteration,
                 args=[task_id],
@@ -169,9 +176,19 @@ class AgentTaskWorkflow:
             
             # Execute agent step as a child workflow so every LLM turn
             # inside it is visible as a separate activity in Temporal UI.
+            # If there's pending capability feedback, inject it into this
+            # iteration's follow_up and clear it (one-shot).
+            iter_follow_up = self.follow_up
+            if self._capability_feedback:
+                iter_follow_up = (
+                    (iter_follow_up + "\n\n" if iter_follow_up else "")
+                    + self._capability_feedback
+                )
+                self._capability_feedback = ""  # one-shot — don't repeat
+
             result = await workflow.execute_child_workflow(
                 AgentStepWorkflow.run,
-                args=[task_id, iteration, self.current_image, self.llm_model, self.follow_up],
+                args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up],
                 id=f"agent-step-{task_id}-iter-{iteration}",
             )
 
@@ -241,15 +258,29 @@ class AgentTaskWorkflow:
                 if self.capability_approved:
                     # Build new image with capability — use current_image as base
                     # so each version layers on top of the previous (v1 → v2 → v3)
-                    new_image = await workflow.execute_activity(
+                    build_result = await workflow.execute_activity(
                         build_agent_image,
                         args=[task_id, capability, self.current_image],
                         start_to_close_timeout=timedelta(minutes=10)
                     )
                     
+                    # build_result is a dict: {image, feedback, denied}
+                    new_image = build_result.get("image", self.current_image)
+                    supply_chain_feedback = build_result.get("feedback", "")
+
                     # Update current image for subsequent iterations
                     self.current_image = new_image
                     logger.info(f"Updated task image to {new_image}")
+
+                    # If the supply chain denied any packages, inject feedback
+                    # into the follow-up so the agent learns what's unavailable.
+                    if supply_chain_feedback:
+                        logger.warning(f"🚫 Supply-chain feedback for agent: {supply_chain_feedback[:200]}")
+                        self._capability_feedback = (
+                            "--- SYSTEM NOTICE ---\n"
+                            + supply_chain_feedback
+                            + "\n--- END NOTICE ---"
+                        )
                     
                     # Update policy
                     await workflow.execute_activity(
@@ -261,6 +292,13 @@ class AgentTaskWorkflow:
                     logger.info(f"Task {task_id} resumed with new capability")
                 else:
                     logger.info(f"Capability request denied for task {task_id}")
+                    # Tell the agent its capability request was denied by the user
+                    self._capability_feedback = (
+                        "--- SYSTEM NOTICE ---\n"
+                        + f"CAPABILITY_DENIED: Your request for '{capability.get('resource', '')}' "
+                        + "was denied by the operator. Find an alternative approach.\n"
+                        + "--- END NOTICE ---"
+                    )
                 
                 # Reset approval flags
                 self.approval_received = False
@@ -421,34 +459,62 @@ async def start_agent_container(
     try:
         docker_client = get_docker_client()
 
-        # --- resolve image (try name variants) ---
-        image_found = False
-        image_variants = [
-            agent_image,
-            agent_image.replace("localhost:5000/", "registry:5000/"),
-            agent_image.replace("localhost:5000/", ""),
-            agent_image.replace("registry:5000/", ""),
-        ]
-        seen = set()
-        image_variants = [v for v in image_variants if v not in seen and not seen.add(v)]
+        # --- resolve image ---
+        # Determine the canonical registry tag for pulling.
+        agent_image_pull = agent_image.replace("localhost:5000/", "registry:5000/")
+        if not agent_image_pull.startswith("registry:5000/"):
+            agent_image_pull = f"registry:5000/{agent_image_pull}"
 
-        for variant in image_variants:
+        # Always pull base images (tags without -v suffix) so we pick up
+        # rebuilds immediately.  Versioned images (task-xxx-v2) are immutable
+        # and safe to use from cache.
+        tag_part = agent_image_pull.rsplit(":", 1)[-1] if ":" in agent_image_pull else ""
+        is_versioned = bool(re.search(r'-v\d+$', tag_part))
+
+        if not is_versioned:
+            # Base / mutable tag — always pull latest from registry
             try:
-                docker_client.images.get(variant)
-                logger.info(f"✅ Image found locally as: {variant}")
-                agent_image = variant
-                image_found = True
-                break
-            except docker.errors.ImageNotFound:
-                continue
+                logger.info(f"📥 Pulling latest {agent_image_pull} (mutable tag)")
+                docker_client.images.pull(agent_image_pull)
+                agent_image = agent_image_pull
+            except Exception as pull_err:
+                logger.warning(f"⚠️  Pull failed ({pull_err}), falling back to local cache")
+                # Fall back to whatever is locally available
+                for variant in [agent_image_pull, agent_image,
+                                agent_image.replace("localhost:5000/", ""),
+                                agent_image.replace("registry:5000/", "")]:
+                    try:
+                        docker_client.images.get(variant)
+                        agent_image = variant
+                        break
+                    except docker.errors.ImageNotFound:
+                        continue
+        else:
+            # Versioned / immutable tag — use cache, pull only if missing
+            image_found = False
+            image_variants = [
+                agent_image,
+                agent_image_pull,
+                agent_image.replace("localhost:5000/", ""),
+                agent_image.replace("registry:5000/", ""),
+            ]
+            seen = set()
+            image_variants = [v for v in image_variants if v not in seen and not seen.add(v)]
 
-        if not image_found:
-            agent_image_fixed = agent_image.replace("localhost:5000/", "registry:5000/")
-            if not agent_image_fixed.startswith("registry:5000/"):
-                agent_image_fixed = f"registry:5000/{agent_image_fixed}"
-            logger.info(f"📥 Pulling {agent_image_fixed}")
-            docker_client.images.pull(agent_image_fixed)
-            agent_image = agent_image_fixed
+            for variant in image_variants:
+                try:
+                    docker_client.images.get(variant)
+                    logger.info(f"✅ Image found locally as: {variant}")
+                    agent_image = variant
+                    image_found = True
+                    break
+                except docker.errors.ImageNotFound:
+                    continue
+
+            if not image_found:
+                logger.info(f"📥 Pulling {agent_image_pull}")
+                docker_client.images.pull(agent_image_pull)
+                agent_image = agent_image_pull
 
         # --- workspace ---
         workspaces_root = "/workspaces"
@@ -964,11 +1030,17 @@ async def build_agent_image(
     task_id: str,
     capability: Dict[str, Any],
     current_image: str = "localhost:5000/openclaw-agent:openclaw"
-) -> str:
+) -> Dict[str, Any]:
     """Build new agent image with capability.
     
     Uses current_image as the base so capabilities accumulate
     incrementally: base → v1 (+ redis) → v2 (+ flask) → v3 ...
+
+    Returns a dict:
+      - image: the new (or fallback) image tag
+      - feedback: supply-chain feedback string to inject into agent context
+                  (empty string if everything was approved)
+      - denied: list of denied package dicts (empty if none)
     """
     import httpx
     
@@ -1022,6 +1094,21 @@ async def build_agent_image(
                         raise
             else:
                 raise last_err  # type: ignore[misc]
+
+            # ── Check for supply-chain denial ────────────────────────────
+            supply_chain_feedback = result.get("supply_chain_feedback", "") or ""
+            supply_chain_denied = result.get("supply_chain_denied") or []
+
+            # If the build was entirely denied (status="denied"), return
+            # the current image + feedback immediately — no polling needed.
+            if result.get("status") == "denied":
+                logger.warning(f"🚫 BUILD_DENIED (supply chain) | Task: {task_id} | "
+                               f"Denied: {[d.get('name') for d in supply_chain_denied]}")
+                return {
+                    "image": current_image,
+                    "feedback": supply_chain_feedback,
+                    "denied": supply_chain_denied,
+                }
             
             build_id = result["build_id"]
             expected_tag = result["image_tag"]
@@ -1047,7 +1134,11 @@ async def build_agent_image(
                         image_tag = image_tag.replace("registry:5000/", "localhost:5000/")
                     logger.info(f"✅ BUILD_SUCCESS | Task: {task_id} | Image: {image_tag} | Build time: {waited}s")
                     logger.info(f"   └─ Dockerfile saved to: agent-images/{task_id}/")
-                    return image_tag
+                    return {
+                        "image": image_tag,
+                        "feedback": supply_chain_feedback,
+                        "denied": supply_chain_denied,
+                    }
                 elif status["status"] == "failed":
                     error = status.get("error", "Unknown error")
                     logger.error(f"❌ BUILD_FAILED | Task: {task_id} | Error: {error}")
@@ -1062,8 +1153,17 @@ async def build_agent_image(
         logger.error(f"❌ BUILD_ERROR | Task: {task_id} | {type(e).__name__}: {repr(e)}")
         logger.error(f"   └─ Traceback:\n{traceback.format_exc()}")
         logger.warning(f"⚠️  FALLBACK | Task: {task_id} | Continuing with previous image: {current_image}")
-        # Fall back to the image we already had (NOT a non-existent "base" tag)
-        return current_image
+        # Fall back to the image we already had — include build error as feedback
+        return {
+            "image": current_image,
+            "feedback": (
+                f"CAPABILITY_BUILD_FAILED: Could not install '{resource}'. "
+                f"Error: {str(e)[:300]}. "
+                "The package may not be available for this platform. "
+                "Find an alternative approach."
+            ),
+            "denied": [],
+        }
 
 
 @activity.defn
@@ -1072,13 +1172,29 @@ async def update_task_policy(
     capability: Dict[str, Any],
     new_image: str
 ) -> Dict[str, Any]:
-    """Update task policy with new capability"""
-    logger.info(f"Updating policy for task {task_id}")
-    
-    # TODO: Call control plane to update policy
-    # TODO: Update task with new image reference
-    
-    return {"updated": True}
+    """Update task policy and persist the new image tag in the DB.
+
+    After a capability build, the rebuilt image (e.g. task-xxx-v2) must be
+    persisted so that continuation workflows pick it up instead of falling
+    back to the bare base image.
+    """
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    # Persist the new image on the task record
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(
+                f"{control_plane_url}/api/tasks/{task_id}/image",
+                json={"current_image": new_image},
+            )
+            resp.raise_for_status()
+            logger.info(f"✅ TASK_IMAGE_UPDATED | Task: {task_id} | Image: {new_image}")
+    except Exception as e:
+        logger.error(f"❌ Failed to persist image for task {task_id}: {e}")
+
+    return {"updated": True, "new_image": new_image}
 
 
 @activity.defn

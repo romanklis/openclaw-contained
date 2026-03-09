@@ -1,12 +1,17 @@
 # TaskForge Agent Images
 
-This directory contains version-controlled agent images for the TaskForge platform.
+This directory contains version-controlled agent images and the **Agent Profiles
+Registry** for the TaskForge platform.
 
-## Structure
+## Architecture
+
+TaskForge supports 4 distinct **Base Images** (the "body") that are paired with
+specific LLMs (the "brain") through **Agent Profiles**.
 
 ```
 agent-images/
-├── base/                    # Base agent image (foundation)
+├── agent_profiles.yaml      # Agent Profiles Registry (see below)
+├── base/                    # OpenClaw — Full Python environment
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── agent_runtime.py
@@ -14,40 +19,60 @@ agent-images/
 │   ├── config.py
 │   ├── VERSION
 │   └── CHANGELOG.md
-├── variants/                # Pre-built variants (future)
-│   ├── data-science/
-│   ├── web-scraping/
-│   └── code-analysis/
+├── nanobot/                 # NanoBot — Lightweight Alpine Python
+│   ├── Dockerfile
+│   └── requirements.txt
+├── picoclaw/                # PicoClaw — Minimal Shell (Alpine)
+│   ├── Dockerfile
+│   ├── agent_runner.sh
+│   └── policy_check.sh
+├── zeroclaw/                # ZeroClaw — Rust-based runtime
+│   ├── Dockerfile
+│   └── agent/
+│       ├── Cargo.toml
+│       └── src/main.rs
 └── README.md
 ```
 
-## Base Image
+## Base Images
 
-The base image (`openclaw-base:1.0.0`) provides:
+| Image      | Runtime             | Use Case                               | Size     |
+|------------|---------------------|----------------------------------------|----------|
+| **OpenClaw**  | Python 3.11 (Debian) | Full coding & automation              | ~450 MB  |
+| **NanoBot**   | Python 3.11 (Alpine) | Fast scripts & data transforms        | ~80 MB   |
+| **PicoClaw**  | Shell (Alpine)       | File manipulation & CLI automation    | ~15 MB   |
+| **ZeroClaw**  | Rust (Debian)        | High-security & performance-critical  | ~120 MB  |
 
-- **Runtime**: Python 3.11 with core dependencies
-- **Security**: Non-root execution (UID 1001)
-- **Policy Integration**: Built-in policy client
-- **Workspace**: Isolated `/workspace` directory
-- **Monitoring**: Health checks and structured logging
+## Agent Profiles
 
-### Building the Base Image
+Agent Profiles abstract LLM selection away from users. Instead of picking a raw
+model name, users select a **profile** which is a pre-defined combination of:
+
+- **Base Image** (Docker tag) — the execution environment
+- **LLM Model** (API name) — the AI model powering the agent
+
+See [`agent_profiles.yaml`](agent_profiles.yaml) for the full registry.
+
+### Example
+
+When a user selects **"Senior Reviewer"**, the system resolves:
+- **Body**: `openclaw-agent:zeroclaw` (Rust runtime)
+- **Brain**: `claude-sonnet-4-20250514`
+
+The UI shows badges: `Runtime: Rust (Debian)` · `Model: claude-sonnet-4-20250514`
+
+## Building Images
 
 ```bash
-cd agent-images/base
-docker build -t openclaw-base:1.0.0 .
-docker tag openclaw-base:1.0.0 openclaw-base:latest
+# Build all 4 base images
+make build-all-images
+
+# Or individually:
+make build-base       # OpenClaw (full Python)
+make build-nanobot    # NanoBot (Alpine Python)
+make build-picoclaw   # PicoClaw (Shell)
+make build-zeroclaw   # ZeroClaw (Rust)
 ```
-
-### Using the Base Image
-
-The image-builder service uses this as the foundation and layers approved capabilities on top:
-
-```dockerfile
-FROM openclaw-base:1.0.0
-
-# Install approved capability
-RUN pip install pandas==2.0.0
 
 # Task-specific metadata
 LABEL task_id="task-abc123"

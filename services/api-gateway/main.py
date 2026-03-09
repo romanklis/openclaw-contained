@@ -47,6 +47,7 @@ from fastapi.responses import StreamingResponse
 from config import settings
 from control_plane_client import ControlPlaneClient
 from schemas import (
+    AgentProfileCard,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
@@ -56,6 +57,11 @@ from schemas import (
     Usage,
 )
 from session_manager import SessionStore
+from agent_profiles import (
+    load_profiles, get_profiles, get_profile, get_base_image_info,
+    create_profile, update_profile, delete_profile,
+    AgentProfile, AgentProfileMetadata,
+)
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
@@ -367,9 +373,13 @@ def _format_iteration(output: dict, task_id: str = "unknown") -> str:
         if dep_files:
             file_list = ", ".join(f"`{f}`" for f in dep_files.keys())
             parts.append(f"\n  - **Files:** {file_list}")
+
+        dashboard = settings.DASHBOARD_URL.rstrip("/")
         parts.append(
-            "\n\n📋 *The deployment is pending approval in the TaskForge dashboard. "
-            "Approve it to build and run the application.*"
+            f"\n\n👉 **[Review Deployment in Dashboard]({dashboard}/deployments)**"
+        )
+        parts.append(
+            "\n⏳ *Pending approval — approve it to build and launch the application.*"
         )
 
     parts.append("\n")
@@ -461,6 +471,10 @@ def _format_iteration_summary(output: dict, task_id: str = "unknown") -> str:
         if dep_files:
             file_list = ", ".join(f"`{f}`" for f in dep_files.keys())
             parts.append(f"\n  - **Files:** {file_list}")
+        dashboard = settings.DASHBOARD_URL.rstrip("/")
+        parts.append(
+            f"\n\n👉 **[Review Deployment in Dashboard]({dashboard}/deployments)**"
+        )
 
     parts.append("\n")
     return "".join(parts)
@@ -582,6 +596,21 @@ async def stream_task_execution(
     yield _sse(completion_id, model, role="assistant", content="")
     yield _sse(completion_id, model, content=f"🚀 Task `{task_id}` is running…\n")
 
+    # ── Emit Temporal workflow link ────────────────────────────────────
+    try:
+        _task_info = await cp.get_task(task_id)
+        _wf_id = _task_info.get("workflow_id", "")
+        if _wf_id:
+            _temporal_url = (
+                f"{settings.TEMPORAL_UI_URL}/namespaces/default/workflows/{_wf_id}"
+            )
+            yield _sse(
+                completion_id, model,
+                content=f"📋 [Track in Temporal UI]({_temporal_url})\n",
+            )
+    except Exception:
+        pass  # Non-critical — don't break the stream
+
     while time.monotonic() < deadline:
         # ── Fetch task status ──────────────────────────────────────────────
         try:
@@ -622,6 +651,97 @@ async def stream_task_execution(
         new_outputs = [
             o for o in outputs if o.get("iteration") not in seen_iterations
         ]
+
+        # ── Capability lifecycle updates (runs BEFORE turn polling) ─────
+        # While a capability request is pending, poll for status changes and
+        # surface approval / build progress to the user in real-time.
+        # This MUST run before the turn-polling block so that _cap_pending
+        # is cleared as soon as the agent resumes → turn streaming resumes.
+        if _cap_pending and status == "running":
+            try:
+                cap_reqs = await cp.get_capability_requests(task_id=task_id)
+                latest = None
+                for cr in cap_reqs:
+                    if latest is None or cr.get("id", 0) > latest.get("id", 0):
+                        latest = cr
+                if latest:
+                    cap_status = latest.get("status", "pending")
+
+                    if cap_status in ("approved", "modified") and not _cap_approved_emitted:
+                        _cap_approved_emitted = True
+                        _cap_last_status = cap_status
+                        pkgs = latest.get("resource_name", "")
+                        yield _sse(
+                            completion_id, model,
+                            content=f"\n✅ **Capability approved** — `{pkgs}`\n"
+                                    f"🔨 Building new agent image with the requested packages…\n",
+                        )
+                        waiting_emitted = False
+
+                    elif cap_status == "denied" and _cap_last_status != "denied":
+                        _cap_last_status = "denied"
+                        _cap_pending = False
+                        yield _sse(
+                            completion_id, model,
+                            content="\n❌ **Capability denied** — the agent will try to continue without it.\n",
+                        )
+                        waiting_emitted = False
+
+                    if _cap_approved_emitted and not _cap_building_emitted:
+                        _cap_building_emitted = True
+                        yield _sse(
+                            completion_id, model,
+                            content="⏳ *Image build in progress — this may take 1-2 minutes…*\n",
+                        )
+
+            except Exception:
+                pass  # Non-critical — don't break the stream
+
+            # Detect agent resume: if the build completed and the agent is
+            # now running, new LLM turns will appear.  Check for them so
+            # we can clear _cap_pending and let the turn-polling block below
+            # start streaming immediately — not just after the full iteration
+            # output lands.
+            if _cap_building_emitted:
+                try:
+                    _probe = await cp.get_llm_interactions(task_id, since=_turns_seen)
+                    _probe_turns = _probe.get("interactions", [])
+                    if _probe_turns:
+                        # Agent is running on the new image — build is done
+                        latest_output_for_img = max(outputs, key=lambda o: o.get("iteration", 0)) if outputs else {}
+                        new_image = latest_output_for_img.get("image_used", "")
+                        if new_image:
+                            short = new_image.split("/")[-1] if "/" in new_image else new_image
+                            yield _sse(
+                                completion_id, model,
+                                content=f"\n✅ **New image built:** `{short}` — agent resumed\n",
+                            )
+                        else:
+                            yield _sse(
+                                completion_id, model,
+                                content="\n✅ **Image build complete** — agent resumed\n",
+                            )
+                        _cap_pending = False
+                        _cap_approved_emitted = False
+                        _cap_building_emitted = False
+                        waiting_emitted = False
+                except Exception:
+                    pass
+
+            # Also detect via new iteration outputs (agent already finished)
+            if new_outputs and _cap_approved_emitted:
+                latest_output = max(new_outputs, key=lambda o: o.get("iteration", 0))
+                new_image = latest_output.get("image_used", "")
+                if new_image:
+                    short = new_image.split("/")[-1] if "/" in new_image else new_image
+                    yield _sse(
+                        completion_id, model,
+                        content=f"\n✅ **New image built:** `{short}` — agent resumed\n",
+                    )
+                _cap_pending = False
+                _cap_approved_emitted = False
+                _cap_building_emitted = False
+                waiting_emitted = False
 
         # ── Poll LLM turns for live progress ───────────────────────────────
         # This gives the user real-time insight into what the agent is doing
@@ -693,71 +813,6 @@ async def stream_task_execution(
                 _cap_building_emitted = False
                 _cap_last_status = "pending"
 
-        # ── Capability lifecycle updates ───────────────────────────────────
-        # While a capability request is pending, poll for status changes and
-        # surface approval / build progress to the user in real-time.
-        if _cap_pending and status == "running":
-            try:
-                cap_reqs = await cp.get_capability_requests(task_id=task_id)
-                # Find the latest pending or recently-decided request
-                latest = None
-                for cr in cap_reqs:
-                    if latest is None or cr.get("id", 0) > latest.get("id", 0):
-                        latest = cr
-                if latest:
-                    cap_status = latest.get("status", "pending")
-
-                    if cap_status in ("approved", "modified") and not _cap_approved_emitted:
-                        _cap_approved_emitted = True
-                        _cap_last_status = cap_status
-                        pkgs = latest.get("resource_name", "")
-                        yield _sse(
-                            completion_id, model,
-                            content=f"\n✅ **Capability approved** — `{pkgs}`\n"
-                                    f"🔨 Building new agent image with the requested packages…\n",
-                        )
-                        waiting_emitted = False
-
-                    elif cap_status == "denied" and _cap_last_status != "denied":
-                        _cap_last_status = "denied"
-                        _cap_pending = False
-                        yield _sse(
-                            completion_id, model,
-                            content="\n❌ **Capability denied** — the agent will try to continue without it.\n",
-                        )
-                        waiting_emitted = False
-
-                    # If approved, check if the workflow has moved past the
-                    # wait (i.e. a new iteration appeared → _cap_pending will
-                    # be reset by the new_outputs block above).  Also detect
-                    # image build completion by checking if a new output
-                    # appeared with a different image tag.
-                    if _cap_approved_emitted and not _cap_building_emitted:
-                        _cap_building_emitted = True
-                        yield _sse(
-                            completion_id, model,
-                            content="⏳ *Image build in progress — this may take 1-2 minutes…*\n",
-                        )
-
-            except Exception:
-                pass  # Non-critical — don't break the stream
-
-            # If we see a new iteration output after the capability was approved,
-            # the build completed and the agent resumed — announce it.
-            if new_outputs and _cap_approved_emitted:
-                latest_output = max(new_outputs, key=lambda o: o.get("iteration", 0))
-                new_image = latest_output.get("image_used", "")
-                if new_image:
-                    short = new_image.split("/")[-1] if "/" in new_image else new_image
-                    yield _sse(
-                        completion_id, model,
-                        content=f"✅ **New image built:** `{short}` — agent resumed\n",
-                    )
-                _cap_pending = False
-                _cap_approved_emitted = False
-                _cap_building_emitted = False
-                waiting_emitted = False
-
         # ── Check for terminal state ───────────────────────────────────────
         if status in TERMINAL_STATUSES:
             # ── Deployment status summary ──────────────────────────────────
@@ -781,20 +836,29 @@ async def stream_task_execution(
                             "failed": "❌",
                         }.get(d_status, "❓")
 
-                        line = f"| {status_icon} `{d_name}` | status: **{d_status}** | id: `{d_id}`"
+                        line = f"  {status_icon} **`{d_name}`** — {d_status}"
                         if d_url:
-                            line += f" | [Open App]({d_url})"
-                        elif d_status in ("built", "running") and d_port:
-                            line += f" | port: {d_port}"
-                        dep_lines.append(line + " |")
+                            line += f" · [Open App]({d_url})"
+                        elif d_status == "running" and d_port:
+                            app_url = f"http://localhost:{d_port}"
+                            line += f" · [Open App ({app_url})]({app_url})"
+                        elif d_status in ("built",) and d_port:
+                            line += f" · port {d_port}"
+                        dep_lines.append(line)
 
-                    if any(
+                    dashboard = settings.DASHBOARD_URL.rstrip("/")
+                    has_pending = any(
                         d.get("status") == "pending_approval"
                         for d in (deployments if isinstance(deployments, list) else [])
-                    ):
+                    )
+                    if has_pending:
                         dep_lines.append(
-                            "\n\n📋 *One or more deployments are **pending approval** "
-                            "in the TaskForge dashboard.*"
+                            f"\n📋 *Pending approval — "
+                            f"[Review in Dashboard]({dashboard}/deployments)*"
+                        )
+                    else:
+                        dep_lines.append(
+                            f"\n📋 [Manage Deployments]({dashboard}/deployments)"
                         )
 
                     dep_text = "\n".join(dep_lines)
@@ -805,10 +869,20 @@ async def stream_task_execution(
                 logger.debug("Could not fetch deployments for %s: %s", task_id, exc)
 
             icon = "✅" if status == "completed" else "❌"
+            # Build links for the footer
+            _footer_links = []
+            _wf_id_final = task.get("workflow_id", "")
+            if _wf_id_final:
+                _t_url = f"{settings.TEMPORAL_UI_URL}/namespaces/default/workflows/{_wf_id_final}"
+                _footer_links.append(f"[Temporal]({_t_url})")
+            _dash = settings.DASHBOARD_URL.rstrip("/")
+            _footer_links.append(f"[Dashboard]({_dash}/tasks/{task_id})")
+            _links_str = " · ".join(_footer_links)
+
             yield _sse(
                 completion_id,
                 model,
-                content=f"\n\n{icon} Task **{status}**.",
+                content=f"\n\n{icon} Task **{status}** · {_links_str}",
             )
             # Termination chunk (empty delta + finish_reason)
             yield _sse(completion_id, model, finish_reason="stop")
@@ -846,6 +920,9 @@ async def lifespan(app: FastAPI):
     logger.info("    Control-Plane : %s", settings.CONTROL_PLANE_URL)
     logger.info("    Redis         : %s", settings.REDIS_URL or "(none — in-memory)")
     logger.info("    Default LLM   : %s", settings.DEFAULT_LLM_MODEL)
+    load_profiles()
+    profiles = get_profiles()
+    logger.info("    Agent Profiles: %d loaded", len(profiles))
     yield
     logger.info("🔴  OpenClaw API Gateway shutting down")
 
@@ -892,42 +969,194 @@ async def health():
 
 @app.get("/v1/models", tags=["openai-compat"])
 async def list_models():
-    """Return available model identifiers (OpenAI /v1/models).
+    """Return available Agent Profiles (OpenAI /v1/models compatible).
 
-    Fetches the real LLM model catalogue from the control-plane's
-    ``/api/llm/models`` endpoint so Open WebUI (or any OpenAI-compatible
-    client) shows the actual models the user can choose from —
-    gemini-*, claude-*, gpt-*, ollama models, etc.
+    Instead of exposing raw LLM model names, this endpoint returns
+    **Agent Profiles** — pre-defined combinations of a Base Image
+    (the "body") and a specific LLM (the "brain").
+
+    Each profile includes metadata such as the runtime environment,
+    icon, tags, and strengths so the UI can display rich information
+    about what the user is selecting.
 
     Two "meta-models" are always appended at the end of the list:
 
-    * **taskforge-iterator** — selects the default LLM and runs in
+    * **taskforge-iterator** — selects the default profile and runs in
       multi-turn (iterate) mode.
     * **taskforge-oneshot** — single-shot task execution.
-
-    These are *not* real LLM model names; the gateway recognises them and
-    falls back to ``DEFAULT_LLM_MODEL`` for the actual inference call.
     """
-    cards: list[ModelCard] = []
-    try:
-        models = await cp.get_llm_models()
-        for m in models:
-            mid = m.get("id", "")
-            provider = m.get("provider", "openclaw")
-            if mid:
-                cards.append(ModelCard(id=mid, owned_by=provider))
-    except Exception as exc:
-        logger.warning("Could not fetch models from control-plane: %s", exc)
+    cards: list[AgentProfileCard] = []
 
-    # Always include a fallback entry so the UI has at least one option
+    # ── Load agent profiles from registry ────────────────────────────────
+    profiles = get_profiles()
+    for p in profiles:
+        img_info = get_base_image_info(p.base_image)
+        runtime = p.metadata.runtime or (img_info.runtime if img_info else p.base_image)
+        cards.append(
+            AgentProfileCard(
+                id=p.id,
+                owned_by="openclaw",
+                profile_name=p.name,
+                profile_description=p.description,
+                base_image=p.base_image,
+                llm_model=p.llm_model,
+                runtime=runtime,
+                icon=p.icon,
+                tags=p.tags,
+                strengths=p.metadata.strengths,
+            )
+        )
+
+    # ── Fallback: if no profiles loaded, expose raw LLM models ───────────
     if not cards:
-        cards.append(ModelCard(id=settings.DEFAULT_LLM_MODEL, owned_by="openclaw"))
+        logger.warning("No agent profiles loaded — falling back to raw LLM models")
+        try:
+            models = await cp.get_llm_models()
+            for m in models:
+                mid = m.get("id", "")
+                provider = m.get("provider", "openclaw")
+                if mid:
+                    cards.append(AgentProfileCard(id=mid, owned_by=provider))
+        except Exception as exc:
+            logger.warning("Could not fetch models from control-plane: %s", exc)
+
+    # Always include at least one option
+    if not cards:
+        cards.append(AgentProfileCard(id=settings.DEFAULT_LLM_MODEL, owned_by="openclaw"))
 
     # ── Meta-models (always present) ─────────────────────────────────────
-    cards.append(ModelCard(id="taskforge-iterator", owned_by="openclaw-gateway"))
-    cards.append(ModelCard(id="taskforge-oneshot", owned_by="openclaw-gateway"))
+    cards.append(AgentProfileCard(
+        id="taskforge-iterator",
+        owned_by="openclaw-gateway",
+        profile_name="TaskForge Iterator",
+        profile_description="Multi-turn iterative agent using the default profile.",
+        icon="🔄",
+    ))
+    cards.append(AgentProfileCard(
+        id="taskforge-oneshot",
+        owned_by="openclaw-gateway",
+        profile_name="TaskForge One-Shot",
+        profile_description="Single-shot task execution using the default profile.",
+        icon="🎯",
+    ))
 
     return ModelList(data=cards)
+
+
+@app.get("/v1/agent-profiles", tags=["agent-profiles"])
+async def list_agent_profiles():
+    """Return the full agent profiles registry with all metadata.
+
+    Unlike /v1/models (which is OpenAI-compatible), this endpoint returns
+    the complete profile data including base image details.
+    """
+    profiles = get_profiles()
+    result = []
+    for p in profiles:
+        img_info = get_base_image_info(p.base_image)
+        result.append({
+            "id": p.id,
+            "name": p.name,
+            "description": p.description,
+            "base_image": p.base_image,
+            "llm_model": p.llm_model,
+            "tags": p.tags,
+            "icon": p.icon,
+            "metadata": p.metadata.model_dump(),
+            "image_info": img_info.model_dump() if img_info else None,
+        })
+    return {"profiles": result}
+
+
+@app.get("/v1/agent-profiles/{profile_id}", tags=["agent-profiles"])
+async def get_agent_profile(profile_id: str):
+    """Return a single agent profile by ID."""
+    p = get_profile(profile_id)
+    if not p:
+        raise HTTPException(status_code=404, detail=f"Agent profile '{profile_id}' not found")
+    img_info = get_base_image_info(p.base_image)
+    return {
+        "id": p.id,
+        "name": p.name,
+        "description": p.description,
+        "base_image": p.base_image,
+        "llm_model": p.llm_model,
+        "tags": p.tags,
+        "icon": p.icon,
+        "metadata": p.metadata.model_dump(),
+        "image_info": img_info.model_dump() if img_info else None,
+    }
+
+
+@app.post("/v1/agent-profiles", tags=["agent-profiles"], status_code=201)
+async def create_agent_profile(body: dict):
+    """Create a new agent profile.
+
+    Required fields: ``id``, ``name``, ``base_image``, ``llm_model``.
+    """
+    try:
+        profile = AgentProfile(**body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        created = create_profile(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    img_info = get_base_image_info(created.base_image)
+    return {
+        "id": created.id,
+        "name": created.name,
+        "description": created.description,
+        "base_image": created.base_image,
+        "llm_model": created.llm_model,
+        "tags": created.tags,
+        "icon": created.icon,
+        "metadata": created.metadata.model_dump(),
+        "image_info": img_info.model_dump() if img_info else None,
+    }
+
+
+@app.put("/v1/agent-profiles/{profile_id}", tags=["agent-profiles"])
+async def update_agent_profile(profile_id: str, body: dict):
+    """Update an existing agent profile (partial update)."""
+    try:
+        updated = update_profile(profile_id, body)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Agent profile '{profile_id}' not found")
+
+    img_info = get_base_image_info(updated.base_image)
+    return {
+        "id": updated.id,
+        "name": updated.name,
+        "description": updated.description,
+        "base_image": updated.base_image,
+        "llm_model": updated.llm_model,
+        "tags": updated.tags,
+        "icon": updated.icon,
+        "metadata": updated.metadata.model_dump(),
+        "image_info": img_info.model_dump() if img_info else None,
+    }
+
+
+@app.delete("/v1/agent-profiles/{profile_id}", tags=["agent-profiles"])
+async def delete_agent_profile(profile_id: str):
+    """Delete an agent profile."""
+    try:
+        deleted = delete_profile(profile_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Agent profile '{profile_id}' not found")
+
+    return {"status": "deleted", "id": profile_id}
 
 
 # ---------------------------------------------------------------------------
@@ -1051,8 +1280,18 @@ async def chat_completions(
     # (what the user picked in the UI dropdown)  →  env default.
     # Meta-names like "taskforge-iterator" are not real LLM models;
     # they indicate the gateway *mode*, so we skip them.
+    #
+    # Agent Profile resolution: if the model field matches a profile ID
+    # (e.g. "senior-reviewer"), resolve it to the profile's real LLM model.
     _META_MODELS = {"taskforge-iterator", "taskforge-oneshot"}
-    if body.llm_model:
+    _raw_model = body.llm_model or body.model
+
+    _resolved_profile = get_profile(_raw_model) if _raw_model else None
+    if _resolved_profile:
+        llm_model = _resolved_profile.llm_model
+        logger.info("Agent profile '%s' resolved → llm=%s, image=%s",
+                     _raw_model, llm_model, _resolved_profile.base_image)
+    elif body.llm_model:
         llm_model = body.llm_model
     elif body.model and body.model not in _META_MODELS:
         llm_model = body.model
@@ -1163,6 +1402,8 @@ async def chat_completions(
                 name=task_name[:100],
                 description=description,
                 llm_model=llm_model,
+                base_image=_resolved_profile.base_image if _resolved_profile else None,
+                agent_profile=_resolved_profile.id if _resolved_profile else None,
             )
         except httpx.HTTPStatusError as exc:
             raise HTTPException(

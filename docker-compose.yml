@@ -65,6 +65,9 @@ services:
       - ./openclaw:/openclaw:ro
       - ./agent-images:/agent-images
       - ./workspaces:/workspaces
+      - ./config/supply-chain.yaml:/config/supply-chain.yaml:ro
+    ports:
+      - "8002:8002"
     networks:
       - openclaw-network
     healthcheck:
@@ -89,6 +92,7 @@ services:
       - docker-data:/var/lib/docker
       - ./docker-dind-daemon.json:/etc/docker/daemon.json:ro
       - ./workspaces:/workspaces
+      - ./agent-images:/agent-images:ro
     ports:
       - "9100-9120:9100-9120"
     networks:
@@ -211,6 +215,7 @@ services:
     container_name: openclaw-frontend
     environment:
       - NEXT_PUBLIC_API_URL=${API_URL:-http://localhost:8000}
+      - NEXT_PUBLIC_API_GATEWAY_URL=${API_GATEWAY_URL:-http://localhost:8080}
     depends_on:
       - control-plane
     ports:
@@ -250,8 +255,10 @@ services:
       - LOG_LEVEL=INFO
       - DASHBOARD_URL=http://localhost:3000
       - IMAGE_BUILDER_URL=http://openclaw-image-builder:8002
+      - TEMPORAL_UI_URL=http://localhost:8088
     volumes:
       - ./services/api-gateway:/app          # live-reload during development
+      - ./agent-images:/agent-images          # agent profiles registry (rw for editing)
     depends_on:
       control-plane:
         condition: service_healthy

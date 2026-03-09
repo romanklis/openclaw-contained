@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # build progress to the WebUI user.
     IMAGE_BUILDER_URL: str = "http://openclaw-image-builder:8002"
 
+    # Temporal UI URL — used for generating direct links to workflow runs.
+    # The default assumes the temporal-ui container is exposed on port 8088.
+    TEMPORAL_UI_URL: str = "http://localhost:8088"
+
     LOG_LEVEL: str = "INFO"
 
     class Config:

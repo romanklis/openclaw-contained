@@ -15,6 +15,7 @@ import time
 import json
 import subprocess
 import asyncio
+import yaml
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +29,209 @@ REGISTRY_URL = os.getenv("REGISTRY_URL", "localhost:5000")
 BASE_IMAGE = f"{REGISTRY_URL}/openclaw-agent:openclaw"
 AGENT_IMAGES_DIR = Path(os.getenv("AGENT_IMAGES_DIR", "/app/agent-images"))
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+# =============================================================================
+# Supply-Chain Configuration — loaded once at import / startup
+# =============================================================================
+
+SUPPLY_CHAIN_PATH = Path(os.getenv("SUPPLY_CHAIN_PATH", "/config/supply-chain.yaml"))
+_supply_chain: Dict[str, Any] = {}  # populated by _load_supply_chain()
+_supply_chain_aliases: Dict[str, Dict[str, str]] = {}  # apt_to_apk / apk_to_apt
+
+
+def _load_supply_chain() -> None:
+    """Load (or reload) the supply-chain config from disk.
+
+    Called once at startup and can be called again via the reload endpoint.
+    """
+    global _supply_chain, _supply_chain_aliases
+
+    if not SUPPLY_CHAIN_PATH.exists():
+        logger.warning(f"Supply-chain config not found at {SUPPLY_CHAIN_PATH} — "
+                       "all packages will be ALLOWED (open mode)")
+        _supply_chain = {}
+        _supply_chain_aliases = {}
+        return
+
+    try:
+        raw = yaml.safe_load(SUPPLY_CHAIN_PATH.read_text())
+        _supply_chain_aliases = raw.pop("aliases", {})
+        # Top-level keys are image types (openclaw, nanobot, picoclaw, zeroclaw)
+        _supply_chain = {k: v for k, v in raw.items() if isinstance(v, dict)}
+        image_types = list(_supply_chain.keys())
+        total_entries = sum(
+            len(v.get("pip", []) + v.get("apt", []) + v.get("apk", []) + v.get("npm", []))
+            for v in _supply_chain.values()
+        )
+        logger.info(f"✅ Supply-chain loaded | Image types: {image_types} | "
+                     f"Total allowlist entries: {total_entries} | "
+                     f"Aliases: apt_to_apk={len(_supply_chain_aliases.get('apt_to_apk', {}))}, "
+                     f"apk_to_apt={len(_supply_chain_aliases.get('apk_to_apt', {}))}")
+    except Exception as exc:
+        logger.error(f"Failed to parse supply-chain config: {exc}")
+        _supply_chain = {}
+        _supply_chain_aliases = {}
+
+
+# Load at import time so it's available before any request
+_load_supply_chain()
+
+
+# ---------------------------------------------------------------------------
+# Supply-chain validation helpers
+# ---------------------------------------------------------------------------
+
+class SupplyChainVerdict:
+    """Result of validating a list of capabilities against the supply chain."""
+
+    def __init__(self):
+        self.approved: List[Dict[str, str]] = []   # [{name, type, note}]
+        self.denied: List[Dict[str, str]] = []     # [{name, type, reason}]
+        self.remapped: List[Dict[str, str]] = []   # [{name, original_type, new_type, note}]
+
+    @property
+    def all_approved(self) -> bool:
+        return len(self.denied) == 0
+
+    def summary(self) -> str:
+        parts = []
+        if self.denied:
+            pkg_list = ", ".join(d["name"] for d in self.denied)
+            parts.append(f"DENIED: {pkg_list}")
+        if self.remapped:
+            for r in self.remapped:
+                parts.append(f"REMAPPED: {r['name']} ({r['original_type']}→{r['new_type']})")
+        if self.approved:
+            parts.append(f"APPROVED: {len(self.approved)} packages")
+        return " | ".join(parts) if parts else "no packages"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "all_approved": self.all_approved,
+            "approved": self.approved,
+            "denied": self.denied,
+            "remapped": self.remapped,
+            "summary": self.summary(),
+        }
+
+
+def _resolve_alias(pkg_name: str, from_mgr: str, to_mgr: str) -> str:
+    """Translate a package name between apt ↔ apk using the aliases table."""
+    direction = f"{from_mgr}_to_{to_mgr}"
+    mapping = _supply_chain_aliases.get(direction, {})
+    return mapping.get(pkg_name, pkg_name)
+
+
+def validate_supply_chain(
+    image_type: str,
+    capabilities: list,
+) -> SupplyChainVerdict:
+    """Check each capability against the supply-chain allowlist.
+
+    Returns a SupplyChainVerdict with approved / denied / remapped lists.
+    If no supply-chain config is loaded, everything is approved (open mode).
+    """
+    verdict = SupplyChainVerdict()
+
+    if not _supply_chain:
+        # Open mode — no config → approve everything
+        for cap in capabilities:
+            verdict.approved.append({"name": cap.name, "type": cap.type, "note": "open-mode"})
+        return verdict
+
+    chain = _supply_chain.get(image_type)
+    if chain is None:
+        # Unknown image type — deny all
+        for cap in capabilities:
+            verdict.denied.append({
+                "name": cap.name,
+                "type": cap.type,
+                "reason": f"Unknown image type '{image_type}' — no supply-chain entry",
+            })
+        return verdict
+
+    # Build quick-lookup sets
+    allowed_pip = set(chain.get("pip", []))
+    allowed_apt = set(chain.get("apt", []))
+    allowed_apk = set(chain.get("apk", []))
+    allowed_npm = set(chain.get("npm", []))
+
+    # Determine the native system package manager for this image type
+    is_alpine = image_type in ("nanobot", "picoclaw")
+    native_sys = "apk" if is_alpine else "apt"
+    allowed_sys = allowed_apk if is_alpine else allowed_apt
+
+    for cap in capabilities:
+        name = cap.name.strip()
+        ctype = cap.type
+
+        # --- pip ---
+        if ctype == "pip_package":
+            if not allowed_pip:
+                verdict.denied.append({
+                    "name": name, "type": ctype,
+                    "reason": f"pip packages not available on {image_type}",
+                })
+            elif name.lower() in {p.lower() for p in allowed_pip}:
+                verdict.approved.append({"name": name, "type": ctype, "note": "allowlisted"})
+            else:
+                verdict.denied.append({
+                    "name": name, "type": ctype,
+                    "reason": f"'{name}' not in {image_type} pip allowlist",
+                })
+
+        # --- apt / apk (system) ---
+        elif ctype in ("apt_package", "apk_package"):
+            # Translate across distros if needed
+            effective_name = name
+            if ctype == "apt_package" and is_alpine:
+                effective_name = _resolve_alias(name, "apt", "apk")
+                if effective_name != name:
+                    verdict.remapped.append({
+                        "name": name, "original_type": "apt_package",
+                        "new_type": "apk_package", "note": f"→ {effective_name}",
+                    })
+            elif ctype == "apk_package" and not is_alpine:
+                effective_name = _resolve_alias(name, "apk", "apt")
+                if effective_name != name:
+                    verdict.remapped.append({
+                        "name": name, "original_type": "apk_package",
+                        "new_type": "apt_package", "note": f"→ {effective_name}",
+                    })
+
+            if effective_name.lower() in {p.lower() for p in allowed_sys}:
+                verdict.approved.append({
+                    "name": effective_name, "type": native_sys + "_package",
+                    "note": "allowlisted",
+                })
+            else:
+                verdict.denied.append({
+                    "name": name, "type": ctype,
+                    "reason": f"'{effective_name}' not in {image_type} {native_sys} allowlist",
+                })
+
+        # --- npm ---
+        elif ctype == "npm_package":
+            if not allowed_npm:
+                verdict.denied.append({
+                    "name": name, "type": ctype,
+                    "reason": f"npm packages not available on {image_type}",
+                })
+            elif name.lower() in {p.lower() for p in allowed_npm}:
+                verdict.approved.append({"name": name, "type": ctype, "note": "allowlisted"})
+            else:
+                verdict.denied.append({
+                    "name": name, "type": ctype,
+                    "reason": f"'{name}' not in {image_type} npm allowlist",
+                })
+
+        # --- tool / other ---
+        else:
+            # Tools are not supply-chain managed (yet); approve
+            verdict.approved.append({"name": name, "type": ctype, "note": "not-managed"})
+
+    logger.info(f"🔐 Supply-chain verdict for {image_type}: {verdict.summary()}")
+    return verdict
 
 
 # =============================================================================
@@ -55,6 +259,8 @@ class BuildResponse(BaseModel):
     image_tag: str
     status: str
     log_url: Optional[str] = None
+    supply_chain_denied: Optional[List[Dict[str, str]]] = None
+    supply_chain_feedback: Optional[str] = None
 
 
 class BuildStatus(BaseModel):
@@ -80,6 +286,13 @@ class DeploymentBuildRequest(BaseModel):
 # Dockerfile Generation
 # =============================================================================
 
+# Per-image-type install strategies
+# ─────────────────────────────────
+#  openclaw  : Debian + /opt/venv/bin/pip + npm + apt-get
+#  nanobot   : Alpine + /usr/local/bin/pip + apk (no npm)
+#  picoclaw  : Alpine + apk only (no Python, no npm)
+#  zeroclaw  : Debian + /usr/bin/pip3 --break-system-packages + apt-get (no npm)
+
 DOCKERFILE_TEMPLATE = """
 FROM {{ base_image }}
 
@@ -87,32 +300,70 @@ FROM {{ base_image }}
 LABEL task_id="{{ task_id }}"
 LABEL build_id="{{ build_id }}"
 LABEL capabilities="{{ capabilities }}"
+LABEL image_type="{{ image_type }}"
 
-{% if apt_packages %}
-# Install APT packages
+{% if system_packages %}
+# Install system packages ({{ pkg_manager }})
 USER root
+{% if pkg_manager == 'apk' %}
+RUN apk add --no-cache \\
+{% for pkg in system_packages %}
+    {{ pkg }}{{ ' \\\\' if not loop.last else '' }}
+{% endfor %}
+{% else %}
 RUN apt-get update && apt-get install -y \\
-{% for pkg in apt_packages %}
+{% for pkg in system_packages %}
     {{ pkg }} \\
 {% endfor %}
     && rm -rf /var/lib/apt/lists/*
 {% endif %}
+{% endif %}
 
 {% if pip_packages %}
-# Install Python packages into both venv and system python
-# Use absolute paths to ensure we install into BOTH interpreters
+{% if image_type == 'picoclaw' %}
+# ⚠ PicoClaw has no Python — cannot install pip packages
+# Requested: {{ pip_packages | join(', ') }}
+RUN echo "ERROR: pip packages requested but PicoClaw has no Python runtime" >&2 && exit 1
+{% elif image_type == 'openclaw' %}
+# Install Python packages into venv (OpenClaw)
 USER root
-RUN /opt/venv/bin/pip install --no-cache-dir {{ pip_packages | join(' ') }} ; /usr/bin/pip3 install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }} || /usr/bin/pip3 install --no-cache-dir {{ pip_packages | join(' ') }} || true
+RUN /opt/venv/bin/pip install --no-cache-dir {{ pip_packages | join(' ') }}
+{% elif image_type == 'nanobot' %}
+# Install Python packages (NanoBot — Alpine Python)
+USER root
+RUN pip install --no-cache-dir {{ pip_packages | join(' ') }}
+{% elif image_type == 'zeroclaw' %}
+# Install Python packages (ZeroClaw — Debian system Python)
+USER root
+RUN pip3 install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
+{% else %}
+# Install Python packages (generic — auto-detect pip)
+USER root
+RUN set -e; \\
+    PIP=""; \\
+    for p in /opt/venv/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip /usr/bin/pip3; do \\
+        if [ -x "$p" ]; then PIP="$p"; break; fi; \\
+    done; \\
+    if [ -z "$PIP" ]; then echo "ERROR: no pip found" >&2; exit 1; fi; \\
+    echo "Using pip: $PIP"; \\
+    $PIP install --no-cache-dir {{ pip_packages | join(' ') }} || \\
+    $PIP install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
+{% endif %}
 {% endif %}
 
 {% if npm_packages %}
-# Install NPM packages globally
+{% if image_type == 'openclaw' %}
+# Install NPM packages globally (OpenClaw only)
 USER root
 RUN npm install -g \\
 {% for pkg in npm_packages %}
     {{ pkg }} \\
 {% endfor %}
     && npm list -g --depth=0
+{% else %}
+# ⚠ npm packages requested but {{ image_type }} has no Node.js
+RUN echo "WARNING: npm packages not available on {{ image_type }}" >&2
+{% endif %}
 {% endif %}
 
 {% if tools %}
@@ -126,8 +377,51 @@ RUN chmod +x /usr/local/bin/{{ tool }}
 WORKDIR /workspace
 
 # Verify installation
-RUN echo "Image built successfully for task {{ task_id }}"
+RUN echo "Image built successfully for task {{ task_id }} ({{ image_type }})"
 """
+
+
+def _detect_image_type(base_image: str) -> str:
+    """Detect the image type from a base image tag.
+
+    Strategy (in order):
+      1. Direct tag match: openclaw-agent:nanobot → nanobot
+      2. Docker image labels: org.openclaw.image.type
+      3. Docker image env vars: OPENCLAW_IMAGE_TYPE=...
+      4. Fallback: 'openclaw'
+    """
+    KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
+    tag = base_image.rsplit(":", 1)[-1] if ":" in base_image else ""
+
+    # 1. Direct base image tags
+    if tag in KNOWN_TYPES:
+        return tag
+
+    # 2 & 3. Inspect the image via Docker SDK
+    try:
+        image = docker_client.images.get(base_image)
+        # Check labels
+        labels = image.labels or {}
+        label_type = labels.get("image_type") or labels.get("org.openclaw.image.type", "")
+        if label_type in KNOWN_TYPES:
+            return label_type
+        # Map base-agent label to openclaw
+        if label_type == "base-agent":
+            return "openclaw"
+
+        # Check env vars
+        env_list = image.attrs.get("Config", {}).get("Env", []) or []
+        for entry in env_list:
+            if entry.startswith("OPENCLAW_IMAGE_TYPE="):
+                val = entry.split("=", 1)[1].strip()
+                if val in KNOWN_TYPES:
+                    return val
+    except Exception as e:
+        logger.warning(f"   └─ Could not inspect image {base_image}: {e}")
+
+    # 4. Fallback
+    logger.warning(f"   └─ Falling back to 'openclaw' for image {base_image}")
+    return "openclaw"
 
 
 def generate_dockerfile(
@@ -136,8 +430,14 @@ def generate_dockerfile(
     base_image: str,
     capabilities: List[BuildCapability]
 ) -> str:
-    """Generate Dockerfile from capabilities"""
-    
+    """Generate Dockerfile from capabilities, tailored to the base image type."""
+
+    image_type = _detect_image_type(base_image)
+    logger.info(f"   └─ Detected image type: {image_type}")
+
+    # Choose the right system package manager
+    pkg_manager = "apk" if image_type in ("nanobot", "picoclaw") else "apt"
+
     apt_packages = []
     pip_packages = []
     npm_packages = []
@@ -162,8 +462,10 @@ def generate_dockerfile(
         base_image=base_image,
         task_id=task_id,
         build_id=build_id,
+        image_type=image_type,
+        pkg_manager=pkg_manager,
         capabilities=",".join([f"{c.type}:{c.name}" for c in capabilities]),
-        apt_packages=apt_packages,
+        system_packages=apt_packages,
         pip_packages=pip_packages,
         npm_packages=npm_packages,
         tools=tools
@@ -172,17 +474,146 @@ def generate_dockerfile(
     return dockerfile
 
 
+# =============================================================================
+# Import scanning — auto-detect third-party packages from app source files
+# =============================================================================
+
+# Standard library modules (Python 3.11) — imports of these do NOT need pip
+_STDLIB_MODULES = {
+    "abc", "aifc", "argparse", "array", "ast", "asynchat", "asyncio",
+    "asyncore", "atexit", "audioop", "base64", "bdb", "binascii",
+    "binhex", "bisect", "builtins", "bz2", "calendar", "cgi", "cgitb",
+    "chunk", "cmath", "cmd", "code", "codecs", "codeop", "collections",
+    "colorsys", "compileall", "concurrent", "configparser", "contextlib",
+    "contextvars", "copy", "copyreg", "cProfile", "crypt", "csv",
+    "ctypes", "curses", "dataclasses", "datetime", "dbm", "decimal",
+    "difflib", "dis", "distutils", "doctest", "email", "encodings",
+    "enum", "errno", "faulthandler", "fcntl", "filecmp", "fileinput",
+    "fnmatch", "fractions", "ftplib", "functools", "gc", "getopt",
+    "getpass", "gettext", "glob", "graphlib", "grp", "gzip", "hashlib",
+    "heapq", "hmac", "html", "http", "idlelib", "imaplib", "imghdr",
+    "imp", "importlib", "inspect", "io", "ipaddress", "itertools",
+    "json", "keyword", "lib2to3", "linecache", "locale", "logging",
+    "lzma", "mailbox", "mailcap", "marshal", "math", "mimetypes",
+    "mmap", "modulefinder", "multiprocessing", "netrc", "nis", "nntplib",
+    "numbers", "operator", "optparse", "os", "ossaudiodev", "pathlib",
+    "pdb", "pickle", "pickletools", "pipes", "pkgutil", "platform",
+    "plistlib", "poplib", "posix", "posixpath", "pprint", "profile",
+    "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc",
+    "queue", "quopri", "random", "re", "readline", "reprlib",
+    "resource", "rlcompleter", "runpy", "sched", "secrets", "select",
+    "selectors", "shelve", "shlex", "shutil", "signal", "site",
+    "smtpd", "smtplib", "sndhdr", "socket", "socketserver", "spwd",
+    "sqlite3", "sre_compile", "sre_constants", "sre_parse", "ssl",
+    "stat", "statistics", "string", "stringprep", "struct", "subprocess",
+    "sunau", "symtable", "sys", "sysconfig", "syslog", "tabnanny",
+    "tarfile", "telnetlib", "tempfile", "termios", "test", "textwrap",
+    "threading", "time", "timeit", "tkinter", "token", "tokenize",
+    "tomllib", "trace", "traceback", "tracemalloc", "tty", "turtle",
+    "turtledemo", "types", "typing", "unicodedata", "unittest", "urllib",
+    "uu", "uuid", "venv", "warnings", "wave", "weakref", "webbrowser",
+    "winreg", "winsound", "wsgiref", "xdrlib", "xml", "xmlrpc",
+    "zipapp", "zipfile", "zipimport", "zlib",
+    # Also underscore-prefixed internal modules
+    "_thread", "__future__", "_abc", "_collections_abc",
+}
+
+# Map of import names that differ from pip package names
+_IMPORT_TO_PIP = {
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "dateutil": "python-dateutil",
+    "dotenv": "python-dotenv",
+    "gi": "PyGObject",
+    "google": "google-api-python-client",
+    "jose": "python-jose",
+    "lxml": "lxml",
+    "magic": "python-magic",
+    "PIL": "Pillow",
+    "serial": "pyserial",
+    "skimage": "scikit-image",
+    "sklearn": "scikit-learn",
+    "usb": "pyusb",
+    "yaml": "pyyaml",
+    "attr": "attrs",
+    "wx": "wxPython",
+}
+
+
+def _scan_imports_for_pip_packages(app_dir: Path) -> List[str]:
+    """Scan Python files in *app_dir* for import statements and return a list
+    of pip package names for any third-party modules detected.
+
+    Uses simple regex-based parsing (no AST) so it works even on files with
+    syntax errors.  Only top-level module names are considered.
+    """
+    import_re = re.compile(
+        r'^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)'
+    )
+
+    top_level_imports: set[str] = set()
+
+    for py_file in app_dir.rglob("*.py"):
+        try:
+            text = py_file.read_text(errors="replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            m = import_re.match(line)
+            if m:
+                top_level_imports.add(m.group(1))
+
+    # Determine which are relative (local) — any module name that corresponds
+    # to a file/dir inside app_dir is local, not third-party.
+    local_modules: set[str] = set()
+    for item in app_dir.iterdir():
+        if item.is_dir() and (item / "__init__.py").exists():
+            local_modules.add(item.name)
+        elif item.suffix == ".py":
+            local_modules.add(item.stem)
+
+    third_party = top_level_imports - _STDLIB_MODULES - local_modules
+
+    # Map import names → pip package names
+    pip_packages: list[str] = []
+    for mod in sorted(third_party):
+        pip_name = _IMPORT_TO_PIP.get(mod, mod)
+        pip_packages.append(pip_name)
+
+    return pip_packages
+
+
+# Per-image-type deployment base images
+# picoclaw/nanobot are Alpine-based; zeroclaw/openclaw are Debian-based
+_DEPLOYMENT_BASE_IMAGES = {
+    "picoclaw": "alpine:3.19",
+    "nanobot":  "python:3.11-alpine",
+    "zeroclaw": "python:3.11-slim",
+    "openclaw": "python:3.11-slim",
+}
+
+# System packages to always include for shell-based deployments (picoclaw)
+_PICOCLAW_DEPLOY_PACKAGES = ["bash", "coreutils", "curl", "jq"]
+
 # Deployment image Dockerfile template (minimal — no OpenClaw)
 DEPLOYMENT_DOCKERFILE_TEMPLATE = """
-FROM python:3.11-slim
+FROM {{ base_image }}
 
 LABEL deployment_id="{{ deployment_id }}"
 LABEL task_id="{{ task_id }}"
 
 WORKDIR /app
 
+{% if apk_packages %}
+# Install system packages (Alpine)
+RUN apk add --no-cache \\
+{% for pkg in apk_packages %}
+    {{ pkg }}{{ ' \\\\' if not loop.last else '' }}
+{% endfor %}
+
+{% endif %}
 {% if apt_packages %}
-# Install system packages
+# Install system packages (Debian)
 RUN apt-get update && apt-get install -y \\
 {% for pkg in apt_packages %}
     {{ pkg }} \\
@@ -215,10 +646,30 @@ def generate_deployment_dockerfile(
     task_id: str,
     entrypoint: str,
     port: int,
+    image_type: str = "openclaw",
     pip_packages: Optional[List[str]] = None,
     apt_packages: Optional[List[str]] = None,
 ) -> str:
-    """Generate a minimal Dockerfile for a deployment (no OpenClaw)."""
+    """Generate a minimal Dockerfile for a deployment (no OpenClaw).
+
+    The base image and system package manager are chosen based on *image_type*
+    so that shell-only agents (picoclaw) get an Alpine base with the right
+    tools, while Python-based agents get python:3.11-slim.
+    """
+    base_image = _DEPLOYMENT_BASE_IMAGES.get(image_type, "python:3.11-slim")
+    is_alpine = "alpine" in base_image
+
+    # For picoclaw deployments, ensure essential shell tools are present
+    apk_packages: List[str] = []
+    if is_alpine:
+        apk_packages = list(_PICOCLAW_DEPLOY_PACKAGES) if image_type == "picoclaw" else []
+        # Move any apt_packages to apk equivalents
+        if apt_packages:
+            for pkg in apt_packages:
+                if pkg not in apk_packages:
+                    apk_packages.append(pkg)
+            apt_packages = []  # clear — we use apk on Alpine
+
     # Rewrite /workspace/ paths to /app/ since deployment copies files to /app/
     entrypoint = entrypoint.replace("/workspace/", "/app/")
     entrypoint = entrypoint.replace("/workspace", "/app")
@@ -243,12 +694,14 @@ def generate_deployment_dockerfile(
 
     template = Template(DEPLOYMENT_DOCKERFILE_TEMPLATE)
     return template.render(
+        base_image=base_image,
         deployment_id=deployment_id,
         task_id=task_id,
         port=port,
         entrypoint_cmd=entrypoint_cmd,
         pip_packages=pip_packages or [],
         apt_packages=apt_packages or [],
+        apk_packages=apk_packages,
     )
 
 
@@ -675,12 +1128,62 @@ async def build_image(
     
     logger.info(f"Expanded {len(request.capabilities)} capability entries → {len(expanded_capabilities)} individual packages")
     
-    # Generate Dockerfile
+    # ── Supply-chain validation ──────────────────────────────────────────
+    image_type = _detect_image_type(request.base_image)
+    verdict = validate_supply_chain(image_type, expanded_capabilities)
+
+    supply_chain_denied = verdict.denied if verdict.denied else None
+    supply_chain_feedback = ""
+
+    if verdict.denied:
+        denied_names = [d["name"] for d in verdict.denied]
+        reasons = [f"  • {d['name']}: {d['reason']}" for d in verdict.denied]
+        supply_chain_feedback = (
+            "SUPPLY_CHAIN_DENIED — the following packages are NOT available "
+            f"in the {image_type} supply chain and will NOT be installed:\n"
+            + "\n".join(reasons)
+            + "\nYou must find an alternative approach. Do NOT request these packages again."
+        )
+        logger.warning(f"🚫 Supply-chain denied {len(verdict.denied)} packages: {denied_names}")
+
+        # Filter out denied capabilities — only build with approved ones
+        denied_set = {(d["name"], d["type"]) for d in verdict.denied}
+        approved_capabilities = [
+            cap for cap in expanded_capabilities
+            if (cap.name, cap.type) not in denied_set
+        ]
+        logger.info(f"   └─ Building with {len(approved_capabilities)} approved packages "
+                     f"(stripped {len(verdict.denied)} denied)")
+    else:
+        approved_capabilities = expanded_capabilities
+
+    # If ALL capabilities were denied, skip the build entirely and
+    # return immediately with the feedback message.
+    if not approved_capabilities and expanded_capabilities:
+        build_id_skip = str(uuid.uuid4())[:8]
+        logger.warning(f"🚫 All capabilities denied — skipping build entirely for {request.task_id}")
+        builds[build_id_skip] = BuildStatus(
+            build_id=build_id_skip,
+            status="denied",
+            image_tag=None,
+            error=supply_chain_feedback,
+        )
+        return BuildResponse(
+            build_id=build_id_skip,
+            task_id=request.task_id,
+            image_tag=request.base_image.replace("registry:5000/", f"{REGISTRY_URL}/"),
+            status="denied",
+            log_url=f"/builds/{build_id_skip}/logs",
+            supply_chain_denied=supply_chain_denied,
+            supply_chain_feedback=supply_chain_feedback,
+        )
+
+    # Generate Dockerfile (with approved capabilities only)
     dockerfile = generate_dockerfile(
         request.task_id,
         build_id,
         request.base_image,
-        expanded_capabilities
+        approved_capabilities
     )
     
     # Create build record
@@ -704,7 +1207,9 @@ async def build_image(
         task_id=request.task_id,
         image_tag=image_tag,
         status="pending",
-        log_url=f"/builds/{build_id}/logs"
+        log_url=f"/builds/{build_id}/logs",
+        supply_chain_denied=supply_chain_denied,
+        supply_chain_feedback=supply_chain_feedback if supply_chain_feedback else None,
     )
 
 
@@ -773,13 +1278,60 @@ async def build_deployment_image(
                 if not pkg.startswith("-") and pkg not in pip_packages:
                     pip_packages.append(pkg)
     
-    logger.info(f"Deployment packages — pip: {pip_packages}, apt: {apt_packages}")
+    logger.info(f"Deployment packages from capabilities — pip: {pip_packages}, apt: {apt_packages}")
+
+    # ---- Detect image type from the task's current_image / agent_profile ----
+    image_type = "openclaw"  # default
+    workspace_path = Path("/workspaces")
+    _ws_path = None
+    try:
+        control_plane_url_env = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+        import httpx as _httpx_sync
+        with _httpx_sync.Client(timeout=10.0) as _client:
+            _resp = _client.get(f"{control_plane_url_env}/api/tasks/{request.task_id}")
+            if _resp.status_code == 200:
+                _task_data = _resp.json()
+                _ws_id = _task_data.get("workspace_id", "")
+                _ws_path = workspace_path / _ws_id if _ws_id else None
+
+                # Detect image type from current_image tag or agent_profile
+                _cur_img = _task_data.get("current_image", "")
+                _tag = _cur_img.rsplit(":", 1)[-1] if ":" in _cur_img else ""
+                KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
+                if _tag in KNOWN_TYPES:
+                    image_type = _tag
+                else:
+                    # Try from Dockerfile labels in task image dir
+                    _detected = _detect_image_type(_cur_img) if _cur_img else "openclaw"
+                    if _detected in KNOWN_TYPES:
+                        image_type = _detected
+    except Exception as _det_err:
+        logger.warning(f"Image type detection failed (non-fatal): {_det_err}")
+
+    logger.info(f"Detected image type for deployment: {image_type}")
+
+    # ---- Also scan app source files for third-party imports ----
+    # This catches packages that were pre-installed in the agent base image
+    # (e.g. `requests` in ZeroClaw) but never explicitly requested as a capability.
+    if image_type != "picoclaw":  # picoclaw has no Python
+        try:
+            if _ws_path and _ws_path.exists():
+                scanned = _scan_imports_for_pip_packages(_ws_path)
+                for pkg in scanned:
+                    if pkg.lower() not in {p.lower() for p in pip_packages}:
+                        pip_packages.append(pkg)
+                logger.info(f"Import scan found additional packages: {scanned}")
+        except Exception as _scan_err:
+            logger.warning(f"Import scanning failed (non-fatal): {_scan_err}")
+
+    logger.info(f"Final deployment packages — pip: {pip_packages}, apt: {apt_packages}")
 
     dockerfile = generate_deployment_dockerfile(
         deployment_id=request.deployment_id,
         task_id=request.task_id,
         entrypoint=request.entrypoint,
         port=request.port,
+        image_type=image_type,
         pip_packages=pip_packages if pip_packages else None,
         apt_packages=apt_packages if apt_packages else None,
     )
@@ -1043,5 +1595,99 @@ async def health():
     return {
         "status": "healthy" if docker_connected else "unhealthy",
         "service": "image-builder",
-        "docker_connected": docker_connected
+        "docker_connected": docker_connected,
+        "supply_chain_loaded": bool(_supply_chain),
+    }
+
+
+# =============================================================================
+# Supply-Chain API Endpoints
+# =============================================================================
+
+class SupplyChainCheckRequest(BaseModel):
+    """Pre-flight check: will these capabilities pass the supply chain?"""
+    image_type: str  # openclaw, nanobot, picoclaw, zeroclaw
+    capabilities: List[BuildCapability]
+
+
+class SupplyChainCheckResponse(BaseModel):
+    """Result of a supply-chain check."""
+    image_type: str
+    all_approved: bool
+    approved: List[Dict[str, str]]
+    denied: List[Dict[str, str]]
+    remapped: List[Dict[str, str]]
+    summary: str
+    feedback_message: str  # human-readable message suitable for injecting into agent context
+
+
+@app.post("/supply-chain/check", response_model=SupplyChainCheckResponse)
+async def check_supply_chain(request: SupplyChainCheckRequest):
+    """Pre-flight supply-chain validation.
+
+    Callers (typically the temporal-worker) can check whether a set of
+    capabilities would be approved BEFORE triggering a full image build.
+    The response includes a ``feedback_message`` suitable for injecting
+    into the agent's context so it can adapt.
+    """
+    verdict = validate_supply_chain(request.image_type, request.capabilities)
+
+    feedback_parts = []
+    if verdict.denied:
+        for d in verdict.denied:
+            feedback_parts.append(
+                f"CAPABILITY_DENIED: {d['name']} ({d['type']}) — {d['reason']}"
+            )
+        feedback_parts.append(
+            "You must find an alternative approach that does not require the denied packages. "
+            "Do NOT request them again."
+        )
+    if verdict.remapped:
+        for r in verdict.remapped:
+            feedback_parts.append(
+                f"CAPABILITY_REMAPPED: {r['name']} → {r['note']} (auto-translated for this platform)"
+            )
+
+    feedback_message = "\n".join(feedback_parts) if feedback_parts else ""
+
+    return SupplyChainCheckResponse(
+        image_type=request.image_type,
+        all_approved=verdict.all_approved,
+        approved=verdict.approved,
+        denied=verdict.denied,
+        remapped=verdict.remapped,
+        summary=verdict.summary(),
+        feedback_message=feedback_message,
+    )
+
+
+@app.get("/supply-chain/config")
+async def get_supply_chain_config():
+    """Return the current supply-chain configuration (for audit UI)."""
+    return {
+        "loaded": bool(_supply_chain),
+        "path": str(SUPPLY_CHAIN_PATH),
+        "image_types": {
+            itype: {
+                "pip": len(cfg.get("pip", [])),
+                "apt": len(cfg.get("apt", [])),
+                "apk": len(cfg.get("apk", [])),
+                "npm": len(cfg.get("npm", [])),
+                "notes": cfg.get("notes", ""),
+            }
+            for itype, cfg in _supply_chain.items()
+        },
+        "aliases": _supply_chain_aliases,
+        "raw": _supply_chain,
+    }
+
+
+@app.post("/supply-chain/reload")
+async def reload_supply_chain():
+    """Hot-reload the supply-chain config from disk without restarting."""
+    _load_supply_chain()
+    return {
+        "status": "reloaded",
+        "image_types": list(_supply_chain.keys()),
+        "loaded": bool(_supply_chain),
     }

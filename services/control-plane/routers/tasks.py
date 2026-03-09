@@ -30,6 +30,7 @@ async def create_task(
     # Resolve aliased fields
     description = task_data.effective_description
     llm_model = task_data.effective_model
+    base_image_tag = task_data.effective_base_image_tag
 
     # Create task first (without policy reference)
     task = Task(
@@ -40,6 +41,8 @@ async def create_task(
         status=TaskStatus.CREATED,
         current_policy_id=None,
         llm_model=llm_model,
+        current_image=base_image_tag,
+        agent_profile=task_data.agent_profile,
     )
     
     db.add(task)
@@ -74,7 +77,7 @@ async def create_task(
 
     # Auto-start the workflow
     try:
-        workflow_id = await start_task_workflow(task_id, llm_model)
+        workflow_id = await start_task_workflow(task_id, llm_model, base_image_tag)
         task.status = TaskStatus.RUNNING
         task.workflow_id = workflow_id
         task.started_at = datetime.utcnow()
@@ -332,6 +335,42 @@ async def complete_task(
     await db.commit()
     
     return {"task_id": task_id, "status": "completed"}
+
+
+@router.patch("/{task_id}/image")
+async def update_task_image(
+    task_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update the current image for a task after a capability build.
+
+    Called by the temporal-worker after successfully building a new image
+    with additional packages.  This ensures continuation workflows pick
+    up the rebuilt image (with packages) instead of the bare base image.
+    """
+    result = await db.execute(
+        select(Task).where(Task.id == task_id)
+    )
+    task = result.scalar_one_or_none()
+
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found"
+        )
+
+    new_image = body.get("current_image", "")
+    if not new_image:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="current_image is required"
+        )
+
+    task.current_image = new_image
+    await db.commit()
+
+    return {"task_id": task_id, "current_image": new_image}
 
 
 @router.post("/{task_id}/fail")
