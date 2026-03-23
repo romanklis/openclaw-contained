@@ -48,6 +48,8 @@ aliases:
     wkhtmltopdf: wkhtmltopdf
     chromium-browser: chromium
     chromium: chromium
+    libgdal-dev: gdal-dev
+    gdal-bin: gdal
     imagemagick: imagemagick
     graphviz: graphviz
     tesseract-ocr: tesseract-ocr
@@ -75,6 +77,8 @@ aliases:
     mariadb-dev: default-libmysqlclient-dev
     bind-tools: dnsutils
     iputils: iputils-ping
+    gdal-dev: libgdal-dev
+    gdal: gdal-bin
     sqlite: sqlite3
 
 # ---------------------------------------------------------------------------
@@ -144,6 +148,11 @@ openclaw:
     # ML (lightweight)
     - scikit-learn
     - joblib
+    # Geospatial
+    - rasterio
+    - rio-cogeo
+    # CORS
+    - flask-cors
     # Misc
     - celery
     - boto3
@@ -177,6 +186,8 @@ openclaw:
     - libpng-dev
     - zlib1g-dev
     - libpq-dev
+    - libgdal-dev
+    - gdal-bin
     - default-libmysqlclient-dev
     - curl
     - wget
@@ -196,6 +207,16 @@ openclaw:
     - tailwindcss
     - postcss
     - autoprefixer
+    # Frontend frameworks
+    - react
+    - react-dom
+    # Mapping / geospatial
+    - leaflet
+    - react-leaflet
+    - georaster
+    - georaster-layer-for-leaflet
+    # Charts
+    - recharts
 
 # ---------------------------------------------------------------------------
 # nanobot — Lightweight Alpine + Python
@@ -234,6 +255,11 @@ nanobot:
     - pandas
     - numpy
     - matplotlib
+    - rasterio
+    - rio-cogeo
+    - flask-cors
+    - scikit-learn
+    - joblib
 
   apk:
     - bash
@@ -253,6 +279,8 @@ nanobot:
     - libpng-dev
     - zlib-dev
     - libpq-dev
+    - gdal
+    - gdal-dev
     - sqlite
     - redis
     - imagemagick
@@ -356,6 +384,11 @@ zeroclaw:
     - pytest
     - maturin
     - pyo3
+    # Geospatial
+    - rasterio
+    - rio-cogeo
+    # CORS
+    - flask-cors
 
   apt:
     - redis-server
@@ -363,6 +396,8 @@ zeroclaw:
     - postgresql-client
     - sqlite3
     - libsqlite3-dev
+    - nodejs
+    - npm
     - nginx
     - ffmpeg
     - imagemagick
@@ -384,6 +419,8 @@ zeroclaw:
     - libpng-dev
     - zlib1g-dev
     - libpq-dev
+    - libgdal-dev
+    - gdal-bin
     - default-libmysqlclient-dev
     - curl
     - wget
@@ -392,4 +429,25 @@ zeroclaw:
     - zip
     - unzip
 
-  npm: []
+  npm:
+    - express
+    - typescript
+    - ts-node
+    - prettier
+    - eslint
+    - webpack
+    - vite
+    - tailwindcss
+    - postcss
+    - autoprefixer
+    # Frontend frameworks
+    - react
+    - react-dom
+    # Mapping / geospatial
+    - leaflet
+    - react-leaflet
+    - georaster
+    - georaster-layer-for-leaflet
+    # Charts
+    - recharts
+

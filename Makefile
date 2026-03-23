@@ -78,7 +78,7 @@ build-base: ## Force rebuild the base agent image (openclaw-agent:openclaw)
 	@echo "Triggering base agent image rebuild via image-builder..."
 	@curl -sf http://localhost:8000/health > /dev/null 2>&1 || \
 		{ echo "❌ Services must be running first. Run: make up"; exit 1; }
-	docker-compose exec image-builder python -c "import httpx; r = httpx.post('http://localhost:8002/api/build', json={'task_id': '_base_rebuild', 'base_image': 'python:3.11-slim', 'capabilities': {'pip_packages': []}}, timeout=300); print(r.json())"
+	docker-compose exec image-builder python -c "import httpx; r = httpx.post('http://localhost:8002/build', json={'task_id': '_base_rebuild', 'base_image': 'python:3.11-slim', 'capabilities': {'pip_packages': []}}, timeout=300); print(r.json())"
 	@echo ""
 	@echo "  Base image rebuild triggered. Watch logs:"
 	@echo "    make logs-service SERVICE=image-builder"
