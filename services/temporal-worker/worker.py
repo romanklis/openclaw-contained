@@ -221,15 +221,30 @@ class AgentTaskWorkflow:
             if result.get("deployment_requested"):
                 deployment = result.get("deployment", {})
                 logger.info(f"🚀 DEPLOYMENT_REQUEST | Task: {task_id} | Name: {deployment.get('name')} | Port: {deployment.get('port')}")
-                
-                # Create deployment record via control plane
-                deploy_result = await workflow.execute_activity(
-                    create_deployment,
-                    args=[task_id, deployment],
-                    start_to_close_timeout=timedelta(seconds=30)
+
+                # If this task is part of a Task Force, check if the role
+                # is allowed to deploy (only the lead / developer can deploy).
+                should_deploy = True
+                tf_role_info = await workflow.execute_activity(
+                    check_task_force_deploy_role,
+                    args=[task_id],
+                    start_to_close_timeout=timedelta(seconds=15),
                 )
-                
-                logger.info(f"📦 Deployment created: {deploy_result.get('id')}")
+                if tf_role_info.get("is_task_force") and not tf_role_info.get("can_deploy"):
+                    logger.info(
+                        f"🚫 DEPLOY_SUPPRESSED | {task_id} role={tf_role_info.get('role')} "
+                        f"— deployment handled by {tf_role_info.get('lead_role')} only"
+                    )
+                    should_deploy = False
+
+                if should_deploy:
+                    # Create deployment record via control plane
+                    deploy_result = await workflow.execute_activity(
+                        create_deployment,
+                        args=[task_id, deployment],
+                        start_to_close_timeout=timedelta(seconds=30)
+                    )
+                    logger.info(f"📦 Deployment created: {deploy_result.get('id')}")
                 break
             
             # Check if task complete
@@ -1258,6 +1273,49 @@ async def create_deployment(task_id: str, deployment: Dict[str, Any]) -> Dict[st
 
 
 @activity.defn
+async def check_task_force_deploy_role(task_id: str) -> Dict[str, Any]:
+    """Check whether a TF member task's role is allowed to deploy.
+
+    Only the 'lead' role (Developer, Lead, Architect, etc.) can deploy.
+    Support roles (Tester, Reviewer, QA, etc.) are suppressed.
+    Returns {is_task_force, can_deploy, role, lead_role}.
+    """
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
+        if resp.status_code != 200:
+            return {"is_task_force": False, "can_deploy": True}
+
+        task_data = resp.json()
+        tf_id = task_data.get("task_force_id")
+        if not tf_id:
+            return {"is_task_force": False, "can_deploy": True}
+
+        role = (task_data.get("task_force_role") or "").lower()
+        support_roles = {"tester", "reviewer", "qa", "auditor", "validator"}
+
+        # Find the lead role from the task force
+        tf_resp = await client.get(f"{control_plane_url}/api/task-forces/{tf_id}")
+        lead_role = "Developer"
+        if tf_resp.status_code == 200:
+            tf_data = tf_resp.json()
+            lead_roles_set = {"developer", "lead", "architect", "engineer", "implementer"}
+            for m in tf_data.get("members", []):
+                if (m.get("role") or "").lower() in lead_roles_set:
+                    lead_role = m["role"]
+                    break
+
+        return {
+            "is_task_force": True,
+            "can_deploy": role not in support_roles,
+            "role": task_data.get("task_force_role", ""),
+            "lead_role": lead_role,
+        }
+
+
+@activity.defn
 async def build_deployment_image(deployment_id: str) -> Dict[str, Any]:
     """Build a minimal deployment image (no OpenClaw, just app + deps)."""
     import httpx
@@ -1489,6 +1547,1157 @@ async def stop_deployment_container(deployment_id: str) -> Dict[str, Any]:
 
 
 # =============================================================================
+# Task Force Activities — Multi-Agent Orchestration
+# =============================================================================
+
+@activity.defn
+async def post_task_force_progress(
+    task_force_id: str,
+    message: str,
+) -> bool:
+    """Post a progress message to the Task Force coordinator task.
+
+    Finds the coordinator task (task_force_role='coordinator') and
+    creates a TaskMessage so progress is visible on the task detail page.
+    """
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Find coordinator task
+        resp = await client.get(
+            f"{control_plane_url}/api/tasks",
+            params={"limit": 200},
+        )
+        if resp.status_code != 200:
+            return False
+
+        tasks = resp.json()
+        coord_task_id = None
+        for t in tasks:
+            if (t.get("agent_profile") == task_force_id
+                    and "coordinator" in (t.get("name", "") + t.get("description", "")).lower()
+                    or t.get("agent_profile") == task_force_id):
+                # Use the first task with this task_force as agent_profile
+                coord_task_id = t["id"]
+                break
+
+        if not coord_task_id:
+            logger.warning(f"⚠️ Could not find coordinator task for {task_force_id}")
+            return False
+
+        # Post a message to the coordinator task
+        msg_resp = await client.post(
+            f"{control_plane_url}/api/tasks/{coord_task_id}/messages",
+            json={"content": message, "role": "system"},
+        )
+        return msg_resp.status_code in (200, 201)
+
+
+@activity.defn
+async def update_coordinator_task_status(
+    task_force_id: str,
+    status: str,
+) -> bool:
+    """Update the coordinator task status to completed/failed."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{control_plane_url}/api/tasks",
+            params={"limit": 200},
+        )
+        if resp.status_code != 200:
+            return False
+
+        tasks = resp.json()
+        for t in tasks:
+            if t.get("agent_profile") == task_force_id:
+                task_id = t["id"]
+                endpoint = "complete" if status == "completed" else "fail"
+                await client.post(f"{control_plane_url}/api/tasks/{task_id}/{endpoint}")
+                return True
+    return False
+
+
+@activity.defn
+async def load_task_force(task_force_id: str) -> Dict[str, Any]:
+    """Load Task Force definition including members and ceremonies from the control plane."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{control_plane_url}/api/task-forces/{task_force_id}")
+        if resp.status_code != 200:
+            raise Exception(f"Failed to load Task Force {task_force_id}: HTTP {resp.status_code}")
+        return resp.json()
+
+
+@activity.defn
+async def start_member_task(task_id: str, llm_model: str, base_image: str) -> str:
+    """Start a Temporal AgentTaskWorkflow for a single Task Force member."""
+    import httpx
+    from temporalio.client import Client as TClient
+
+    client = await TClient.connect(TEMPORAL_HOST)
+    workflow_id = f"task-workflow-{task_id}"
+
+    await client.start_workflow(
+        "AgentTaskWorkflow",
+        args=[task_id, llm_model, base_image],
+        id=workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+    logger.info(f"🚀 TASK_FORCE_MEMBER | Started workflow {workflow_id}")
+
+    # Persist workflow_id back to the control-plane so that capability
+    # approval signals can be routed to this specific workflow.
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            await http.patch(
+                f"{control_plane_url}/api/tasks/{task_id}",
+                json={"workflow_id": workflow_id},
+            )
+        logger.info(f"✅ Saved workflow_id {workflow_id} to task {task_id}")
+    except Exception as e:
+        logger.warning(f"Could not persist workflow_id for {task_id}: {e}")
+
+    return workflow_id
+
+
+@activity.defn
+async def update_member_status(task_force_id: str, member_id: int, status: str) -> bool:
+    """Update a Task Force member's status via the control plane."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Update the task that belongs to this member
+        resp = await client.get(f"{control_plane_url}/api/task-forces/{task_force_id}")
+        if resp.status_code != 200:
+            return False
+        tf_data = resp.json()
+        for m in tf_data.get("members", []):
+            if m["id"] == member_id and m.get("task_id"):
+                task_resp = await client.get(f"{control_plane_url}/api/tasks/{m['task_id']}")
+                if task_resp.status_code == 200:
+                    task_status = task_resp.json().get("status", "unknown")
+                    logger.info(f"📊 Member {member_id} task status: {task_status}")
+                    return task_status in ("completed", "failed")
+    return False
+
+
+@activity.defn
+async def poll_member_task_status(task_id: str) -> Dict[str, Any]:
+    """Poll a member's task to check if it's completed."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
+        if resp.status_code != 200:
+            return {"status": "unknown", "error": f"HTTP {resp.status_code}"}
+        data = resp.json()
+        return {
+            "status": data.get("status", "unknown"),
+            "task_id": task_id,
+        }
+
+
+@activity.defn
+async def write_ceremony_artifact(
+    workspace_id: str,
+    filename: str,
+    content: str,
+) -> Dict[str, Any]:
+    """Write a ceremony artifact file to the shared workspace so all agents can see it."""
+    workspaces_root = "/workspaces"
+    workspace_dir = os.path.join(workspaces_root, workspace_id)
+    os.makedirs(workspace_dir, exist_ok=True)
+
+    filepath = os.path.join(workspace_dir, filename)
+    with open(filepath, "w") as f:
+        f.write(content)
+    os.chmod(filepath, 0o666)
+
+    logger.info(f"📝 CEREMONY ARTIFACT | Written: {filepath} ({len(content)} bytes)")
+    return {"filepath": filepath, "filename": filename, "size": len(content)}
+
+
+@activity.defn
+async def generate_ceremony_plan(
+    objective: str,
+    team_info: str,
+    ceremony_info: str,
+    workspace_id: str,
+) -> Dict[str, Any]:
+    """Use the LLM to generate a structured ceremony plan.
+
+    Calls the control-plane LLM router to produce a work plan
+    that coordinates agent activities.
+    """
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    prompt = f"""You are a technical project coordinator. Generate a structured work plan for the following task force.
+
+## Objective
+{objective}
+
+## Team
+{team_info}
+
+## Ceremony Context
+{ceremony_info}
+
+## Instructions
+Create a DETAILED work plan in Markdown format that:
+1. Breaks the objective into clear phases with owners (which role does what)
+2. Specifies what files/deliverables each team member should produce
+3. Defines handoff points — when one role finishes, what artifact does the next role pick up
+4. Lists acceptance criteria for each phase
+5. Specifies which team member is the deployment lead (who creates deployment requests)
+
+Output ONLY the Markdown plan, no preamble.
+"""
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{control_plane_url}/api/llm/v1/chat/completions",
+                json={
+                    "model": "gemini-flash-latest",
+                    "messages": [
+                        {"role": "system", "content": "You are a technical project coordinator producing structured work plans."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.3,
+                },
+                headers={"Authorization": "Bearer task:ceremony-planner"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                plan_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if plan_text:
+                    logger.info(f"📋 CEREMONY PLAN | Generated {len(plan_text)} chars")
+                    return {"plan": plan_text, "status": "generated"}
+
+            logger.warning(f"⚠️ LLM plan generation returned {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        logger.warning(f"⚠️ LLM plan generation failed: {e}")
+
+    # Fallback: produce a basic plan without LLM
+    fallback = f"""# Work Plan
+
+## Objective
+{objective}
+
+## Team
+{team_info}
+
+## Phases
+1. **Development Phase** — Lead developer implements the solution
+2. **Review Phase** — Reviewer/Tester examines the deliverables
+3. **Finalization** — Lead incorporates feedback and prepares deployment
+
+## Coordination
+- Lead developer owns the deployment request
+- All deliverables should be placed in the shared workspace
+- Each member writes a DONE_<ROLE>.md file when finished
+"""
+    return {"plan": fallback, "status": "fallback"}
+
+
+@activity.defn
+async def collect_member_outputs(
+    task_force_id: str,
+    member_task_outputs: Dict[str, str],
+    workspace_id: str,
+) -> Dict[str, Any]:
+    """Collect outputs from member tasks and read their workspace files.
+
+    Returns a dict with role → {api_outputs, workspace_files} for each member.
+    """
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    workspaces_root = "/workspaces"
+    workspace_dir = os.path.join(workspaces_root, workspace_id)
+
+    collected = {}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for task_id, role in member_task_outputs.items():
+            role_data: Dict[str, Any] = {"task_id": task_id, "api_outputs": [], "workspace_files": []}
+
+            # Collect outputs via API
+            try:
+                resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
+                if resp.status_code == 200:
+                    role_data["api_outputs"] = resp.json()
+            except Exception as e:
+                logger.warning(f"⚠️ Could not collect API output from {task_id}: {e}")
+
+            # Collect workspace files for this task
+            try:
+                task_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
+                if task_resp.status_code == 200:
+                    task_data = task_resp.json()
+                    task_workspace = task_data.get("workspace_id", "")
+                    ws_path = os.path.join(workspaces_root, task_workspace) if task_workspace else workspace_dir
+                    if os.path.isdir(ws_path):
+                        for fname in os.listdir(ws_path):
+                            fpath = os.path.join(ws_path, fname)
+                            if os.path.isfile(fpath):
+                                try:
+                                    with open(fpath, "r", errors="replace") as f:
+                                        content = f.read(8192)  # First 8KB
+                                    role_data["workspace_files"].append({
+                                        "filename": fname,
+                                        "size": os.path.getsize(fpath),
+                                        "preview": content[:2000],
+                                    })
+                                except Exception:
+                                    role_data["workspace_files"].append({
+                                        "filename": fname,
+                                        "size": os.path.getsize(fpath),
+                                        "preview": "(binary or unreadable)",
+                                    })
+            except Exception as e:
+                logger.warning(f"⚠️ Could not scan workspace for {task_id}: {e}")
+
+            collected[role] = role_data
+
+    logger.info(
+        f"📦 COLLECTED OUTPUTS | TF: {task_force_id} | "
+        f"Roles: {list(collected.keys())} | "
+        f"Files: {sum(len(r.get('workspace_files', [])) for r in collected.values())}"
+    )
+    return collected
+
+
+@activity.defn
+async def execute_ceremony(
+    task_force_id: str,
+    ceremony_id: int,
+    ceremony_data: Dict[str, Any],
+    member_task_outputs: Dict[str, str],
+    workspace_id: str = "",
+    collected_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Execute a ceremony with type-specific behavior.
+
+    - planning:     Generate a work plan via LLM, write CEREMONY_PLAN.md
+    - peer_review:  Collect developer outputs, write REVIEW_BRIEF.md for reviewer
+    - aggregation:  Collect all outputs, produce FINAL_SUMMARY.md
+    - sync/custom:  Write coordination notes as SYNC_NOTES.md
+    """
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    ceremony_type = ceremony_data.get("ceremony_type", "custom")
+    ceremony_name = ceremony_data.get("name", "Unnamed Ceremony")
+
+    logger.info(
+        f"🎭 CEREMONY | TF: {task_force_id} | #{ceremony_id} | "
+        f"Type: {ceremony_type} | Mode: {ceremony_data.get('mode')}"
+    )
+
+    # Resolve workspace_id if not provided
+    if not workspace_id:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(f"{control_plane_url}/api/task-forces/{task_force_id}")
+                if resp.status_code == 200:
+                    workspace_id = resp.json().get("workspace_id", "")
+        except Exception:
+            pass
+
+    workspaces_root = "/workspaces"
+    workspace_dir = os.path.join(workspaces_root, workspace_id) if workspace_id else ""
+
+    # Build role summary from collected data or member_task_outputs
+    role_summary_lines = []
+    if collected_data:
+        for role, data in collected_data.items():
+            if isinstance(data, dict) and "workspace_files" in data:
+                files = [f.get("filename", "?") for f in data.get("workspace_files", [])]
+                n_outputs = len(data.get("api_outputs", []))
+                role_summary_lines.append(
+                    f"- **{role}**: {n_outputs} iterations, files: {', '.join(files) or 'none'}"
+                )
+            elif isinstance(data, str):
+                # Simple string value (e.g. plan text) — skip for role summary
+                continue
+            else:
+                role_summary_lines.append(f"- **{role}**: (data collected)")
+    if not role_summary_lines:
+        for task_id, role in member_task_outputs.items():
+            role_summary_lines.append(f"- **{role}**: task {task_id}")
+
+    role_summary = "\n".join(role_summary_lines)
+    artifact_content = ""
+    artifact_filename = ""
+
+    # ── Type-specific ceremony execution ──
+
+    if ceremony_type == "planning":
+        # Planning ceremony: write plan BEFORE agents start
+        artifact_filename = "CEREMONY_PLAN.md"
+        artifact_content = (
+            f"# 📋 Ceremony Plan: {ceremony_name}\n\n"
+            f"**Task Force:** {task_force_id}\n"
+            f"**Ceremony Type:** Planning\n"
+            f"**Generated at:** {__import__('datetime').datetime.utcnow().isoformat()}\n\n"
+            f"## Team\n{role_summary}\n\n"
+        )
+        # If we have LLM-generated plan data, include it
+        if collected_data and collected_data.get("plan"):
+            artifact_content += f"## Detailed Plan\n\n{collected_data['plan']}\n"
+        else:
+            artifact_content += (
+                "## Instructions\n\n"
+                "Each team member should:\n"
+                "1. Read this plan and coordinate accordingly\n"
+                "2. Focus on your assigned role responsibilities\n"
+                "3. Place all deliverables in the shared workspace\n"
+                "4. Write a DONE_<YOUR_ROLE>.md file when finished\n"
+                "5. Only the designated lead should request deployments\n"
+            )
+
+    elif ceremony_type == "peer_review":
+        # Peer review: collect dev outputs, write review brief for reviewer
+        artifact_filename = "REVIEW_BRIEF.md"
+        artifact_content = (
+            f"# 🔍 Review Brief: {ceremony_name}\n\n"
+            f"**Task Force:** {task_force_id}\n"
+            f"**Ceremony Type:** Peer Review\n"
+            f"**Generated at:** {__import__('datetime').datetime.utcnow().isoformat()}\n\n"
+            f"## Deliverables to Review\n\n{role_summary}\n\n"
+        )
+        # Include file previews from collected data
+        if collected_data:
+            artifact_content += "## File Contents\n\n"
+            for role, data in collected_data.items():
+                artifact_content += f"### {role} Deliverables\n\n"
+                for finfo in data.get("workspace_files", []):
+                    fname = finfo.get("filename", "?")
+                    preview = finfo.get("preview", "")
+                    if preview and fname not in ("result.json",):
+                        artifact_content += f"#### `{fname}` ({finfo.get('size', 0)} bytes)\n```\n{preview[:1500]}\n```\n\n"
+
+            artifact_content += (
+                "## Review Instructions\n\n"
+                "1. Review each deliverable above for correctness and completeness\n"
+                "2. Check that the implementation matches the objective\n"
+                "3. Note any issues, bugs, or improvements needed\n"
+                "4. Write your review findings to REVIEW_FINDINGS.md\n"
+                "5. If the code is acceptable, confirm in your findings\n"
+            )
+
+    elif ceremony_type == "aggregation":
+        # Aggregation: collect everything and produce final summary
+        artifact_filename = "FINAL_SUMMARY.md"
+        artifact_content = (
+            f"# 📊 Final Summary: {ceremony_name}\n\n"
+            f"**Task Force:** {task_force_id}\n"
+            f"**Ceremony Type:** Aggregation\n"
+            f"**Generated at:** {__import__('datetime').datetime.utcnow().isoformat()}\n\n"
+            f"## All Team Outputs\n\n{role_summary}\n\n"
+        )
+        if collected_data:
+            artifact_content += "## Deliverable Details\n\n"
+            for role, data in collected_data.items():
+                artifact_content += f"### {role}\n"
+                for finfo in data.get("workspace_files", []):
+                    artifact_content += f"- `{finfo.get('filename', '?')}` ({finfo.get('size', 0)} bytes)\n"
+                artifact_content += "\n"
+
+    else:
+        # sync / custom: write coordination notes
+        artifact_filename = f"SYNC_NOTES_{ceremony_id}.md"
+        artifact_content = (
+            f"# 🔄 Sync Notes: {ceremony_name}\n\n"
+            f"**Task Force:** {task_force_id}\n"
+            f"**Ceremony Type:** {ceremony_type}\n"
+            f"**Generated at:** {__import__('datetime').datetime.utcnow().isoformat()}\n\n"
+            f"## Participants\n\n{role_summary}\n\n"
+            f"## Status\n\nAll participants have been synchronized.\n"
+        )
+
+    # Write the artifact to workspace
+    if artifact_content and workspace_dir:
+        try:
+            os.makedirs(workspace_dir, exist_ok=True)
+            filepath = os.path.join(workspace_dir, artifact_filename)
+            with open(filepath, "w") as f:
+                f.write(artifact_content)
+            os.chmod(filepath, 0o666)
+            logger.info(f"📝 CEREMONY ARTIFACT | {artifact_filename} → {filepath}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not write ceremony artifact: {e}")
+
+    summary = (
+        f"Ceremony '{ceremony_name}' ({ceremony_type}) completed.\n"
+        f"Participants: {len(member_task_outputs)} agents\n"
+        f"Artifact: {artifact_filename}\n"
+        f"Roles: {list(member_task_outputs.values())}\n"
+    )
+
+    return {
+        "ceremony_id": ceremony_id,
+        "ceremony_type": ceremony_type,
+        "status": "completed",
+        "summary": summary,
+        "artifact_filename": artifact_filename,
+        "collected_outputs": {
+            k: (
+                f"{len(v.get('workspace_files', []))} files, {len(v.get('api_outputs', []))} iterations"
+                if isinstance(v, dict) and "workspace_files" in v
+                else str(v)[:100]
+            )
+            for k, v in (collected_data or {}).items()
+        },
+    }
+
+
+@activity.defn
+async def finalize_task_force(task_force_id: str, status: str = "completed") -> Dict[str, Any]:
+    """Mark the Task Force as completed/failed."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    endpoint = "complete" if status == "completed" else "cancel"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Update task force status directly via the router
+        # (We POST to a status endpoint)
+        try:
+            resp = await client.post(
+                f"{control_plane_url}/api/task-forces/{task_force_id}/{endpoint}"
+            )
+            if resp.status_code == 200:
+                logger.info(f"✅ Task Force {task_force_id} finalized as {status}")
+                return {"status": status}
+        except Exception as e:
+            logger.warning(f"⚠️ Could not finalize task force: {e}")
+
+    return {"status": status, "task_force_id": task_force_id}
+
+
+# =============================================================================
+# Task Force Workflow
+# =============================================================================
+
+@workflow.defn
+class TaskForceWorkflow:
+    """Orchestrates a multi-agent Task Force.
+
+    Execution flow:
+    1. Load Task Force definition (members + ceremonies)
+    2. Sort ceremonies by sequence_order
+    3. For each ceremony phase:
+       a. Start member tasks (as child AgentTaskWorkflow instances)
+       b. Wait for all members to complete (or timeout)
+       c. Execute the ceremony (aggregate, review, etc.)
+    4. If no ceremonies defined, run all members in parallel and wait
+
+    Members share a workspace, allowing context sharing between agents.
+    """
+
+    @workflow.run
+    async def run(self, task_force_id: str) -> Dict[str, Any]:
+        logger.info(f"🎯 TaskForceWorkflow | Starting for {task_force_id}")
+
+        # 1. Load the Task Force definition
+        tf_data = await workflow.execute_activity(
+            load_task_force,
+            args=[task_force_id],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        members = tf_data.get("members", [])
+        ceremonies = sorted(
+            tf_data.get("ceremonies", []),
+            key=lambda c: c.get("sequence_order", 0),
+        )
+        tf_name = tf_data.get("name", task_force_id)
+
+        if not members:
+            return {"status": "failed", "error": "No members in Task Force"}
+
+        # Post initial progress
+        member_roles = [m.get("role", "Agent") for m in members]
+        await workflow.execute_activity(
+            post_task_force_progress,
+            args=[
+                task_force_id,
+                f"🚀 **Task Force '{tf_name}' started**\n\n"
+                f"**Team:** {len(members)} agents\n"
+                f"**Roles:** {', '.join(member_roles)}\n"
+                f"**Ceremonies:** {len(ceremonies)}\n\n"
+                f"Launching member agents now..."
+            ],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        workspace_id = tf_data.get("workspace_id", "")
+
+        # 2. Run the workflow based on ceremonies
+        if not ceremonies:
+            result = await self._run_all_parallel(task_force_id, members, tf_name)
+        else:
+            result = await self._run_with_ceremonies(
+                task_force_id, members, ceremonies, tf_name, workspace_id
+            )
+
+        # 3. Finalize
+        final_status = "completed" if not result.get("error") else "failed"
+
+        # Post completion summary
+        member_results = result.get("members", {})
+        summary_lines = []
+        for tid, fstatus in member_results.items():
+            icon = "✅" if fstatus == "completed" else "❌"
+            summary_lines.append(f"  {icon} {tid}: {fstatus}")
+
+        await workflow.execute_activity(
+            post_task_force_progress,
+            args=[
+                task_force_id,
+                f"{'✅' if final_status == 'completed' else '❌'} **Task Force '{tf_name}' {final_status}**\n\n"
+                f"**Results:**\n" + "\n".join(summary_lines or ["No member results recorded."])
+            ],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        await workflow.execute_activity(
+            finalize_task_force,
+            args=[task_force_id, final_status],
+            start_to_close_timeout=timedelta(minutes=2),
+        )
+
+        # Update coordinator task status
+        await workflow.execute_activity(
+            update_coordinator_task_status,
+            args=[task_force_id, final_status],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        return result
+
+    async def _run_all_parallel(
+        self, task_force_id: str, members: list, tf_name: str = ""
+    ) -> Dict[str, Any]:
+        """Run all members in parallel, wait for all to finish."""
+        # Start all member tasks
+        member_workflows = {}
+        for member in members:
+            task_id = member.get("task_id")
+            if not task_id:
+                continue
+
+            llm_model = member.get("llm_model") or "gemini-flash-latest"
+            base_image_key = member.get("base_image") or "openclaw"
+            base_image = f"localhost:5000/openclaw-agent:{base_image_key}"
+
+            wf_id = await workflow.execute_activity(
+                start_member_task,
+                args=[task_id, llm_model, base_image],
+                start_to_close_timeout=timedelta(minutes=5),
+            )
+            member_workflows[task_id] = {
+                "workflow_id": wf_id,
+                "role": member.get("role", "Agent"),
+                "member_id": member.get("id"),
+            }
+
+        # Poll until all complete (or timeout at 4 hours)
+        max_polls = 480  # 4h at 30s intervals
+        last_progress_poll = -1
+        for poll in range(max_polls):
+            all_done = True
+            completed_count = 0
+            status_lines = []
+            for task_id, info in member_workflows.items():
+                if info.get("completed"):
+                    completed_count += 1
+                    continue
+
+                result = await workflow.execute_activity(
+                    poll_member_task_status,
+                    args=[task_id],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                task_status = result.get("status", "unknown")
+                if task_status in ("completed", "failed"):
+                    member_workflows[task_id]["completed"] = True
+                    member_workflows[task_id]["final_status"] = task_status
+                    completed_count += 1
+                    status_lines.append(
+                        f"  {'✅' if task_status == 'completed' else '❌'} **{info['role']}**: {task_status}"
+                    )
+                elif task_status == "paused":
+                    all_done = False
+                    status_lines.append(
+                        f"  🔒 **{info['role']}**: waiting for capability approval"
+                    )
+                    # Post an immediate alert if this is the first time we see it paused
+                    if not info.get("_paused_notified"):
+                        member_workflows[task_id]["_paused_notified"] = True
+                        await workflow.execute_activity(
+                            post_task_force_progress,
+                            args=[
+                                task_force_id,
+                                f"🔒 **{info['role']}** is requesting a new capability.\n"
+                                f"Approve it on the **Approvals** page to continue execution."
+                            ],
+                            start_to_close_timeout=timedelta(seconds=15),
+                        )
+                else:
+                    all_done = False
+                    # Reset paused notification when task resumes
+                    if info.get("_paused_notified") and task_status == "running":
+                        member_workflows[task_id]["_paused_notified"] = False
+                    status_lines.append(f"  ⏳ **{info['role']}**: {task_status}")
+
+            # Post progress every 2 minutes (4 polls at 30s)
+            if status_lines and (poll - last_progress_poll >= 4 or all_done):
+                last_progress_poll = poll
+                await workflow.execute_activity(
+                    post_task_force_progress,
+                    args=[
+                        task_force_id,
+                        f"📊 **Progress Update** ({completed_count}/{len(member_workflows)} agents done)\n\n"
+                        + "\n".join(status_lines)
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+
+            if all_done:
+                break
+
+            await asyncio.sleep(30)
+
+        return {
+            "status": "completed",
+            "members": {
+                tid: info.get("final_status", "unknown")
+                for tid, info in member_workflows.items()
+            },
+        }
+
+    async def _run_with_ceremonies(
+        self,
+        task_force_id: str,
+        members: list,
+        ceremonies: list,
+        tf_name: str = "",
+        workspace_id: str = "",
+    ) -> Dict[str, Any]:
+        """Run members with ceremony-driven phased execution.
+
+        Properly sequences work based on ceremony types:
+        - planning:     Generate plan → write to workspace → THEN start agents
+        - peer_review:  Start dev agents → wait → collect outputs → write review brief → start reviewers
+        - aggregation:  Wait for all → collect → produce summary
+        - sync/custom:  Checkpoint between phases
+
+        Members are categorized as lead (Developer/Lead/Architect) vs support
+        (Tester/Reviewer/QA) to determine execution ordering.
+        """
+        results = {}
+        member_map = {m.get("id"): m for m in members}
+
+        # Categorize members by role type
+        LEAD_ROLES = {"developer", "lead", "architect", "engineer", "implementer"}
+        SUPPORT_ROLES = {"tester", "reviewer", "qa", "auditor", "validator"}
+
+        lead_members = []
+        support_members = []
+        for m in members:
+            role_lower = (m.get("role") or "").lower()
+            if any(r in role_lower for r in SUPPORT_ROLES):
+                support_members.append(m)
+            else:
+                lead_members.append(m)
+
+        # If no clear lead, first member is lead
+        if not lead_members and members:
+            lead_members = [members[0]]
+            support_members = members[1:]
+
+        all_member_tasks: Dict[str, str] = {}  # task_id → role (accumulated)
+
+        # Build team info string for LLM
+        team_info = "\n".join([
+            f"- {m.get('role', 'Agent')}: {m.get('responsibilities', 'N/A')} (task: {m.get('task_id', '?')})"
+            for m in members
+        ])
+
+        for ceremony_idx, ceremony in enumerate(ceremonies):
+            ceremony_name = ceremony.get("name", "Unnamed")
+            ceremony_type = ceremony.get("ceremony_type", "custom")
+            participant_ids = ceremony.get("participant_member_ids")
+            trigger = ceremony.get("trigger_condition", "after_all_complete")
+
+            logger.info(
+                f"🎭 Ceremony phase [{ceremony_idx + 1}/{len(ceremonies)}]: "
+                f"{ceremony_name} ({ceremony_type}) | "
+                f"Trigger: {trigger} | Participants: {participant_ids or 'all'}"
+            )
+
+            await workflow.execute_activity(
+                post_task_force_progress,
+                args=[
+                    task_force_id,
+                    f"🎭 **Ceremony Phase: {ceremony_name}** ({ceremony_type})\n\n"
+                    f"Phase {ceremony_idx + 1} of {len(ceremonies)} beginning..."
+                ],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+
+            # ── PLANNING CEREMONY ──
+            if ceremony_type == "planning":
+                # 1. Generate plan via LLM BEFORE starting agents
+                plan_result = await workflow.execute_activity(
+                    generate_ceremony_plan,
+                    args=[
+                        ceremony.get("description", tf_name),
+                        team_info,
+                        f"Ceremony: {ceremony_name}\nType: Planning\nDescription: {ceremony.get('description', '')}",
+                        workspace_id,
+                    ],
+                    start_to_close_timeout=timedelta(minutes=2),
+                )
+
+                # 2. Write plan to workspace
+                plan_text = plan_result.get("plan", "No plan generated.")
+                await workflow.execute_activity(
+                    write_ceremony_artifact,
+                    args=[workspace_id, "CEREMONY_PLAN.md", plan_text],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+
+                # 3. Execute ceremony (writes the formal planning artifact)
+                plan_tasks = {m.get("task_id"): m.get("role", "Agent") for m in members if m.get("task_id")}
+                ceremony_result = await workflow.execute_activity(
+                    execute_ceremony,
+                    args=[
+                        task_force_id, ceremony.get("id"), ceremony,
+                        plan_tasks, workspace_id,
+                        {"plan": plan_text},
+                    ],
+                    start_to_close_timeout=timedelta(minutes=5),
+                )
+                results[ceremony_name] = ceremony_result
+
+                await workflow.execute_activity(
+                    post_task_force_progress,
+                    args=[
+                        task_force_id,
+                        f"📋 **Planning ceremony complete**\n\n"
+                        f"Work plan generated and written to `CEREMONY_PLAN.md`.\n"
+                        f"Plan status: {plan_result.get('status', 'unknown')}\n\n"
+                        f"Starting team members..."
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+
+                # 4. Now start ALL agents (they will find the plan in workspace)
+                for member in members:
+                    task_id = member.get("task_id")
+                    if not task_id:
+                        continue
+
+                    llm_model = member.get("llm_model") or "gemini-flash-latest"
+                    base_image_key = member.get("base_image") or "openclaw"
+                    base_image = f"localhost:5000/openclaw-agent:{base_image_key}"
+
+                    wf_id = await workflow.execute_activity(
+                        start_member_task,
+                        args=[task_id, llm_model, base_image],
+                        start_to_close_timeout=timedelta(minutes=5),
+                    )
+                    all_member_tasks[task_id] = member.get("role", "Agent")
+
+                    await workflow.execute_activity(
+                        post_task_force_progress,
+                        args=[
+                            task_force_id,
+                            f"🚀 Started **{member.get('role', 'Agent')}** agent (task: {task_id})"
+                        ],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+
+            # ── PEER REVIEW CEREMONY ──
+            elif ceremony_type == "peer_review":
+                # 1. Wait for lead/dev members to finish first
+                lead_tasks = {
+                    tid: role for tid, role in all_member_tasks.items()
+                    if any(tid == m.get("task_id") for m in lead_members)
+                }
+
+                if lead_tasks:
+                    await workflow.execute_activity(
+                        post_task_force_progress,
+                        args=[
+                            task_force_id,
+                            f"⏳ **Peer Review: Waiting for development phase**\n\n"
+                            f"Waiting for: {', '.join(lead_tasks.values())}"
+                        ],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+
+                    await self._wait_for_tasks(
+                        task_force_id, lead_tasks, ceremony_name,
+                        timeout_minutes=ceremony.get("timeout_minutes", 60),
+                    )
+
+                # 2. Collect outputs from completed dev members
+                collected = await workflow.execute_activity(
+                    collect_member_outputs,
+                    args=[task_force_id, lead_tasks, workspace_id],
+                    start_to_close_timeout=timedelta(minutes=2),
+                )
+
+                # 3. Write review brief to workspace
+                ceremony_result = await workflow.execute_activity(
+                    execute_ceremony,
+                    args=[
+                        task_force_id, ceremony.get("id"), ceremony,
+                        lead_tasks, workspace_id, collected,
+                    ],
+                    start_to_close_timeout=timedelta(minutes=5),
+                )
+                results[ceremony_name] = ceremony_result
+
+                # 4. Now start support/reviewer agents (they'll find REVIEW_BRIEF.md)
+                reviewers_started = []
+                for member in support_members:
+                    task_id = member.get("task_id")
+                    if not task_id or task_id in all_member_tasks:
+                        continue  # Already started
+
+                    llm_model = member.get("llm_model") or "gemini-flash-latest"
+                    base_image_key = member.get("base_image") or "openclaw"
+                    base_image = f"localhost:5000/openclaw-agent:{base_image_key}"
+
+                    wf_id = await workflow.execute_activity(
+                        start_member_task,
+                        args=[task_id, llm_model, base_image],
+                        start_to_close_timeout=timedelta(minutes=5),
+                    )
+                    all_member_tasks[task_id] = member.get("role", "Agent")
+                    reviewers_started.append(member.get("role", "Agent"))
+
+                if reviewers_started:
+                    await workflow.execute_activity(
+                        post_task_force_progress,
+                        args=[
+                            task_force_id,
+                            f"🔍 **Peer Review phase started**\n\n"
+                            f"Development outputs collected and written to `REVIEW_BRIEF.md`.\n"
+                            f"Started reviewers: {', '.join(reviewers_started)}\n\n"
+                            f"Files available for review:\n"
+                            + "\n".join([
+                                f"- `{f.get('filename', '?')}` ({f.get('size', 0)} bytes)"
+                                for role_data in collected.values()
+                                for f in role_data.get("workspace_files", [])
+                            ][:10])
+                        ],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+
+            # ── AGGREGATION CEREMONY ──
+            elif ceremony_type == "aggregation":
+                # Wait for ALL active tasks to complete
+                if all_member_tasks:
+                    await workflow.execute_activity(
+                        post_task_force_progress,
+                        args=[
+                            task_force_id,
+                            f"⏳ **Aggregation: Waiting for all members to complete**\n\n"
+                            f"Waiting for: {', '.join(all_member_tasks.values())}"
+                        ],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+
+                    await self._wait_for_tasks(
+                        task_force_id, all_member_tasks, ceremony_name,
+                        timeout_minutes=ceremony.get("timeout_minutes", 60),
+                    )
+
+                # Collect all outputs
+                collected = await workflow.execute_activity(
+                    collect_member_outputs,
+                    args=[task_force_id, all_member_tasks, workspace_id],
+                    start_to_close_timeout=timedelta(minutes=2),
+                )
+
+                ceremony_result = await workflow.execute_activity(
+                    execute_ceremony,
+                    args=[
+                        task_force_id, ceremony.get("id"), ceremony,
+                        all_member_tasks, workspace_id, collected,
+                    ],
+                    start_to_close_timeout=timedelta(minutes=5),
+                )
+                results[ceremony_name] = ceremony_result
+
+                await workflow.execute_activity(
+                    post_task_force_progress,
+                    args=[
+                        task_force_id,
+                        f"📊 **Aggregation ceremony complete**\n\n"
+                        f"All outputs collected and summarized in `FINAL_SUMMARY.md`.\n"
+                        f"Participants: {', '.join(all_member_tasks.values())}"
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+
+            # ── SYNC / CUSTOM CEREMONY ──
+            else:
+                # Determine participants
+                if participant_ids:
+                    participants = [
+                        member_map[mid] for mid in participant_ids
+                        if mid in member_map
+                    ]
+                else:
+                    participants = members
+
+                # Start any participants not yet started
+                for member in participants:
+                    task_id = member.get("task_id")
+                    if not task_id or task_id in all_member_tasks:
+                        continue
+
+                    llm_model = member.get("llm_model") or "gemini-flash-latest"
+                    base_image_key = member.get("base_image") or "openclaw"
+                    base_image = f"localhost:5000/openclaw-agent:{base_image_key}"
+
+                    wf_id = await workflow.execute_activity(
+                        start_member_task,
+                        args=[task_id, llm_model, base_image],
+                        start_to_close_timeout=timedelta(minutes=5),
+                    )
+                    all_member_tasks[task_id] = member.get("role", "Agent")
+
+                # Wait for this phase's participants
+                phase_tasks = {
+                    tid: role for tid, role in all_member_tasks.items()
+                    if any(tid == m.get("task_id") for m in participants)
+                }
+                if phase_tasks:
+                    await self._wait_for_tasks(
+                        task_force_id, phase_tasks, ceremony_name,
+                        timeout_minutes=ceremony.get("timeout_minutes", 60),
+                    )
+
+                ceremony_result = await workflow.execute_activity(
+                    execute_ceremony,
+                    args=[
+                        task_force_id, ceremony.get("id"), ceremony,
+                        phase_tasks, workspace_id, None,
+                    ],
+                    start_to_close_timeout=timedelta(minutes=5),
+                )
+                results[ceremony_name] = ceremony_result
+
+        # ── Final: wait for any still-running tasks ──
+        remaining = {
+            tid: role for tid, role in all_member_tasks.items()
+        }
+        if remaining:
+            await self._wait_for_tasks(
+                task_force_id, remaining, "Final wait",
+                timeout_minutes=120,
+            )
+
+        # Determine final member statuses
+        final_members = {}
+        for task_id in all_member_tasks:
+            poll_result = await workflow.execute_activity(
+                poll_member_task_status,
+                args=[task_id],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            final_members[task_id] = poll_result.get("status", "unknown")
+
+        return {"status": "completed", "ceremonies": results, "members": final_members}
+
+    async def _wait_for_tasks(
+        self,
+        task_force_id: str,
+        tasks: Dict[str, str],
+        phase_name: str,
+        timeout_minutes: int = 60,
+    ) -> None:
+        """Poll tasks until all complete or timeout. Handles paused tasks."""
+        max_polls = (timeout_minutes * 60) // 30
+        paused_notified: dict = {}
+        last_progress_poll = -1
+
+        for poll in range(max_polls):
+            all_done = True
+            status_lines = []
+            completed_count = 0
+
+            for task_id, role in tasks.items():
+                result = await workflow.execute_activity(
+                    poll_member_task_status,
+                    args=[task_id],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                member_status = result.get("status", "unknown")
+
+                if member_status in ("completed", "failed"):
+                    completed_count += 1
+                    icon = "✅" if member_status == "completed" else "❌"
+                    status_lines.append(f"  {icon} **{role}**: {member_status}")
+                    continue
+
+                all_done = False
+
+                if member_status == "paused" and not paused_notified.get(task_id):
+                    paused_notified[task_id] = True
+                    await workflow.execute_activity(
+                        post_task_force_progress,
+                        args=[
+                            task_force_id,
+                            f"🔒 **{role}** is requesting a new capability during "
+                            f"'{phase_name}'.\nApprove it on the **Approvals** page."
+                        ],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    status_lines.append(f"  🔒 **{role}**: waiting for approval")
+                elif member_status == "running" and paused_notified.get(task_id):
+                    paused_notified[task_id] = False
+                    status_lines.append(f"  ⏳ **{role}**: running")
+                else:
+                    status_lines.append(f"  ⏳ **{role}**: {member_status}")
+
+            # Post progress every 2 minutes
+            if status_lines and (poll - last_progress_poll >= 4 or all_done):
+                last_progress_poll = poll
+                await workflow.execute_activity(
+                    post_task_force_progress,
+                    args=[
+                        task_force_id,
+                        f"📊 **{phase_name}** ({completed_count}/{len(tasks)} done)\n\n"
+                        + "\n".join(status_lines)
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+
+            if all_done:
+                break
+
+            await asyncio.sleep(30)
+
+
+# =============================================================================
 # Deployment Workflows
 # =============================================================================
 
@@ -1551,7 +2760,7 @@ async def main():
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow],
+        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, TaskForceWorkflow],
         activities=[
             initialize_task,
             start_agent_container,
@@ -1568,6 +2777,19 @@ async def main():
             build_deployment_image,
             start_deployment_container,
             stop_deployment_container,
+            # Task Force activities
+            load_task_force,
+            start_member_task,
+            update_member_status,
+            poll_member_task_status,
+            execute_ceremony,
+            finalize_task_force,
+            post_task_force_progress,
+            update_coordinator_task_status,
+            check_task_force_deploy_role,
+            write_ceremony_artifact,
+            generate_ceremony_plan,
+            collect_member_outputs,
         ],
     )
     

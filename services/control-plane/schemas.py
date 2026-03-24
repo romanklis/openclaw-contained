@@ -53,6 +53,8 @@ class TaskResponse(BaseModel):
     workspace_id: str
     workflow_id: Optional[str]
     agent_profile: Optional[str] = None
+    task_force_id: Optional[str] = None
+    task_force_role: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime]
     
@@ -329,3 +331,136 @@ class SBOMDiffResponse(BaseModel):
     from_version: int
     to_version: int
     changes: List[SBOMDiffEntry]
+
+
+# =========================================================================
+# Task Force schemas — Multi-Agent Orchestration
+# =========================================================================
+
+class TaskForceStatus(str, Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class CeremonyType(str, Enum):
+    PLANNING = "planning"
+    SYNC = "sync"
+    PEER_REVIEW = "peer_review"
+    AGGREGATION = "aggregation"
+    CUSTOM = "custom"
+
+
+class CeremonyMode(str, Enum):
+    SYNCHRONOUS = "synchronous"
+    ASYNCHRONOUS = "asynchronous"
+
+
+class ExecutionEnvironment(str, Enum):
+    DIND = "dind"
+    DEDICATED_VM = "dedicated_vm"
+
+
+# ── Members ─────────────────────────────────────────────
+
+class TaskForceMemberCreate(BaseModel):
+    """Define a member of the Task Force."""
+    agent_profile: str  # profile ID
+    role: str  # e.g. "Researcher", "Developer"
+    responsibilities: Optional[str] = None
+    llm_model: Optional[str] = None  # override
+    base_image: Optional[str] = None  # override
+    execution_order: int = 0
+
+
+class TaskForceMemberResponse(BaseModel):
+    id: int
+    task_force_id: str
+    agent_profile: str
+    role: str
+    responsibilities: Optional[str]
+    llm_model: Optional[str]
+    base_image: Optional[str]
+    task_id: Optional[str]
+    status: str
+    execution_order: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ── Ceremonies ──────────────────────────────────────────
+
+class TaskForceCeremonyCreate(BaseModel):
+    """Define a coordination ceremony."""
+    name: str
+    ceremony_type: CeremonyType
+    mode: CeremonyMode = CeremonyMode.SYNCHRONOUS
+    sequence_order: int = 0
+    participant_member_ids: Optional[List[int]] = None  # null = all members
+    description: Optional[str] = None
+    trigger_condition: str = "after_all_complete"  # after_all_complete, manual
+    timeout_minutes: int = 60
+
+
+class TaskForceCeremonyResponse(BaseModel):
+    id: int
+    task_force_id: str
+    name: str
+    ceremony_type: CeremonyType
+    mode: CeremonyMode
+    sequence_order: int
+    participant_member_ids: Optional[List[int]]
+    description: Optional[str]
+    trigger_condition: Optional[str]
+    timeout_minutes: int
+    status: str
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    result_summary: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ── Task Force CRUD ─────────────────────────────────────
+
+class TaskForceCreate(BaseModel):
+    """Create a Task Force with members and ceremonies."""
+    name: str
+    description: Optional[str] = None
+    objective: str
+    execution_environment: ExecutionEnvironment = ExecutionEnvironment.DIND
+    members: List[TaskForceMemberCreate]
+    ceremonies: List[TaskForceCeremonyCreate] = []
+
+
+class TaskForceResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    objective: str
+    execution_environment: ExecutionEnvironment
+    status: TaskForceStatus
+    workspace_id: str
+    workflow_id: Optional[str]
+    created_by: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class TaskForceDetail(TaskForceResponse):
+    """Full Task Force detail including members and ceremonies."""
+    members: List[TaskForceMemberResponse] = []
+    ceremonies: List[TaskForceCeremonyResponse] = []

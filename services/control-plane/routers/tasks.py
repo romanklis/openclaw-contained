@@ -4,14 +4,18 @@ Task management router
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from typing import List
 import uuid
 from datetime import datetime
 
 from database import get_db
-from models import Task, TaskStatus, Policy, TaskOutput
+from models import (
+    Task, TaskStatus, Policy, TaskOutput,
+    TaskForce, TaskForceMember, TaskForceStatus as TFStatus,
+)
 from schemas import TaskCreate, TaskResponse, TaskDetail, TaskContinue
-from temporal_client import start_task_workflow, continue_task_workflow
+from temporal_client import start_task_workflow, continue_task_workflow, start_task_force_workflow
 
 router = APIRouter()
 
@@ -21,7 +25,19 @@ async def create_task(
     task_data: TaskCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Create a new task"""
+    """Create a new task.
+
+    If agent_profile is a Task Force ID (starts with 'taskforce-'), the
+    system creates a *coordinator* task visible to the user plus sub-tasks
+    for each team member, then starts the TaskForceWorkflow.
+    """
+    profile = task_data.agent_profile or ""
+
+    # ── Task Force path ──────────────────────────────────────────────
+    if profile.startswith("taskforce-"):
+        return await _create_task_force_task(task_data, profile, db)
+
+    # ── Normal single-agent path ─────────────────────────────────────
     
     # Generate task ID
     task_id = f"task-{str(uuid.uuid4())[:8]}"
@@ -373,6 +389,33 @@ async def update_task_image(
     return {"task_id": task_id, "current_image": new_image}
 
 
+@router.patch("/{task_id}")
+async def update_task(
+    task_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Partially update mutable task fields (workflow_id, status, etc).
+
+    Used by the temporal-worker to persist the Temporal workflow_id
+    immediately after launching a member sub-task workflow, so that
+    capability approval signals can be routed correctly.
+    """
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Task {task_id} not found")
+
+    if "workflow_id" in body:
+        task.workflow_id = body["workflow_id"]
+    if "current_image" in body:
+        task.current_image = body["current_image"]
+
+    await db.commit()
+    return {"task_id": task_id, "updated": list(body.keys())}
+
+
 @router.post("/{task_id}/fail")
 async def fail_task(
     task_id: str,
@@ -405,3 +448,205 @@ async def get_task_logs(
     """Get task execution logs"""
     # TODO: Implement log retrieval
     return {"task_id": task_id, "logs": []}
+
+
+@router.get("/{task_id}/subtasks")
+async def get_subtasks(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return sub-tasks belonging to the same Task Force as this coordinator task."""
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Task {task_id} not found")
+    if not task.task_force_id:
+        return {"subtasks": []}
+
+    sub_result = await db.execute(
+        select(Task)
+        .where(Task.workspace_id == task.workspace_id, Task.id != task_id)
+        .order_by(Task.created_at)
+    )
+    subtasks = sub_result.scalars().all()
+
+    # Fetch pending capability requests for all sub-task IDs
+    subtask_ids = [s.id for s in subtasks]
+    cap_reqs_by_task: dict = {}
+    if subtask_ids:
+        from models import CapabilityRequest
+        cap_result = await db.execute(
+            select(CapabilityRequest)
+            .where(CapabilityRequest.task_id.in_(subtask_ids))
+            .order_by(CapabilityRequest.requested_at.desc())
+        )
+        for cr in cap_result.scalars().all():
+            cap_reqs_by_task.setdefault(cr.task_id, []).append({
+                "id": cr.id,
+                "type": cr.capability_type,
+                "resource": cr.resource_name,
+                "justification": cr.justification,
+                "status": cr.status.value if hasattr(cr.status, 'value') else str(cr.status),
+                "requested_at": cr.requested_at.isoformat() if cr.requested_at else None,
+            })
+
+    return {
+        "task_force_id": task.task_force_id,
+        "subtasks": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "status": s.status.value if s.status else "unknown",
+                "role": s.task_force_role,
+                "agent_profile": s.agent_profile,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "capability_requests": cap_reqs_by_task.get(s.id, []),
+                "has_pending_approval": any(
+                    cr["status"] == "pending" for cr in cap_reqs_by_task.get(s.id, [])
+                ),
+            }
+            for s in subtasks
+        ],
+    }
+
+
+# ── HELPERS ──────────────────────────────────────────────────────────────
+
+async def _create_task_force_task(
+    task_data: TaskCreate,
+    task_force_id: str,
+    db: AsyncSession,
+) -> Task:
+    """Create a coordinator task + member sub-tasks for a Task Force agent.
+
+    The coordinator task is the one the user sees and interacts with.
+    Behind the scenes each team member gets its own sub-task which is
+    orchestrated by the TaskForceWorkflow in Temporal.
+    """
+    # Load the Task Force
+    result = await db.execute(
+        select(TaskForce)
+        .options(selectinload(TaskForce.members))
+        .where(TaskForce.id == task_force_id)
+    )
+    tf = result.scalar_one_or_none()
+    if not tf:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Task Force '{task_force_id}' not found",
+        )
+    if tf.status != TFStatus.ACTIVE:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Task Force must be in 'active' status (current: {tf.status.value})",
+        )
+    if not tf.members:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Task Force has no members.",
+        )
+
+    # ── Create coordinator task (user-facing) ────────────────────────
+    coord_task_id = f"task-{str(uuid.uuid4())[:8]}"
+    workspace_id = f"workspace-{str(uuid.uuid4())[:8]}"
+
+    description = task_data.effective_description or tf.objective
+
+    coord_task = Task(
+        id=coord_task_id,
+        name=task_data.name,
+        description=description,
+        workspace_id=workspace_id,
+        status=TaskStatus.CREATED,
+        current_policy_id=None,
+        llm_model="multi-agent",
+        current_image="",
+        agent_profile=task_force_id,
+        task_force_id=task_force_id,
+        task_force_role="coordinator",
+    )
+    db.add(coord_task)
+    await db.flush()
+
+    # Create policy for the coordinator
+    coord_policy = Policy(
+        task_id=coord_task_id,
+        version=1,
+        tools_allowed=[],
+        network_rules={},
+        filesystem_rules={"read": ["/workspace"], "write": ["/workspace/output"]},
+        database_rules={},
+        resource_limits={"max_cpu": "2", "max_memory": "4Gi", "timeout": "2h"},
+    )
+    db.add(coord_policy)
+    await db.flush()
+    coord_task.current_policy_id = coord_policy.id
+
+    # ── Create sub-tasks for each member ─────────────────────────────
+    for member in tf.members:
+        sub_task_id = f"task-{str(uuid.uuid4())[:8]}"
+        llm_model = member.llm_model or "gemini-flash-latest"
+        base_image_key = member.base_image or "openclaw"
+        base_image_tag = f"localhost:5000/openclaw-agent:{base_image_key}"
+
+        agent_description = (
+            f"## TASK FORCE OBJECTIVE\n{description}\n\n"
+            f"## YOUR ROLE: {member.role}\n"
+            f"{member.responsibilities or 'Execute tasks within your assigned role.'}\n\n"
+            f"## IMPORTANT\n"
+            f"You are part of a multi-agent Task Force named '{tf.name}'. "
+            f"Work cooperatively — your deliverables may be reviewed by peers. "
+            f"Focus strictly on your role: {member.role}."
+        )
+
+        sub_task = Task(
+            id=sub_task_id,
+            name=f"[{tf.name}] {member.role}",
+            description=agent_description,
+            workspace_id=workspace_id,  # shared workspace
+            status=TaskStatus.CREATED,
+            current_image=base_image_tag,
+            llm_model=llm_model,
+            agent_profile=member.agent_profile,
+            task_force_id=task_force_id,
+            task_force_role=member.role,
+        )
+        db.add(sub_task)
+        await db.flush()
+
+        sub_policy = Policy(
+            task_id=sub_task_id,
+            version=1,
+            tools_allowed=[],
+            network_rules={},
+            filesystem_rules={"read": ["/workspace"], "write": ["/workspace/output"]},
+            database_rules={},
+            resource_limits={"max_cpu": "2", "max_memory": "4Gi", "timeout": "1h"},
+        )
+        db.add(sub_policy)
+        await db.flush()
+        sub_task.current_policy_id = sub_policy.id
+
+        # Link member to its sub-task
+        member.task_id = sub_task_id
+        member.status = "created"
+
+    await db.commit()
+    await db.refresh(coord_task)
+
+    # ── Start the Task Force workflow in Temporal ────────────────────
+    try:
+        workflow_id = await start_task_force_workflow(task_force_id)
+        coord_task.status = TaskStatus.RUNNING
+        coord_task.workflow_id = workflow_id
+        coord_task.started_at = datetime.utcnow()
+        tf.workflow_id = workflow_id
+        tf.started_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(coord_task)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to start TaskForce workflow: {e}")
+        # Task is still created — user can retry
+
+    return coord_task

@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 
-from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom
+from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom, task_forces
 from database import engine, Base
 from config import settings
 
@@ -63,6 +63,7 @@ app.include_router(llm.router)
 app.include_router(tasks_extended.router)
 app.include_router(deployments.router, prefix="/api/deployments", tags=["deployments"])
 app.include_router(sbom.router)
+app.include_router(task_forces.router, prefix="/api/task-forces", tags=["task-forces"])
 
 
 @app.get("/health")

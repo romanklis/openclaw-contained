@@ -123,11 +123,14 @@ class ControlPlaneClient:
 
     async def get_capability_requests(
         self, task_id: str | None = None, status_filter: str | None = None,
+        task_force_id: str | None = None,
     ) -> List[Dict[str, Any]]:
-        """GET /api/capabilities/requests — filter by task_id and/or status."""
+        """GET /api/capabilities/requests — filter by task_id, task_force_id, and/or status."""
         params: Dict[str, str] = {}
         if task_id:
             params["task_id"] = task_id
+        if task_force_id:
+            params["task_force_id"] = task_force_id
         if status_filter:
             params["status_filter"] = status_filter
         async with httpx.AsyncClient(timeout=_TIMEOUT) as c:

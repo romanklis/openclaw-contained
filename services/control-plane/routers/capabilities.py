@@ -39,13 +39,33 @@ async def get_temporal_client():
 @router.get("/requests", response_model=List[CapabilityRequestResponse])
 async def list_capability_requests(
     task_id: str = None,
+    task_force_id: str = None,
     status_filter: RequestStatus = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """List capability requests"""
+    """List capability requests.
+
+    - task_id: filter to a single task
+    - task_force_id: include requests from ALL tasks belonging to this Task Force
+    - status_filter: filter by request status
+    """
     query = select(CapabilityRequest)
-    
-    if task_id:
+
+    if task_force_id:
+        # Find all task IDs in this Task Force (excluding the coordinator)
+        tf_tasks = await db.execute(
+            select(Task.id).where(
+                Task.task_force_id == task_force_id,
+                Task.task_force_role != "coordinator",
+            )
+        )
+        tf_task_ids = [row[0] for row in tf_tasks.all()]
+        if tf_task_ids:
+            query = query.where(CapabilityRequest.task_id.in_(tf_task_ids))
+        else:
+            # No sub-tasks → return empty
+            return []
+    elif task_id:
         query = query.where(CapabilityRequest.task_id == task_id)
     
     if status_filter:
@@ -139,25 +159,65 @@ async def review_capability_request(
     await db.commit()
     await db.refresh(capability_request)
     
-    # Signal Temporal workflow
+    # Signal Temporal workflow(s)
     try:
         # Get task to find workflow ID
         result = await db.execute(
             select(Task).where(Task.id == capability_request.task_id)
         )
         task = result.scalar_one_or_none()
-        
+
+        approved = decision.decision == "approved"
+
         if task and task.workflow_id:
             temporal_client = await get_temporal_client()
             if temporal_client:
-                # Get workflow handle
+                # Signal the requesting sub-task's workflow
                 workflow_handle = temporal_client.get_workflow_handle(task.workflow_id)
-                
-                # Send approval signal
-                approved = decision.decision == "approved"
                 await workflow_handle.signal("approve_capability", approved)
-                
                 logger.info(f"Sent signal to workflow {task.workflow_id}: approved={approved}")
+
+                # If this task belongs to a Task Force, also signal ALL
+                # sibling sub-task workflows so they ALL rebuild their images
+                # with the newly approved capability.
+                if approved and task.task_force_id:
+                    siblings_result = await db.execute(
+                        select(Task).where(
+                            Task.task_force_id == task.task_force_id,
+                            Task.id != task.id,
+                            Task.task_force_role != "coordinator",
+                        )
+                    )
+                    siblings = siblings_result.scalars().all()
+                    for sibling in siblings:
+                        if sibling.workflow_id:
+                            try:
+                                # Create a matching capability request for each sibling
+                                # so their AgentTaskWorkflow can find it
+                                sib_cap = CapabilityRequest(
+                                    task_id=sibling.id,
+                                    capability_type=capability_request.capability_type,
+                                    resource_name=capability_request.resource_name,
+                                    justification=f"Propagated from sibling {task.id}: {capability_request.justification}",
+                                    details=capability_request.details,
+                                    status=RequestStatus.APPROVED,
+                                    reviewed_at=datetime.utcnow(),
+                                    reviewed_by="system (task-force-propagation)",
+                                    decision_notes=f"Auto-approved: same Task Force as {task.id}",
+                                )
+                                db.add(sib_cap)
+
+                                sib_handle = temporal_client.get_workflow_handle(sibling.workflow_id)
+                                await sib_handle.signal("approve_capability", True)
+                                logger.info(
+                                    f"Propagated cap approval to sibling {sibling.id} "
+                                    f"(workflow {sibling.workflow_id})"
+                                )
+                            except Exception as sib_err:
+                                logger.warning(
+                                    f"Could not propagate to sibling {sibling.id}: {sib_err}"
+                                )
+                    await db.commit()
             else:
                 logger.error("Could not connect to Temporal to send signal")
         else:

@@ -20,6 +20,8 @@ interface TaskOutput {
   deliverables: Record<string, string> | null;
   raw_result: any;
   created_at: string | null;
+  source_task_id?: string;
+  source_role?: string;
 }
 
 interface SBOMPackage {
@@ -179,6 +181,233 @@ function DockerfilePreview({ taskId, imageTag, iterationNumber }: { taskId: stri
   );
 }
 
+// --- AuditIterationContent component ---
+function AuditIterationContent({ iter, iterTurns, iterTokens, taskId, selectedDockerfile, setSelectedDockerfile }: {
+  iter: any;
+  iterTurns: any[];
+  iterTokens: number;
+  taskId: string;
+  selectedDockerfile: string | null;
+  setSelectedDockerfile: (v: string | null) => void;
+}) {
+  return (
+    <>
+      {/* Iteration header */}
+      <div className="px-5 py-3 border-b border-gray-700 flex items-center justify-between bg-blue-900/15">
+        <div className="flex items-center gap-3">
+          <span className="text-lg">🤖</span>
+          <div>
+            <span className="font-semibold text-white">Iteration {iter.iteration}</span>
+            <span className="text-sm text-gray-400 ml-3">
+              {iterTurns.length} turn{iterTurns.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+        </div>
+        <div className="flex items-center gap-4 text-xs text-gray-500">
+          {iterTokens > 0 && <span>{iterTokens.toLocaleString()} tokens</span>}
+          <a
+            href={`http://localhost:8088/namespaces/default/workflows/${iter.workflow_id}`}
+            target="_blank"
+            className="text-blue-400 hover:underline"
+          >
+            Temporal ↗
+          </a>
+        </div>
+      </div>
+
+      <div className="p-5 space-y-5">
+        {/* Container metadata */}
+        {iter.container && iter.container.container_id && (
+          <div>
+            <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">Container Environment</div>
+            <div className="grid grid-cols-3 gap-2 mb-2">
+              <div className="bg-gray-900/50 rounded-lg p-2.5">
+                <div className="text-xs text-gray-600">Container</div>
+                <div className="text-xs font-mono text-gray-300 truncate">{iter.container.container_id?.substring(0, 12) || '—'}</div>
+              </div>
+              <div className="bg-gray-900/50 rounded-lg p-2.5">
+                <div className="text-xs text-gray-600">Status</div>
+                <div className="text-xs font-mono text-gray-300">
+                  {iter.container.status === 'running' ? (
+                    <span className="text-blue-400">● running</span>
+                  ) : iter.container.status === 'completed' ? (
+                    <span className="text-emerald-400">✓ completed</span>
+                  ) : (
+                    iter.container.status || '—'
+                  )}
+                </div>
+              </div>
+              <div className="bg-gray-900/50 rounded-lg p-2.5">
+                <div className="text-xs text-gray-600">Turns</div>
+                <div className="text-xs font-mono text-gray-300">{iter.turn_count}</div>
+              </div>
+            </div>
+            {/* Image name - full width so it's never truncated */}
+            <div className="bg-gray-900/50 rounded-lg p-2.5 mb-2">
+              <div className="text-xs text-gray-600 mb-1">Image</div>
+              <div className="text-xs font-mono text-gray-300 break-all select-all">{iter.container.image || iter.container.agent_image || '—'}</div>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              {iter.container.sandbox_mode && (
+                iter.container.sandbox_mode === 'gvisor' ? (
+                  <span className="inline-flex items-center gap-1 text-xs bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/20">
+                    🛡️ gVisor (runsc)
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 text-xs bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded border border-amber-500/20">
+                    ⚠️ insecure-dind (privileged)
+                  </span>
+                )
+              )}
+              <button
+                onClick={() => {
+                  const key = `dockerfile-${iter.workflow_id}`;
+                  setSelectedDockerfile(selectedDockerfile === key ? null : key);
+                }}
+                className="inline-flex items-center gap-1 text-xs bg-indigo-500/10 text-indigo-400 px-2 py-0.5 rounded border border-indigo-500/20 hover:bg-indigo-500/20 transition-colors cursor-pointer"
+              >
+                🐳 {selectedDockerfile === `dockerfile-${iter.workflow_id}` ? 'Hide' : 'View'} Dockerfile
+              </button>
+            </div>
+            {/* Dockerfile preview */}
+            {selectedDockerfile === `dockerfile-${iter.workflow_id}` && (
+              <DockerfilePreview taskId={taskId} imageTag={iter.container.image || iter.container.agent_image || ''} iterationNumber={iter.iteration} />
+            )}
+          </div>
+        )}
+
+        {/* LLM Turns */}
+        {iterTurns.length > 0 && (
+          <div>
+            <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">
+              LLM Interactions ({iterTurns.length} turn{iterTurns.length > 1 ? 's' : ''})
+            </div>
+            <div className="space-y-3">
+              {iterTurns.map((turn: any, idx: number) => {
+                const turnData = turn.data || {};
+                const resp = turnData.response || {};
+                const reqInfo = turnData.request || {};
+                const toolCalls = resp.tool_calls || [];
+                const usage = resp.usage || {};
+                const turnResult = turn.result || {};
+
+                return (
+                  <div key={idx} className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
+                    {/* Turn header */}
+                    <div className="flex items-center justify-between px-4 py-2.5 bg-gray-800/50 border-b border-gray-700">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold text-indigo-400">Turn {turn.turn_number || idx + 1}</span>
+                        <span className="text-xs text-gray-600">via {turnData.provider || turnResult.provider || 'unknown'}</span>
+                        {turnData.streaming && <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">streaming</span>}
+                      </div>
+                      <div className="flex items-center gap-3 text-xs text-gray-500">
+                        {(usage.prompt_tokens || usage.input_tokens) && (
+                          <span>in: {(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()}</span>
+                        )}
+                        {(usage.completion_tokens || usage.output_tokens) && (
+                          <span>out: {(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()}</span>
+                        )}
+                        {usage.total_tokens && (
+                          <span className="text-gray-400 font-medium">Σ {usage.total_tokens.toLocaleString()}</span>
+                        )}
+                        {turnData.timestamp && <span>{new Date(turnData.timestamp).toLocaleTimeString()}</span>}
+                      </div>
+                    </div>
+
+                    {/* Request info */}
+                    <div className="px-4 py-2 border-b border-gray-800">
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="text-gray-600">Request:</span>
+                        <span className="text-gray-400">{reqInfo.msg_count || '?'} messages</span>
+                        {reqInfo.roles && (
+                          <span className="text-gray-600">
+                            [{reqInfo.roles.join(' → ')}]
+                          </span>
+                        )}
+                        {reqInfo.tool_results && reqInfo.tool_results.length > 0 && (
+                          <span className="text-purple-400">
+                            + {reqInfo.tool_results.length} tool result{reqInfo.tool_results.length > 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Tool calls */}
+                    {toolCalls.length > 0 && (
+                      <div className="px-4 py-2.5">
+                        <div className="text-xs text-gray-600 mb-2">Tool Calls:</div>
+                        <div className="space-y-2">
+                          {toolCalls.map((tc: any, tci: number) => {
+                            let argsPreview = '';
+                            try {
+                              const parsed = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
+                              if (parsed && typeof parsed === 'object') {
+                                if (parsed.file_path) argsPreview = parsed.file_path;
+                                else if (parsed.command) argsPreview = parsed.command;
+                                else argsPreview = Object.keys(parsed).join(', ');
+                              } else {
+                                argsPreview = String(tc.arguments || '').substring(0, 80);
+                              }
+                            } catch {
+                              argsPreview = String(tc.arguments || '').substring(0, 80);
+                            }
+                            return (
+                              <div key={tci} className="flex items-start gap-2">
+                                <span className="text-xs font-mono bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded shrink-0">
+                                  {tc.name}
+                                </span>
+                                <span className="text-xs text-gray-500 font-mono truncate">
+                                  {argsPreview}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Tool results from request */}
+                    {reqInfo.tool_results && reqInfo.tool_results.length > 0 && (
+                      <div className="px-4 py-2.5 border-t border-gray-800">
+                        <div className="text-xs text-gray-600 mb-2">Tool Results:</div>
+                        <div className="space-y-1.5">
+                          {reqInfo.tool_results.map((tr: any, tri: number) => (
+                            <div key={tri} className="text-xs">
+                              <span className="font-mono text-gray-500">{tr.tool_call_id?.substring(0, 20)}...</span>
+                              <div className="bg-gray-950 rounded p-2 mt-1 text-gray-400 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto">
+                                {String(tr.content || '').substring(0, 300)}{String(tr.content || '').length > 300 ? '...' : ''}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Finish reason */}
+                    {resp.finish_reason && toolCalls.length === 0 && (
+                      <div className="px-4 py-2 border-t border-gray-800">
+                        <span className="text-xs text-gray-600">Response: </span>
+                        <span className={`text-xs ${resp.finish_reason === 'stop' || resp.finish_reason === 'end_turn' ? 'text-emerald-400' : 'text-amber-400'}`}>
+                          {resp.finish_reason}
+                        </span>
+                        {resp.content && (
+                          <div className="mt-2 bg-gray-950 rounded p-2 text-xs text-gray-300 whitespace-pre-wrap max-h-32 overflow-y-auto">
+                            {resp.content.substring(0, 500)}{resp.content.length > 500 ? '...' : ''}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
 // --- Page ---
 export default function TaskDetailPage() {
   const params = useParams();
@@ -197,6 +426,12 @@ export default function TaskDetailPage() {
   const [continuing, setContinuing] = useState(false);
   const [auditTurns, setAuditTurns] = useState<any>(null);
   const [auditLoading, setAuditLoading] = useState(false);
+
+  // Task Force sub-tasks state
+  const [subtasks, setSubtasks] = useState<any[]>([]);
+  const [isTaskForce, setIsTaskForce] = useState(false);
+  const [ceremonyMessages, setCeremonyMessages] = useState<any[]>([]);
+  const [showAllCeremonyMessages, setShowAllCeremonyMessages] = useState(false);
 
   // SBOM state
   const [sbomData, setSbomData] = useState<SBOMData | null>(null);
@@ -236,6 +471,46 @@ export default function TaskDetailPage() {
     const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
   }, [taskId]);
+
+  // --- Sub-tasks fetching for Task Force coordinator tasks ---
+  useEffect(() => {
+    const fetchSubtasks = async () => {
+      try {
+        const res = await fetch(`${API}/api/tasks/${taskId}/subtasks`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.subtasks && data.subtasks.length > 0) {
+            setSubtasks(data.subtasks);
+            setIsTaskForce(true);
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+    };
+    fetchSubtasks();
+    const interval = setInterval(fetchSubtasks, 8000);
+    return () => clearInterval(interval);
+  }, [taskId]);
+
+  // --- Ceremony messages fetching for Task Force ---
+  useEffect(() => {
+    if (!isTaskForce) return;
+    const fetchMessages = async () => {
+      try {
+        const res = await fetch(`${API}/api/tasks/${taskId}/messages`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.messages && data.messages.length > 0) {
+            setCeremonyMessages(data.messages.filter((m: any) => m.role === 'system'));
+          }
+        }
+      } catch (e) { /* ignore */ }
+    };
+    fetchMessages();
+    const interval = setInterval(fetchMessages, 6000);
+    return () => clearInterval(interval);
+  }, [taskId, isTaskForce]);
 
   // --- Audit turns fetching (from Temporal child workflows) ---
   useEffect(() => {
@@ -537,6 +812,160 @@ export default function TaskDetailPage() {
           </div>
         )}
 
+        {/* Task Force Sub-Tasks Panel */}
+        {isTaskForce && subtasks.length > 0 && (
+          <div className="bg-gradient-to-r from-cyan-900/20 to-blue-900/20 border border-cyan-500/20 rounded-lg p-4 mb-4">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-lg">⚓</span>
+              <span className="text-sm font-semibold text-cyan-300">Task Force Team</span>
+              <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">
+                {subtasks.length} Agents
+              </span>
+              {subtasks.some((st: any) => st.has_pending_approval) && (
+                <a href="/approvals" className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 animate-pulse hover:bg-yellow-500/30 transition-colors">
+                  🔒 Needs Approval
+                </a>
+              )}
+            </div>
+            <div className="space-y-2">
+              {subtasks.map((st: any) => (
+                <a
+                  key={st.id}
+                  href={`/tasks/${st.id}`}
+                  className={`bg-gray-800/60 hover:bg-gray-800/90 border rounded-lg p-3 transition-all group flex items-start gap-3 ${
+                    st.has_pending_approval ? 'border-yellow-500/40' : 'border-gray-700 hover:border-cyan-500/40'
+                  }`}
+                >
+                  <span className={`w-2 h-2 mt-1.5 rounded-full shrink-0 ${
+                    st.status === 'completed' ? 'bg-green-400' :
+                    st.status === 'running' ? 'bg-blue-400 animate-pulse' :
+                    st.status === 'failed' ? 'bg-red-400' :
+                    st.status === 'paused' ? 'bg-yellow-400 animate-pulse' :
+                    'bg-gray-500'
+                  }`} />
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-xs font-semibold text-white group-hover:text-cyan-300 transition-colors">
+                        {st.role || st.name}
+                      </span>
+                      <span className="text-[10px] text-gray-500 font-mono">{st.id}</span>
+                      <span className="capitalize text-[10px] text-gray-500">
+                        {st.status === 'paused' ? 'awaiting approval' : st.status}
+                      </span>
+                    </div>
+                    {st.has_pending_approval && st.capability_requests && (
+                      <div className="mt-1 space-y-1">
+                        {st.capability_requests.filter((cr: any) => cr.status === 'pending').map((cr: any) => (
+                          <div key={cr.id} className="flex items-center gap-1 text-[10px] text-yellow-400 bg-yellow-500/10 rounded px-1.5 py-0.5">
+                            <span>🔒</span>
+                            <span className="font-medium">{cr.type}:</span>
+                            <span className="text-yellow-300 truncate">{cr.resource}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {st.agent_profile && !st.has_pending_approval && (
+                      <div className="mt-1 text-[10px] text-gray-600">
+                        Profile: {st.agent_profile}
+                      </div>
+                    )}
+                  </div>
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Task Force Ceremony Progress */}
+        {isTaskForce && ceremonyMessages.length > 0 && (
+          <div className="bg-gradient-to-r from-purple-900/20 to-indigo-900/20 border border-purple-500/20 rounded-lg p-4 mb-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-lg">{'\u{1F3AD}'}</span>
+                <span className="text-sm font-semibold text-purple-300">Ceremony Log</span>
+                <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 border border-purple-500/30">
+                  {ceremonyMessages.length} events
+                </span>
+              </div>
+              {ceremonyMessages.length > 3 && (
+                <button
+                  onClick={() => setShowAllCeremonyMessages(!showAllCeremonyMessages)}
+                  className="text-[10px] text-purple-400 hover:text-purple-300 transition-colors"
+                >
+                  {showAllCeremonyMessages ? 'Show latest' : `Show all (${ceremonyMessages.length})`}
+                </button>
+              )}
+            </div>
+            <div className="space-y-2">
+              {(showAllCeremonyMessages ? ceremonyMessages : ceremonyMessages.slice(-3)).map((msg: any, idx: number) => {
+                const content = msg.content || '';
+                // Detect ceremony phase markers
+                const isPhase = content.includes('Ceremony Phase');
+                const isPlan = content.includes('Planning ceremony') || content.includes('CEREMONY_PLAN');
+                const isReview = content.includes('Peer Review') || content.includes('REVIEW_BRIEF');
+                const isAggregation = content.includes('Aggregation');
+                const isStarted = content.includes('Started') && content.includes('agent');
+                const isProgress = content.includes('Progress Update');
+                const isComplete = content.includes('completed') || content.includes('✅');
+                const isApproval = content.includes('approval') || content.includes('🔒');
+
+                let borderColor = 'border-gray-700';
+                let bgColor = 'bg-gray-800/40';
+                let icon = '📌';
+
+                if (isPhase) { borderColor = 'border-purple-500/40'; bgColor = 'bg-purple-900/20'; icon = '\u{1F3AD}'; }
+                else if (isPlan) { borderColor = 'border-blue-500/40'; bgColor = 'bg-blue-900/20'; icon = '📋'; }
+                else if (isReview) { borderColor = 'border-amber-500/40'; bgColor = 'bg-amber-900/20'; icon = '🔍'; }
+                else if (isAggregation) { borderColor = 'border-emerald-500/40'; bgColor = 'bg-emerald-900/20'; icon = '📊'; }
+                else if (isStarted) { borderColor = 'border-cyan-500/40'; bgColor = 'bg-cyan-900/20'; icon = '🚀'; }
+                else if (isComplete) { borderColor = 'border-green-500/40'; bgColor = 'bg-green-900/20'; icon = '✅'; }
+                else if (isApproval) { borderColor = 'border-yellow-500/40'; bgColor = 'bg-yellow-900/20'; icon = '🔒'; }
+                else if (isProgress) { borderColor = 'border-gray-600'; bgColor = 'bg-gray-800/30'; icon = '📊'; }
+
+                // Parse markdown-style bold
+                const formatContent = (text: string) => {
+                  return text.split('\n').map((line: string, li: number) => {
+                    const parts = line.split(/(\*\*.*?\*\*)/g);
+                    return (
+                      <div key={li} className={li > 0 ? 'mt-0.5' : ''}>
+                        {parts.map((part: string, pi: number) => {
+                          if (part.startsWith('**') && part.endsWith('**')) {
+                            return <span key={pi} className="font-semibold text-white">{part.slice(2, -2)}</span>;
+                          }
+                          // Highlight file references
+                          const fileParts = part.split(/(`[^`]+`)/g);
+                          return fileParts.map((fp: string, fi: number) => {
+                            if (fp.startsWith('`') && fp.endsWith('`')) {
+                              return <code key={`${pi}-${fi}`} className="text-[10px] bg-gray-700/50 px-1 py-0.5 rounded text-emerald-400 font-mono">{fp.slice(1, -1)}</code>;
+                            }
+                            return <span key={`${pi}-${fi}`}>{fp}</span>;
+                          });
+                        })}
+                      </div>
+                    );
+                  });
+                };
+
+                return (
+                  <div key={msg.id || idx} className={`${bgColor} border ${borderColor} rounded-lg px-3 py-2`}>
+                    <div className="flex items-start gap-2">
+                      <span className="text-xs mt-0.5">{icon}</span>
+                      <div className="flex-1 text-xs text-gray-300 leading-relaxed">
+                        {formatContent(content)}
+                      </div>
+                      {msg.created_at && (
+                        <span className="text-[9px] text-gray-600 whitespace-nowrap mt-0.5">
+                          {new Date(msg.created_at).toLocaleTimeString()}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Current State */}
         {currentState && (
           <div className="bg-gradient-to-r from-blue-900/20 to-purple-900/20 border border-blue-500/30 rounded-lg p-5 mb-6">
@@ -603,7 +1032,8 @@ export default function TaskDetailPage() {
               </div>
             ) : (
               outputs.map((o) => {
-                const isExpanded = expandedOutput === o.iteration;
+                const outputKey = `${o.source_task_id || o.id}-iter${o.iteration}`;
+                const isExpanded = expandedOutput === o.id;
                 const preview = extractLlmPreview(o);
                 const hasError = !!o.error;
                 const isDone = o.completed === 'true';
@@ -612,7 +1042,7 @@ export default function TaskDetailPage() {
 
                 return (
                   <div
-                    key={o.id}
+                    key={outputKey}
                     className={`rounded-lg border transition-colors ${
                       hasError ? 'border-red-500/40 bg-red-900/10' :
                       isDone   ? 'border-green-500/40 bg-green-900/10' :
@@ -622,13 +1052,18 @@ export default function TaskDetailPage() {
                   >
                     {/* Header row */}
                     <button
-                      onClick={() => setExpandedOutput(isExpanded ? null : o.iteration)}
+                      onClick={() => setExpandedOutput(isExpanded ? null : o.id)}
                       className="w-full text-left px-5 py-3 flex items-center justify-between hover:bg-white/5 rounded-t-lg"
                     >
                       <div className="flex items-center gap-3">
                         <span className="text-lg">
                           {hasError ? '\u274C' : isDone ? '\u2705' : hasCap ? '\u{1F510}' : '\u{1F916}'}
                         </span>
+                        {o.source_role && (
+                          <span className="text-xs font-semibold px-2 py-0.5 rounded bg-cyan-900/50 text-cyan-300 border border-cyan-500/30">
+                            {o.source_role}
+                          </span>
+                        )}
                         <span className="font-mono text-sm text-gray-300">
                           Iteration {o.iteration}
                         </span>
@@ -665,9 +1100,22 @@ export default function TaskDetailPage() {
                     </button>
 
                     {/* Preview (always visible when collapsed) */}
-                    {!isExpanded && preview && (
-                      <div className="px-5 pb-3 text-sm text-gray-400 truncate">
-                        {preview.slice(0, 200)}
+                    {!isExpanded && (
+                      <div className="px-5 pb-3">
+                        {deliverableCount > 0 && (
+                          <div className="flex flex-wrap gap-1 mb-1">
+                            {Object.keys(o.deliverables!).map(fname => (
+                              <span key={fname} className="text-[10px] font-mono bg-emerald-900/30 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">
+                                {fname}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {preview && (
+                          <div className="text-sm text-gray-400 truncate">
+                            {preview.slice(0, 200)}
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -773,12 +1221,12 @@ export default function TaskDetailPage() {
                         {/* Raw JSON toggle */}
                         <div>
                           <button
-                            onClick={() => setShowRawJson(showRawJson === o.iteration ? null : o.iteration)}
+                            onClick={() => setShowRawJson(showRawJson === o.id ? null : o.id)}
                             className="text-xs text-blue-400 hover:text-blue-300"
                           >
-                            {showRawJson === o.iteration ? '\u25BC Hide' : '\u25B6 Show'} Raw JSON
+                            {showRawJson === o.id ? '\u25BC Hide' : '\u25B6 Show'} Raw JSON
                           </button>
-                          {showRawJson === o.iteration && o.raw_result && (
+                          {showRawJson === o.id && o.raw_result && (
                             <pre className="mt-2 bg-gray-900 rounded p-3 text-xs text-gray-400 whitespace-pre-wrap max-h-64 overflow-y-auto font-mono">
                               {JSON.stringify(o.raw_result, null, 2)}
                             </pre>
@@ -808,230 +1256,81 @@ export default function TaskDetailPage() {
               </div>
             ) : (
               <>
-                {auditTurns.iterations.map((iter: any) => {
-                  const iterTurns = iter.turns || [];
-                  const iterTokens = iterTurns.reduce((sum: number, t: any) => {
-                    const usage = t.data?.response?.usage || {};
-                    return sum + (usage.total_tokens || 0);
-                  }, 0);
-
-                  return (
-                    <div key={iter.workflow_id} className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
-                      {/* Iteration header */}
-                      <div className="px-5 py-3 border-b border-gray-700 flex items-center justify-between bg-blue-900/15">
-                        <div className="flex items-center gap-3">
-                          <span className="text-lg">🤖</span>
-                          <div>
-                            <span className="font-semibold text-white">Iteration {iter.iteration}</span>
-                            <span className="text-sm text-gray-400 ml-3">
-                              {iterTurns.length} turn{iterTurns.length !== 1 ? 's' : ''}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-4 text-xs text-gray-500">
-                          {iterTokens > 0 && <span>{iterTokens.toLocaleString()} tokens</span>}
-                          <a
-                            href={`http://localhost:8088/namespaces/default/workflows/${iter.workflow_id}`}
-                            target="_blank"
-                            className="text-blue-400 hover:underline"
-                          >
-                            Temporal ↗
-                          </a>
-                        </div>
-                      </div>
-
-                      <div className="p-5 space-y-5">
-                        {/* Container metadata */}
-                        {iter.container && iter.container.container_id && (
-                          <div>
-                            <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">Container Environment</div>
-                            <div className="grid grid-cols-3 gap-2 mb-2">
-                              <div className="bg-gray-900/50 rounded-lg p-2.5">
-                                <div className="text-xs text-gray-600">Container</div>
-                                <div className="text-xs font-mono text-gray-300 truncate">{iter.container.container_id?.substring(0, 12) || '—'}</div>
-                              </div>
-                              <div className="bg-gray-900/50 rounded-lg p-2.5">
-                                <div className="text-xs text-gray-600">Status</div>
-                                <div className="text-xs font-mono text-gray-300">
-                                  {iter.container.status === 'running' ? (
-                                    <span className="text-blue-400">● running</span>
-                                  ) : iter.container.status === 'completed' ? (
-                                    <span className="text-emerald-400">✓ completed</span>
-                                  ) : (
-                                    iter.container.status || '—'
-                                  )}
-                                </div>
-                              </div>
-                              <div className="bg-gray-900/50 rounded-lg p-2.5">
-                                <div className="text-xs text-gray-600">Turns</div>
-                                <div className="text-xs font-mono text-gray-300">{iter.turn_count}</div>
-                              </div>
+                {/* Group audit iterations by agent if Task Force */}
+                {(() => {
+                  const iterations = auditTurns.iterations || [];
+                  // Build a map from task_id → role for Task Force
+                  const roleMap: Record<string, string> = {};
+                  subtasks.forEach((st: any) => { if (st.id && st.role) roleMap[st.id] = st.role; });
+                  
+                  // Group iterations by task_id when isTaskForce
+                  if (isTaskForce && Object.keys(roleMap).length > 0) {
+                    const grouped: Record<string, any[]> = {};
+                    for (const iter of iterations) {
+                      const key = iter.task_id || 'unknown';
+                      (grouped[key] = grouped[key] || []).push(iter);
+                    }
+                    return Object.entries(grouped).map(([tId, iters]) => {
+                      const role = roleMap[tId] || 'Coordinator';
+                      // Find deliverables from the outputs for this agent
+                      const agentOutputs = outputs.filter(o => o.source_task_id === tId);
+                      const agentDeliverables = agentOutputs
+                        .filter(o => o.deliverables && Object.keys(o.deliverables).length > 0)
+                        .flatMap(o => Object.keys(o.deliverables!));
+                      return (
+                        <div key={tId} className="rounded-xl border border-gray-700 bg-gray-800/20 overflow-hidden mb-4">
+                          {/* Agent header */}
+                          <div className="px-5 py-3 border-b border-gray-700 bg-cyan-900/15 flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              <span className="text-lg">⚓</span>
+                              <span className="font-bold text-cyan-300">{role}</span>
+                              <span className="text-[10px] font-mono text-gray-500">{tId}</span>
+                              <span className="text-xs text-gray-500">
+                                {iters.length} iteration{iters.length !== 1 ? 's' : ''}
+                              </span>
                             </div>
-                            {/* Image name - full width so it's never truncated */}
-                            <div className="bg-gray-900/50 rounded-lg p-2.5 mb-2">
-                              <div className="text-xs text-gray-600 mb-1">Image</div>
-                              <div className="text-xs font-mono text-gray-300 break-all select-all">{iter.container.image || iter.container.agent_image || '—'}</div>
-                            </div>
-                            <div className="flex items-center gap-2 flex-wrap">
-                              {iter.container.sandbox_mode && (
-                                iter.container.sandbox_mode === 'gvisor' ? (
-                                  <span className="inline-flex items-center gap-1 text-xs bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/20">
-                                    🛡️ gVisor (runsc)
+                            {agentDeliverables.length > 0 && (
+                              <div className="flex flex-wrap gap-1">
+                                {agentDeliverables.map(f => (
+                                  <span key={f} className="text-[10px] font-mono bg-emerald-900/30 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">
+                                    {f}
                                   </span>
-                                ) : (
-                                  <span className="inline-flex items-center gap-1 text-xs bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded border border-amber-500/20">
-                                    ⚠️ insecure-dind (privileged)
-                                  </span>
-                                )
-                              )}
-                              <button
-                                onClick={() => {
-                                  const key = `dockerfile-${iter.workflow_id}`;
-                                  setSelectedDockerfile(selectedDockerfile === key ? null : key);
-                                }}
-                                className="inline-flex items-center gap-1 text-xs bg-indigo-500/10 text-indigo-400 px-2 py-0.5 rounded border border-indigo-500/20 hover:bg-indigo-500/20 transition-colors cursor-pointer"
-                              >
-                                🐳 {selectedDockerfile === `dockerfile-${iter.workflow_id}` ? 'Hide' : 'View'} Dockerfile
-                              </button>
-                            </div>
-                            {/* Dockerfile preview */}
-                            {selectedDockerfile === `dockerfile-${iter.workflow_id}` && (
-                              <DockerfilePreview taskId={taskId} imageTag={iter.container.image || iter.container.agent_image || ''} iterationNumber={iter.iteration} />
+                                ))}
+                              </div>
                             )}
                           </div>
-                        )}
-
-                        {/* LLM Turns */}
-                        {iterTurns.length > 0 && (
-                          <div>
-                            <div className="text-xs text-gray-500 uppercase font-medium tracking-wider mb-2">
-                              LLM Interactions ({iterTurns.length} turn{iterTurns.length > 1 ? 's' : ''})
-                            </div>
-                            <div className="space-y-3">
-                              {iterTurns.map((turn: any, idx: number) => {
-                                const turnData = turn.data || {};
-                                const resp = turnData.response || {};
-                                const reqInfo = turnData.request || {};
-                                const toolCalls = resp.tool_calls || [];
-                                const usage = resp.usage || {};
-                                const turnResult = turn.result || {};
-
-                                return (
-                                  <div key={idx} className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
-                                    {/* Turn header */}
-                                    <div className="flex items-center justify-between px-4 py-2.5 bg-gray-800/50 border-b border-gray-700">
-                                      <div className="flex items-center gap-2">
-                                        <span className="text-xs font-bold text-indigo-400">Turn {turn.turn_number || idx + 1}</span>
-                                        <span className="text-xs text-gray-600">via {turnData.provider || turnResult.provider || 'unknown'}</span>
-                                        {turnData.streaming && <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">streaming</span>}
-                                      </div>
-                                      <div className="flex items-center gap-3 text-xs text-gray-500">
-                                        {(usage.prompt_tokens || usage.input_tokens) && (
-                                          <span>in: {(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()}</span>
-                                        )}
-                                        {(usage.completion_tokens || usage.output_tokens) && (
-                                          <span>out: {(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()}</span>
-                                        )}
-                                        {usage.total_tokens && (
-                                          <span className="text-gray-400 font-medium">Σ {usage.total_tokens.toLocaleString()}</span>
-                                        )}
-                                        {turnData.timestamp && <span>{new Date(turnData.timestamp).toLocaleTimeString()}</span>}
-                                      </div>
-                                    </div>
-
-                                    {/* Request info */}
-                                    <div className="px-4 py-2 border-b border-gray-800">
-                                      <div className="flex items-center gap-2 text-xs">
-                                        <span className="text-gray-600">Request:</span>
-                                        <span className="text-gray-400">{reqInfo.msg_count || '?'} messages</span>
-                                        {reqInfo.roles && (
-                                          <span className="text-gray-600">
-                                            [{reqInfo.roles.join(' → ')}]
-                                          </span>
-                                        )}
-                                        {reqInfo.tool_results && reqInfo.tool_results.length > 0 && (
-                                          <span className="text-purple-400">
-                                            + {reqInfo.tool_results.length} tool result{reqInfo.tool_results.length > 1 ? 's' : ''}
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-
-                                    {/* Tool calls */}
-                                    {toolCalls.length > 0 && (
-                                      <div className="px-4 py-2.5">
-                                        <div className="text-xs text-gray-600 mb-2">Tool Calls:</div>
-                                        <div className="space-y-2">
-                                          {toolCalls.map((tc: any, tci: number) => {
-                                            let argsPreview = '';
-                                            try {
-                                              const parsed = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
-                                              if (parsed && typeof parsed === 'object') {
-                                                if (parsed.file_path) argsPreview = parsed.file_path;
-                                                else if (parsed.command) argsPreview = parsed.command;
-                                                else argsPreview = Object.keys(parsed).join(', ');
-                                              } else {
-                                                argsPreview = String(tc.arguments || '').substring(0, 80);
-                                              }
-                                            } catch {
-                                              argsPreview = String(tc.arguments || '').substring(0, 80);
-                                            }
-                                            return (
-                                              <div key={tci} className="flex items-start gap-2">
-                                                <span className="text-xs font-mono bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded shrink-0">
-                                                  {tc.name}
-                                                </span>
-                                                <span className="text-xs text-gray-500 font-mono truncate">
-                                                  {argsPreview}
-                                                </span>
-                                              </div>
-                                            );
-                                          })}
-                                        </div>
-                                      </div>
-                                    )}
-
-                                    {/* Tool results from request */}
-                                    {reqInfo.tool_results && reqInfo.tool_results.length > 0 && (
-                                      <div className="px-4 py-2.5 border-t border-gray-800">
-                                        <div className="text-xs text-gray-600 mb-2">Tool Results:</div>
-                                        <div className="space-y-1.5">
-                                          {reqInfo.tool_results.map((tr: any, tri: number) => (
-                                            <div key={tri} className="text-xs">
-                                              <span className="font-mono text-gray-500">{tr.tool_call_id?.substring(0, 20)}...</span>
-                                              <div className="bg-gray-950 rounded p-2 mt-1 text-gray-400 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto">
-                                                {String(tr.content || '').substring(0, 300)}{String(tr.content || '').length > 300 ? '...' : ''}
-                                              </div>
-                                            </div>
-                                          ))}
-                                        </div>
-                                      </div>
-                                    )}
-
-                                    {/* Finish reason */}
-                                    {resp.finish_reason && toolCalls.length === 0 && (
-                                      <div className="px-4 py-2 border-t border-gray-800">
-                                        <span className="text-xs text-gray-600">Response: </span>
-                                        <span className={`text-xs ${resp.finish_reason === 'stop' || resp.finish_reason === 'end_turn' ? 'text-emerald-400' : 'text-amber-400'}`}>
-                                          {resp.finish_reason}
-                                        </span>
-                                        {resp.content && (
-                                          <div className="mt-2 bg-gray-950 rounded p-2 text-xs text-gray-300 whitespace-pre-wrap max-h-32 overflow-y-auto">
-                                            {resp.content.substring(0, 500)}{resp.content.length > 500 ? '...' : ''}
-                                          </div>
-                                        )}
-                                      </div>
-                                    )}
-                                  </div>
-                                );
-                              })}
-                            </div>
+                          <div className="p-3 space-y-4">
+                            {iters.map((iter: any) => {
+                              const iterTurns = iter.turns || [];
+                              const iterTokens = iterTurns.reduce((sum: number, t: any) => {
+                                const usage = t.data?.response?.usage || {};
+                                return sum + (usage.total_tokens || 0);
+                              }, 0);
+                              return (
+                                <div key={iter.workflow_id} className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
+                                  <AuditIterationContent iter={iter} iterTurns={iterTurns} iterTokens={iterTokens} taskId={taskId} selectedDockerfile={selectedDockerfile} setSelectedDockerfile={setSelectedDockerfile} />
+                                </div>
+                              );
+                            })}
                           </div>
-                        )}
+                        </div>
+                      );
+                    });
+                  }
+                  // Non-Task Force: flat list as before
+                  return iterations.map((iter: any) => {
+                    const iterTurns = iter.turns || [];
+                    const iterTokens = iterTurns.reduce((sum: number, t: any) => {
+                      const usage = t.data?.response?.usage || {};
+                      return sum + (usage.total_tokens || 0);
+                    }, 0);
+                    return (
+                      <div key={iter.workflow_id} className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
+                        <AuditIterationContent iter={iter} iterTurns={iterTurns} iterTokens={iterTokens} taskId={taskId} selectedDockerfile={selectedDockerfile} setSelectedDockerfile={setSelectedDockerfile} />
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  });
+                })()}
 
                 {/* Token Usage Summary */}
                 <div className="rounded-xl border border-gray-700 bg-gray-800/30 p-5">
@@ -1336,24 +1635,44 @@ export default function TaskDetailPage() {
                 <h2 className="text-xl font-bold mb-4">Capability Requests</h2>
                 {timeline.capability_requests.length > 0 ? (
                   <div className="space-y-3">
-                    {timeline.capability_requests.map((req: any) => (
-                      <div key={req.id} className="bg-gray-800 rounded-lg p-4">
-                        <div className="flex justify-between items-start mb-2">
-                          <span className="font-semibold">{req.type}: {req.resource}</span>
-                          <span className={`px-2 py-1 rounded text-xs ${
-                            req.status === 'approved' ? 'bg-green-900 text-green-300' :
-                            req.status === 'denied' ? 'bg-red-900 text-red-300' :
-                            'bg-yellow-900 text-yellow-300'
-                          }`}>
-                            {req.status}
-                          </span>
+                    {timeline.capability_requests.map((req: any) => {
+                      const subtaskInfo = isTaskForce && req.task_id
+                        ? subtasks.find((st: any) => st.id === req.task_id)
+                        : null;
+                      return (
+                        <div key={req.id} className={`bg-gray-800 rounded-lg p-4 ${
+                          req.status === 'pending' ? 'border border-yellow-500/30' : ''
+                        }`}>
+                          <div className="flex justify-between items-start mb-2">
+                            <div>
+                              <span className="font-semibold">{req.type}: {req.resource}</span>
+                              {subtaskInfo && (
+                                <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">
+                                  {subtaskInfo.role || subtaskInfo.agent_profile}
+                                </span>
+                              )}
+                            </div>
+                            <span className={`px-2 py-1 rounded text-xs ${
+                              req.status === 'approved' ? 'bg-green-900 text-green-300' :
+                              req.status === 'denied' ? 'bg-red-900 text-red-300' :
+                              'bg-yellow-900 text-yellow-300'
+                            }`}>
+                              {req.status}
+                            </span>
+                          </div>
+                          <p className="text-sm text-gray-400">{req.justification}</p>
+                          <div className="flex items-center gap-3 text-xs text-gray-500 mt-2">
+                            <span>Requested: {new Date(req.requested_at).toLocaleString()}</span>
+                            {req.status === 'pending' && (
+                              <a href={`/approvals?task_id=${req.task_id || ''}`}
+                                className="text-yellow-400 hover:text-yellow-300 font-medium">
+                                → Review
+                              </a>
+                            )}
+                          </div>
                         </div>
-                        <p className="text-sm text-gray-400">{req.justification}</p>
-                        <div className="text-xs text-gray-500 mt-2">
-                          Requested: {new Date(req.requested_at).toLocaleString()}
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ) : (
                   <p className="text-gray-500 text-sm">No capability requests yet.</p>

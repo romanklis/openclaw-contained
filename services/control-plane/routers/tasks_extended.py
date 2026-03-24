@@ -83,10 +83,20 @@ async def get_execution_timeline(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    # Get all capability requests for this task
+    # Get all capability requests for this task — and for Task Force
+    # coordinator tasks, also include capability requests from all sub-tasks
+    # so they are surfaced on the coordinator's detail page.
+    task_ids_to_query = [task_id]
+    if task.task_force_id and task.task_force_role == "coordinator":
+        sub_result = await db.execute(
+            select(Task.id)
+            .where(Task.workspace_id == task.workspace_id, Task.id != task_id)
+        )
+        task_ids_to_query.extend([row[0] for row in sub_result.all()])
+
     requests_result = await db.execute(
         select(CapabilityRequest)
-        .where(CapabilityRequest.task_id == task_id)
+        .where(CapabilityRequest.task_id.in_(task_ids_to_query))
         .order_by(CapabilityRequest.requested_at)
     )
     capability_requests = requests_result.scalars().all()
@@ -178,6 +188,7 @@ async def get_execution_timeline(
         "capability_requests": [
             {
                 "id": req.id,
+                "task_id": req.task_id,
                 "type": req.capability_type,
                 "resource": req.resource_name,
                 "justification": req.justification,
@@ -289,17 +300,40 @@ async def get_task_outputs(
     task_id: str,
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
-    """Get all iteration outputs for a task"""
+    """Get all iteration outputs for a task.
+
+    For Task Force coordinators this aggregates outputs from ALL
+    sub-tasks so the coordinator's detail page shows every
+    deliverable produced by its team members.
+    """
+    # Check if this is a Task Force coordinator
+    task_result = await db.execute(select(Task).where(Task.id == task_id))
+    task = task_result.scalar_one_or_none()
+
+    task_ids_to_query = [task_id]
+    # Map task_id → role label for UI display
+    role_labels: Dict[str, str] = {}
+
+    if task and task.task_force_id and task.task_force_role == "coordinator":
+        sub_result = await db.execute(
+            select(Task.id, Task.task_force_role)
+            .where(Task.workspace_id == task.workspace_id, Task.id != task_id)
+        )
+        for row in sub_result.all():
+            task_ids_to_query.append(row[0])
+            role_labels[row[0]] = row[1] or "Agent"
+
     result = await db.execute(
         select(TaskOutput)
-        .where(TaskOutput.task_id == task_id)
-        .order_by(TaskOutput.iteration)
+        .where(TaskOutput.task_id.in_(task_ids_to_query))
+        .order_by(TaskOutput.created_at, TaskOutput.iteration)
     )
     outputs = result.scalars().all()
 
     return {
         "task_id": task_id,
         "count": len(outputs),
+        "is_task_force": len(task_ids_to_query) > 1,
         "outputs": [
             {
                 "id": o.id,
@@ -316,6 +350,8 @@ async def get_task_outputs(
                 "deliverables": o.deliverables,
                 "raw_result": o.raw_result,
                 "created_at": o.created_at.isoformat() if o.created_at else None,
+                "source_task_id": o.task_id,
+                "source_role": role_labels.get(o.task_id),
             }
             for o in outputs
         ],
@@ -579,99 +615,106 @@ async def get_audit_turns(
     temporal_http = os.getenv("TEMPORAL_HTTP_URL", "http://temporal-ui:8080")
     namespace = "default"
 
-    # Find all child workflows for this task
-    # They are named: agent-step-{task_id}-iter-{N}
-    # Also check continuation workflows: task-workflow-{task_id}-cont-{N}
-    workflow_ids_to_check = []
+    # Collect all task IDs relevant for this audit query
+    relevant_task_ids = [task_id]
+    if task.task_force_id and task.task_force_role == "coordinator":
+        sub_result = await db.execute(
+            select(Task.id)
+            .where(Task.workspace_id == task.workspace_id, Task.id != task_id)
+        )
+        relevant_task_ids.extend([row[0] for row in sub_result.all()])
 
-    # Primary workflow
-    primary_wf_id = f"task-workflow-{task_id}"
-    workflow_ids_to_check.append(primary_wf_id)
+    all_iterations_data: List[Dict[str, Any]] = []
 
-    # Find continuations (cont-1, cont-2, etc.)
-    for cont_num in range(1, 20):
-        cont_wf_id = f"task-workflow-{task_id}-cont-{cont_num}"
-        workflow_ids_to_check.append(cont_wf_id)
+    for current_task_id in relevant_task_ids:
+        # Find all child workflows for this current_task_id
+        # They are named: agent-step-{task_id}-iter-{N}
+        # Also check continuation workflows: task-workflow-{task_id}-cont-{N}
+        workflow_ids_to_check = []
 
-    # For each parent workflow, find the child AgentStepWorkflow IDs
-    child_workflows: List[Dict[str, Any]] = []
+        # Primary workflow
+        primary_wf_id = f"task-workflow-{current_task_id}"
+        workflow_ids_to_check.append(primary_wf_id)
 
-    for parent_wf_id in workflow_ids_to_check:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    f"{temporal_http}/api/v1/namespaces/{namespace}/workflows/{parent_wf_id}/history",
-                    params={"maximumPageSize": 500},
-                )
-                if resp.status_code != 200:
-                    continue
-                data = resp.json()
+        # Find continuations (cont-1, cont-2, etc.)
+        for cont_num in range(1, 20):
+            cont_wf_id = f"task-workflow-{current_task_id}-cont-{cont_num}"
+            workflow_ids_to_check.append(cont_wf_id)
 
-            for event in data.get("history", {}).get("events", []) or data.get("events", []):
-                event_type = event.get("eventType", "")
-                if event_type == "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED":
-                    attrs = event.get("startChildWorkflowExecutionInitiatedEventAttributes", {})
-                    child_wf_id = attrs.get("workflowId", "")
-                    child_wf_type = attrs.get("workflowType", {}).get("name", "")
-                    if child_wf_type == "AgentStepWorkflow" and child_wf_id:
-                        # Extract iteration from input payloads
-                        input_payloads = _decode_temporal_payloads(attrs.get("input", {}))
-                        iteration = input_payloads[1] if len(input_payloads) > 1 else 0
-                        child_workflows.append({
-                            "workflow_id": child_wf_id,
-                            "iteration": iteration,
-                            "parent": parent_wf_id,
-                        })
-        except Exception as e:
-            logger.debug(f"Could not fetch history for {parent_wf_id}: {e}")
-            continue
+        # For each parent workflow, find the child AgentStepWorkflow IDs
+        child_workflows: List[Dict[str, Any]] = []
 
-    # Now fetch turns from each child workflow
-    iterations_data: List[Dict[str, Any]] = []
+        for parent_wf_id in workflow_ids_to_check:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"{temporal_http}/api/v1/namespaces/{namespace}/workflows/{parent_wf_id}/history",
+                        params={"maximumPageSize": 500},
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
 
-    for child in child_workflows:
-        raw_events = await _fetch_child_workflow_turns(child["workflow_id"])
+                for event in data.get("history", {}).get("events", []) or data.get("events", []):
+                    event_type = event.get("eventType", "")
+                    if event_type == "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED":
+                        attrs = event.get("startChildWorkflowExecutionInitiatedEventAttributes", {})
+                        child_wf_id = attrs.get("workflowId", "")
+                        child_wf_type = attrs.get("workflowType", {}).get("name", "")
+                        if child_wf_type == "AgentStepWorkflow" and child_wf_id:
+                            # Extract iteration from input payloads
+                            input_payloads = _decode_temporal_payloads(attrs.get("input", {}))
+                            iteration = input_payloads[1] if len(input_payloads) > 1 else 0
+                            child_workflows.append({
+                                "workflow_id": child_wf_id,
+                                "iteration": iteration,
+                                "parent": parent_wf_id,
+                                "task_id": current_task_id, # Add originating task ID
+                            })
+            except Exception as e:
+                logger.debug(f"Could not fetch history for {parent_wf_id}: {e}")
+                continue
 
-        # Separate turn activities from structural activities
-        turns = []
-        container_info = {}
-        for ev in raw_events:
-            if ev.get("activity_type") == "start_agent_container":
-                raw_ci = ev.get("result", {})
-                # Normalize field names for the frontend:
-                # - worker returns "agent_image"; frontend expects "image"
-                # - worker may or may not include "status"
-                container_info = {
-                    "container_id": raw_ci.get("container_id", ""),
-                    "image": raw_ci.get("image") or raw_ci.get("agent_image", ""),
-                    "status": raw_ci.get("status", "completed"),
-                    "sandbox_mode": raw_ci.get("sandbox_mode", ""),
-                    "workspace_dir": raw_ci.get("workspace_dir", ""),
-                }
-            elif ev.get("activity_type") == "collect_agent_result":
-                # Mark container as completed once result is collected
-                if container_info:
-                    container_info["status"] = "completed"
-            elif ev.get("data"):
-                turns.append(ev)
+        # Now fetch turns from each child workflow
+        for child in child_workflows:
+            raw_events = await _fetch_child_workflow_turns(child["workflow_id"])
 
-        iterations_data.append({
-            "iteration": child["iteration"],
-            "workflow_id": child["workflow_id"],
-            "parent_workflow": child["parent"],
-            "container": container_info,
-            "turns": turns,
-            "turn_count": len(turns),
-        })
+            turns = []
+            container_info = {}
+            for ev in raw_events:
+                if ev.get("activity_type") == "start_agent_container":
+                    raw_ci = ev.get("result", {})
+                    container_info = {
+                        "container_id": raw_ci.get("container_id", ""),
+                        "image": raw_ci.get("image") or raw_ci.get("agent_image", ""),
+                        "status": raw_ci.get("status", "completed"),
+                        "sandbox_mode": raw_ci.get("sandbox_mode", ""),
+                        "workspace_dir": raw_ci.get("workspace_dir", ""),
+                    }
+                elif ev.get("activity_type") == "collect_agent_result":
+                    if container_info:
+                        container_info["status"] = "completed"
+                elif ev.get("data"):
+                    turns.append(ev)
 
-    # Sort by iteration
-    iterations_data.sort(key=lambda x: x["iteration"])
+            all_iterations_data.append({
+                "iteration": child["iteration"],
+                "workflow_id": child["workflow_id"],
+                "parent_workflow": child["parent"],
+                "task_id": child["task_id"], # Include originating task ID
+                "container": container_info,
+                "turns": turns,
+                "turn_count": len(turns),
+            })
 
-    # Compute totals
-    total_turns = sum(it["turn_count"] for it in iterations_data)
+    # Sort all iterations by creation time, then by iteration number
+    all_iterations_data.sort(key=lambda x: (x.get("created_at", ""), x["iteration"])) # Assuming created_at will be available or can be added
+
+    # Compute totals across all aggregated audit turns
+    total_turns = sum(it["turn_count"] for it in all_iterations_data)
     total_input_tokens = 0
     total_output_tokens = 0
-    for it in iterations_data:
+    for it in all_iterations_data:
         for t in it["turns"]:
             usage = t.get("data", {}).get("response", {}).get("usage", {})
             total_input_tokens += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
@@ -679,8 +722,8 @@ async def get_audit_turns(
 
     return {
         "task_id": task_id,
-        "iterations": iterations_data,
-        "total_iterations": len(iterations_data),
+        "iterations": all_iterations_data,
+        "total_iterations": len(all_iterations_data),
         "total_turns": total_turns,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,

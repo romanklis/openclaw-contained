@@ -587,6 +587,9 @@ async def stream_task_execution(
     _cap_building_emitted = False
     _cap_last_status: str | None = None
 
+    # Task Force: detect if coordinator so we query sibling cap requests
+    _task_force_id: str | None = None
+
     # Turn-by-turn tracking
     _turns_seen = 0              # Number of LLM turns already streamed
     _iter_header_emitted = False # Whether we emitted the current iteration header
@@ -600,6 +603,11 @@ async def stream_task_execution(
     try:
         _task_info = await cp.get_task(task_id)
         _wf_id = _task_info.get("workflow_id", "")
+        # Detect Task Force coordinator tasks — their agent_profile starts
+        # with "taskforce-" and they have a task_force_id.
+        _agent_profile = _task_info.get("agent_profile", "")
+        if _agent_profile.startswith("taskforce-"):
+            _task_force_id = _task_info.get("task_force_id") or _agent_profile
         if _wf_id:
             _temporal_url = (
                 f"{settings.TEMPORAL_UI_URL}/namespaces/default/workflows/{_wf_id}"
@@ -657,9 +665,35 @@ async def stream_task_execution(
         # surface approval / build progress to the user in real-time.
         # This MUST run before the turn-polling block so that _cap_pending
         # is cleared as soon as the agent resumes → turn streaming resumes.
+        # For Task Force coordinator tasks, query by task_force_id to catch
+        # capability requests from ALL sub-tasks.
+
+        # Task Force coordinators: proactively detect sub-task cap requests
+        if _task_force_id and not _cap_pending:
+            try:
+                tf_cap_reqs = await cp.get_capability_requests(
+                    task_force_id=_task_force_id, status_filter="pending"
+                )
+                if tf_cap_reqs:
+                    _cap_pending = True
+                    _cap_approved_emitted = False
+                    _cap_building_emitted = False
+                    _cap_last_status = "pending"
+                    pkgs = ", ".join(set(cr.get("resource_name", "?") for cr in tf_cap_reqs))
+                    yield _sse(
+                        completion_id, model,
+                        content=f"\n🔒 **Sub-task capability request:** `{pkgs}`\n"
+                                f"Approve on the [Approvals](/approvals) page to continue.\n",
+                    )
+            except Exception:
+                pass
+
         if _cap_pending and status == "running":
             try:
-                cap_reqs = await cp.get_capability_requests(task_id=task_id)
+                if _task_force_id:
+                    cap_reqs = await cp.get_capability_requests(task_force_id=_task_force_id)
+                else:
+                    cap_reqs = await cp.get_capability_requests(task_id=task_id)
                 latest = None
                 for cr in cap_reqs:
                     if latest is None or cr.get("id", 0) > latest.get("id", 0):
@@ -671,10 +705,14 @@ async def stream_task_execution(
                         _cap_approved_emitted = True
                         _cap_last_status = cap_status
                         pkgs = latest.get("resource_name", "")
+                        rebuild_msg = (
+                            f"🔨 Rebuilding images for **all** Task Force agents…\n"
+                            if _task_force_id
+                            else f"🔨 Building new agent image with the requested packages…\n"
+                        )
                         yield _sse(
                             completion_id, model,
-                            content=f"\n✅ **Capability approved** — `{pkgs}`\n"
-                                    f"🔨 Building new agent image with the requested packages…\n",
+                            content=f"\n✅ **Capability approved** — `{pkgs}`\n" + rebuild_msg,
                         )
                         waiting_emitted = False
 
@@ -1049,6 +1087,9 @@ async def list_agent_profiles():
 
     Unlike /v1/models (which is OpenAI-compatible), this endpoint returns
     the complete profile data including base image details.
+
+    Also includes active Task Forces as virtual agent profiles so they
+    appear in the agent selection dropdown.
     """
     profiles = get_profiles()
     result = []
@@ -1062,9 +1103,24 @@ async def list_agent_profiles():
             "llm_model": p.llm_model,
             "tags": p.tags,
             "icon": p.icon,
+            "is_task_force": False,
             "metadata": p.metadata.model_dump(),
             "image_info": img_info.model_dump() if img_info else None,
         })
+
+    # Merge in active Task Forces as virtual agent profiles
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{settings.CONTROL_PLANE_URL}/api/task-forces/as-profiles"
+            )
+            if resp.status_code == 200:
+                tf_profiles = resp.json().get("profiles", [])
+                result.extend(tf_profiles)
+    except Exception as e:
+        logger.warning(f"Could not fetch Task Force profiles: {e}")
+
     return {"profiles": result}
 
 
@@ -1286,17 +1342,39 @@ async def chat_completions(
     _META_MODELS = {"taskforge-iterator", "taskforge-oneshot"}
     _raw_model = body.llm_model or body.model
 
+    # Task Force virtual profiles are not in the static YAML profiles store;
+    # they live in the control-plane DB.  Detect them by prefix so we can
+    # pass the ID through as agent_profile without a full profile object.
+    _is_task_force = bool(_raw_model and _raw_model.startswith("taskforce-"))
+
     _resolved_profile = get_profile(_raw_model) if _raw_model else None
-    if _resolved_profile:
+    llm_model: str
+    agent_profile: str | None
+    base_image: str | None
+
+    if _raw_model and _raw_model.startswith("taskforce-"):
+        llm_model = settings.DEFAULT_LLM_MODEL
+        agent_profile = _raw_model
+        base_image = None  # Task forces don't have a single base image
+        logger.info("TaskForce profile '%s' detected → llm=%s", _raw_model, llm_model)
+    elif _resolved_profile:
         llm_model = _resolved_profile.llm_model
+        agent_profile = _resolved_profile.id
+        base_image = _resolved_profile.base_image
         logger.info("Agent profile '%s' resolved → llm=%s, image=%s",
                      _raw_model, llm_model, _resolved_profile.base_image)
     elif body.llm_model:
         llm_model = body.llm_model
+        agent_profile = None
+        base_image = None
     elif body.model and body.model not in _META_MODELS:
         llm_model = body.model
+        agent_profile = None
+        base_image = None
     else:
         llm_model = settings.DEFAULT_LLM_MODEL
+        agent_profile = None
+        base_image = None
 
     # ── Fast-path: lightweight LLM-only requests ──────────────────────────
     # Open WebUI sends auto-generated meta-requests after every conversation
@@ -1396,14 +1474,21 @@ async def chat_completions(
                 desc_parts.append(f"[USER]\n{m.text()}")
         description = "\n\n".join(desc_parts) or instruction
 
+        # Determine agent_profile to send to the control-plane.
+        # For Task Force virtual agents, pass the taskforce-xxx ID directly.
+        _agent_profile_for_task = (
+            _raw_model if _is_task_force
+            else (_resolved_profile.id if _resolved_profile else None)
+        )
+
         logger.info("[%s] Creating new task: %s…", conv_id, task_name[:60])
         try:
             task_data = await cp.create_task(
                 name=task_name[:100],
                 description=description,
                 llm_model=llm_model,
-                base_image=_resolved_profile.base_image if _resolved_profile else None,
-                agent_profile=_resolved_profile.id if _resolved_profile else None,
+                base_image=base_image,
+                agent_profile=agent_profile,
             )
         except httpx.HTTPStatusError as exc:
             raise HTTPException(
