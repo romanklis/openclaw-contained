@@ -37,6 +37,7 @@ class CeremonyType(str, enum.Enum):
     PLANNING = "planning"
     SYNC = "sync"
     PEER_REVIEW = "peer_review"
+    REVIEW_GATE = "review_gate"
     AGGREGATION = "aggregation"
     CUSTOM = "custom"
 
@@ -381,6 +382,49 @@ class TaskForceMember(Base):
     task = relationship("Task", foreign_keys=[task_id])
 
 
+class SupplyChainPackage(Base):
+    """A single approved package in the supply-chain allowlist.
+
+    Each row represents one package that an agent is allowed to install
+    for a given image type and package manager.
+    """
+    __tablename__ = "supply_chain_packages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    image_type = Column(String, nullable=False, index=True)  # e.g. openclaw, nanobot
+    manager = Column(String, nullable=False)  # pip, apt, apk, npm
+    package_name = Column(String, nullable=False)
+    notes = Column(Text)
+    is_exception = Column(String, default="false")  # "true" for one-off exceptions
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class SupplyChainAlias(Base):
+    """Cross-distro package name mapping (apt ↔ apk)."""
+    __tablename__ = "supply_chain_aliases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    direction = Column(String, nullable=False)  # "apt_to_apk" or "apk_to_apt"
+    from_name = Column(String, nullable=False)
+    to_name = Column(String, nullable=False)
+
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SupplyChainImageType(Base):
+    """Metadata for each image type in the supply chain."""
+    __tablename__ = "supply_chain_image_types"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    image_type = Column(String, unique=True, nullable=False)
+    notes = Column(Text)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
 class TaskForceCeremony(Base):
     """A coordination ceremony within a Task Force.
 
@@ -407,6 +451,11 @@ class TaskForceCeremony(Base):
     trigger_condition = Column(String)  # "after_all_complete", "after_member:<id>", "manual"
     timeout_minutes = Column(Integer, default=60)
 
+    # review_gate specific
+    review_target_order = Column(Integer)           # execution_order to rewind to on FAIL
+    max_rework_cycles = Column(Integer, default=2)  # max feedback loops
+    verdict_file = Column(String, default="REVIEW_BRIEF.md")  # workspace file with PASS/FAIL
+
     # Runtime state
     status = Column(String, default="pending")  # pending, active, completed, skipped
     started_at = Column(DateTime)
@@ -417,3 +466,87 @@ class TaskForceCeremony(Base):
 
     # Relationships
     task_force = relationship("TaskForce", back_populates="ceremonies")
+
+
+# =========================================================================
+# Ceremony State — API-tracked artifacts, verdicts & agent state exchange
+# =========================================================================
+
+class ArtifactKind(str, enum.Enum):
+    """Kind of ceremony artifact."""
+    PLAN = "plan"
+    REVIEW_BRIEF = "review_brief"
+    VERDICT = "verdict"
+    SUMMARY = "summary"
+    SYNC_NOTES = "sync_notes"
+    REWORK_FEEDBACK = "rework_feedback"
+    CUSTOM = "custom"
+
+
+class CeremonyArtifact(Base):
+    """An immutable artifact produced during a ceremony.
+
+    Replaces filesystem-based ceremony files (CEREMONY_PLAN.md, REVIEW_BRIEF.md,
+    REVIEW_VERDICT.md, FINAL_SUMMARY.md, etc.) with DB-tracked records.
+    Artifacts are append-only — once created they cannot be modified, giving
+    a full audit trail of decisions and handoffs.
+    """
+    __tablename__ = "ceremony_artifacts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_force_id = Column(String, ForeignKey("task_forces.id"), nullable=False, index=True)
+    ceremony_id = Column(Integer, ForeignKey("task_force_ceremonies.id"), nullable=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True)  # producing agent
+
+    kind = Column(SQLEnum(ArtifactKind), nullable=False)
+    filename = Column(String)  # original filename reference (e.g. "REVIEW_BRIEF.md")
+    title = Column(String)
+    content = Column(Text, nullable=False)
+    metadata_json = Column("metadata", JSON)  # structured payload (checksums, etc.)
+
+    # For verdicts: hard verdict keyword
+    verdict = Column(String)  # "pass" / "fail" / null for non-verdicts
+
+    # Rework tracking
+    rework_cycle = Column(Integer, default=0)
+
+    # Immutability: once created, superseded_by points to the replacement
+    superseded_by = Column(Integer, ForeignKey("ceremony_artifacts.id"), nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+
+    task_force = relationship("TaskForce", backref="artifacts")
+    ceremony = relationship("TaskForceCeremony", backref="artifacts")
+    task = relationship("Task", backref="ceremony_artifacts")
+
+
+class AgentStateExchange(Base):
+    """A state-change message between agents in a task force.
+
+    Provides a structured, append-only channel for agents to exchange
+    decisions, status updates, and coordination signals — fully tracked
+    in the DB instead of relying on filesystem side-channels.
+
+    Examples:
+    - Developer announces "implementation complete"
+    - Tester reports "3/5 tests passing"
+    - Reviewer posts "rework needed: missing error handling"
+    """
+    __tablename__ = "agent_state_exchanges"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_force_id = Column(String, ForeignKey("task_forces.id"), nullable=False, index=True)
+    from_task_id = Column(String, nullable=False)  # task ID or "system" for ceremony-generated
+    to_task_id = Column(String, ForeignKey("tasks.id"), nullable=True)  # null = broadcast
+
+    # Structured state
+    state_type = Column(String, nullable=False)  # "status_update", "decision", "handoff", "feedback"
+    subject = Column(String)  # short label
+    body = Column(Text)  # detailed content
+    state_data = Column(JSON)  # structured payload
+
+    created_at = Column(DateTime, server_default=func.now())
+
+    task_force = relationship("TaskForce", backref="state_exchanges")
+    # from_task_id can be "system" for ceremony-generated messages, so no FK relationship
+    to_task = relationship("Task", foreign_keys=[to_task_id], backref="state_exchanges_received")

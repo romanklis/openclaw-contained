@@ -246,10 +246,13 @@ execute_tool() {
         read)
             local path
             path=$(echo "$args_json" | jq -r '.path')
-            if [ ! -f "$path" ]; then
-                result="ERROR: File not found: ${path}"
-            else
+            if [ -d "$path" ]; then
+                # Directory: list contents with sizes
+                result=$(ls -la "$path" 2>/dev/null | head -100)
+            elif [ -f "$path" ]; then
                 result=$(cat "$path" 2>/dev/null | head -c 50000)
+            else
+                result="ERROR: File not found: ${path}"
             fi
             ;;
         exec)
@@ -587,9 +590,9 @@ parse_deployment_request() {
 
     if [ -n "$match" ]; then
         local name port entrypoint
-        name=$(echo "$match" | cut -d: -f2)
+        name=$(echo "$match" | cut -d: -f2 | sed 's/^\*\+//;s/\*\+$//')
         port=$(echo "$match" | cut -d: -f3)
-        entrypoint=$(echo "$match" | cut -d: -f4-)
+        entrypoint=$(echo "$match" | cut -d: -f4- | sed 's/^\*\+//;s/\*\+$//')
         echo "${name}|${port}|${entrypoint}"
         return 0
     fi

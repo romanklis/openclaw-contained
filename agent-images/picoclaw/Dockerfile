@@ -5,7 +5,7 @@
 # No Python runtime — only POSIX shell, coreutils, and essential CLI tools.
 # Ideal for file manipulation, system commands, and lightweight automation.
 
-FROM alpine:3.19
+FROM alpine:3.19.7
 
 # Image metadata
 LABEL org.openclaw.image.type="picoclaw"

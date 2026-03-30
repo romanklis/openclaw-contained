@@ -71,7 +71,7 @@ profiles:
   name: Shell Operator
   description: Minimal shell agent for file manipulation and CLI automation.
   base_image: picoclaw
-  llm_model: gemini-flash-latest
+  llm_model: granite4:latest
   tags:
   - shell
   - devops
@@ -82,12 +82,16 @@ profiles:
     strengths:
     - Tiny image (~15 MB)
     - POSIX-compliant shell
-    - jq, yq, awk, sed, grep
+    - jq
+    - yq
+    - awk
+    - sed
+    - grep
 - id: devops-runner
   name: DevOps Runner
   description: Shell-based agent for CI/CD scripts, deploys, and infrastructure tasks.
   base_image: picoclaw
-  llm_model: claude-sonnet-4-20250514
+  llm_model: granite4:latest
   tags:
   - devops
   - ci-cd
@@ -117,22 +121,16 @@ profiles:
     - Tamper-resistant runtime
     - Deep code analysis
 - id: crypto-agent
-  name: Crypto Agent
+  name: Local Ollama Agent
   description: Rust-based agent for cryptographic operations and security-sensitive
     workloads.
   base_image: zeroclaw
-  llm_model: gpt-4o
-  tags:
-  - security
-  - crypto
-  - performance
+  llm_model: granite4:latest
+  tags: []
   icon: 🔐
   metadata:
     runtime: Rust (Debian)
-    strengths:
-    - High-performance crypto
-    - Sandboxed execution
-    - Zero-copy data handling
+    strengths: []
 - id: performance-agent
   name: Performance Agent
   description: Rust runtime optimised for compute-heavy and latency-sensitive tasks.

@@ -31,7 +31,7 @@ AGENT_IMAGES_DIR = Path(os.getenv("AGENT_IMAGES_DIR", "/app/agent-images"))
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
 # =============================================================================
-# Supply-Chain Configuration — loaded once at import / startup
+# Supply-Chain Configuration — loaded from control-plane DB (with YAML fallback)
 # =============================================================================
 
 SUPPLY_CHAIN_PATH = Path(os.getenv("SUPPLY_CHAIN_PATH", "/config/supply-chain.yaml"))
@@ -39,11 +39,45 @@ _supply_chain: Dict[str, Any] = {}  # populated by _load_supply_chain()
 _supply_chain_aliases: Dict[str, Dict[str, str]] = {}  # apt_to_apk / apk_to_apt
 
 
-def _load_supply_chain() -> None:
-    """Load (or reload) the supply-chain config from disk.
+def _load_supply_chain_from_api() -> bool:
+    """Try to load supply-chain config from the control-plane DB API.
 
-    Called once at startup and can be called again via the reload endpoint.
+    Returns True on success, False if the API is unavailable.
     """
+    global _supply_chain, _supply_chain_aliases
+    import httpx
+
+    try:
+        resp = httpx.get(f"{CONTROL_PLANE_URL}/api/supply-chain/config", timeout=5.0)
+        if resp.status_code != 200:
+            logger.warning(f"Supply-chain API returned {resp.status_code} — falling back to YAML")
+            return False
+
+        data = resp.json()
+        _supply_chain = data.get("raw", {})
+        _supply_chain_aliases = data.get("aliases", {})
+
+        if not _supply_chain:
+            logger.warning("Supply-chain API returned empty config — falling back to YAML")
+            return False
+
+        image_types = list(_supply_chain.keys())
+        total_entries = sum(
+            len(v.get("pip", []) + v.get("apt", []) + v.get("apk", []) + v.get("npm", []))
+            for v in _supply_chain.values()
+        )
+        logger.info(f"✅ Supply-chain loaded from DB API | Image types: {image_types} | "
+                     f"Total allowlist entries: {total_entries} | "
+                     f"Aliases: apt_to_apk={len(_supply_chain_aliases.get('apt_to_apk', {}))}, "
+                     f"apk_to_apt={len(_supply_chain_aliases.get('apk_to_apt', {}))}")
+        return True
+    except Exception as exc:
+        logger.warning(f"Supply-chain API unavailable ({exc}) — falling back to YAML")
+        return False
+
+
+def _load_supply_chain_from_yaml() -> None:
+    """Fallback: load supply-chain config from the static YAML file."""
     global _supply_chain, _supply_chain_aliases
 
     if not SUPPLY_CHAIN_PATH.exists():
@@ -56,21 +90,30 @@ def _load_supply_chain() -> None:
     try:
         raw = yaml.safe_load(SUPPLY_CHAIN_PATH.read_text())
         _supply_chain_aliases = raw.pop("aliases", {})
-        # Top-level keys are image types (openclaw, nanobot, picoclaw, zeroclaw)
         _supply_chain = {k: v for k, v in raw.items() if isinstance(v, dict)}
         image_types = list(_supply_chain.keys())
         total_entries = sum(
             len(v.get("pip", []) + v.get("apt", []) + v.get("apk", []) + v.get("npm", []))
             for v in _supply_chain.values()
         )
-        logger.info(f"✅ Supply-chain loaded | Image types: {image_types} | "
+        logger.info(f"✅ Supply-chain loaded from YAML | Image types: {image_types} | "
                      f"Total allowlist entries: {total_entries} | "
                      f"Aliases: apt_to_apk={len(_supply_chain_aliases.get('apt_to_apk', {}))}, "
                      f"apk_to_apt={len(_supply_chain_aliases.get('apk_to_apt', {}))}")
     except Exception as exc:
-        logger.error(f"Failed to parse supply-chain config: {exc}")
+        logger.error(f"Failed to parse supply-chain YAML: {exc}")
         _supply_chain = {}
         _supply_chain_aliases = {}
+
+
+def _load_supply_chain() -> None:
+    """Load (or reload) the supply-chain config.
+
+    Tries the control-plane DB API first, falls back to the static YAML file.
+    Called once at startup and can be called again via the reload endpoint.
+    """
+    if not _load_supply_chain_from_api():
+        _load_supply_chain_from_yaml()
 
 
 # Load at import time so it's available before any request
@@ -586,10 +629,10 @@ def _scan_imports_for_pip_packages(app_dir: Path) -> List[str]:
 # Per-image-type deployment base images
 # picoclaw/nanobot are Alpine-based; zeroclaw/openclaw are Debian-based
 _DEPLOYMENT_BASE_IMAGES = {
-    "picoclaw": "alpine:3.19",
-    "nanobot":  "python:3.11-alpine",
-    "zeroclaw": "python:3.11-slim",
-    "openclaw": "python:3.11-slim",
+    "picoclaw": "alpine:3.19.7",
+    "nanobot":  "python:3.11.15-alpine3.21",
+    "zeroclaw": "python:3.11.15-slim-bookworm",
+    "openclaw": "python:3.11.15-slim-bookworm",
 }
 
 # System packages to always include for shell-based deployments (picoclaw)
@@ -656,7 +699,7 @@ def generate_deployment_dockerfile(
     so that shell-only agents (picoclaw) get an Alpine base with the right
     tools, while Python-based agents get python:3.11-slim.
     """
-    base_image = _DEPLOYMENT_BASE_IMAGES.get(image_type, "python:3.11-slim")
+    base_image = _DEPLOYMENT_BASE_IMAGES.get(image_type, "python:3.11.15-slim-bookworm")
     is_alpine = "alpine" in base_image
 
     # For picoclaw deployments, ensure essential shell tools are present
@@ -1663,10 +1706,13 @@ async def check_supply_chain(request: SupplyChainCheckRequest):
 
 @app.get("/supply-chain/config")
 async def get_supply_chain_config():
-    """Return the current supply-chain configuration (for audit UI)."""
+    """Return the current supply-chain configuration (for audit UI).
+    
+    Now backed by the control-plane DB; the in-memory cache is returned.
+    """
     return {
         "loaded": bool(_supply_chain),
-        "path": str(SUPPLY_CHAIN_PATH),
+        "source": "database" if _supply_chain else "none",
         "image_types": {
             itype: {
                 "pip": len(cfg.get("pip", [])),
@@ -1684,7 +1730,7 @@ async def get_supply_chain_config():
 
 @app.post("/supply-chain/reload")
 async def reload_supply_chain():
-    """Hot-reload the supply-chain config from disk without restarting."""
+    """Hot-reload the supply-chain config from the control-plane DB API."""
     _load_supply_chain()
     return {
         "status": "reloaded",

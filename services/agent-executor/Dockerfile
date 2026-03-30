@@ -1,5 +1,6 @@
 # Use OpenClaw official image as base
-FROM ghcr.io/openclaw/openclaw:latest
+# Pin to specific version for reproducibility
+FROM ghcr.io/openclaw/openclaw:0.5.43
 
 # Install Python for the wrapper script
 RUN apt-get update && apt-get install -y --no-install-recommends \

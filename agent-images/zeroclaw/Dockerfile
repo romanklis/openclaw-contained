@@ -9,7 +9,7 @@
 # control plane protocol, but core execution happens in Rust.
 
 # ── Stage 1: Build the Rust agent binary ──────────────────────────
-FROM rust:1.77-slim AS builder
+FROM rust:1.77.2-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -28,7 +28,7 @@ RUN cargo build --release 2>/dev/null || \
     chmod +x /build/target/release/zeroclaw-agent
 
 # ── Stage 2: Minimal runtime ─────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:bookworm-20250317-slim
 
 # Image metadata
 LABEL org.openclaw.image.type="zeroclaw"

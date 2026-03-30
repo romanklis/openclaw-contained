@@ -27,6 +27,11 @@ class TaskCreate(BaseModel):
     model: Optional[str] = None  # alias for llm_model (from curl/CLI)
     base_image: Optional[str] = None  # agent base image key (e.g. "zeroclaw")
     agent_profile: Optional[str] = None  # agent profile ID for display
+    # ── rework / task-force context (optional) ──
+    workspace_id: Optional[str] = None   # share an existing workspace
+    task_force_id: Optional[str] = None  # link to parent task force
+    task_force_role: Optional[str] = None
+    auto_start: bool = True              # set False to create without starting
 
     @property
     def effective_description(self) -> Optional[str]:
@@ -351,6 +356,7 @@ class CeremonyType(str, Enum):
     PLANNING = "planning"
     SYNC = "sync"
     PEER_REVIEW = "peer_review"
+    REVIEW_GATE = "review_gate"
     AGGREGATION = "aggregation"
     CUSTOM = "custom"
 
@@ -397,7 +403,14 @@ class TaskForceMemberResponse(BaseModel):
 # ── Ceremonies ──────────────────────────────────────────
 
 class TaskForceCeremonyCreate(BaseModel):
-    """Define a coordination ceremony."""
+    """Define a coordination ceremony.
+
+    For ``review_gate`` ceremonies, set ``review_target_order`` to the
+    execution_order that should be re-run when the reviewer verdict is FAIL.
+    The workflow reads the reviewer's verdict file from the workspace,
+    creates fresh tasks for the target order-groups, and re-executes them.
+    Use ``max_rework_cycles`` to cap the number of feedback iterations.
+    """
     name: str
     ceremony_type: CeremonyType
     mode: CeremonyMode = CeremonyMode.SYNCHRONOUS
@@ -406,6 +419,10 @@ class TaskForceCeremonyCreate(BaseModel):
     description: Optional[str] = None
     trigger_condition: str = "after_all_complete"  # after_all_complete, manual
     timeout_minutes: int = 60
+    # ── review_gate specific ──
+    review_target_order: Optional[int] = None   # execution_order to rewind to on FAIL
+    max_rework_cycles: int = 2                  # max feedback loops (0 = unlimited)
+    verdict_file: str = "REVIEW_BRIEF.md"       # workspace file containing PASS/FAIL
 
 
 class TaskForceCeremonyResponse(BaseModel):
@@ -418,6 +435,9 @@ class TaskForceCeremonyResponse(BaseModel):
     participant_member_ids: Optional[List[int]]
     description: Optional[str]
     trigger_condition: Optional[str]
+    review_target_order: Optional[int] = None
+    max_rework_cycles: int = 2
+    verdict_file: str = "REVIEW_BRIEF.md"
     timeout_minutes: int
     status: str
     started_at: Optional[datetime]
@@ -464,3 +484,197 @@ class TaskForceDetail(TaskForceResponse):
     """Full Task Force detail including members and ceremonies."""
     members: List[TaskForceMemberResponse] = []
     ceremonies: List[TaskForceCeremonyResponse] = []
+
+
+# =========================================================================
+# Supply Chain schemas — Package allowlist management
+# =========================================================================
+
+class SupplyChainPackageCreate(BaseModel):
+    """Add a package to the supply-chain allowlist."""
+    image_type: str
+    manager: str  # pip, apt, apk, npm
+    package_name: str
+    notes: Optional[str] = None
+    is_exception: bool = False
+
+
+class SupplyChainPackageResponse(BaseModel):
+    id: int
+    image_type: str
+    manager: str
+    package_name: str
+    notes: Optional[str]
+    is_exception: str
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class SupplyChainBulkAdd(BaseModel):
+    """Add multiple packages at once."""
+    image_type: str
+    manager: str
+    packages: List[str]
+    notes: Optional[str] = None
+    is_exception: bool = False
+
+
+class SupplyChainAliasCreate(BaseModel):
+    """Add a cross-distro alias mapping."""
+    direction: str  # apt_to_apk or apk_to_apt
+    from_name: str
+    to_name: str
+
+
+class SupplyChainAliasResponse(BaseModel):
+    id: int
+    direction: str
+    from_name: str
+    to_name: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SupplyChainImageTypeCreate(BaseModel):
+    """Create/update an image type."""
+    image_type: str
+    notes: Optional[str] = None
+
+
+class SupplyChainImageTypeResponse(BaseModel):
+    id: int
+    image_type: str
+    notes: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class SupplyChainImageTypeSummary(BaseModel):
+    """Summary of an image type with package counts."""
+    image_type: str
+    notes: Optional[str]
+    pip: int = 0
+    apt: int = 0
+    apk: int = 0
+    npm: int = 0
+    exceptions: int = 0
+
+
+class SupplyChainFullConfig(BaseModel):
+    """Full supply-chain config (mirrors the YAML structure)."""
+    image_types: List[SupplyChainImageTypeSummary]
+    aliases: Dict[str, Dict[str, str]]
+    raw: Dict[str, Any]
+
+
+# =========================================================================
+# Ceremony State schemas — artifacts, verdicts & agent state exchange
+# =========================================================================
+
+class ArtifactKind(str, Enum):
+    PLAN = "plan"
+    REVIEW_BRIEF = "review_brief"
+    VERDICT = "verdict"
+    SUMMARY = "summary"
+    SYNC_NOTES = "sync_notes"
+    REWORK_FEEDBACK = "rework_feedback"
+    CUSTOM = "custom"
+
+
+# ── Ceremony Artifacts ──────────────────────────────────
+
+class CeremonyArtifactCreate(BaseModel):
+    """Create a ceremony artifact (immutable once created)."""
+    kind: ArtifactKind
+    ceremony_id: Optional[int] = None
+    task_id: Optional[str] = None  # producing agent's task_id
+    filename: Optional[str] = None
+    title: Optional[str] = None
+    content: str
+    metadata: Optional[Dict[str, Any]] = None
+    verdict: Optional[str] = None  # "pass" / "fail" — only for verdict artifacts
+    rework_cycle: int = 0
+
+
+class CeremonyArtifactResponse(BaseModel):
+    id: int
+    task_force_id: str
+    ceremony_id: Optional[int]
+    task_id: Optional[str]
+    kind: ArtifactKind
+    filename: Optional[str]
+    title: Optional[str]
+    content: str
+    metadata: Optional[Dict[str, Any]] = Field(None, alias="metadata_json")
+    verdict: Optional[str]
+    rework_cycle: int
+    superseded_by: Optional[int]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+
+
+# ── Verdicts (convenience wrapper over artifact) ────────
+
+class VerdictSubmit(BaseModel):
+    """Submit a verdict for a task (immutable once created).
+
+    Used by agents (via the LLM router proxy) or by the review_gate
+    ceremony handler.
+    """
+    verdict: str  # "pass" or "fail"
+    summary: Optional[str] = None
+    files_reviewed: Optional[List[str]] = None
+    ceremony_id: Optional[int] = None
+    rework_cycle: int = 0
+
+
+class VerdictResponse(BaseModel):
+    id: int
+    task_force_id: str
+    task_id: str
+    verdict: str
+    summary: Optional[str]
+    files_reviewed: Optional[List[str]]
+    rework_cycle: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ── Agent State Exchange ────────────────────────────────
+
+class AgentStateExchangeCreate(BaseModel):
+    """Post a state message to the task force channel."""
+    from_task_id: str
+    to_task_id: Optional[str] = None  # null = broadcast to all
+    state_type: str  # "status_update", "decision", "handoff", "feedback"
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    state_data: Optional[Dict[str, Any]] = None
+
+
+class AgentStateExchangeResponse(BaseModel):
+    id: int
+    task_force_id: str
+    from_task_id: str
+    to_task_id: Optional[str]
+    state_type: str
+    subject: Optional[str]
+    body: Optional[str]
+    state_data: Optional[Dict[str, Any]]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

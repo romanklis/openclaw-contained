@@ -1,0 +1,72 @@
+{
+  "name": "granite_devsquad_v7",
+  "description": "Four-agent squad on Granite4 with proper ceremonies: developer codes, tester validates with review gate, DevOps preps artifacts, deployer triggers deployment.",
+  "objective": "Build a simple Flask calculator web application with add, subtract, multiply, divide operations and an HTML frontend. The app must use Flask with render_template for the UI. Test the app thoroughly, prepare deployment artifacts (Dockerfile using python:3.11-slim base image), and deploy it.",
+  "execution_environment": "dind",
+  "members": [
+    {
+      "agent_profile": "crypto-agent",
+      "role": "Developer",
+      "responsibilities": "Create a Flask calculator web app. Produce these files in /workspace:\n- app.py: Flask app with routes /add, /subtract, /multiply, /divide (accepting query params a and b, returning JSON {\"result\": value}), plus a root route / serving an HTML calculator UI via render_template.\n- templates/index.html: Clean HTML/CSS calculator form that posts to the operation routes and displays results.\n- requirements.txt: containing flask.\nExecute the app briefly with `python3 app.py &` then curl each endpoint to verify it works. Kill the server when done.",
+      "llm_model": "granite4:latest",
+      "base_image": "zeroclaw",
+      "execution_order": 0
+    },
+    {
+      "agent_profile": "crypto-agent",
+      "role": "Tester",
+      "responsibilities": "Test the Flask calculator app created by the Developer.\n1. First check /workspace for REVIEW_BRIEF.md and CEREMONY_PLAN.md to understand what was built.\n2. Read the actual app.py to understand the routes and expected behavior.\n3. Install flask from requirements.txt if needed.\n4. Write test_app.py that imports the Flask app from app.py, creates a test client using app.test_client(), and tests all four operations with known inputs.\n5. Run the tests with python3 test_app.py.\n6. Write REVIEW_VERDICT.md with either PASS (all tests green) or FAIL (with details of what broke and what the Developer needs to fix).",
+      "llm_model": "granite4:latest",
+      "base_image": "zeroclaw",
+      "execution_order": 1
+    },
+    {
+      "agent_profile": "shell-operator",
+      "role": "DevOps",
+      "responsibilities": "Review the Flask app files in /workspace (app.py, templates/, requirements.txt).\n1. Read REVIEW_BRIEF.md and any ceremony artifacts.\n2. Create a Dockerfile using python:3.11-slim as base image, that copies the app files, runs pip install -r requirements.txt, exposes port 5000, and uses CMD [\"python3\", \"app.py\"].\n3. Create run.sh startup script.\n4. Create README.md with build and run instructions.\n5. Verify the project structure with ls -laR /workspace.",
+      "llm_model": "granite4:latest",
+      "base_image": "picoclaw",
+      "execution_order": 2
+    },
+    {
+      "agent_profile": "shell-operator",
+      "role": "Deployer",
+      "responsibilities": "You have ONE job: look at the workspace, verify that Dockerfile and app.py exist, then emit EXACTLY this line in your response:\nDEPLOYMENT_REQUEST:flask-calculator:5000:python3 app.py\nDo NOT wrap it in markdown, do NOT add asterisks or backticks. Just print that exact line on its own.",
+      "llm_model": "granite4:latest",
+      "base_image": "picoclaw",
+      "execution_order": 3
+    }
+  ],
+  "ceremonies": [
+    {
+      "name": "Development Review",
+      "ceremony_type": "peer_review",
+      "mode": "synchronous",
+      "sequence_order": 0,
+      "description": "Collect the Developer output (app.py, templates, requirements.txt) and write REVIEW_BRIEF.md so the Tester can see exactly what was built.",
+      "trigger_condition": "after_all_complete",
+      "timeout_minutes": 10
+    },
+    {
+      "name": "Test Quality Gate",
+      "ceremony_type": "review_gate",
+      "mode": "synchronous",
+      "sequence_order": 1,
+      "description": "Read the Tester verdict from REVIEW_VERDICT.md. If FAIL, send feedback back to the Developer for rework. If PASS, proceed to DevOps.",
+      "trigger_condition": "after_all_complete",
+      "timeout_minutes": 15,
+      "review_target_order": 0,
+      "max_rework_cycles": 2,
+      "verdict_file": "REVIEW_VERDICT.md"
+    },
+    {
+      "name": "Final Aggregation",
+      "ceremony_type": "aggregation",
+      "mode": "synchronous",
+      "sequence_order": 2,
+      "description": "Aggregate all agent outputs into FINAL_SUMMARY.md before the Deployer runs.",
+      "trigger_condition": "after_all_complete",
+      "timeout_minutes": 10
+    }
+  ]
+}

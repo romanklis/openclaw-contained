@@ -591,8 +591,10 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
                     func = tc.get("function", {})
                     tool_name = func.get("name", "")
                     try:
-                        tool_args = json.loads(func.get("arguments", "{}"))
-                    except json.JSONDecodeError:
+                        raw_args = func.get("arguments", "{}")
+                        # Ollama returns arguments as a dict; OpenAI/Gemini as a JSON string
+                        tool_args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
+                    except (json.JSONDecodeError, TypeError):
                         tool_args = {}
 
                     print(f"   🔧 Tool: {tool_name}({json.dumps(tool_args)[:120]})")
@@ -677,7 +679,10 @@ def parse_deployment_request(output: str) -> Optional[Dict[str, Any]]:
     """Parse output for DEPLOYMENT_REQUEST markers."""
     match = re.search(r"DEPLOYMENT_REQUEST:([^:]+):(\d+):(.+)", output)
     if match:
-        entrypoint = match.group(3).strip().rstrip(".,;\\]})")
+        entrypoint = match.group(3).strip()
+        # Strip markdown bold markers and other trailing punctuation
+        entrypoint = entrypoint.strip("*")
+        entrypoint = entrypoint.rstrip(".,;\\]})")
         while entrypoint and entrypoint[-1] in ('"', "'"):
             q = entrypoint[-1]
             if entrypoint.count(q) % 2 == 1:
@@ -686,8 +691,9 @@ def parse_deployment_request(output: str) -> Optional[Dict[str, Any]]:
                 break
         if entrypoint.startswith('"') and entrypoint.endswith('"'):
             entrypoint = entrypoint[1:-1]
+        entrypoint = entrypoint.strip()
         return {
-            "name": match.group(1).strip(),
+            "name": match.group(1).strip().strip("*"),
             "port": int(match.group(2)),
             "entrypoint": entrypoint,
         }

@@ -41,7 +41,7 @@ async def create_task(
     
     # Generate task ID
     task_id = f"task-{str(uuid.uuid4())[:8]}"
-    workspace_id = f"workspace-{str(uuid.uuid4())[:8]}"
+    workspace_id = task_data.workspace_id or f"workspace-{str(uuid.uuid4())[:8]}"
     
     # Resolve aliased fields
     description = task_data.effective_description
@@ -59,6 +59,8 @@ async def create_task(
         llm_model=llm_model,
         current_image=base_image_tag,
         agent_profile=task_data.agent_profile,
+        task_force_id=task_data.task_force_id,
+        task_force_role=task_data.task_force_role,
     )
     
     db.add(task)
@@ -91,18 +93,19 @@ async def create_task(
     await db.commit()
     await db.refresh(task)
 
-    # Auto-start the workflow
-    try:
-        workflow_id = await start_task_workflow(task_id, llm_model, base_image_tag)
-        task.status = TaskStatus.RUNNING
-        task.workflow_id = workflow_id
-        task.started_at = datetime.utcnow()
-        await db.commit()
-        await db.refresh(task)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"Failed to auto-start task {task_id}: {e}")
-        # Task is still created, user can start manually
+    # Auto-start the workflow (unless explicitly disabled)
+    if task_data.auto_start:
+        try:
+            workflow_id = await start_task_workflow(task_id, llm_model, base_image_tag)
+            task.status = TaskStatus.RUNNING
+            task.workflow_id = workflow_id
+            task.started_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(task)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Failed to auto-start task {task_id}: {e}")
+            # Task is still created, user can start manually
 
     return task
 

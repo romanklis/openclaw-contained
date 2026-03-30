@@ -1,4 +1,4 @@
-FROM docker:24-dind
+FROM docker:24.0.9-dind
 
 # iproute2 gives us the `ip` command needed by the watchdog entrypoint
 # to snapshot and restore eth0's IPv4 address.

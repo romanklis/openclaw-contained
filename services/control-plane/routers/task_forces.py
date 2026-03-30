@@ -86,6 +86,9 @@ async def create_task_force(
             description=c.description,
             trigger_condition=c.trigger_condition,
             timeout_minutes=c.timeout_minutes,
+            review_target_order=c.review_target_order,
+            max_rework_cycles=c.max_rework_cycles,
+            verdict_file=c.verdict_file,
         )
         db.add(ceremony)
 
@@ -559,3 +562,43 @@ async def _get_task_force_detail(db: AsyncSession, tf_id: str) -> TaskForceDetai
             TaskForceCeremonyResponse.model_validate(c) for c in tf.ceremonies
         ],
     )
+
+
+# ── MEMBER PATCH (rework support) ───────────────────────
+
+from pydantic import BaseModel as _BaseModel
+from typing import Optional as _Optional
+
+class _MemberPatch(_BaseModel):
+    task_id: _Optional[str] = None
+    status: _Optional[str] = None
+
+@router.patch(
+    "/{tf_id}/members/{member_id}",
+    response_model=TaskForceMemberResponse,
+)
+async def patch_member(
+    tf_id: str,
+    member_id: int,
+    patch: _MemberPatch,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a task force member's task_id or status (used by rework cycles)."""
+    result = await db.execute(
+        select(TaskForceMember).where(
+            TaskForceMember.task_force_id == tf_id,
+            TaskForceMember.id == member_id,
+        )
+    )
+    member = result.scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    if patch.task_id is not None:
+        member.task_id = patch.task_id
+    if patch.status is not None:
+        member.status = patch.status
+
+    await db.commit()
+    await db.refresh(member)
+    return TaskForceMemberResponse.model_validate(member)

@@ -30,6 +30,7 @@ services:
     volumes:
       - ./workspaces:/workspaces
       - ./agent-images:/agent-images:ro
+      - ./config/supply-chain.yaml:/config/supply-chain.yaml:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -109,7 +110,7 @@ services:
   # DOCKER REGISTRY — Stores built agent images
   # =============================================================================
   registry:
-    image: registry:2
+    image: registry:2.8.3
     container_name: openclaw-registry
     ports:
       - "5000:5000"
@@ -123,7 +124,7 @@ services:
   # TEMPORAL — Workflow orchestration
   # =============================================================================
   temporal-postgres:
-    image: postgres:13
+    image: postgres:13.22
     container_name: openclaw-temporal-postgres
     environment:
       POSTGRES_USER: temporal
@@ -137,7 +138,7 @@ services:
     restart: unless-stopped
 
   temporal:
-    image: temporalio/auto-setup:1.22
+    image: temporalio/auto-setup:1.22.7
     container_name: openclaw-temporal
     environment:
       - DB=postgres12
@@ -228,7 +229,7 @@ services:
   # REDIS — Lightweight session store for the API Gateway
   # =============================================================================
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.7-alpine3.21
     container_name: openclaw-redis
     command: redis-server --save "" --appendonly no
     networks:
@@ -283,7 +284,7 @@ services:
   # the "taskforge-iterator" model, and start chatting.
   # =============================================================================
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.6.5
     container_name: openclaw-open-webui
     environment:
       # Point Open WebUI exclusively at our gateway (disable Ollama direct access)
@@ -311,7 +312,7 @@ services:
   # POSTGRESQL — Primary database
   # =============================================================================
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15.15-alpine3.21
     container_name: openclaw-postgres
     environment:
       - POSTGRES_USER=openclaw

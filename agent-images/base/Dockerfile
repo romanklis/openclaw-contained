@@ -4,7 +4,7 @@
 # This is the foundational image for all OpenClaw agents.
 # Capabilities are layered on top of this image.
 
-FROM python:3.11-slim
+FROM python:3.11.15-slim-bookworm
 
 # Image metadata
 LABEL org.openclaw.image.type="base-agent"
