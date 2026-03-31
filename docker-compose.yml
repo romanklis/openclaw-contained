@@ -332,6 +332,49 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # =============================================================================
+  # ZEP CE — Agent memory service (inter & intra-iteration memory)
+  # =============================================================================
+  zep-postgres:
+    image: pgvector/pgvector:pg15
+    container_name: openclaw-zep-postgres
+    environment:
+      POSTGRES_USER: zep
+      POSTGRES_PASSWORD: zep
+      POSTGRES_DB: zep
+    volumes:
+      - zep-postgres-data:/var/lib/postgresql/data
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -d zep -U zep"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  zep:
+    image: ghcr.io/getzep/zep:0.25.0
+    container_name: openclaw-zep
+    depends_on:
+      zep-postgres:
+        condition: service_healthy
+    environment:
+      ZEP_OPENAI_API_KEY: "sk-not-used"
+    volumes:
+      - ./config/zep/config.yaml:/app/config.yaml:ro
+    ports:
+      - "8198:8000"
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /proc/1/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
 # =============================================================================
 # NETWORKS
 # =============================================================================
@@ -345,6 +388,8 @@ networks:
 volumes:
   postgres-data:
   temporal-postgres-data:
+  zep-postgres-data:
   registry-data:
   docker-data:
   open-webui-data:
+  zep-postgres-data:

@@ -5,6 +5,7 @@ import asyncio
 import logging
 import re
 from temporalio import workflow, activity
+from .worker_api import get_task_current_image
 from temporalio.client import Client
 from temporalio.worker import Worker
 from datetime import timedelta, datetime
@@ -553,6 +554,7 @@ async def start_agent_container(
         workspaces_root = "/workspaces"
         workspace_id = ""
         task_description = ""
+        task_force_id = ""
         try:
             import httpx as _httpx
             _cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
@@ -562,11 +564,39 @@ async def start_agent_container(
                     _task_data = _resp.json()
                     workspace_id = _task_data.get("workspace_id", "")
                     task_description = _task_data.get("description", "")
+                    task_force_id = _task_data.get("task_force_id", "") or ""
         except Exception as _e:
             logger.warning(f"⚠️ Could not fetch task details: {_e}")
 
         if not workspace_id:
             workspace_id = f"workspace-{task_id}"
+
+        # --- pre-installed packages discovery ---
+        # Query approved capability requests so the agent knows what's
+        # already baked into its image and doesn't re-request them.
+        pre_installed_packages = ""
+        try:
+            import httpx as _httpx2
+            _cp2 = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+            async with _httpx2.AsyncClient(timeout=10.0) as _hc2:
+                # Query by task_force_id if available, otherwise by task_id
+                _q = f"task_force_id={task_force_id}" if task_force_id else f"task_id={task_id}"
+                _cr = await _hc2.get(f"{_cp2}/api/capabilities/requests?{_q}")
+                if _cr.status_code == 200:
+                    _caps = _cr.json()
+                    # Collect unique approved package names
+                    _pkgs = sorted(set(
+                        c.get("resource_name", "")
+                        for c in _caps
+                        if c.get("status") == "approved" and c.get("resource_name")
+                    ))
+                    if _pkgs:
+                        pre_installed_packages = ",".join(_pkgs)
+                        logger.info(
+                            f"📦 Pre-installed packages for {task_id}: {pre_installed_packages}"
+                        )
+        except Exception as _cap_err:
+            logger.warning(f"⚠️ Could not fetch capabilities: {_cap_err}")
 
         workspace_dir = os.path.join(workspaces_root, workspace_id)
         os.makedirs(workspace_dir, exist_ok=True)
@@ -596,6 +626,32 @@ async def start_agent_container(
         cp_url_for_agent = f"http://{control_plane_ip}:8000"
         llm_router_url = f"{cp_url_for_agent}/api/llm"
 
+        # --- Zep CE memory service discovery ---
+        zep_ip = os.getenv("ZEP_IP", "") or _resolve("zep", fallback="")
+        zep_url_for_agent = f"http://{zep_ip}:8000" if zep_ip else ""
+        # Session ID: task-force scoped by role so memory persists across
+        # rework cycles for the same agent role.  For standalone tasks we
+        # fall back to the task_id.
+        zep_session_id = ""
+        if task_force_id:
+            _role = agent_image.split("/")[-1].split(":")[0]  # e.g. "openclaw-agent" – not useful
+            # Use the task's role from API (member_role field) if available
+            try:
+                import httpx as _httpx_zep
+                _cp_zep = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+                async with _httpx_zep.AsyncClient(timeout=10.0) as _hcz:
+                    _tz = await _hcz.get(f"{_cp_zep}/api/tasks/{task_id}")
+                    if _tz.status_code == 200:
+                        _td = _tz.json()
+                        _member_role = _td.get("task_force_role", "") or _td.get("role", "") or "agent"
+                        zep_session_id = f"{task_force_id}_{_member_role}"
+            except Exception:
+                zep_session_id = f"{task_force_id}_agent"
+            if not zep_session_id:
+                zep_session_id = f"{task_force_id}_agent"
+        else:
+            zep_session_id = task_id
+
         # --- Dockerfile injection ---
         agent_dockerfile = ""
         agent_images_dir = os.getenv("AGENT_IMAGES_DIR", "/agent-images")
@@ -618,6 +674,9 @@ async def start_agent_container(
             "AGENT_IMAGE": agent_image,
             "AGENT_DOCKERFILE": agent_dockerfile[:4000],
             "FOLLOW_UP": follow_up[:2000],
+            "PRE_INSTALLED_PACKAGES": pre_installed_packages[:1000],
+            "ZEP_URL": zep_url_for_agent,
+            "ZEP_SESSION_ID": zep_session_id,
         }
 
 
@@ -1688,6 +1747,32 @@ async def start_member_task(task_id: str, llm_model: str, base_image: str) -> st
 
 
 @activity.defn
+async def get_task_current_image(task_id: str) -> Optional[str]:
+    """Fetch the task's current_image from the control plane."""
+    import httpx
+    import os
+    from temporalio import activity
+
+    _cp = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as _hc:
+            _tr = await _hc.get(f"{_cp}/api/tasks/{task_id}")
+            _tr.raise_for_status()
+            db_image = _tr.json().get("current_image", "")
+            if db_image:
+                activity.logger.info(
+                    f"✅ Fetched DB image for {task_id}: {db_image}"
+                )
+                return db_image
+    except Exception as e:
+        activity.logger.warning(
+            f"Could not fetch current_image for {task_id}: {e}"
+        )
+    activity.logger.info(f"❌ No DB image found for {task_id}, returning None")
+    return None
+
+
+@activity.defn
 async def persist_member_workflow_id(task_id: str, workflow_id: str) -> bool:
     """Persist a child-workflow ID to the control-plane DB.
 
@@ -1793,7 +1878,6 @@ async def write_ceremony_artifact(
                     json={
                         "kind": artifact_kind,
                         "ceremony_id": ceremony_id or None,
-                        "task_id": task_id or None,
                         "filename": filename,
                         "title": filename.replace("_", " ").replace(".md", ""),
                         "content": content[:64000],  # cap at 64k for DB
@@ -2137,8 +2221,31 @@ async def create_rework_tasks(
             responsibilities = db_member.get("responsibilities", "")
             llm_model = db_member.get("llm_model") or "gemini-flash-latest"
             base_image_key = db_member.get("base_image") or "openclaw"
-            base_image_tag = f"localhost:5000/openclaw-agent:{base_image_key}"
+            base_image = f"localhost:5000/openclaw-agent:{base_image_key}"
             agent_profile = db_member.get("agent_profile", "general-assistant")
+
+            logger.info(f"DEBUG: Initial base_image for {member_id}: {base_image}")
+
+            # ── Inherit the previous task's image (preserves capability builds) ──
+            old_task_id = db_member.get("task_id")
+            inherited_image = None
+            if old_task_id:
+                try:
+                    old_resp = await client.get(
+                        f"{control_plane_url}/api/tasks/{old_task_id}"
+                    )
+                    if old_resp.status_code == 200:
+                        old_image = old_resp.json().get("current_image", "")
+                        if old_image:
+                            inherited_image = old_image
+                            logger.info(
+                                f"♻️  Inheriting image from {old_task_id} → "
+                                f"{inherited_image} (for {role} rework)"
+                            )
+                except Exception as img_err:
+                    logger.warning(
+                        f"⚠️ Could not fetch image for {old_task_id}: {img_err}"
+                    )
 
             import uuid
             new_task_id = f"task-{str(uuid.uuid4())[:8]}"
@@ -2187,6 +2294,22 @@ async def create_rework_tasks(
 
             new_task = resp.json()
             actual_task_id = new_task.get("id", new_task_id)
+
+            # Carry over the previous task's image so the rework starts
+            # from the already-built image (with packages etc.)
+            if inherited_image:
+                try:
+                    await client.patch(
+                        f"{control_plane_url}/api/tasks/{actual_task_id}/image",
+                        json={"current_image": inherited_image},
+                    )
+                    logger.info(
+                        f"✅ Rework task {actual_task_id} image set to {inherited_image}"
+                    )
+                except Exception as patch_err:
+                    logger.warning(
+                        f"⚠️ Could not set inherited image on {actual_task_id}: {patch_err}"
+                    )
 
             # Update member's task_id in DB
             await client.patch(
@@ -2741,6 +2864,21 @@ class TaskForceWorkflow:
             llm_model = member.get("llm_model") or "gemini-flash-latest"
             base_image_key = member.get("base_image") or "openclaw"
             base_image = f"localhost:5000/openclaw-agent:{base_image_key}"
+
+            # Fetch the task's current_image from DB — it may have been
+            # patched to an inherited image from a previous rework cycle.
+            db_image = await workflow.execute_activity(
+                get_task_current_image,
+                args=[task_id],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            if db_image and db_image != base_image:
+                workflow.logger.info(
+                    f"♻️  Using DB image for {task_id}: {db_image} "
+                    f"(instead of base {base_image})"
+                )
+                base_image = db_image
+
             child_wf_id = f"task-workflow-{task_id}"
 
             # Launch as a Temporal child workflow (native parent-child)
