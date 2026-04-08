@@ -1,7 +1,7 @@
 {
   "name": "gemini_lite_test_v2",
   "description": "Test run: all agents use gemini-flash-lite-latest. 3 members (no DevOps).",
-  "objective": "Build a simple Flask calculator web application with add, subtract, multiply, divide operations and an HTML frontend. The app must use Flask with render_template for the UI. Test the app thoroughly. Create a Dockerfile (python:3.11-slim base), run.sh, and README.md as part of the Developer deliverables. Deploy it.",
+  "objective": "Build a simple Flask calculator 2.0 web application with add, subtract, multiply, divide operations and an HTML frontend. The app must use Flask with render_template for the UI. Test the app thoroughly. Create a Dockerfile (python:3.11-slim base), run.sh, and README.md as part of the Developer deliverables. Deploy it.",
   "execution_environment": "dind",
   "members": [
     {

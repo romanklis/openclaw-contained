@@ -603,8 +603,7 @@ async def stream_task_execution(
     try:
         _task_info = await cp.get_task(task_id)
         _wf_id = _task_info.get("workflow_id", "")
-        # Detect Task Force coordinator tasks — their agent_profile starts
-        # with "taskforce-" and they have a task_force_id.
+        # Detect Task Force coordinator tasks — legacy, now replaced by DAGs.
         _agent_profile = _task_info.get("agent_profile", "")
         if _agent_profile.startswith("taskforce-"):
             _task_force_id = _task_info.get("task_force_id") or _agent_profile
@@ -1342,9 +1341,8 @@ async def chat_completions(
     _META_MODELS = {"taskforge-iterator", "taskforge-oneshot"}
     _raw_model = body.llm_model or body.model
 
-    # Task Force virtual profiles are not in the static YAML profiles store;
-    # they live in the control-plane DB.  Detect them by prefix so we can
-    # pass the ID through as agent_profile without a full profile object.
+    # Task Force virtual profiles are deprecated — DAG-based orchestration
+    # is now handled via /api/dags endpoints.
     _is_task_force = bool(_raw_model and _raw_model.startswith("taskforce-"))
 
     _resolved_profile = get_profile(_raw_model) if _raw_model else None
@@ -1353,10 +1351,11 @@ async def chat_completions(
     base_image: str | None
 
     if _raw_model and _raw_model.startswith("taskforce-"):
+        # Legacy task force references — treat as default model
         llm_model = settings.DEFAULT_LLM_MODEL
         agent_profile = _raw_model
-        base_image = None  # Task forces don't have a single base image
-        logger.info("TaskForce profile '%s' detected → llm=%s", _raw_model, llm_model)
+        base_image = None
+        logger.info("Legacy TaskForce profile '%s' detected → llm=%s", _raw_model, llm_model)
     elif _resolved_profile:
         llm_model = _resolved_profile.llm_model
         agent_profile = _resolved_profile.id
@@ -1475,7 +1474,6 @@ async def chat_completions(
         description = "\n\n".join(desc_parts) or instruction
 
         # Determine agent_profile to send to the control-plane.
-        # For Task Force virtual agents, pass the taskforce-xxx ID directly.
         _agent_profile_for_task = (
             _raw_model if _is_task_force
             else (_resolved_profile.id if _resolved_profile else None)

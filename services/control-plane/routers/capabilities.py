@@ -39,31 +39,29 @@ async def get_temporal_client():
 @router.get("/requests", response_model=List[CapabilityRequestResponse])
 async def list_capability_requests(
     task_id: str = None,
-    task_force_id: str = None,
+    dag_id: str = None,
     status_filter: RequestStatus = None,
     db: AsyncSession = Depends(get_db)
 ):
     """List capability requests.
 
     - task_id: filter to a single task
-    - task_force_id: include requests from ALL tasks belonging to this Task Force
+    - dag_id: include requests from ALL tasks belonging to this DAG
     - status_filter: filter by request status
     """
     query = select(CapabilityRequest)
 
-    if task_force_id:
-        # Find all task IDs in this Task Force (excluding the coordinator)
-        tf_tasks = await db.execute(
+    if dag_id:
+        # Find all task IDs in this DAG
+        dag_tasks = await db.execute(
             select(Task.id).where(
-                Task.task_force_id == task_force_id,
-                Task.task_force_role != "coordinator",
+                Task.dag_id == dag_id,
             )
         )
-        tf_task_ids = [row[0] for row in tf_tasks.all()]
-        if tf_task_ids:
-            query = query.where(CapabilityRequest.task_id.in_(tf_task_ids))
+        dag_task_ids = [row[0] for row in dag_tasks.all()]
+        if dag_task_ids:
+            query = query.where(CapabilityRequest.task_id.in_(dag_task_ids))
         else:
-            # No sub-tasks → return empty
             return []
     elif task_id:
         query = query.where(CapabilityRequest.task_id == task_id)
@@ -177,15 +175,14 @@ async def review_capability_request(
                 await workflow_handle.signal("approve_capability", approved)
                 logger.info(f"Sent signal to workflow {task.workflow_id}: approved={approved}")
 
-                # If this task belongs to a Task Force, also signal ALL
-                # sibling sub-task workflows so they ALL rebuild their images
+                # If this task belongs to a DAG, also signal ALL
+                # sibling node workflows so they ALL rebuild their images
                 # with the newly approved capability.
-                if approved and task.task_force_id:
+                if approved and task.dag_id:
                     siblings_result = await db.execute(
                         select(Task).where(
-                            Task.task_force_id == task.task_force_id,
+                            Task.dag_id == task.dag_id,
                             Task.id != task.id,
-                            Task.task_force_role != "coordinator",
                         )
                     )
                     siblings = siblings_result.scalars().all()

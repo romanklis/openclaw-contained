@@ -83,14 +83,13 @@ async def get_execution_timeline(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    # Get all capability requests for this task — and for Task Force
-    # coordinator tasks, also include capability requests from all sub-tasks
-    # so they are surfaced on the coordinator's detail page.
+    # Get all capability requests for this task — and for DAG tasks,
+    # also include capability requests from all sibling nodes.
     task_ids_to_query = [task_id]
-    if task.task_force_id and task.task_force_role == "coordinator":
+    if task.dag_id:
         sub_result = await db.execute(
             select(Task.id)
-            .where(Task.workspace_id == task.workspace_id, Task.id != task_id)
+            .where(Task.dag_id == task.dag_id, Task.id != task_id)
         )
         task_ids_to_query.extend([row[0] for row in sub_result.all()])
 
@@ -314,10 +313,10 @@ async def get_task_outputs(
     # Map task_id → role label for UI display
     role_labels: Dict[str, str] = {}
 
-    if task and task.task_force_id and task.task_force_role == "coordinator":
+    if task and task.dag_id:
         sub_result = await db.execute(
-            select(Task.id, Task.task_force_role)
-            .where(Task.workspace_id == task.workspace_id, Task.id != task_id)
+            select(Task.id, Task.node_id)
+            .where(Task.dag_id == task.dag_id, Task.id != task_id)
         )
         for row in sub_result.all():
             task_ids_to_query.append(row[0])
@@ -333,7 +332,7 @@ async def get_task_outputs(
     return {
         "task_id": task_id,
         "count": len(outputs),
-        "is_task_force": len(task_ids_to_query) > 1,
+        "is_dag": len(task_ids_to_query) > 1,
         "outputs": [
             {
                 "id": o.id,
@@ -617,10 +616,10 @@ async def get_audit_turns(
 
     # Collect all task IDs relevant for this audit query
     relevant_task_ids = [task_id]
-    if task.task_force_id and task.task_force_role == "coordinator":
+    if task.dag_id:
         sub_result = await db.execute(
             select(Task.id)
-            .where(Task.workspace_id == task.workspace_id, Task.id != task_id)
+            .where(Task.dag_id == task.dag_id, Task.id != task_id)
         )
         relevant_task_ids.extend([row[0] for row in sub_result.all()])
 

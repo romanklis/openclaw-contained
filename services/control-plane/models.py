@@ -21,31 +21,23 @@ class TaskStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
-class TaskForceStatus(str, enum.Enum):
-    """Task Force lifecycle status"""
-    DRAFT = "draft"
-    ACTIVE = "active"  # Registered as a virtual agent — reusable template
+class DAGStatus(str, enum.Enum):
+    """Master DAG lifecycle status"""
+    PLANNING = "planning"
+    READY = "ready"
     RUNNING = "running"
-    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
-class CeremonyType(str, enum.Enum):
-    """Types of coordination ceremonies"""
-    PLANNING = "planning"
-    SYNC = "sync"
-    PEER_REVIEW = "peer_review"
-    REVIEW_GATE = "review_gate"
-    AGGREGATION = "aggregation"
-    CUSTOM = "custom"
-
-
-class CeremonyMode(str, enum.Enum):
-    """Ceremony coordination mode"""
-    SYNCHRONOUS = "synchronous"
-    ASYNCHRONOUS = "asynchronous"
+class NodeStatus(str, enum.Enum):
+    """DAG node execution status"""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
 
 
 class ExecutionEnvironment(str, enum.Enum):
@@ -101,9 +93,9 @@ class Task(Base):
     workflow_id = Column(String, unique=True)
     workflow_run_id = Column(String)
 
-    # Task Force membership (null for standalone tasks)
-    task_force_id = Column(String, ForeignKey("task_forces.id"), nullable=True)
-    task_force_role = Column(String)  # Role within the task force
+    # DAG membership (null for standalone tasks)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=True)
+    node_id = Column(String)  # node_id within the DAG
 
     # Metadata
     created_by = Column(String)
@@ -304,36 +296,58 @@ class SBOM(Base):
 
 
 # =========================================================================
-# Task Force Models — Multi-Agent Orchestration
+# DAG Orchestration Models — Task-Centric Skill-Based Execution
 # =========================================================================
 
-class TaskForce(Base):
-    """A Task Force is a team of agents collaborating on a task.
+class Skill(Base):
+    """A reusable skill template defining a sequence of functional steps.
 
-    It defines the composition (which agents, their roles) and the
-    coordination ceremonies (meeting points, sync events) that govern
-    how agents interact.
+    Skills are the building blocks of DAGs. Each skill describes what
+    inputs it needs, what artifacts it produces, and the ordered steps
+    to achieve its goal. Steps are executed as individual DAG nodes.
     """
-    __tablename__ = "task_forces"
+    __tablename__ = "skills"
 
-    id = Column(String, primary_key=True)  # taskforce-<uuid8>
-    name = Column(String, nullable=False)
+    id = Column(String, primary_key=True)  # skill-<uuid8>
+    name = Column(String, unique=True, nullable=False)
     description = Column(Text)
-    objective = Column(Text, nullable=False)  # The overall goal for the team
+    version = Column(Integer, default=1)
 
-    # Execution environment
-    execution_environment = Column(
-        SQLEnum(ExecutionEnvironment),
-        default=ExecutionEnvironment.DIND,
-    )
+    # Schema definitions
+    input_schema = Column(JSON, default=dict)   # required inputs {key: type_description}
+    output_artifacts = Column(JSON, default=list)  # expected output file paths/patterns
+    steps = Column(JSON, default=list)  # ordered list of sub-steps
 
-    # Lifecycle
-    status = Column(SQLEnum(TaskForceStatus), default=TaskForceStatus.DRAFT)
+    # Searchability
+    tags = Column(JSON, default=list)  # list of string tags
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class MasterDAG(Base):
+    """A Master DAG representing a decomposed user objective.
+
+    Created by the Planner from a user's objective and a set of skills.
+    Contains the full DAG structure (nodes + edges) as JSON, and is
+    executed by a Temporal DAGWorkflow.
+    """
+    __tablename__ = "master_dags"
+
+    id = Column(String, primary_key=True)  # dag-<uuid8>
+    objective = Column(Text, nullable=False)  # original user prompt
+    status = Column(SQLEnum(DAGStatus), default=DAGStatus.PLANNING)
+
+    # The full DAG structure
+    dag_json = Column(JSON, nullable=False, default=dict)
+
+    # Execution config
+    workspace_id = Column(String, nullable=False)
+    llm_model = Column(String, default="gemma3:4b")
+
+    # Temporal workflow reference
     workflow_id = Column(String, unique=True)
     workflow_run_id = Column(String)
-
-    # Shared workspace for all agents in the force
-    workspace_id = Column(String, nullable=False)
 
     # Metadata
     created_by = Column(String)
@@ -343,43 +357,75 @@ class TaskForce(Base):
     completed_at = Column(DateTime)
 
     # Relationships
-    members = relationship("TaskForceMember", back_populates="task_force", cascade="all, delete-orphan")
-    ceremonies = relationship("TaskForceCeremony", back_populates="task_force", cascade="all, delete-orphan")
-    tasks = relationship("Task", backref="task_force", foreign_keys="Task.task_force_id")
+    nodes = relationship("DAGNode", back_populates="dag", cascade="all, delete-orphan")
+    tasks = relationship("Task", backref="dag", foreign_keys="Task.dag_id")
 
 
-class TaskForceMember(Base):
-    """A member of a Task Force — an agent with a specific role.
+class DAGNode(Base):
+    """A single node in a Master DAG.
 
-    Each member maps to a real agent profile and is assigned a role
-    that defines its responsibilities within the team.
+    Each node represents one unit of work — typically one step from a
+    skill, or an inline custom task. Nodes track their dependencies,
+    execution status, and output data.
     """
-    __tablename__ = "task_force_members"
+    __tablename__ = "dag_nodes"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    task_force_id = Column(String, ForeignKey("task_forces.id"), nullable=False)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False)  # unique within DAG (e.g. "search-1")
 
-    # Agent identity
-    agent_profile = Column(String, nullable=False)  # profile ID (e.g. "senior-reviewer")
-    role = Column(String, nullable=False)  # e.g. "Researcher", "Developer", "Reviewer"
-    responsibilities = Column(Text)  # Free-text description of what this agent should do
+    # Skill reference (nullable for inline/custom nodes)
+    skill_id = Column(String, ForeignKey("skills.id"), nullable=True)
+    skill_step_index = Column(Integer)  # which step within the skill
 
-    # Execution config overrides
-    llm_model = Column(String)  # Override profile's default LLM
-    base_image = Column(String)  # Override profile's default image
+    # Execution
+    description = Column(Text)
+    status = Column(SQLEnum(NodeStatus), default=NodeStatus.PENDING)
+    depends_on = Column(JSON, default=list)  # list of node_ids
+    config = Column(JSON, default=dict)  # overrides: base_image, llm_model, env_id, timeout, deploy_authorized
+    input_mapping = Column(JSON, default=dict)  # maps inputs to dependency outputs
+    output_data = Column(JSON)  # captured results after execution
 
-    # Runtime state
-    task_id = Column(String, ForeignKey("tasks.id"))  # The actual spawned task for this member
-    status = Column(String, default="pending")  # pending, running, completed, failed
+    # Runtime
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+    container_id = Column(String)
 
-    # Order in which this member acts (for sequential ceremonies)
-    execution_order = Column(Integer, default=0)
-
-    created_at = Column(DateTime, server_default=func.now())
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
 
     # Relationships
-    task_force = relationship("TaskForce", back_populates="members")
+    dag = relationship("MasterDAG", back_populates="nodes")
+    skill = relationship("Skill")
     task = relationship("Task", foreign_keys=[task_id])
+
+
+class NodeEnvironment(Base):
+    """A reusable execution environment with approved capabilities.
+
+    Environments decouple the execution context from individual tasks.
+    They accumulate approved packages over time and can be referenced
+    by any DAG node. They can also be forked to create variants.
+    """
+    __tablename__ = "node_environments"
+
+    id = Column(String, primary_key=True)  # env-<uuid8>
+    name = Column(String, nullable=False)
+    description = Column(Text)
+
+    # Capability tracking
+    capability_fingerprint = Column(String, index=True)  # sorted SHA256 of capabilities
+    capabilities = Column(JSON, default=list)  # list of approved packages/tools
+    base_image = Column(String, default="openclaw")  # openclaw/nanobot/picoclaw/zeroclaw
+    current_image_tag = Column(String)  # registry tag (e.g. localhost:5000/openclaw-agent:env-abc123-v3)
+    version = Column(Integer, default=0)  # increments on each capability addition
+
+    # Forking
+    parent_env_id = Column(String, ForeignKey("node_environments.id"), nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    parent = relationship("NodeEnvironment", remote_side="NodeEnvironment.id")
 
 
 class SupplyChainPackage(Base):
@@ -423,130 +469,3 @@ class SupplyChainImageType(Base):
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
-
-
-class TaskForceCeremony(Base):
-    """A coordination ceremony within a Task Force.
-
-    Ceremonies define synchronization points where agents meet, share
-    context, review each other's work, or aggregate results.
-    """
-    __tablename__ = "task_force_ceremonies"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    task_force_id = Column(String, ForeignKey("task_forces.id"), nullable=False)
-
-    name = Column(String, nullable=False)  # e.g. "Planning Phase", "Code Review Sync"
-    ceremony_type = Column(SQLEnum(CeremonyType), nullable=False)
-    mode = Column(SQLEnum(CeremonyMode), default=CeremonyMode.SYNCHRONOUS)
-
-    # Ordering: ceremonies execute in this order
-    sequence_order = Column(Integer, nullable=False, default=0)
-
-    # Which members participate (JSON list of member IDs; null = all)
-    participant_member_ids = Column(JSON)
-
-    # Configuration
-    description = Column(Text)  # Instructions for this ceremony
-    trigger_condition = Column(String)  # "after_all_complete", "after_member:<id>", "manual"
-    timeout_minutes = Column(Integer, default=60)
-
-    # review_gate specific
-    review_target_order = Column(Integer)           # execution_order to rewind to on FAIL
-    max_rework_cycles = Column(Integer, default=2)  # max feedback loops
-    verdict_file = Column(String, default="REVIEW_BRIEF.md")  # workspace file with PASS/FAIL
-
-    # Runtime state
-    status = Column(String, default="pending")  # pending, active, completed, skipped
-    started_at = Column(DateTime)
-    completed_at = Column(DateTime)
-    result_summary = Column(Text)  # Aggregated output from ceremony
-
-    created_at = Column(DateTime, server_default=func.now())
-
-    # Relationships
-    task_force = relationship("TaskForce", back_populates="ceremonies")
-
-
-# =========================================================================
-# Ceremony State — API-tracked artifacts, verdicts & agent state exchange
-# =========================================================================
-
-class ArtifactKind(str, enum.Enum):
-    """Kind of ceremony artifact."""
-    PLAN = "plan"
-    REVIEW_BRIEF = "review_brief"
-    VERDICT = "verdict"
-    SUMMARY = "summary"
-    SYNC_NOTES = "sync_notes"
-    REWORK_FEEDBACK = "rework_feedback"
-    CUSTOM = "custom"
-
-
-class CeremonyArtifact(Base):
-    """An immutable artifact produced during a ceremony.
-
-    Replaces filesystem-based ceremony files (CEREMONY_PLAN.md, REVIEW_BRIEF.md,
-    REVIEW_VERDICT.md, FINAL_SUMMARY.md, etc.) with DB-tracked records.
-    Artifacts are append-only — once created they cannot be modified, giving
-    a full audit trail of decisions and handoffs.
-    """
-    __tablename__ = "ceremony_artifacts"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    task_force_id = Column(String, ForeignKey("task_forces.id"), nullable=False, index=True)
-    ceremony_id = Column(Integer, ForeignKey("task_force_ceremonies.id"), nullable=True)
-    task_id = Column(String, ForeignKey("tasks.id"), nullable=True)  # producing agent
-
-    kind = Column(SQLEnum(ArtifactKind), nullable=False)
-    filename = Column(String)  # original filename reference (e.g. "REVIEW_BRIEF.md")
-    title = Column(String)
-    content = Column(Text, nullable=False)
-    metadata_json = Column("metadata", JSON)  # structured payload (checksums, etc.)
-
-    # For verdicts: hard verdict keyword
-    verdict = Column(String)  # "pass" / "fail" / null for non-verdicts
-
-    # Rework tracking
-    rework_cycle = Column(Integer, default=0)
-
-    # Immutability: once created, superseded_by points to the replacement
-    superseded_by = Column(Integer, ForeignKey("ceremony_artifacts.id"), nullable=True)
-
-    created_at = Column(DateTime, server_default=func.now())
-
-    task_force = relationship("TaskForce", backref="artifacts")
-    ceremony = relationship("TaskForceCeremony", backref="artifacts")
-    task = relationship("Task", backref="ceremony_artifacts")
-
-
-class AgentStateExchange(Base):
-    """A state-change message between agents in a task force.
-
-    Provides a structured, append-only channel for agents to exchange
-    decisions, status updates, and coordination signals — fully tracked
-    in the DB instead of relying on filesystem side-channels.
-
-    Examples:
-    - Developer announces "implementation complete"
-    - Tester reports "3/5 tests passing"
-    - Reviewer posts "rework needed: missing error handling"
-    """
-    __tablename__ = "agent_state_exchanges"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    task_force_id = Column(String, ForeignKey("task_forces.id"), nullable=False, index=True)
-    from_task_id = Column(String, nullable=False)  # task ID or "system" for ceremony-generated
-    to_task_id = Column(String, ForeignKey("tasks.id"), nullable=True)  # null = broadcast
-
-    # Structured state
-    state_type = Column(String, nullable=False)  # "status_update", "decision", "handoff", "feedback"
-    subject = Column(String)  # short label
-    body = Column(Text)  # detailed content
-    state_data = Column(JSON)  # structured payload
-
-    created_at = Column(DateTime, server_default=func.now())
-
-    task_force = relationship("TaskForce", backref="state_exchanges")
-    # from_task_id can be "system" for ceremony-generated messages, so no FK relationship
-    to_task = relationship("Task", foreign_keys=[to_task_id], backref="state_exchanges_received")

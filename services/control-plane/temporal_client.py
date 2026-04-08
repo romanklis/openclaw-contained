@@ -34,20 +34,20 @@ async def start_task_workflow(task_id: str, llm_model: str = "gemma3:4b", base_i
     return workflow_id
 
 
-async def start_task_force_workflow(task_force_id: str) -> str:
-    """Start the multi-agent Task Force workflow."""
+async def start_dag_workflow(dag_id: str) -> str:
+    """Start a DAG orchestration workflow."""
     client = await get_temporal_client()
 
-    workflow_id = f"taskforce-workflow-{task_force_id}"
+    workflow_id = f"dag-workflow-{dag_id}"
 
     handle = await client.start_workflow(
-        "TaskForceWorkflow",
-        args=[task_force_id],
+        "DAGWorkflow",
+        args=[dag_id],
         id=workflow_id,
         task_queue=settings.TEMPORAL_TASK_QUEUE,
     )
 
-    logger.info(f"Started TaskForceWorkflow {workflow_id} for {task_force_id}")
+    logger.info(f"Started DAGWorkflow {workflow_id} for {dag_id}")
     return workflow_id
 
 

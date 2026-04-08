@@ -4,8 +4,9 @@ Temporal Worker - Executes workflows and activities
 import asyncio
 import logging
 import re
+import uuid
 from temporalio import workflow, activity
-from .worker_api import get_task_current_image
+from temporalio.exceptions import ApplicationError
 from temporalio.client import Client
 from temporalio.worker import Worker
 from datetime import timedelta, datetime
@@ -223,18 +224,16 @@ class AgentTaskWorkflow:
                 deployment = result.get("deployment", {})
                 logger.info(f"🚀 DEPLOYMENT_REQUEST | Task: {task_id} | Name: {deployment.get('name')} | Port: {deployment.get('port')}")
 
-                # If this task is part of a Task Force, check if the role
-                # is allowed to deploy (only the lead / developer can deploy).
+                # Check if this task/node is authorized to deploy
                 should_deploy = True
-                tf_role_info = await workflow.execute_activity(
-                    check_task_force_deploy_role,
+                deploy_info = await workflow.execute_activity(
+                    check_deploy_authority,
                     args=[task_id],
                     start_to_close_timeout=timedelta(seconds=15),
                 )
-                if tf_role_info.get("is_task_force") and not tf_role_info.get("can_deploy"):
+                if not deploy_info.get("can_deploy"):
                     logger.info(
-                        f"🚫 DEPLOY_SUPPRESSED | {task_id} role={tf_role_info.get('role')} "
-                        f"— deployment handled by {tf_role_info.get('lead_role')} only"
+                        f"🚫 DEPLOY_SUPPRESSED | {task_id} — {deploy_info.get('reason')}"
                     )
                     should_deploy = False
 
@@ -554,7 +553,8 @@ async def start_agent_container(
         workspaces_root = "/workspaces"
         workspace_id = ""
         task_description = ""
-        task_force_id = ""
+        dag_id = ""
+        node_id = ""
         try:
             import httpx as _httpx
             _cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
@@ -564,7 +564,8 @@ async def start_agent_container(
                     _task_data = _resp.json()
                     workspace_id = _task_data.get("workspace_id", "")
                     task_description = _task_data.get("description", "")
-                    task_force_id = _task_data.get("task_force_id", "") or ""
+                    dag_id = _task_data.get("dag_id", "") or ""
+                    node_id = _task_data.get("node_id", "") or ""
         except Exception as _e:
             logger.warning(f"⚠️ Could not fetch task details: {_e}")
 
@@ -579,8 +580,8 @@ async def start_agent_container(
             import httpx as _httpx2
             _cp2 = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
             async with _httpx2.AsyncClient(timeout=10.0) as _hc2:
-                # Query by task_force_id if available, otherwise by task_id
-                _q = f"task_force_id={task_force_id}" if task_force_id else f"task_id={task_id}"
+                # Query by dag_id if available, otherwise by task_id
+                _q = f"dag_id={dag_id}" if dag_id else f"task_id={task_id}"
                 _cr = await _hc2.get(f"{_cp2}/api/capabilities/requests?{_q}")
                 if _cr.status_code == 200:
                     _caps = _cr.json()
@@ -629,26 +630,14 @@ async def start_agent_container(
         # --- Zep CE memory service discovery ---
         zep_ip = os.getenv("ZEP_IP", "") or _resolve("zep", fallback="")
         zep_url_for_agent = f"http://{zep_ip}:8000" if zep_ip else ""
-        # Session ID: task-force scoped by role so memory persists across
-        # rework cycles for the same agent role.  For standalone tasks we
+        # Session ID: DAG-scoped by node_id so memory persists across
+        # retries for the same DAG node.  For standalone tasks we
         # fall back to the task_id.
         zep_session_id = ""
-        if task_force_id:
-            _role = agent_image.split("/")[-1].split(":")[0]  # e.g. "openclaw-agent" – not useful
-            # Use the task's role from API (member_role field) if available
-            try:
-                import httpx as _httpx_zep
-                _cp_zep = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-                async with _httpx_zep.AsyncClient(timeout=10.0) as _hcz:
-                    _tz = await _hcz.get(f"{_cp_zep}/api/tasks/{task_id}")
-                    if _tz.status_code == 200:
-                        _td = _tz.json()
-                        _member_role = _td.get("task_force_role", "") or _td.get("role", "") or "agent"
-                        zep_session_id = f"{task_force_id}_{_member_role}"
-            except Exception:
-                zep_session_id = f"{task_force_id}_agent"
-            if not zep_session_id:
-                zep_session_id = f"{task_force_id}_agent"
+        if dag_id and node_id:
+            zep_session_id = f"{dag_id}_{node_id}"
+        elif dag_id:
+            zep_session_id = f"{dag_id}_agent"
         else:
             zep_session_id = task_id
 
@@ -1350,12 +1339,12 @@ async def create_deployment(task_id: str, deployment: Dict[str, Any]) -> Dict[st
 
 
 @activity.defn
-async def check_task_force_deploy_role(task_id: str) -> Dict[str, Any]:
-    """Check whether a TF member task's role is allowed to deploy.
+async def check_deploy_authority(task_id: str) -> Dict[str, Any]:
+    """Check whether a task (DAG node) is authorized to deploy.
 
-    Only the 'lead' role (Developer, Lead, Architect, etc.) can deploy.
-    Support roles (Tester, Reviewer, QA, etc.) are suppressed.
-    Returns {is_task_force, can_deploy, role, lead_role}.
+    For DAG nodes, checks the 'deploy_authorized' flag in the node config.
+    For standalone tasks, always allows deployment.
+    Returns {can_deploy, reason}.
     """
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
@@ -1363,35 +1352,28 @@ async def check_task_force_deploy_role(task_id: str) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
         if resp.status_code != 200:
-            return {"is_task_force": False, "can_deploy": True}
+            return {"can_deploy": True, "reason": "standalone_task"}
 
         task_data = resp.json()
-        tf_id = task_data.get("task_force_id")
-        if not tf_id:
-            return {"is_task_force": False, "can_deploy": True}
+        dag_id = task_data.get("dag_id")
+        node_id = task_data.get("node_id")
 
-        role = (task_data.get("task_force_role") or "").lower()
-        support_roles = {"tester", "qa", "auditor", "validator"}
+        if not dag_id or not node_id:
+            return {"can_deploy": True, "reason": "standalone_task"}
 
-        # Find the lead role from the task force — whoever has the
-        # highest execution_order is the "deploy lead" (typically the
-        # Reviewer or Deployer).  Fall back to the first Developer.
-        tf_resp = await client.get(f"{control_plane_url}/api/task-forces/{tf_id}")
-        lead_role = "Developer"
-        if tf_resp.status_code == 200:
-            tf_data = tf_resp.json()
-            members = tf_data.get("members", [])
-            # Highest execution_order member is the deploy lead
-            if members:
-                last_member = max(members, key=lambda m: m.get("execution_order", 0))
-                lead_role = last_member.get("role", "Developer")
+        # Fetch DAG nodes to check deploy_authorized flag
+        nodes_resp = await client.get(f"{control_plane_url}/api/dags/{dag_id}/nodes")
+        if nodes_resp.status_code == 200:
+            nodes = nodes_resp.json()
+            for node in nodes:
+                if node.get("node_id") == node_id:
+                    config = node.get("config", {})
+                    if config.get("deploy_authorized", False):
+                        return {"can_deploy": True, "reason": "deploy_authorized"}
+                    else:
+                        return {"can_deploy": False, "reason": "node_not_authorized"}
 
-        return {
-            "is_task_force": True,
-            "can_deploy": role not in support_roles,
-            "role": task_data.get("task_force_role", ""),
-            "lead_role": lead_role,
-        }
+        return {"can_deploy": False, "reason": "node_not_found"}
 
 
 @activity.defn
@@ -1626,1913 +1608,585 @@ async def stop_deployment_container(deployment_id: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Task Force Activities — Multi-Agent Orchestration
+# DAG Activities — Task-Centric DAG Orchestration
 # =============================================================================
 
 @activity.defn
-async def post_task_force_progress(
-    task_force_id: str,
-    message: str,
-) -> bool:
-    """Post a progress message to the Task Force coordinator task.
-
-    Finds the coordinator task (task_force_role='coordinator') and
-    creates a TaskMessage so progress is visible on the task detail page.
-    """
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # Find coordinator task
-        resp = await client.get(
-            f"{control_plane_url}/api/tasks",
-            params={"limit": 200},
-        )
-        if resp.status_code != 200:
-            return False
-
-        tasks = resp.json()
-        coord_task_id = None
-        for t in tasks:
-            if (t.get("agent_profile") == task_force_id
-                    and "coordinator" in (t.get("name", "") + t.get("description", "")).lower()
-                    or t.get("agent_profile") == task_force_id):
-                # Use the first task with this task_force as agent_profile
-                coord_task_id = t["id"]
-                break
-
-        if not coord_task_id:
-            logger.warning(f"⚠️ Could not find coordinator task for {task_force_id}")
-            return False
-
-        # Post a message to the coordinator task
-        msg_resp = await client.post(
-            f"{control_plane_url}/api/tasks/{coord_task_id}/messages",
-            json={"content": message, "role": "system"},
-        )
-        return msg_resp.status_code in (200, 201)
-
-
-@activity.defn
-async def update_coordinator_task_status(
-    task_force_id: str,
-    status: str,
-) -> bool:
-    """Update the coordinator task status to completed/failed."""
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            f"{control_plane_url}/api/tasks",
-            params={"limit": 200},
-        )
-        if resp.status_code != 200:
-            return False
-
-        tasks = resp.json()
-        for t in tasks:
-            if t.get("agent_profile") == task_force_id:
-                task_id = t["id"]
-                endpoint = "complete" if status == "completed" else "fail"
-                await client.post(f"{control_plane_url}/api/tasks/{task_id}/{endpoint}")
-                return True
-    return False
-
-
-@activity.defn
-async def load_task_force(task_force_id: str) -> Dict[str, Any]:
-    """Load Task Force definition including members and ceremonies from the control plane."""
+async def load_dag(dag_id: str) -> Dict[str, Any]:
+    """Load the full DAG definition including nodes from the control plane."""
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(f"{control_plane_url}/api/task-forces/{task_force_id}")
+        resp = await client.get(f"{control_plane_url}/api/dags/{dag_id}")
         if resp.status_code != 200:
-            raise Exception(f"Failed to load Task Force {task_force_id}: HTTP {resp.status_code}")
+            raise ApplicationError(f"Failed to load DAG {dag_id}: {resp.status_code}")
         return resp.json()
 
 
 @activity.defn
-async def start_member_task(task_id: str, llm_model: str, base_image: str) -> str:
-    """Start a Temporal AgentTaskWorkflow for a single Task Force member."""
+async def update_node_status(
+    dag_id: str,
+    node_id: str,
+    status: str,
+    output_data: Optional[Dict[str, Any]] = None,
+    task_id: Optional[str] = None,
+    container_id: Optional[str] = None,
+) -> bool:
+    """Update the status of a DAG node via the control plane."""
     import httpx
-    from temporalio.client import Client as TClient
-
-    client = await TClient.connect(TEMPORAL_HOST)
-    workflow_id = f"task-workflow-{task_id}"
-
-    await client.start_workflow(
-        "AgentTaskWorkflow",
-        args=[task_id, llm_model, base_image],
-        id=workflow_id,
-        task_queue=TASK_QUEUE,
-    )
-    logger.info(f"🚀 TASK_FORCE_MEMBER | Started workflow {workflow_id}")
-
-    # Persist workflow_id back to the control-plane so that capability
-    # approval signals can be routed to this specific workflow.
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as http:
-            await http.patch(
-                f"{control_plane_url}/api/tasks/{task_id}",
-                json={"workflow_id": workflow_id},
-            )
-        logger.info(f"✅ Saved workflow_id {workflow_id} to task {task_id}")
-    except Exception as e:
-        logger.warning(f"Could not persist workflow_id for {task_id}: {e}")
 
-    return workflow_id
+    payload: Dict[str, Any] = {"status": status}
+    if output_data is not None:
+        payload["output_data"] = output_data
+    if task_id is not None:
+        payload["task_id"] = task_id
+    if container_id is not None:
+        payload["container_id"] = container_id
 
-
-@activity.defn
-async def get_task_current_image(task_id: str) -> Optional[str]:
-    """Fetch the task's current_image from the control plane."""
-    import httpx
-    import os
-    from temporalio import activity
-
-    _cp = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as _hc:
-            _tr = await _hc.get(f"{_cp}/api/tasks/{task_id}")
-            _tr.raise_for_status()
-            db_image = _tr.json().get("current_image", "")
-            if db_image:
-                activity.logger.info(
-                    f"✅ Fetched DB image for {task_id}: {db_image}"
-                )
-                return db_image
-    except Exception as e:
-        activity.logger.warning(
-            f"Could not fetch current_image for {task_id}: {e}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.patch(
+            f"{control_plane_url}/api/dags/{dag_id}/nodes/{node_id}",
+            json=payload,
         )
-    activity.logger.info(f"❌ No DB image found for {task_id}, returning None")
-    return None
-
-
-@activity.defn
-async def persist_member_workflow_id(task_id: str, workflow_id: str) -> bool:
-    """Persist a child-workflow ID to the control-plane DB.
-
-    This keeps the control-plane aware of workflows started natively as
-    Temporal child workflows (instead of via the old ``start_member_task``
-    activity).  The stored ``workflow_id`` is used to route capability-
-    approval signals.
-    """
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.patch(
-                f"{control_plane_url}/api/tasks/{task_id}",
-                json={"workflow_id": workflow_id},
-            )
-            if resp.status_code < 300:
-                logger.info(f"✅ Persisted workflow_id {workflow_id} → task {task_id}")
-                return True
-            logger.warning(f"persist_member_workflow_id: HTTP {resp.status_code} for {task_id}")
+        if resp.status_code not in (200, 204):
+            logger.warning(f"⚠️ Failed to update node {node_id} status: {resp.status_code}")
             return False
-    except Exception as e:
-        logger.warning(f"persist_member_workflow_id failed for {task_id}: {e}")
-        return False
+        return True
 
 
 @activity.defn
-async def update_member_status(task_force_id: str, member_id: int, status: str) -> bool:
-    """Update a Task Force member's status via the control plane."""
+async def update_dag_status(dag_id: str, status: str) -> bool:
+    """Update the overall DAG status via the control plane."""
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        # Update the task that belongs to this member
-        resp = await client.get(f"{control_plane_url}/api/task-forces/{task_force_id}")
+        resp = await client.patch(
+            f"{control_plane_url}/api/dags/{dag_id}",
+            json={"status": status},
+        )
+        if resp.status_code not in (200, 204):
+            logger.warning(f"⚠️ Failed to update DAG {dag_id} status: {resp.status_code}")
+            return False
+        return True
+
+
+@activity.defn
+async def post_dag_progress(dag_id: str, message: str) -> bool:
+    """Post a progress message to the DAG's associated task (if any)."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Find any task associated with this DAG
+        resp = await client.get(
+            f"{control_plane_url}/api/tasks",
+            params={"limit": 200},
+        )
         if resp.status_code != 200:
             return False
-        tf_data = resp.json()
-        for m in tf_data.get("members", []):
-            if m["id"] == member_id and m.get("task_id"):
-                task_resp = await client.get(f"{control_plane_url}/api/tasks/{m['task_id']}")
-                if task_resp.status_code == 200:
-                    task_status = task_resp.json().get("status", "unknown")
-                    logger.info(f"📊 Member {member_id} task status: {task_status}")
-                    return task_status in ("completed", "failed")
+
+        tasks = resp.json()
+        for t in tasks:
+            if t.get("dag_id") == dag_id:
+                msg_resp = await client.post(
+                    f"{control_plane_url}/api/tasks/{t['id']}/messages",
+                    json={"content": message, "role": "system"},
+                )
+                return msg_resp.status_code in (200, 201)
     return False
 
 
 @activity.defn
-async def poll_member_task_status(task_id: str) -> Dict[str, Any]:
-    """Poll a member's task to check if it's completed."""
+async def create_node_task(
+    dag_id: str,
+    node_id: str,
+    description: str,
+    agent_image: str = "localhost:5000/openclaw-agent:openclaw",
+    llm_model: str = "gemma3:4b",
+    workspace_id: str = "",
+) -> str:
+    """Create a Task record for a DAG node and return the task_id."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    task_id = f"task-{uuid.uuid4().hex[:8]}"
+
+    # Control-plane /api/tasks expects base_image key values like
+    # openclaw|nanobot|picoclaw|zeroclaw, not a full image URL.
+    base_image = (agent_image or "openclaw").strip()
+    if "/" in base_image and ":" in base_image:
+        base_image = base_image.rsplit(":", 1)[-1]
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"{control_plane_url}/api/tasks",
+            json={
+                "name": f"DAG node {node_id}",
+                "description": description or f"Execute node {node_id}",
+                "base_image": base_image,
+                "llm_model": llm_model,
+                "workspace_id": workspace_id or None,
+                "dag_id": dag_id,
+                "node_id": node_id,
+                "auto_start": False,
+            },
+        )
+        if resp.status_code not in (200, 201):
+            raise ApplicationError(f"Failed to create task for node {node_id}: {resp.status_code} {resp.text}")
+        data = resp.json()
+        return data.get("id", task_id)
+
+
+@activity.defn
+async def collect_node_output(task_id: str) -> Dict[str, Any]:
+    """Collect output from a completed node task."""
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
         if resp.status_code != 200:
-            return {"status": "unknown", "error": f"HTTP {resp.status_code}"}
-        data = resp.json()
-        return {
-            "status": data.get("status", "unknown"),
+            return {"error": f"Failed to fetch task {task_id}"}
+
+        task = resp.json()
+
+        # Fetch the latest output
+        outputs_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
+        outputs = outputs_resp.json() if outputs_resp.status_code == 200 else []
+
+        result = {
             "task_id": task_id,
+            "status": task.get("status"),
         }
 
-
-@activity.defn
-async def write_ceremony_artifact(
-    workspace_id: str,
-    filename: str,
-    content: str,
-    task_force_id: str = "",
-    ceremony_id: int = 0,
-    artifact_kind: str = "custom",
-    task_id: str = "",
-    rework_cycle: int = 0,
-) -> Dict[str, Any]:
-    """Write a ceremony artifact to workspace AND to the ceremony state API.
-
-    The workspace file is kept for backward compatibility (agents read from
-    /workspace), but the API record is the source of truth for verdicts and
-    audit trails.
-    """
-    workspaces_root = "/workspaces"
-    workspace_dir = os.path.join(workspaces_root, workspace_id)
-    os.makedirs(workspace_dir, exist_ok=True)
-
-    filepath = os.path.join(workspace_dir, filename)
-    with open(filepath, "w") as f:
-        f.write(content)
-    os.chmod(filepath, 0o666)
-
-    logger.info(f"📝 CEREMONY ARTIFACT | Written: {filepath} ({len(content)} bytes)")
-
-    # Also store in the ceremony state API for traceability
-    api_id = None
-    if task_force_id:
-        import httpx
-        control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    f"{control_plane_url}/api/task-forces/{task_force_id}/artifacts",
-                    json={
-                        "kind": artifact_kind,
-                        "ceremony_id": ceremony_id or None,
-                        "filename": filename,
-                        "title": filename.replace("_", " ").replace(".md", ""),
-                        "content": content[:64000],  # cap at 64k for DB
-                        "rework_cycle": rework_cycle,
-                    },
-                )
-                if resp.status_code in (200, 201):
-                    api_id = resp.json().get("id")
-                    logger.info(f"📝 Artifact also stored in API: #{api_id}")
-                else:
-                    logger.warning(f"⚠️ Artifact API store failed: {resp.status_code} {resp.text[:200]}")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not store artifact via API: {e}")
-
-    return {"filepath": filepath, "filename": filename, "size": len(content), "api_id": api_id}
-
-
-@activity.defn
-async def generate_ceremony_plan(
-    objective: str,
-    team_info: str,
-    ceremony_info: str,
-    workspace_id: str,
-) -> Dict[str, Any]:
-    """Use the LLM to generate a structured ceremony plan.
-
-    Calls the control-plane LLM router to produce a work plan
-    that coordinates agent activities.
-    """
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-
-    prompt = f"""You are a technical project coordinator. Generate a structured work plan for the following task force.
-
-## Objective
-{objective}
-
-## Team
-{team_info}
-
-## Ceremony Context
-{ceremony_info}
-
-## Instructions
-Create a DETAILED work plan in Markdown format that:
-1. Breaks the objective into clear phases with owners (which role does what)
-2. Specifies what files/deliverables each team member should produce
-3. Defines handoff points — when one role finishes, what artifact does the next role pick up
-4. Lists acceptance criteria for each phase
-5. Specifies which team member is the deployment lead (who creates deployment requests)
-
-Output ONLY the Markdown plan, no preamble.
-"""
-
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{control_plane_url}/api/llm/v1/chat/completions",
-                json={
-                    "model": "gemini-flash-latest",
-                    "messages": [
-                        {"role": "system", "content": "You are a technical project coordinator producing structured work plans."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.3,
-                },
-                headers={"Authorization": "Bearer task:ceremony-planner"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                plan_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if plan_text:
-                    logger.info(f"📋 CEREMONY PLAN | Generated {len(plan_text)} chars")
-                    return {"plan": plan_text, "status": "generated"}
-
-            logger.warning(f"⚠️ LLM plan generation returned {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        logger.warning(f"⚠️ LLM plan generation failed: {e}")
-
-    # Fallback: produce a basic plan without LLM
-    fallback = f"""# Work Plan
-
-## Objective
-{objective}
-
-## Team
-{team_info}
-
-## Phases
-1. **Development Phase** — Lead developer implements the solution
-2. **Review Phase** — Reviewer/Tester examines the deliverables
-3. **Finalization** — Lead incorporates feedback and prepares deployment
-
-## Coordination
-- Lead developer owns the deployment request
-- All deliverables should be placed in the shared workspace
-- Each member writes a DONE_<ROLE>.md file when finished
-"""
-    return {"plan": fallback, "status": "fallback"}
-
-
-@activity.defn
-async def read_verdict_file(
-    workspace_id: str,
-    verdict_file: str,
-    task_force_id: str = "",
-    rework_cycle: int = 0,
-) -> Dict[str, Any]:
-    """Read a verdict — first from the ceremony state API, then fall back to
-    the workspace file.
-
-    The API is the authoritative source: verdicts submitted via
-    ``POST /api/tasks/{task_id}/verdict`` are immutable and can't be
-    overwritten by rogue agent iterations.
-
-    Falls back to filesystem scan for backward compatibility with agents
-    that haven't been updated to use the verdict API yet.
-
-    Returns ``{"verdict": "pass"|"fail"|"unknown", "content": "<text>", "source": "api"|"file"}``
-    """
-    import re
-
-    # --- 1. Try API first (authoritative) ---
-    if task_force_id:
-        import httpx
-        control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                params = {}
-                if rework_cycle is not None:
-                    params["rework_cycle"] = rework_cycle
-                resp = await client.get(
-                    f"{control_plane_url}/api/task-forces/{task_force_id}/verdict",
-                    params=params,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    api_verdict = data.get("verdict", "unknown")
-                    logger.info(
-                        f"⚖️ Verdict from API: {api_verdict.upper()} "
-                        f"(tf={task_force_id}, cycle={rework_cycle})"
-                    )
-                    return {
-                        "verdict": api_verdict,
-                        "content": data.get("summary", ""),
-                        "source": "api",
-                        "artifact_id": data.get("id"),
-                    }
-                elif resp.status_code == 404:
-                    logger.info("No API verdict found — falling back to file")
-                else:
-                    logger.warning(f"⚠️ Verdict API returned {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"⚠️ Verdict API query failed: {e} — falling back to file")
-
-    # --- 2. Fall back to workspace file ---
-    workspaces_root = "/workspaces"
-    filepath = os.path.join(workspaces_root, workspace_id, verdict_file)
-
-    if not os.path.isfile(filepath):
-        logger.warning(f"Verdict file not found: {filepath}")
-        return {"verdict": "unknown", "content": "", "error": "file_not_found", "source": "file"}
-
-    with open(filepath, "r", errors="replace") as f:
-        content = f.read(16384)
-
-    # Try JSON first
-    try:
-        import json as _json
-        data = _json.loads(content)
-        v = str(data.get("verdict", "")).strip().lower()
-        if v in ("pass", "fail"):
-            return {"verdict": v, "content": content, "source": "file"}
-    except Exception:
-        pass
-
-    # Regex scan for verdict markers
-    fail_pattern = re.compile(
-        r"\b(FAIL|FAILED|REJECTED|REWORK\s*NEEDED)\b", re.IGNORECASE
-    )
-    pass_pattern = re.compile(
-        r"\b(PASS|PASSED|APPROVED)\b", re.IGNORECASE
-    )
-
-    has_fail = bool(fail_pattern.search(content))
-    has_pass = bool(pass_pattern.search(content))
-
-    if has_fail and not has_pass:
-        verdict = "fail"
-    elif has_pass and not has_fail:
-        verdict = "pass"
-    elif has_fail and has_pass:
-        # Both present — look at the last occurrence to decide
-        last_fail = max(m.start() for m in fail_pattern.finditer(content))
-        last_pass = max(m.start() for m in pass_pattern.finditer(content))
-        verdict = "fail" if last_fail > last_pass else "pass"
-    else:
-        verdict = "unknown"
-
-    logger.info(f"📝 Verdict from {verdict_file}: {verdict.upper()} (source=file)")
-
-    return {"verdict": verdict, "content": content, "source": "file"}
-
-
-# === Ceremony State API Activities ===
-@activity.defn
-async def post_agent_state_exchange(
-    task_force_id: str,
-    from_task_id: str,
-    state_type: str,
-    subject: str = "",
-    body: str = "",
-    state_data: dict = None,
-    to_task_id: str = None,
-) -> dict:
-    """Post a state exchange message to the ceremony state API."""
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    payload = {
-        "from_task_id": from_task_id,
-        "to_task_id": to_task_id,
-        "state_type": state_type,
-        "subject": subject,
-        "body": body,
-        "state_data": state_data or {},
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{control_plane_url}/api/task-forces/{task_force_id}/state",
-                json=payload,
-            )
-            if resp.status_code in (200, 201):
-                return resp.json()
-            else:
-                logger.warning(f"⚠️ State exchange API failed: {resp.status_code} {resp.text[:200]}")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not post state exchange: {e}")
-    return {"error": "failed"}
-
-
-@activity.defn
-async def check_verdict_guard(
-    task_id: str,
-) -> dict:
-    """Check if a PASS verdict already exists for this task's task force.
-
-    Called after capability rebuilds to prevent the agent from continuing
-    to iterate (and potentially corrupting the workspace) after it has
-    already submitted a PASS verdict in a previous iteration.
-
-    Looks up the task's task_force_id from the control-plane, then queries
-    the ceremony state API for an existing verdict.  Returns early with
-    ``{"verdict": "unknown"}`` for standalone tasks (no task force).
-    """
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # 1. Get task to find task_force_id
-            task_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
-            if task_resp.status_code != 200:
-                return {"verdict": "unknown"}
-            task_data = task_resp.json()
-            tf_id = task_data.get("task_force_id")
-            if not tf_id:
-                return {"verdict": "unknown"}  # standalone task — no guard needed
-
-            # 2. Check for existing PASS verdict in the task force
-            resp = await client.get(
-                f"{control_plane_url}/api/task-forces/{tf_id}/verdict",
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("verdict") == "pass":
-                    logger.info(
-                        f"⚖️ Verdict guard: PASS already exists for tf={tf_id} "
-                        f"(artifact #{data.get('id')})"
-                    )
-                    return {"verdict": "pass", "artifact_id": data.get("id")}
-    except Exception as e:
-        logger.warning(f"⚠️ Verdict guard API failed: {e}")
-    return {"verdict": "unknown"}
-
-
-@activity.defn
-async def create_rework_tasks(
-    task_force_id: str,
-    members: list,
-    target_order: int,
-    workspace_id: str,
-    feedback_content: str,
-    cycle: int,
-) -> Dict[str, Any]:
-    """Create fresh tasks for members at ``execution_order >= target_order``.
-
-    Writes ``REWORK_FEEDBACK_CYCLE_<N>.md`` to the workspace so new agents
-    pick up the reviewer's notes, then creates new Task rows via the
-    control-plane API.
-
-    Returns ``{"new_members": [<updated member dicts with new task_ids>]}``.
-    """
-    import httpx
-
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    workspaces_root = "/workspaces"
-
-    # 1. Write feedback to workspace
-    feedback_path = os.path.join(
-        workspaces_root, workspace_id, f"REWORK_FEEDBACK_CYCLE_{cycle}.md"
-    )
-    os.makedirs(os.path.dirname(feedback_path), exist_ok=True)
-    with open(feedback_path, "w") as f:
-        f.write(f"# Rework Feedback — Cycle {cycle}\n\n")
-        f.write(feedback_content)
-    logger.info(f"📝 Wrote rework feedback to {feedback_path}")
-
-    # 2. Identify members that need new tasks
-    effective_target = target_order if target_order is not None else 0
-    target_members = [
-        m for m in members
-        if m.get("execution_order", 0) >= effective_target
-    ]
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # Load current task force data to get member details
-        tf_resp = await client.get(f"{control_plane_url}/api/task-forces/{task_force_id}")
-        if tf_resp.status_code != 200:
-            raise Exception(f"Failed to load TF: HTTP {tf_resp.status_code}")
-        tf_data = tf_resp.json()
-        tf_members = {m["id"]: m for m in tf_data.get("members", [])}
-        tf_obj = tf_data.get("objective", "")
-        tf_name = tf_data.get("name", "")
-        all_members = tf_data.get("members", [])
-
-        updated = []
-        for member in target_members:
-            member_id = member.get("id")
-            db_member = tf_members.get(member_id, member)
-            role = db_member.get("role", "Agent")
-            responsibilities = db_member.get("responsibilities", "")
-            llm_model = db_member.get("llm_model") or "gemini-flash-latest"
-            base_image_key = db_member.get("base_image") or "openclaw"
-            base_image = f"localhost:5000/openclaw-agent:{base_image_key}"
-            agent_profile = db_member.get("agent_profile", "general-assistant")
-
-            logger.info(f"DEBUG: Initial base_image for {member_id}: {base_image}")
-
-            # ── Inherit the previous task's image (preserves capability builds) ──
-            old_task_id = db_member.get("task_id")
-            inherited_image = None
-            if old_task_id:
-                try:
-                    old_resp = await client.get(
-                        f"{control_plane_url}/api/tasks/{old_task_id}"
-                    )
-                    if old_resp.status_code == 200:
-                        old_image = old_resp.json().get("current_image", "")
-                        if old_image:
-                            inherited_image = old_image
-                            logger.info(
-                                f"♻️  Inheriting image from {old_task_id} → "
-                                f"{inherited_image} (for {role} rework)"
-                            )
-                except Exception as img_err:
-                    logger.warning(
-                        f"⚠️ Could not fetch image for {old_task_id}: {img_err}"
-                    )
-
-            import uuid
-            new_task_id = f"task-{str(uuid.uuid4())[:8]}"
-
-            team_roster = "\n".join(
-                f"- **{m.get('role', '?')}** (order {m.get('execution_order', 0)})"
-                for m in all_members
-            )
-
-            description = (
-                f"## TASK FORCE OBJECTIVE\n{tf_obj}\n\n"
-                f"## YOUR ROLE: {role}\n{responsibilities}\n\n"
-                f"## REWORK CYCLE {cycle}\n"
-                f"This is a **rework iteration**. A reviewer has requested changes.\n"
-                f"Read `REWORK_FEEDBACK_CYCLE_{cycle}.md` in the workspace for details.\n"
-                f"Also review `REVIEW_BRIEF.md` for the full review.\n\n"
-                f"## TEAM COMPOSITION\n"
-                f"You are part of **{tf_name}** with {len(all_members)} agents:\n"
-                f"{team_roster}\n\n"
-                f"## COORDINATION RULES\n"
-                f"- Check the workspace for files from previous cycles and teammates.\n"
-                f"- When done, write a summary to `/workspace/DONE_{role.upper().replace(' ', '_')}.md`\n"
-                f"- Focus strictly on your role: **{role}**.\n"
-            )
-
-            # Create task via API (auto_start=false; workflow starts it later)
-            task_payload = {
-                "name": f"[{tf_name}] {role} (rework cycle {cycle})",
-                "description": description,
-                "workspace_id": workspace_id,
-                "llm_model": llm_model,
-                "base_image": base_image_key,
-                "agent_profile": agent_profile,
-                "task_force_id": task_force_id,
-                "task_force_role": role,
-                "auto_start": False,
-            }
-
-            resp = await client.post(
-                f"{control_plane_url}/api/tasks",
-                json=task_payload,
-            )
-            if resp.status_code not in (200, 201):
-                logger.error(f"Failed to create rework task for {role}: {resp.text}")
-                continue
-
-            new_task = resp.json()
-            actual_task_id = new_task.get("id", new_task_id)
-
-            # Carry over the previous task's image so the rework starts
-            # from the already-built image (with packages etc.)
-            if inherited_image:
-                try:
-                    await client.patch(
-                        f"{control_plane_url}/api/tasks/{actual_task_id}/image",
-                        json={"current_image": inherited_image},
-                    )
-                    logger.info(
-                        f"✅ Rework task {actual_task_id} image set to {inherited_image}"
-                    )
-                except Exception as patch_err:
-                    logger.warning(
-                        f"⚠️ Could not set inherited image on {actual_task_id}: {patch_err}"
-                    )
-
-            # Update member's task_id in DB
-            await client.patch(
-                f"{control_plane_url}/api/task-forces/{task_force_id}/members/{member_id}",
-                json={"task_id": actual_task_id, "status": "created"},
-            )
-
-            new_member = dict(member)
-            new_member["task_id"] = actual_task_id
-            updated.append(new_member)
-
-            logger.info(
-                f"🔄 Rework task created: {actual_task_id} for {role} "
-                f"(cycle {cycle}, order {member.get('execution_order', 0)})"
-            )
-
-    return {"new_members": updated}
-
-
-@activity.defn
-async def collect_member_outputs(
-    task_force_id: str,
-    member_task_outputs: Dict[str, str],
-    workspace_id: str,
-) -> Dict[str, Any]:
-    """Collect a lightweight *manifest* of member workspace files.
-
-    Returns role → {task_id, workspace_path, files: [{filename, size}]}.
-    **No file content** is included — keeps the Temporal payload tiny even
-    when agents produce large PDFs, images, or binaries.  Downstream
-    activities (``execute_ceremony``) read content from disk as needed.
-    """
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    workspaces_root = "/workspaces"
-    workspace_dir = os.path.join(workspaces_root, workspace_id)
-
-    collected = {}
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for task_id, role in member_task_outputs.items():
-            role_data: Dict[str, Any] = {
-                "task_id": task_id,
-                "workspace_path": "",
-                "files": [],
-                "api_output_count": 0,
-            }
-
-            # Count API outputs (don't transfer them)
-            try:
-                resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
-                if resp.status_code == 200:
-                    role_data["api_output_count"] = len(resp.json())
-            except Exception as e:
-                logger.warning(f"⚠️ Could not collect API output count from {task_id}: {e}")
-
-            # Build file manifest (names + sizes only)
-            try:
-                task_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
-                if task_resp.status_code == 200:
-                    task_data = task_resp.json()
-                    task_workspace = task_data.get("workspace_id", "")
-                    ws_path = os.path.join(workspaces_root, task_workspace) if task_workspace else workspace_dir
-                    role_data["workspace_path"] = ws_path
-                    if os.path.isdir(ws_path):
-                        for root, dirs, filenames in os.walk(ws_path):
-                            for fname in filenames:
-                                fpath = os.path.join(root, fname)
-                                rel = os.path.relpath(fpath, ws_path)
-                                try:
-                                    sz = os.path.getsize(fpath)
-                                except OSError:
-                                    sz = 0
-                                role_data["files"].append({"filename": rel, "size": sz})
-            except Exception as e:
-                logger.warning(f"⚠️ Could not scan workspace for {task_id}: {e}")
-
-            collected[role] = role_data
-
-    total_files = sum(len(r.get("files", [])) for r in collected.values())
-    logger.info(
-        f"📦 COLLECTED MANIFEST | TF: {task_force_id} | "
-        f"Roles: {list(collected.keys())} | Total files: {total_files}"
-    )
-    return collected
-
-
-@activity.defn
-async def execute_ceremony(
-    task_force_id: str,
-    ceremony_id: int,
-    ceremony_data: Dict[str, Any],
-    member_task_outputs: Dict[str, str],
-    workspace_id: str = "",
-    collected_data: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Execute a ceremony with type-specific behavior.
-
-    - planning:     Generate a work plan via LLM, write CEREMONY_PLAN.md
-    - peer_review:  Collect developer outputs, write REVIEW_BRIEF.md for reviewer
-    - aggregation:  Collect all outputs, produce FINAL_SUMMARY.md
-    - sync/custom:  Write coordination notes as SYNC_NOTES.md
-    """
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    ceremony_type = ceremony_data.get("ceremony_type", "custom")
-    ceremony_name = ceremony_data.get("name", "Unnamed Ceremony")
-
-    logger.info(
-        f"🎭 CEREMONY | TF: {task_force_id} | #{ceremony_id} | "
-        f"Type: {ceremony_type} | Mode: {ceremony_data.get('mode')}"
-    )
-
-    # Resolve workspace_id if not provided
-    if not workspace_id:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(f"{control_plane_url}/api/task-forces/{task_force_id}")
-                if resp.status_code == 200:
-                    workspace_id = resp.json().get("workspace_id", "")
-        except Exception:
-            pass
-
-    workspaces_root = "/workspaces"
-    workspace_dir = os.path.join(workspaces_root, workspace_id) if workspace_id else ""
-
-    # Build role summary from collected data or member_task_outputs
-    role_summary_lines = []
-    if collected_data:
-        for role, data in collected_data.items():
-            if isinstance(data, dict) and "files" in data:
-                files = [f.get("filename", "?") for f in data.get("files", [])]
-                n_outputs = data.get("api_output_count", 0)
-                role_summary_lines.append(
-                    f"- **{role}**: {n_outputs} iterations, files: {', '.join(files) or 'none'}"
-                )
-            elif isinstance(data, str):
-                # Simple string value (e.g. plan text) — skip for role summary
-                continue
-            else:
-                role_summary_lines.append(f"- **{role}**: (data collected)")
-    if not role_summary_lines:
-        for task_id, role in member_task_outputs.items():
-            role_summary_lines.append(f"- **{role}**: task {task_id}")
-
-    role_summary = "\n".join(role_summary_lines)
-    artifact_content = ""
-    artifact_filename = ""
-
-    # ── Type-specific ceremony execution ──
-
-    if ceremony_type == "planning":
-        # Planning ceremony: write plan BEFORE agents start
-        artifact_filename = "CEREMONY_PLAN.md"
-        artifact_content = (
-            f"# 📋 Ceremony Plan: {ceremony_name}\n\n"
-            f"**Task Force:** {task_force_id}\n"
-            f"**Ceremony Type:** Planning\n"
-            f"**Generated at:** {__import__('datetime').datetime.utcnow().isoformat()}\n\n"
-            f"## Team\n{role_summary}\n\n"
-        )
-        # If we have LLM-generated plan data, include it
-        if collected_data and collected_data.get("plan"):
-            artifact_content += f"## Detailed Plan\n\n{collected_data['plan']}\n"
-        else:
-            artifact_content += (
-                "## Instructions\n\n"
-                "Each team member should:\n"
-                "1. Read this plan and coordinate accordingly\n"
-                "2. Focus on your assigned role responsibilities\n"
-                "3. Place all deliverables in the shared workspace\n"
-                "4. Write a DONE_<YOUR_ROLE>.md file when finished\n"
-                "5. Only the designated lead should request deployments\n"
-            )
-
-    elif ceremony_type == "peer_review":
-        # Peer review: collect dev outputs, write review brief for reviewer
-        artifact_filename = "REVIEW_BRIEF.md"
-        artifact_content = (
-            f"# 🔍 Review Brief: {ceremony_name}\n\n"
-            f"**Task Force:** {task_force_id}\n"
-            f"**Ceremony Type:** Peer Review\n"
-            f"**Generated at:** {__import__('datetime').datetime.utcnow().isoformat()}\n\n"
-            f"## Deliverables to Review\n\n{role_summary}\n\n"
-        )
-        # Include file contents by reading from disk (not from Temporal payload)
-        if collected_data:
-            artifact_content += "## File Contents\n\n"
-            TEXT_EXTS = {".py", ".md", ".txt", ".json", ".yaml", ".yml",
-                         ".toml", ".cfg", ".ini", ".csv", ".html", ".css",
-                         ".js", ".ts", ".sh", ".bat", ".xml", ".rst", ".log"}
-            MAX_PREVIEW_CHARS = 2000
-            for role, data in collected_data.items():
-                artifact_content += f"### {role} Deliverables\n\n"
-                ws_path = data.get("workspace_path", "") if isinstance(data, dict) else ""
-                for finfo in (data.get("files", []) if isinstance(data, dict) else []):
-                    fname = finfo.get("filename", "?")
-                    fsize = finfo.get("size", 0)
-                    ext = os.path.splitext(fname)[1].lower()
-                    if ext not in TEXT_EXTS or fname in ("result.json",):
-                        artifact_content += f"- `{fname}` ({fsize} bytes) — *binary/non-text*\n"
-                        continue
-                    # Read preview from disk
-                    fpath = os.path.join(ws_path, fname) if ws_path else ""
-                    preview = ""
-                    if fpath and os.path.isfile(fpath):
-                        try:
-                            with open(fpath, "r", errors="replace") as fp:
-                                preview = fp.read(MAX_PREVIEW_CHARS)
-                        except Exception:
-                            preview = "(could not read)"
-                    if preview:
-                        artifact_content += f"#### `{fname}` ({fsize} bytes)\n```\n{preview}\n```\n\n"
-                    else:
-                        artifact_content += f"- `{fname}` ({fsize} bytes)\n"
-
-            artifact_content += (
-                "## Review Instructions\n\n"
-                "1. Review each deliverable above for correctness and completeness\n"
-                "2. Check that the implementation matches the objective\n"
-                "3. Note any issues, bugs, or improvements needed\n"
-                "4. Write your review findings to REVIEW_FINDINGS.md\n"
-                "5. If the code is acceptable, confirm in your findings\n"
-            )
-
-    elif ceremony_type == "aggregation":
-        # Aggregation: collect everything and produce final summary
-        artifact_filename = "FINAL_SUMMARY.md"
-        artifact_content = (
-            f"# 📊 Final Summary: {ceremony_name}\n\n"
-            f"**Task Force:** {task_force_id}\n"
-            f"**Ceremony Type:** Aggregation\n"
-            f"**Generated at:** {__import__('datetime').datetime.utcnow().isoformat()}\n\n"
-            f"## All Team Outputs\n\n{role_summary}\n\n"
-        )
-        if collected_data:
-            artifact_content += "## Deliverable Details\n\n"
-            for role, data in collected_data.items():
-                artifact_content += f"### {role}\n"
-                for finfo in (data.get("files", []) if isinstance(data, dict) else []):
-                    artifact_content += f"- `{finfo.get('filename', '?')}` ({finfo.get('size', 0)} bytes)\n"
-                artifact_content += "\n"
-
-    else:
-        # sync / custom: write coordination notes
-        artifact_filename = f"SYNC_NOTES_{ceremony_id}.md"
-        artifact_content = (
-            f"# 🔄 Sync Notes: {ceremony_name}\n\n"
-            f"**Task Force:** {task_force_id}\n"
-            f"**Ceremony Type:** {ceremony_type}\n"
-            f"**Generated at:** {__import__('datetime').datetime.utcnow().isoformat()}\n\n"
-            f"## Participants\n\n{role_summary}\n\n"
-            f"## Status\n\nAll participants have been synchronized.\n"
-        )
-
-    # Write the artifact to workspace
-    if artifact_content and workspace_dir:
-        try:
-            os.makedirs(workspace_dir, exist_ok=True)
-            filepath = os.path.join(workspace_dir, artifact_filename)
-            with open(filepath, "w") as f:
-                f.write(artifact_content)
-            os.chmod(filepath, 0o666)
-            logger.info(f"📝 CEREMONY ARTIFACT | {artifact_filename} → {filepath}")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not write ceremony artifact: {e}")
-
-    # Also store in ceremony state API for traceability
-    api_id = None
-    if artifact_content and task_force_id:
-        kind_map = {
-            "planning": "plan",
-            "peer_review": "review_brief",
-            "aggregation": "summary",
-        }
-        artifact_kind = kind_map.get(ceremony_type, "custom")
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    f"{control_plane_url}/api/task-forces/{task_force_id}/artifacts",
-                    json={
-                        "kind": artifact_kind,
-                        "ceremony_id": ceremony_id or None,
-                        "filename": artifact_filename,
-                        "title": ceremony_name,
-                        "content": artifact_content[:64000],
-                        "rework_cycle": 0,
-                    },
-                )
-                if resp.status_code in (200, 201):
-                    api_id = resp.json().get("id")
-                    logger.info(f"📝 Ceremony artifact stored in API: #{api_id}")
-                else:
-                    logger.warning(f"⚠️ Ceremony artifact API store failed: {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not store ceremony artifact via API: {e}")
-
-    summary = (
-        f"Ceremony '{ceremony_name}' ({ceremony_type}) completed.\n"
-        f"Participants: {len(member_task_outputs)} agents\n"
-        f"Artifact: {artifact_filename}\n"
-        f"Roles: {list(member_task_outputs.values())}\n"
-    )
-
-    return {
-        "ceremony_id": ceremony_id,
-        "ceremony_type": ceremony_type,
-        "status": "completed",
-        "summary": summary,
-        "artifact_filename": artifact_filename,
-        "collected_outputs": {
-            k: (
-                f"{len(v.get('files', []))} files, {v.get('api_output_count', 0)} iterations"
-                if isinstance(v, dict) and "files" in v
-                else str(v)[:100]
-            )
-            for k, v in (collected_data or {}).items()
-        },
-    }
-
-
-@activity.defn
-async def finalize_task_force(task_force_id: str, status: str = "completed") -> Dict[str, Any]:
-    """Mark the Task Force as completed/failed."""
-    import httpx
-    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-
-    endpoint = "complete" if status == "completed" else "cancel"
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # Update task force status directly via the router
-        # (We POST to a status endpoint)
-        try:
-            resp = await client.post(
-                f"{control_plane_url}/api/task-forces/{task_force_id}/{endpoint}"
-            )
-            if resp.status_code == 200:
-                logger.info(f"✅ Task Force {task_force_id} finalized as {status}")
-                return {"status": status}
-        except Exception as e:
-            logger.warning(f"⚠️ Could not finalize task force: {e}")
-
-    return {"status": status, "task_force_id": task_force_id}
-
-
-# =============================================================================
-# Task Force Workflow
-# =============================================================================
-
-@workflow.defn
-class TaskForceWorkflow:
-    """Orchestrates a multi-agent Task Force.
-
-    Execution flow:
-    1. Load Task Force definition (members + ceremonies)
-    2. Group members by ``execution_order`` (lower = earlier)
-    3. For each order-group:
-       a. Start member tasks in this group (as child AgentTaskWorkflow instances)
-       b. **Await** all members in this group to reach a terminal state
-       c. Only then proceed to the next order-group
-    4. If ceremonies are defined they are woven between the order-groups –
-       e.g. a *planning* ceremony runs before any agents start, a
-       *peer_review* ceremony runs between the two halves, etc.
-
-    Members share a workspace, allowing context sharing between agents.
-    The ``execution_order`` field on each member is the primary sequencing
-    mechanism.  Members with the *same* ``execution_order`` run in parallel;
-    the workflow blocks on each group finishing before launching the next.
-    """
-
-    @workflow.run
-    async def run(self, task_force_id: str) -> Dict[str, Any]:
-        logger.info(f"🎯 TaskForceWorkflow | Starting for {task_force_id}")
-
-        # 1. Load the Task Force definition
-        tf_data = await workflow.execute_activity(
-            load_task_force,
-            args=[task_force_id],
-            start_to_close_timeout=timedelta(seconds=30),
-        )
-
-        members = tf_data.get("members", [])
-        ceremonies = sorted(
-            tf_data.get("ceremonies", []),
-            key=lambda c: c.get("sequence_order", 0),
-        )
-        tf_name = tf_data.get("name", task_force_id)
-
-        if not members:
-            return {"status": "failed", "error": "No members in Task Force"}
-
-        # Post initial progress
-        member_roles = [m.get("role", "Agent") for m in members]
-        await workflow.execute_activity(
-            post_task_force_progress,
-            args=[
-                task_force_id,
-                f"🚀 **Task Force '{tf_name}' started**\n\n"
-                f"**Team:** {len(members)} agents\n"
-                f"**Roles:** {', '.join(member_roles)}\n"
-                f"**Ceremonies:** {len(ceremonies)}\n\n"
-                f"Launching member agents now..."
-            ],
-            start_to_close_timeout=timedelta(seconds=15),
-        )
-
-        workspace_id = tf_data.get("workspace_id", "")
-
-        # 2. Run the workflow based on ceremonies
-        if not ceremonies:
-            result = await self._run_all_parallel(task_force_id, members, tf_name)
-        else:
-            result = await self._run_with_ceremonies(
-                task_force_id, members, ceremonies, tf_name, workspace_id
-            )
-
-        # 3. Finalize
-        final_status = "completed" if not result.get("error") else "failed"
-
-        # Post completion summary
-        member_results = result.get("members", {})
-        summary_lines = []
-        for tid, fstatus in member_results.items():
-            icon = "✅" if fstatus == "completed" else "❌"
-            summary_lines.append(f"  {icon} {tid}: {fstatus}")
-
-        await workflow.execute_activity(
-            post_task_force_progress,
-            args=[
-                task_force_id,
-                f"{'✅' if final_status == 'completed' else '❌'} **Task Force '{tf_name}' {final_status}**\n\n"
-                f"**Results:**\n" + "\n".join(summary_lines or ["No member results recorded."])
-            ],
-            start_to_close_timeout=timedelta(seconds=15),
-        )
-
-        await workflow.execute_activity(
-            finalize_task_force,
-            args=[task_force_id, final_status],
-            start_to_close_timeout=timedelta(minutes=2),
-        )
-
-        # Update coordinator task status
-        await workflow.execute_activity(
-            update_coordinator_task_status,
-            args=[task_force_id, final_status],
-            start_to_close_timeout=timedelta(seconds=15),
-        )
+        if outputs:
+            latest = outputs[-1] if isinstance(outputs, list) else outputs
+            result["agent_logs"] = latest.get("agent_logs", "")
+            result["files"] = latest.get("files", [])
 
         return result
 
-    async def _run_all_parallel(
-        self, task_force_id: str, members: list, tf_name: str = ""
-    ) -> Dict[str, Any]:
-        """Run members grouped by execution_order, awaiting each group before
-        starting the next.  Uses native Temporal child workflows instead of
-        independent peer workflows + HTTP polling."""
 
-        order_groups = self._group_by_execution_order(members)
-        all_member_tasks: Dict[str, str] = {}       # task_id → role
-        all_child_handles: Dict[str, Any] = {}       # task_id → ChildWorkflowHandle
+@activity.defn
+async def evaluate_edge_condition(
+    dag_json: Dict[str, Any],
+    from_node: str,
+    to_node: str,
+    node_outputs: Dict[str, Any],
+) -> bool:
+    """Evaluate whether a conditional edge should be followed.
 
-        for order_val, group in order_groups:
-            next_idx = 0
-            # Find the index of this group in order_groups
-            for i, (ov, _) in enumerate(order_groups):
-                if ov == order_val:
-                    next_idx = i
-                    break
+    Checks the edge condition against the source node's output.
+    If no condition is specified, the edge is always followed.
+    """
+    edges = dag_json.get("edges", [])
+    for edge in edges:
+        if edge.get("from") == from_node and edge.get("to") == to_node:
+            condition = edge.get("condition")
+            if not condition:
+                return True
 
-            await self._start_next_order_group(
-                task_force_id, order_groups, next_idx,
-                all_member_tasks, all_child_handles,
+            # Simple condition evaluation:
+            # "on_failure" → follow if source node failed
+            # "on_success" → follow if source node succeeded
+            # "on_output_contains:<text>" → follow if output contains text
+            source_output = node_outputs.get(from_node, {})
+            source_status = source_output.get("status", "")
+
+            if condition == "on_failure":
+                return source_status in ("failed", "error")
+            elif condition == "on_success":
+                return source_status in ("completed", "success")
+            elif condition.startswith("on_output_contains:"):
+                search_text = condition.split(":", 1)[1]
+                logs = source_output.get("agent_logs", "")
+                return search_text.lower() in logs.lower()
+            else:
+                logger.warning(f"Unknown edge condition: {condition}")
+                return True
+    return True
+
+
+@activity.defn
+async def finalize_dag(dag_id: str, status: str) -> bool:
+    """Finalize a DAG — update status and timestamp."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.patch(
+            f"{control_plane_url}/api/dags/{dag_id}",
+            json={
+                "status": status,
+                "completed_at": datetime.utcnow().isoformat(),
+            },
+        )
+        return resp.status_code in (200, 204)
+
+
+@activity.defn
+async def persist_task_workflow_id(task_id: str, workflow_id: str) -> bool:
+    """Persist a task's Temporal workflow ID in control-plane.
+
+    Capability approvals are routed using task.workflow_id, so DAG child
+    workflows must publish their IDs here.
+    """
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.patch(
+                f"{control_plane_url}/api/tasks/{task_id}",
+                json={"workflow_id": workflow_id},
             )
+            return resp.status_code in (200, 204)
+    except Exception as e:
+        logger.warning(f"Could not persist workflow_id for {task_id}: {e}")
+        return False
 
-            # Await the children from this group only
-            group_task_ids = [
-                m.get("task_id") for m in group
-                if m.get("task_id") and m.get("task_id") in all_child_handles
-            ]
-            if group_task_ids:
-                await self._await_children(
-                    task_force_id, group_task_ids,
-                    all_child_handles, all_member_tasks,
-                    phase_name=f"Execution group {order_val}",
-                )
 
-        # Derive final statuses from child results (already completed)
-        final_members = {}
-        for task_id, handle in all_child_handles.items():
-            try:
-                result = handle._result if hasattr(handle, '_result') else {}
-                final_members[task_id] = result.get("status", "completed")
-            except Exception:
-                final_members[task_id] = "unknown"
+# =============================================================================
+# DAG Workflows
+# =============================================================================
 
-        return {"status": "completed", "members": final_members}
+@workflow.defn
+class DAGNodeWorkflow:
+    """Execute a single DAG node.
 
-    # ── helpers ──────────────────────────────────────────────────────────
+    Creates a Task record, then delegates execution to AgentTaskWorkflow
+    as a child workflow, reusing all existing agent infrastructure
+    (container launch, LLM polling, capability approval, deployment).
+    """
 
-    @staticmethod
-    def _group_by_execution_order(members: list):
-        """Return a sorted list of (order_value, [members]) tuples."""
-        from itertools import groupby
-        sorted_members = sorted(members, key=lambda m: m.get("execution_order", 0))
-        return [
-            (k, list(g))
-            for k, g in groupby(sorted_members, key=lambda m: m.get("execution_order", 0))
-        ]
+    @workflow.run
+    async def run(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        dag_id = params["dag_id"]
+        node_id = params["node_id"]
+        description = params.get("description", "")
+        config = params.get("config", {})
+        input_data = params.get("input_data", {})
+        workspace_id = params.get("workspace_id", "")
 
-    async def _start_next_order_group(
-        self,
-        task_force_id: str,
-        order_groups: list,
-        group_idx: int,
-        all_member_tasks: Dict[str, str],
-        all_child_handles: Optional[Dict[str, Any]] = None,
-    ) -> int:
-        """Start every member in ``order_groups[group_idx]`` as Temporal **child
-        workflows**, register them in *all_member_tasks* and
-        *all_child_handles*, then return the incremented index.
+        agent_image = config.get("base_image", "openclaw")
+        if "/" not in agent_image:
+            agent_image = f"localhost:5000/openclaw-agent:{agent_image}"
+        llm_model = config.get("llm_model", "gemma3:4b")
 
-        Each agent gets a child ``AgentTaskWorkflow`` — the parent can later
-        ``await handle.result()`` without polling.  A lightweight activity
-        persists the ``workflow_id`` back to the control-plane DB so the UI
-        and capability-approval signals keep working.
-        """
-        if all_child_handles is None:
-            all_child_handles = {}
+        logger.info(f"🔧 DAGNodeWorkflow | DAG: {dag_id} | Node: {node_id}")
 
-        if group_idx >= len(order_groups):
-            return group_idx
-
-        order_val, group = order_groups[group_idx]
-        group_roles = [m.get("role", "Agent") for m in group]
-
+        # Update node to RUNNING
         await workflow.execute_activity(
-            post_task_force_progress,
-            args=[
-                task_force_id,
-                f"🚀 **Starting execution group {order_val}** "
-                f"({len(group)} agent(s): {', '.join(group_roles)})"
-            ],
+            update_node_status,
+            args=[dag_id, node_id, "running"],
             start_to_close_timeout=timedelta(seconds=15),
         )
 
-        for member in group:
-            task_id = member.get("task_id")
-            if not task_id or task_id in all_member_tasks:
-                continue
+        # Build the follow-up prompt from description + input_data
+        follow_up_parts = []
+        if description:
+            follow_up_parts.append(description)
+        if input_data:
+            follow_up_parts.append("\n--- Input from previous nodes ---")
+            for src_node, data in input_data.items():
+                logs = data.get("agent_logs", "")
+                if logs:
+                    preview = logs[:2000] + ("..." if len(logs) > 2000 else "")
+                    follow_up_parts.append(f"[{src_node}]: {preview}")
+        follow_up = "\n".join(follow_up_parts)
 
-            llm_model = member.get("llm_model") or "gemini-flash-latest"
-            base_image_key = member.get("base_image") or "openclaw"
-            base_image = f"localhost:5000/openclaw-agent:{base_image_key}"
-
-            # Fetch the task's current_image from DB — it may have been
-            # patched to an inherited image from a previous rework cycle.
-            db_image = await workflow.execute_activity(
-                get_task_current_image,
-                args=[task_id],
-                start_to_close_timeout=timedelta(seconds=10),
-            )
-            if db_image and db_image != base_image:
-                workflow.logger.info(
-                    f"♻️  Using DB image for {task_id}: {db_image} "
-                    f"(instead of base {base_image})"
-                )
-                base_image = db_image
-
-            child_wf_id = f"task-workflow-{task_id}"
-
-            # Launch as a Temporal child workflow (native parent-child)
-            handle = await workflow.start_child_workflow(
-                "AgentTaskWorkflow",
-                args=[task_id, llm_model, base_image],
-                id=child_wf_id,
-            )
-            all_child_handles[task_id] = handle
-            all_member_tasks[task_id] = member.get("role", "Agent")
-
-            # Persist workflow_id to control-plane (fire-and-forget)
-            try:
-                await workflow.execute_activity(
-                    persist_member_workflow_id,
-                    args=[task_id, child_wf_id],
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
-            except Exception:
-                pass  # non-critical
-
-        logger.info(
-            f"Order-group {order_val} started as child workflows: {group_roles} "
-            f"(total active: {len(all_member_tasks)})"
-        )
-        return group_idx + 1
-
-    async def _await_children(
-        self,
-        task_force_id: str,
-        task_ids: list,
-        all_child_handles: Dict[str, Any],
-        all_member_tasks: Dict[str, str],
-        phase_name: str = "Awaiting",
-    ) -> Dict[str, Dict[str, Any]]:
-        """Await a set of child-workflow handles natively.
-
-        Uses ``asyncio.gather`` on the Temporal child handles — **no HTTP
-        polling, no sleep loops**.  Each child's structured result is
-        returned keyed by ``task_id``.
-
-        Posts a progress update before waiting and after completion.
-        """
-        handles_to_wait = {
-            tid: all_child_handles[tid]
-            for tid in task_ids
-            if tid in all_child_handles
-        }
-        if not handles_to_wait:
-            return {}
-
-        roles = [all_member_tasks.get(tid, "Agent") for tid in handles_to_wait]
-        await workflow.execute_activity(
-            post_task_force_progress,
-            args=[
-                task_force_id,
-                f"⏳ **{phase_name}** — waiting for {len(handles_to_wait)} agent(s):\n"
-                + ", ".join(roles)
-            ],
-            start_to_close_timeout=timedelta(seconds=15),
-        )
-
-        async def _await_one(tid: str, handle):
-            try:
-                result = await handle            # ChildWorkflowHandle is a Task — just await it
-                return tid, result
-            except Exception as e:
-                logger.error(f"Child workflow {tid} failed: {e}")
-                return tid, {"task_id": tid, "status": "failed", "error": str(e)}
-
-        completed = await asyncio.gather(
-            *[_await_one(tid, h) for tid, h in handles_to_wait.items()]
-        )
-        results = dict(completed)
-
-        # Post completion summary
-        status_lines = []
-        for tid, res in results.items():
-            s = res.get("status", "unknown")
-            icon = "✅" if s == "completed" else "❌"
-            role = all_member_tasks.get(tid, "Agent")
-            status_lines.append(f"  {icon} **{role}**: {s}")
-
-        await workflow.execute_activity(
-            post_task_force_progress,
-            args=[
-                task_force_id,
-                f"📊 **{phase_name}** — all done:\n" + "\n".join(status_lines)
-            ],
-            start_to_close_timeout=timedelta(seconds=15),
-        )
-
-        return results
-
-    async def _run_with_ceremonies(
-        self,
-        task_force_id: str,
-        members: list,
-        ceremonies: list,
-        tf_name: str = "",
-        workspace_id: str = "",
-    ) -> Dict[str, Any]:
-        """Run members with ceremony-driven phased execution.
-
-        Properly sequences work based on ``execution_order`` AND ceremony types:
-        - planning:     Generate plan → write to workspace → start first order-group
-        - peer_review:  Wait for all started groups → collect outputs → write
-                        review brief → start next order-group(s)
-        - review_gate:  Wait for all → read verdict file → if FAIL, create new
-                        tasks for target order and re-run; loop until PASS or
-                        max_rework_cycles exceeded
-        - aggregation:  Wait for all → collect → produce summary
-        - sync/custom:  Checkpoint between phases
-
-        Members are grouped by ``execution_order``.  Between ceremonies the
-        workflow starts the next unstarted order-group, waits for it, then
-        proceeds to the next ceremony.  This guarantees that members with a
-        higher ``execution_order`` never begin before lower-order members have
-        finished.
-        """
-        results = {}
-        member_map = {m.get("id"): m for m in members}
-
-        # Build ordered groups — each element is (order_val, [member, ...])
-        order_groups = self._group_by_execution_order(members)
-        # Track which order-groups have been started / completed
-        next_group_idx = 0          # index into order_groups not yet started
-        all_member_tasks: Dict[str, str] = {}  # task_id → role (accumulated)
-        all_child_handles: Dict[str, Any] = {}  # task_id → ChildWorkflowHandle
-
-        # Build team info string for LLM
-        team_info = "\n".join([
-            f"- {m.get('role', 'Agent')}: {m.get('responsibilities', 'N/A')} (task: {m.get('task_id', '?')})"
-            for m in members
-        ])
-
-        # If the first ceremony is NOT planning, we must start the first
-        # order-group now — otherwise nobody kicks off the agents.
-        first_ceremony_type = ceremonies[0].get("ceremony_type", "") if ceremonies else ""
-        if first_ceremony_type != "planning" and order_groups:
-            logger.info(
-                f"🚀 No planning ceremony — auto-starting first order-group "
-                f"for {task_force_id}"
-            )
-            next_group_idx = await self._start_next_order_group(
-                task_force_id, order_groups, next_group_idx,
-                all_member_tasks, all_child_handles,
+        try:
+            # Create a task for tracking
+            task_id = await workflow.execute_activity(
+                create_node_task,
+                args=[dag_id, node_id, description, agent_image, llm_model, workspace_id],
+                start_to_close_timeout=timedelta(seconds=30),
             )
 
-        for ceremony_idx, ceremony in enumerate(ceremonies):
-            ceremony_name = ceremony.get("name", "Unnamed")
-            ceremony_type = ceremony.get("ceremony_type", "custom")
-            participant_ids = ceremony.get("participant_member_ids")
-            trigger = ceremony.get("trigger_condition", "after_all_complete")
-
-            logger.info(
-                f"🎭 Ceremony phase [{ceremony_idx + 1}/{len(ceremonies)}]: "
-                f"{ceremony_name} ({ceremony_type}) | "
-                f"Trigger: {trigger} | Participants: {participant_ids or 'all'}"
-            )
-
+            # Update node with task_id
             await workflow.execute_activity(
-                post_task_force_progress,
-                args=[
-                    task_force_id,
-                    f"🎭 **Ceremony Phase: {ceremony_name}** ({ceremony_type})\n\n"
-                    f"Phase {ceremony_idx + 1} of {len(ceremonies)} beginning..."
-                ],
+                update_node_status,
+                args=[dag_id, node_id, "running", None, task_id],
                 start_to_close_timeout=timedelta(seconds=15),
             )
 
-            # ── PLANNING CEREMONY ──
-            if ceremony_type == "planning":
-                # 1. Generate plan via LLM BEFORE starting agents
-                plan_result = await workflow.execute_activity(
-                    generate_ceremony_plan,
-                    args=[
-                        ceremony.get("description", tf_name),
-                        team_info,
-                        f"Ceremony: {ceremony_name}\nType: Planning\nDescription: {ceremony.get('description', '')}",
-                        workspace_id,
-                    ],
-                    start_to_close_timeout=timedelta(minutes=2),
-                )
+            # Delegate to AgentTaskWorkflow — this handles iterations,
+            # capability approval, deployment requests, and finalization.
+            child_workflow_id = f"agent-task-{dag_id}-{node_id}"
 
-                # 2. Write plan to workspace + API
-                plan_text = plan_result.get("plan", "No plan generated.")
-                await workflow.execute_activity(
-                    write_ceremony_artifact,
-                    args=[
-                        workspace_id, "CEREMONY_PLAN.md", plan_text,
-                        task_force_id, ceremony.get("id", 0), "plan",
-                    ],
-                    start_to_close_timeout=timedelta(seconds=30),
-                )
+            await workflow.execute_activity(
+                persist_task_workflow_id,
+                args=[task_id, child_workflow_id],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
 
-                # 3. Execute ceremony (writes the formal planning artifact)
-                plan_tasks = {m.get("task_id"): m.get("role", "Agent") for m in members if m.get("task_id")}
-                ceremony_result = await workflow.execute_activity(
-                    execute_ceremony,
-                    args=[
-                        task_force_id, ceremony.get("id"), ceremony,
-                        plan_tasks, workspace_id,
-                        {"plan": plan_text},
-                    ],
-                    start_to_close_timeout=timedelta(minutes=5),
-                )
-                results[ceremony_name] = ceremony_result
+            result = await workflow.execute_child_workflow(
+                AgentTaskWorkflow.run,
+                args=[task_id, llm_model, agent_image, follow_up],
+                id=child_workflow_id,
+            )
 
-                await workflow.execute_activity(
-                    post_task_force_progress,
-                    args=[
-                        task_force_id,
-                        f"📋 **Planning ceremony complete**\n\n"
-                        f"Work plan generated and written to `CEREMONY_PLAN.md`.\n"
-                        f"Plan status: {plan_result.get('status', 'unknown')}\n\n"
-                        f"Starting team members..."
-                    ],
-                    start_to_close_timeout=timedelta(seconds=15),
-                )
+            # Collect full output
+            output = await workflow.execute_activity(
+                collect_node_output,
+                args=[task_id],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
 
-                # 4. Start the FIRST order-group only (the rest will be
-                #    launched after each group completes)
-                next_group_idx = await self._start_next_order_group(
-                    task_force_id, order_groups, next_group_idx,
-                    all_member_tasks, all_child_handles,
-                )
+            # Determine final status from AgentTaskWorkflow result
+            node_status = "completed" if result.get("status") != "failed" else "failed"
 
-            # ── PEER REVIEW CEREMONY ──
-            elif ceremony_type == "peer_review":
-                # 1. Wait for every already-started group to finish (native await)
-                if all_member_tasks:
-                    started_ids = list(all_member_tasks.keys())
-                    await self._await_children(
-                        task_force_id, started_ids,
-                        all_child_handles, all_member_tasks,
-                        phase_name=f"Peer Review: {ceremony_name}",
-                    )
+            # Update node as completed/failed
+            await workflow.execute_activity(
+                update_node_status,
+                args=[dag_id, node_id, node_status, output],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
 
-                # 2. Collect outputs from completed members
-                collected = await workflow.execute_activity(
-                    collect_member_outputs,
-                    args=[task_force_id, all_member_tasks, workspace_id],
-                    start_to_close_timeout=timedelta(minutes=2),
-                )
+            return {
+                "node_id": node_id,
+                "status": node_status,
+                "output": output,
+            }
 
-                # 3. Write review brief to workspace
-                ceremony_result = await workflow.execute_activity(
-                    execute_ceremony,
-                    args=[
-                        task_force_id, ceremony.get("id"), ceremony,
-                        all_member_tasks, workspace_id, collected,
-                    ],
-                    start_to_close_timeout=timedelta(minutes=5),
-                )
-                results[ceremony_name] = ceremony_result
+        except Exception as e:
+            logger.error(f"❌ DAGNodeWorkflow failed | Node: {node_id} | Error: {e}")
+            await workflow.execute_activity(
+                update_node_status,
+                args=[dag_id, node_id, "failed", {"error": str(e)}],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            return {
+                "node_id": node_id,
+                "status": "failed",
+                "error": str(e),
+            }
 
-                # 4. Start the NEXT order-group (reviewers / testers)
-                prev_tasks = set(all_member_tasks.keys())
-                if next_group_idx < len(order_groups):
-                    next_group_idx = await self._start_next_order_group(
-                        task_force_id, order_groups, next_group_idx,
-                        all_member_tasks, all_child_handles,
-                    )
 
-                newly_started = {
-                    tid: role for tid, role in all_member_tasks.items()
-                    if tid not in prev_tasks
-                }
-                if newly_started:
-                    await workflow.execute_activity(
-                        post_task_force_progress,
-                        args=[
-                            task_force_id,
-                            f"🔍 **Peer Review phase started**\n\n"
-                            f"Development outputs collected and written to `REVIEW_BRIEF.md`.\n"
-                            f"Started next group: {', '.join(newly_started.values())}\n\n"
-                            f"Files available for review:\n"
-                            + "\n".join([
-                                f"- `{f.get('filename', '?')}` ({f.get('size', 0)} bytes)"
-                                for role_data in collected.values()
-                                for f in role_data.get("files", [])
-                            ][:10])
-                        ],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
+@workflow.defn
+class DAGWorkflow:
+    """Orchestrate all nodes in a Master DAG.
 
-            # ── AGGREGATION CEREMONY ──
-            elif ceremony_type == "aggregation":
-                # Wait for ALL active tasks to complete (native await)
-                if all_member_tasks:
-                    started_ids = list(all_member_tasks.keys())
-                    await self._await_children(
-                        task_force_id, started_ids,
-                        all_child_handles, all_member_tasks,
-                        phase_name=f"Aggregation: {ceremony_name}",
-                    )
+    Performs topological traversal: identifies ready nodes (all deps completed),
+    launches them in parallel via child DAGNodeWorkflow instances, collects
+    outputs, evaluates conditional edges, and repeats until all nodes finish.
+    """
 
-                # Collect all outputs
-                collected = await workflow.execute_activity(
-                    collect_member_outputs,
-                    args=[task_force_id, all_member_tasks, workspace_id],
-                    start_to_close_timeout=timedelta(minutes=2),
-                )
+    @workflow.run
+    async def run(self, dag_id: str) -> Dict[str, Any]:
+        logger.info(f"🚀 DAGWorkflow started | DAG: {dag_id}")
 
-                ceremony_result = await workflow.execute_activity(
-                    execute_ceremony,
-                    args=[
-                        task_force_id, ceremony.get("id"), ceremony,
-                        all_member_tasks, workspace_id, collected,
-                    ],
-                    start_to_close_timeout=timedelta(minutes=5),
-                )
-                results[ceremony_name] = ceremony_result
+        # Load DAG definition
+        dag_data = await workflow.execute_activity(
+            load_dag,
+            args=[dag_id],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
 
-                await workflow.execute_activity(
-                    post_task_force_progress,
-                    args=[
-                        task_force_id,
-                        f"📊 **Aggregation ceremony complete**\n\n"
-                        f"All outputs collected and summarized in `FINAL_SUMMARY.md`.\n"
-                        f"Participants: {', '.join(all_member_tasks.values())}"
-                    ],
-                    start_to_close_timeout=timedelta(seconds=15),
-                )
+        dag_json = dag_data.get("dag_json", {})
+        nodes_list = dag_data.get("nodes", [])
+        dag_workspace_id = dag_data.get("workspace_id", "")
 
-                # Start the NEXT order-group (just like peer_review does)
-                if next_group_idx < len(order_groups):
-                    next_group_idx = await self._start_next_order_group(
-                        task_force_id, order_groups, next_group_idx,
-                        all_member_tasks, all_child_handles,
-                    )
+        if not nodes_list:
+            logger.warning(f"⚠️ DAG {dag_id} has no nodes")
+            await workflow.execute_activity(
+                update_dag_status,
+                args=[dag_id, "completed"],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            return {"dag_id": dag_id, "status": "completed", "nodes_executed": 0}
 
-            # ── REVIEW GATE CEREMONY ──
-            elif ceremony_type == "review_gate":
-                target_order = ceremony.get("review_target_order") or 0
-                max_cycles = ceremony.get("max_rework_cycles") or 2
-                verdict_file = ceremony.get("verdict_file") or "REVIEW_BRIEF.md"
-                rework_cycle = 0
+        # Build node lookup and adjacency
+        node_map: Dict[str, Dict[str, Any]] = {}
+        for n in nodes_list:
+            nid = n["node_id"]
+            node_map[nid] = n
 
-                while True:
-                    # 1. Wait for every started task (native await)
-                    if all_member_tasks:
-                        started_ids = list(all_member_tasks.keys())
-                        await self._await_children(
-                            task_force_id, started_ids,
-                            all_child_handles, all_member_tasks,
-                            phase_name=f"Review Gate: {ceremony_name}",
-                        )
+        # Track node statuses and outputs
+        node_statuses: Dict[str, str] = {nid: "pending" for nid in node_map}
+        node_outputs: Dict[str, Dict[str, Any]] = {}
 
-                    # 2. Read the verdict — API first, then file fallback
-                    verdict_result = await workflow.execute_activity(
-                        read_verdict_file,
-                        args=[workspace_id, verdict_file, task_force_id, rework_cycle],
-                        start_to_close_timeout=timedelta(seconds=30),
-                    )
-                    verdict = verdict_result.get("verdict", "unknown")
-                    verdict_content = verdict_result.get("content", "")
-                    verdict_source = verdict_result.get("source", "file")
+        await workflow.execute_activity(
+            post_dag_progress,
+            args=[dag_id, f"🚀 DAG execution started with {len(node_map)} nodes"],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
 
-                    await workflow.execute_activity(
-                        post_task_force_progress,
-                        args=[
-                            task_force_id,
-                            f"🔍 **Review Gate verdict: {verdict.upper()}**\n\n"
-                            f"Source: {verdict_source} | File: `{verdict_file}` | Cycle: {rework_cycle}/{max_cycles}"
-                        ],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
+        max_waves = len(node_map) + 5  # safety limit
+        wave = 0
+        failed_nodes = []
 
-                    # Post state exchange so all agents can see the verdict decision
-                    try:
-                        await workflow.execute_activity(
-                            post_agent_state_exchange,
-                            args=[
-                                task_force_id,
-                                "system",  # from system / ceremony
-                                "decision",
-                                f"Review Gate: {verdict.upper()}",
-                                f"Verdict: {verdict.upper()} (cycle {rework_cycle}, source: {verdict_source})",
-                            ],
-                            start_to_close_timeout=timedelta(seconds=10),
-                        )
-                    except Exception:
-                        pass  # non-critical
+        while wave < max_waves:
+            wave += 1
 
-                    # 3. If PASS → proceed; unknown/missing → FAIL (fail-safe)
-                    if verdict == "pass":
-                        logger.info(
-                            f"✅ Review gate PASSED (verdict={verdict}, cycle={rework_cycle})"
-                        )
-                        ceremony_result = {
-                            "verdict": verdict, "cycle": rework_cycle,
-                            "action": "proceed", "source": verdict_source,
-                        }
-                        results[ceremony_name] = ceremony_result
-
-                        # Start the NEXT order-group (just like peer_review does)
-                        if next_group_idx < len(order_groups):
-                            next_group_idx = await self._start_next_order_group(
-                                task_force_id, order_groups, next_group_idx,
-                                all_member_tasks, all_child_handles,
-                            )
-                        break
-
-                    # Treat "unknown" (missing verdict) as FAIL — fail-safe
-                    if verdict == "unknown":
-                        logger.warning(
-                            f"⚠️ Review gate: no verdict found (source={verdict_source}, cycle={rework_cycle}) — treating as FAIL"
-                        )
-                        verdict = "fail"
-                        verdict_content = (
-                            "No verdict file or API verdict was found. "
-                            "The reviewing agent may not have written REVIEW_VERDICT.md. "
-                            "Please ensure you write the verdict file before completing your task."
-                        )
-
-                    # 4. FAIL — check cycle limit
-                    rework_cycle += 1
-                    if max_cycles > 0 and rework_cycle > max_cycles:
-                        logger.warning(
-                            f"⚠️ Review gate: max rework cycles ({max_cycles}) exceeded"
-                        )
-                        await workflow.execute_activity(
-                            post_task_force_progress,
-                            args=[
-                                task_force_id,
-                                f"⚠️ **Review Gate: Max rework cycles reached ({max_cycles})**\n\n"
-                                f"Proceeding despite FAIL verdict."
-                            ],
+            # Find nodes that are ready: all dependencies completed
+            ready_nodes = []
+            for nid, info in node_map.items():
+                if node_statuses[nid] != "pending":
+                    continue
+                deps = info.get("depends_on", [])
+                if all(node_statuses.get(d) == "completed" for d in deps):
+                    # Check edge conditions for conditional deps
+                    should_run = True
+                    for dep in deps:
+                        edge_ok = await workflow.execute_activity(
+                            evaluate_edge_condition,
+                            args=[dag_json, dep, nid, node_outputs],
                             start_to_close_timeout=timedelta(seconds=15),
                         )
-                        ceremony_result = {"verdict": "fail", "cycle": rework_cycle - 1, "action": "max_cycles_exceeded"}
-                        results[ceremony_name] = ceremony_result
-                        break
-
-                    # 5. FAIL within limits → create rework tasks
-                    await workflow.execute_activity(
-                        post_task_force_progress,
-                        args=[
-                            task_force_id,
-                            f"🔄 **Review Gate: REWORK CYCLE {rework_cycle}**\n\n"
-                            f"Reviewer requested changes. Re-running from execution order {target_order}.\n"
-                            f"Creating fresh tasks for affected members..."
-                        ],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
-
-                    rework_result = await workflow.execute_activity(
-                        create_rework_tasks,
-                        args=[
-                            task_force_id, members, target_order,
-                            workspace_id, verdict_content, rework_cycle,
-                        ],
-                        start_to_close_timeout=timedelta(minutes=5),
-                    )
-
-                    # 6. Update members list and rebuild order groups
-                    new_members = rework_result.get("new_members", [])
-                    new_task_ids = {m["task_id"] for m in new_members}
-                    new_member_ids = {m.get("id") for m in new_members}
-                    members = [
-                        m for m in members if m.get("id") not in new_member_ids
-                    ] + new_members
-
-                    # Rebuild order groups and reset cursor to target
-                    order_groups = self._group_by_execution_order(members)
-                    next_group_idx = 0
-                    for idx, (ov, _) in enumerate(order_groups):
-                        if ov >= target_order:
-                            next_group_idx = idx
+                        if not edge_ok:
+                            should_run = False
                             break
 
-                    # Clear rework members from tracking so they start fresh
-                    all_member_tasks = {
-                        tid: role for tid, role in all_member_tasks.items()
-                        if tid not in new_task_ids
-                    }
-                    all_child_handles = {
-                        tid: h for tid, h in all_child_handles.items()
-                        if tid not in new_task_ids
-                    }
-
-                    # 7. Re-run from target order as child workflows
-                    while next_group_idx < len(order_groups):
-                        next_group_idx = await self._start_next_order_group(
-                            task_force_id, order_groups, next_group_idx,
-                            all_member_tasks, all_child_handles,
+                    if should_run:
+                        ready_nodes.append(nid)
+                    else:
+                        node_statuses[nid] = "skipped"
+                        await workflow.execute_activity(
+                            update_node_status,
+                            args=[dag_id, nid, "skipped"],
+                            start_to_close_timeout=timedelta(seconds=15),
                         )
-                        # Await each rework group before starting the next
-                        rework_ids = [
-                            tid for tid in all_member_tasks
-                            if tid in new_task_ids and tid in all_child_handles
-                        ]
-                        if rework_ids:
-                            await self._await_children(
-                                task_force_id, rework_ids,
-                                all_child_handles, all_member_tasks,
-                                phase_name=f"Rework cycle {rework_cycle}",
+
+            # Check if any nodes depend on failed nodes and should be skipped
+            for nid, info in node_map.items():
+                if node_statuses[nid] != "pending":
+                    continue
+                deps = info.get("depends_on", [])
+                # If any dependency failed and no on_failure edge exists, skip this node
+                for dep in deps:
+                    if node_statuses.get(dep) == "failed":
+                        # Check if there's an on_failure edge that allows continuation
+                        has_failure_edge = False
+                        for edge in dag_json.get("edges", []):
+                            if edge.get("from") == dep and edge.get("to") == nid and edge.get("condition") == "on_failure":
+                                has_failure_edge = True
+                                break
+                        if not has_failure_edge:
+                            node_statuses[nid] = "skipped"
+                            await workflow.execute_activity(
+                                update_node_status,
+                                args=[dag_id, nid, "skipped"],
+                                start_to_close_timeout=timedelta(seconds=15),
                             )
 
-                    # Loop back to read verdict again
-
-            # ── SYNC / CUSTOM CEREMONY ──
-            else:
-                # Determine participants
-                if participant_ids:
-                    participants = [
-                        member_map[mid] for mid in participant_ids
-                        if mid in member_map
-                    ]
-                else:
-                    participants = members
-
-                # Start the next order-group(s) whose members overlap with
-                # the ceremony participants.  This keeps order-group
-                # sequencing intact while honouring explicit participant lists.
-                participant_task_ids = {
-                    m.get("task_id") for m in participants if m.get("task_id")
-                }
-                while next_group_idx < len(order_groups):
-                    _, grp = order_groups[next_group_idx]
-                    grp_task_ids = {m.get("task_id") for m in grp if m.get("task_id")}
-                    if grp_task_ids & participant_task_ids:
-                        next_group_idx = await self._start_next_order_group(
-                            task_force_id, order_groups, next_group_idx,
-                            all_member_tasks, all_child_handles,
+            if not ready_nodes:
+                # Check if we're done or stuck
+                active = [nid for nid, s in node_statuses.items() if s in ("pending", "running")]
+                if not active:
+                    break
+                # If nodes are still pending but none are ready, we're stuck (circular dep or all deps failed)
+                pending = [nid for nid, s in node_statuses.items() if s == "pending"]
+                if pending and not any(s == "running" for s in node_statuses.values()):
+                    logger.warning(f"⚠️ DAG {dag_id} stuck — skipping remaining nodes: {pending}")
+                    for nid in pending:
+                        node_statuses[nid] = "skipped"
+                        await workflow.execute_activity(
+                            update_node_status,
+                            args=[dag_id, nid, "skipped"],
+                            start_to_close_timeout=timedelta(seconds=15),
                         )
-                    else:
-                        break
+                    break
+                # Some nodes might still be running — wait
+                await asyncio.sleep(5)
+                continue
 
-                # Wait for this phase's participants (native await)
-                phase_ids = [
-                    tid for tid in all_member_tasks
-                    if tid in participant_task_ids and tid in all_child_handles
-                ]
-                if phase_ids:
-                    await self._await_children(
-                        task_force_id, phase_ids,
-                        all_child_handles, all_member_tasks,
-                        phase_name=ceremony_name,
-                    )
+            await workflow.execute_activity(
+                post_dag_progress,
+                args=[dag_id, f"📋 Wave {wave}: launching {len(ready_nodes)} nodes: {ready_nodes}"],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
 
-                phase_tasks = {
-                    tid: role for tid, role in all_member_tasks.items()
-                    if tid in participant_task_ids
+            # Launch ready nodes in parallel as child workflows
+            child_handles = []
+            for nid in ready_nodes:
+                node_info = node_map[nid]
+                node_statuses[nid] = "running"
+
+                # Build input data from input_mapping
+                input_data = {}
+                input_mapping = node_info.get("input_mapping", {})
+                for key, source_node in input_mapping.items():
+                    if source_node in node_outputs:
+                        input_data[source_node] = node_outputs[source_node]
+
+                # If no explicit mapping, pass all dependency outputs
+                if not input_data:
+                    for dep in node_info.get("depends_on", []):
+                        if dep in node_outputs:
+                            input_data[dep] = node_outputs[dep]
+
+                child_params = {
+                    "dag_id": dag_id,
+                    "node_id": nid,
+                    "description": node_info.get("description", ""),
+                    "config": node_info.get("config", {}),
+                    "input_data": input_data,
+                    "workspace_id": dag_workspace_id,
                 }
-                ceremony_result = await workflow.execute_activity(
-                    execute_ceremony,
-                    args=[
-                        task_force_id, ceremony.get("id"), ceremony,
-                        phase_tasks, workspace_id, None,
-                    ],
-                    start_to_close_timeout=timedelta(minutes=5),
+
+                handle = await workflow.start_child_workflow(
+                    DAGNodeWorkflow.run,
+                    child_params,
+                    id=f"dag-node-{dag_id}-{nid}",
                 )
-                results[ceremony_name] = ceremony_result
+                child_handles.append((nid, handle))
 
-        # ── Final: start & await any remaining order-groups ──
-        while next_group_idx < len(order_groups):
-            next_group_idx = await self._start_next_order_group(
-                task_force_id, order_groups, next_group_idx,
-                all_member_tasks, all_child_handles,
-            )
+            # Wait for all children in this wave
+            for nid, handle in child_handles:
+                try:
+                    result = await handle
+                    node_statuses[nid] = result.get("status", "failed")
+                    if result.get("output"):
+                        node_outputs[nid] = result["output"]
+                    if node_statuses[nid] == "failed":
+                        failed_nodes.append(nid)
+                except Exception as e:
+                    logger.error(f"❌ Child workflow for node {nid} failed: {e}")
+                    node_statuses[nid] = "failed"
+                    failed_nodes.append(nid)
+                    node_outputs[nid] = {"error": str(e), "status": "failed"}
 
-        # Await every outstanding child workflow
-        remaining_ids = [
-            tid for tid in all_member_tasks if tid in all_child_handles
-        ]
-        child_results = {}
-        if remaining_ids:
-            child_results = await self._await_children(
-                task_force_id, remaining_ids,
-                all_child_handles, all_member_tasks,
-                phase_name="Final wait",
-            )
+        # Determine final DAG status
+        completed = sum(1 for s in node_statuses.values() if s == "completed")
+        failed = sum(1 for s in node_statuses.values() if s == "failed")
+        skipped = sum(1 for s in node_statuses.values() if s == "skipped")
+        total = len(node_statuses)
 
-        # Derive final member statuses from child workflow results
-        final_members = {}
-        for task_id in all_member_tasks:
-            if task_id in child_results:
-                final_members[task_id] = child_results[task_id].get("status", "completed")
-            else:
-                final_members[task_id] = "completed"
+        if failed > 0:
+            final_status = "failed"
+        elif completed == total:
+            final_status = "completed"
+        elif completed + skipped == total:
+            final_status = "completed"
+        else:
+            final_status = "failed"
 
-        return {"status": "completed", "ceremonies": results, "members": final_members}
+        await workflow.execute_activity(
+            finalize_dag,
+            args=[dag_id, final_status],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
 
-    async def _wait_for_tasks(
-        self,
-        task_force_id: str,
-        tasks: Dict[str, str],
-        phase_name: str,
-        timeout_minutes: int = 60,
-    ) -> None:
-        """Poll tasks until all complete or timeout. Handles paused tasks."""
-        max_polls = (timeout_minutes * 60) // 30
-        paused_notified: dict = {}
-        last_progress_poll = -1
+        summary = f"DAG {dag_id} {final_status}: {completed}/{total} completed, {failed} failed, {skipped} skipped"
+        await workflow.execute_activity(
+            post_dag_progress,
+            args=[dag_id, f"🏁 {summary}"],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
 
-        for poll in range(max_polls):
-            all_done = True
-            status_lines = []
-            completed_count = 0
+        logger.info(f"🏁 DAGWorkflow finished | {summary}")
 
-            for task_id, role in tasks.items():
-                result = await workflow.execute_activity(
-                    poll_member_task_status,
-                    args=[task_id],
-                    start_to_close_timeout=timedelta(seconds=30),
-                )
-                member_status = result.get("status", "unknown")
-
-                if member_status in ("completed", "failed"):
-                    completed_count += 1
-                    icon = "✅" if member_status == "completed" else "❌"
-                    status_lines.append(f"  {icon} **{role}**: {member_status}")
-                    continue
-
-                all_done = False
-
-                if member_status == "paused" and not paused_notified.get(task_id):
-                    paused_notified[task_id] = True
-                    await workflow.execute_activity(
-                        post_task_force_progress,
-                        args=[
-                            task_force_id,
-                            f"🔒 **{role}** is requesting a new capability during "
-                            f"'{phase_name}'.\nApprove it on the **Approvals** page."
-                        ],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
-                    status_lines.append(f"  🔒 **{role}**: waiting for approval")
-                elif member_status == "running" and paused_notified.get(task_id):
-                    paused_notified[task_id] = False
-                    status_lines.append(f"  ⏳ **{role}**: running")
-                else:
-                    status_lines.append(f"  ⏳ **{role}**: {member_status}")
-
-            # Post progress every 2 minutes
-            if status_lines and (poll - last_progress_poll >= 4 or all_done):
-                last_progress_poll = poll
-                await workflow.execute_activity(
-                    post_task_force_progress,
-                    args=[
-                        task_force_id,
-                        f"📊 **{phase_name}** ({completed_count}/{len(tasks)} done)\n\n"
-                        + "\n".join(status_lines)
-                    ],
-                    start_to_close_timeout=timedelta(seconds=15),
-                )
-
-            if all_done:
-                break
-
-            await asyncio.sleep(30)
+        return {
+            "dag_id": dag_id,
+            "status": final_status,
+            "nodes_executed": completed,
+            "nodes_failed": failed,
+            "nodes_skipped": skipped,
+            "node_statuses": node_statuses,
+        }
 
 
 # =============================================================================
@@ -3598,7 +2252,7 @@ async def main():
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, TaskForceWorkflow],
+        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, DAGWorkflow, DAGNodeWorkflow],
         activities=[
             initialize_task,
             start_agent_container,
@@ -3615,25 +2269,17 @@ async def main():
             build_deployment_image,
             start_deployment_container,
             stop_deployment_container,
-            # Task Force activities
-            load_task_force,
-            start_member_task,
-            persist_member_workflow_id,
-            update_member_status,
-            poll_member_task_status,
-            execute_ceremony,
-            finalize_task_force,
-            post_task_force_progress,
-            update_coordinator_task_status,
-            check_task_force_deploy_role,
-            write_ceremony_artifact,
-            generate_ceremony_plan,
-            collect_member_outputs,
-            read_verdict_file,
-            create_rework_tasks,
-            # Ceremony State API activities
-            post_agent_state_exchange,
-            check_verdict_guard,
+            check_deploy_authority,
+            # DAG activities
+            load_dag,
+            update_node_status,
+            update_dag_status,
+            post_dag_progress,
+            create_node_task,
+            collect_node_output,
+            evaluate_edge_condition,
+            finalize_dag,
+            persist_task_workflow_id,
         ],
     )
     

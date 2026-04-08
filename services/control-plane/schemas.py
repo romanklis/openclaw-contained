@@ -27,10 +27,10 @@ class TaskCreate(BaseModel):
     model: Optional[str] = None  # alias for llm_model (from curl/CLI)
     base_image: Optional[str] = None  # agent base image key (e.g. "zeroclaw")
     agent_profile: Optional[str] = None  # agent profile ID for display
-    # ── rework / task-force context (optional) ──
+    # ── DAG context (optional) ──
     workspace_id: Optional[str] = None   # share an existing workspace
-    task_force_id: Optional[str] = None  # link to parent task force
-    task_force_role: Optional[str] = None
+    dag_id: Optional[str] = None         # link to parent DAG
+    node_id: Optional[str] = None        # DAG node ID
     auto_start: bool = True              # set False to create without starting
 
     @property
@@ -58,8 +58,8 @@ class TaskResponse(BaseModel):
     workspace_id: str
     workflow_id: Optional[str]
     agent_profile: Optional[str] = None
-    task_force_id: Optional[str] = None
-    task_force_role: Optional[str] = None
+    dag_id: Optional[str] = None
+    node_id: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime]
     
@@ -339,31 +339,24 @@ class SBOMDiffResponse(BaseModel):
 
 
 # =========================================================================
-# Task Force schemas — Multi-Agent Orchestration
+# DAG Orchestration schemas — Task-Centric Skill-Based Execution
 # =========================================================================
 
-class TaskForceStatus(str, Enum):
-    DRAFT = "draft"
-    ACTIVE = "active"
+class DAGStatus(str, Enum):
+    PLANNING = "planning"
+    READY = "ready"
     RUNNING = "running"
-    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
-class CeremonyType(str, Enum):
-    PLANNING = "planning"
-    SYNC = "sync"
-    PEER_REVIEW = "peer_review"
-    REVIEW_GATE = "review_gate"
-    AGGREGATION = "aggregation"
-    CUSTOM = "custom"
-
-
-class CeremonyMode(str, Enum):
-    SYNCHRONOUS = "synchronous"
-    ASYNCHRONOUS = "asynchronous"
+class NodeStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
 
 
 class ExecutionEnvironment(str, Enum):
@@ -371,104 +364,118 @@ class ExecutionEnvironment(str, Enum):
     DEDICATED_VM = "dedicated_vm"
 
 
-# ── Members ─────────────────────────────────────────────
+# ── Skills ──────────────────────────────────────────────
 
-class TaskForceMemberCreate(BaseModel):
-    """Define a member of the Task Force."""
-    agent_profile: str  # profile ID
-    role: str  # e.g. "Researcher", "Developer"
-    responsibilities: Optional[str] = None
-    llm_model: Optional[str] = None  # override
-    base_image: Optional[str] = None  # override
-    execution_order: int = 0
-
-
-class TaskForceMemberResponse(BaseModel):
-    id: int
-    task_force_id: str
-    agent_profile: str
-    role: str
-    responsibilities: Optional[str]
-    llm_model: Optional[str]
-    base_image: Optional[str]
-    task_id: Optional[str]
-    status: str
-    execution_order: int
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-# ── Ceremonies ──────────────────────────────────────────
-
-class TaskForceCeremonyCreate(BaseModel):
-    """Define a coordination ceremony.
-
-    For ``review_gate`` ceremonies, set ``review_target_order`` to the
-    execution_order that should be re-run when the reviewer verdict is FAIL.
-    The workflow reads the reviewer's verdict file from the workspace,
-    creates fresh tasks for the target order-groups, and re-executes them.
-    Use ``max_rework_cycles`` to cap the number of feedback iterations.
-    """
-    name: str
-    ceremony_type: CeremonyType
-    mode: CeremonyMode = CeremonyMode.SYNCHRONOUS
-    sequence_order: int = 0
-    participant_member_ids: Optional[List[int]] = None  # null = all members
-    description: Optional[str] = None
-    trigger_condition: str = "after_all_complete"  # after_all_complete, manual
-    timeout_minutes: int = 60
-    # ── review_gate specific ──
-    review_target_order: Optional[int] = None   # execution_order to rewind to on FAIL
-    max_rework_cycles: int = 2                  # max feedback loops (0 = unlimited)
-    verdict_file: str = "REVIEW_BRIEF.md"       # workspace file containing PASS/FAIL
-
-
-class TaskForceCeremonyResponse(BaseModel):
-    id: int
-    task_force_id: str
-    name: str
-    ceremony_type: CeremonyType
-    mode: CeremonyMode
-    sequence_order: int
-    participant_member_ids: Optional[List[int]]
-    description: Optional[str]
-    trigger_condition: Optional[str]
-    review_target_order: Optional[int] = None
-    max_rework_cycles: int = 2
-    verdict_file: str = "REVIEW_BRIEF.md"
-    timeout_minutes: int
-    status: str
-    started_at: Optional[datetime]
-    completed_at: Optional[datetime]
-    result_summary: Optional[str]
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-# ── Task Force CRUD ─────────────────────────────────────
-
-class TaskForceCreate(BaseModel):
-    """Create a Task Force with members and ceremonies."""
+class SkillStepCreate(BaseModel):
+    """A single step within a skill."""
+    step_id: str
     name: str
     description: Optional[str] = None
-    objective: str
-    execution_environment: ExecutionEnvironment = ExecutionEnvironment.DIND
-    members: List[TaskForceMemberCreate]
-    ceremonies: List[TaskForceCeremonyCreate] = []
+    base_image: Optional[str] = None  # override for this step
+    tool_hints: Optional[List[str]] = None  # suggested tools
 
 
-class TaskForceResponse(BaseModel):
+class SkillCreate(BaseModel):
+    """Create a reusable skill template."""
+    name: str
+    description: Optional[str] = None
+    input_schema: Dict[str, str] = {}  # {key: type_description}
+    output_artifacts: List[str] = []  # expected output file paths
+    steps: List[SkillStepCreate] = []
+    tags: List[str] = []
+
+
+class SkillUpdate(BaseModel):
+    """Update a skill (bumps version)."""
+    description: Optional[str] = None
+    input_schema: Optional[Dict[str, str]] = None
+    output_artifacts: Optional[List[str]] = None
+    steps: Optional[List[SkillStepCreate]] = None
+    tags: Optional[List[str]] = None
+
+
+class SkillResponse(BaseModel):
     id: str
     name: str
     description: Optional[str]
+    version: int
+    input_schema: Dict[str, Any]
+    output_artifacts: List[str]
+    steps: List[Dict[str, Any]]
+    tags: List[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+# ── DAG Nodes ───────────────────────────────────────────
+
+class DAGNodeCreate(BaseModel):
+    """A node in the Master DAG."""
+    node_id: str
+    skill_id: Optional[str] = None
+    skill_step_index: Optional[int] = None
+    description: Optional[str] = None
+    depends_on: List[str] = []
+    config: Dict[str, Any] = {}  # base_image, llm_model, env_id, timeout_minutes, deploy_authorized
+    input_mapping: Dict[str, str] = {}  # maps inputs to "dependency_node_id.output_key"
+
+
+class DAGNodeResponse(BaseModel):
+    id: int
+    dag_id: str
+    node_id: str
+    skill_id: Optional[str]
+    skill_step_index: Optional[int]
+    description: Optional[str]
+    status: NodeStatus
+    depends_on: List[str]
+    config: Dict[str, Any]
+    input_mapping: Dict[str, str]
+    output_data: Optional[Dict[str, Any]]
+    task_id: Optional[str]
+    container_id: Optional[str]
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class DAGEdge(BaseModel):
+    """A conditional edge in the DAG (e.g. rework loops)."""
+    from_node: str  # source node_id
+    to_node: str  # target node_id
+    condition: str  # e.g. "review-4.verdict == 'FAIL'"
+    edge_type: str = "rework"  # rework, skip, etc.
+
+
+# ── Master DAG ──────────────────────────────────────────
+
+class DAGCreate(BaseModel):
+    """Create a new DAG from an objective (invokes the Planner)."""
     objective: str
-    execution_environment: ExecutionEnvironment
-    status: TaskForceStatus
+    llm_model: Optional[str] = None
+    auto_start: bool = False
+
+
+class DAGManualCreate(BaseModel):
+    """Create a DAG with an explicit node graph (skip planner)."""
+    objective: str
+    nodes: List[DAGNodeCreate]
+    edges: List[DAGEdge] = []
+    default_image: str = "openclaw"
+    default_llm: str = "gemma3:4b"
+
+
+class DAGResponse(BaseModel):
+    id: str
+    objective: str
+    status: DAGStatus
     workspace_id: str
+    llm_model: Optional[str]
     workflow_id: Optional[str]
     created_by: Optional[str]
     created_at: datetime
@@ -480,10 +487,43 @@ class TaskForceResponse(BaseModel):
         from_attributes = True
 
 
-class TaskForceDetail(TaskForceResponse):
-    """Full Task Force detail including members and ceremonies."""
-    members: List[TaskForceMemberResponse] = []
-    ceremonies: List[TaskForceCeremonyResponse] = []
+class DAGDetail(DAGResponse):
+    """Full DAG detail including nodes and edges."""
+    dag_json: Dict[str, Any]
+    nodes: List[DAGNodeResponse] = []
+
+
+# ── Node Environments ──────────────────────────────────
+
+class NodeEnvironmentCreate(BaseModel):
+    """Create a reusable execution environment."""
+    name: str
+    description: Optional[str] = None
+    base_image: str = "openclaw"
+    capabilities: List[str] = []  # initial packages/tools
+
+
+class NodeEnvironmentFork(BaseModel):
+    """Fork an existing environment."""
+    name: str
+    description: Optional[str] = None
+
+
+class NodeEnvironmentResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    capability_fingerprint: Optional[str]
+    capabilities: List[str]
+    base_image: str
+    current_image_tag: Optional[str]
+    version: int
+    parent_env_id: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
 
 
 # =========================================================================
@@ -573,108 +613,3 @@ class SupplyChainFullConfig(BaseModel):
     image_types: List[SupplyChainImageTypeSummary]
     aliases: Dict[str, Dict[str, str]]
     raw: Dict[str, Any]
-
-
-# =========================================================================
-# Ceremony State schemas — artifacts, verdicts & agent state exchange
-# =========================================================================
-
-class ArtifactKind(str, Enum):
-    PLAN = "plan"
-    REVIEW_BRIEF = "review_brief"
-    VERDICT = "verdict"
-    SUMMARY = "summary"
-    SYNC_NOTES = "sync_notes"
-    REWORK_FEEDBACK = "rework_feedback"
-    CUSTOM = "custom"
-
-
-# ── Ceremony Artifacts ──────────────────────────────────
-
-class CeremonyArtifactCreate(BaseModel):
-    """Create a ceremony artifact (immutable once created)."""
-    kind: ArtifactKind
-    ceremony_id: Optional[int] = None
-    task_id: Optional[str] = None  # producing agent's task_id
-    filename: Optional[str] = None
-    title: Optional[str] = None
-    content: str
-    metadata: Optional[Dict[str, Any]] = None
-    verdict: Optional[str] = None  # "pass" / "fail" — only for verdict artifacts
-    rework_cycle: int = 0
-
-
-class CeremonyArtifactResponse(BaseModel):
-    id: int
-    task_force_id: str
-    ceremony_id: Optional[int]
-    task_id: Optional[str]
-    kind: ArtifactKind
-    filename: Optional[str]
-    title: Optional[str]
-    content: str
-    metadata: Optional[Dict[str, Any]] = Field(None, alias="metadata_json")
-    verdict: Optional[str]
-    rework_cycle: int
-    superseded_by: Optional[int]
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-        populate_by_name = True
-
-
-# ── Verdicts (convenience wrapper over artifact) ────────
-
-class VerdictSubmit(BaseModel):
-    """Submit a verdict for a task (immutable once created).
-
-    Used by agents (via the LLM router proxy) or by the review_gate
-    ceremony handler.
-    """
-    verdict: str  # "pass" or "fail"
-    summary: Optional[str] = None
-    files_reviewed: Optional[List[str]] = None
-    ceremony_id: Optional[int] = None
-    rework_cycle: int = 0
-
-
-class VerdictResponse(BaseModel):
-    id: int
-    task_force_id: str
-    task_id: str
-    verdict: str
-    summary: Optional[str]
-    files_reviewed: Optional[List[str]]
-    rework_cycle: int
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-# ── Agent State Exchange ────────────────────────────────
-
-class AgentStateExchangeCreate(BaseModel):
-    """Post a state message to the task force channel."""
-    from_task_id: str
-    to_task_id: Optional[str] = None  # null = broadcast to all
-    state_type: str  # "status_update", "decision", "handoff", "feedback"
-    subject: Optional[str] = None
-    body: Optional[str] = None
-    state_data: Optional[Dict[str, Any]] = None
-
-
-class AgentStateExchangeResponse(BaseModel):
-    id: int
-    task_force_id: str
-    from_task_id: str
-    to_task_id: Optional[str]
-    state_type: str
-    subject: Optional[str]
-    body: Optional[str]
-    state_data: Optional[Dict[str, Any]]
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
