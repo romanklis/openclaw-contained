@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal:7233")
 TASK_QUEUE = os.getenv("TEMPORAL_TASK_QUEUE", "openclaw-tasks")
 
+
+def is_gemini_lite_model(model: str) -> bool:
+    normalized = (model or "").strip().lower()
+    return "gemini" in normalized and "lite" in normalized
+
 # =============================================================================
 # Agent Sandbox Configuration
 # =============================================================================
@@ -1873,7 +1878,14 @@ class DAGNodeWorkflow:
         agent_image = config.get("base_image", "openclaw")
         if "/" not in agent_image:
             agent_image = f"localhost:5000/openclaw-agent:{agent_image}"
-        llm_model = config.get("llm_model", "gemma3:4b")
+        llm_model = config.get("llm_model", "gemini-flash-lite-latest")
+        if not is_gemini_lite_model(llm_model):
+            logger.warning(
+                "⚠️ Non gemini-lite model '%s' requested for DAG node %s; overriding to gemini-flash-lite-latest",
+                llm_model,
+                node_id,
+            )
+            llm_model = "gemini-flash-lite-latest"
 
         logger.info(f"🔧 DAGNodeWorkflow | DAG: {dag_id} | Node: {node_id}")
 
@@ -1891,10 +1903,14 @@ class DAGNodeWorkflow:
         if input_data:
             follow_up_parts.append("\n--- Input from previous nodes ---")
             for src_node, data in input_data.items():
-                logs = data.get("agent_logs", "")
-                if logs:
-                    preview = logs[:2000] + ("..." if len(logs) > 2000 else "")
-                    follow_up_parts.append(f"[{src_node}]: {preview}")
+                if isinstance(data, dict):
+                    logs = data.get("agent_logs", "")
+                    if logs:
+                        preview = logs[:2000] + ("..." if len(logs) > 2000 else "")
+                        follow_up_parts.append(f"[{src_node}]: {preview}")
+                        continue
+                # Planner mappings may include literal constants (e.g. port=8080).
+                follow_up_parts.append(f"[{src_node}]: {str(data)[:500]}")
         follow_up = "\n".join(follow_up_parts)
 
         try:
@@ -2109,8 +2125,11 @@ class DAGWorkflow:
                 input_data = {}
                 input_mapping = node_info.get("input_mapping", {})
                 for key, source_node in input_mapping.items():
-                    if source_node in node_outputs:
-                        input_data[source_node] = node_outputs[source_node]
+                    if isinstance(source_node, str) and source_node in node_outputs:
+                        input_data[key] = node_outputs[source_node]
+                    elif not isinstance(source_node, str):
+                        # Planner may emit literal constants (e.g. port: 8080).
+                        input_data[key] = source_node
 
                 # If no explicit mapping, pass all dependency outputs
                 if not input_data:

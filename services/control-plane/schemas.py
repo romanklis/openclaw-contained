@@ -420,7 +420,7 @@ class DAGNodeCreate(BaseModel):
     description: Optional[str] = None
     depends_on: List[str] = []
     config: Dict[str, Any] = {}  # base_image, llm_model, env_id, timeout_minutes, deploy_authorized
-    input_mapping: Dict[str, str] = {}  # maps inputs to "dependency_node_id.output_key"
+    input_mapping: Dict[str, Any] = {}  # supports dependency refs and literal constants
 
 
 class DAGNodeResponse(BaseModel):
@@ -433,7 +433,7 @@ class DAGNodeResponse(BaseModel):
     status: NodeStatus
     depends_on: List[str]
     config: Dict[str, Any]
-    input_mapping: Dict[str, str]
+    input_mapping: Dict[str, Any]
     output_data: Optional[Dict[str, Any]]
     task_id: Optional[str]
     container_id: Optional[str]

@@ -10,7 +10,7 @@ from schemas import (
     DAGCreate, DAGManualCreate, DAGResponse, DAGDetail, DAGNodeResponse,
 )
 from dag_validator import validate_dag
-from planner import plan_dag
+from planner import plan_dag, is_gemini_lite_model
 from temporal_client import start_dag_workflow
 import uuid
 import logging
@@ -37,7 +37,13 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
     """Create a new DAG from an objective using the LLM Planner."""
     dag_id = _gen_dag_id()
     workspace_id = _gen_workspace_id(dag_id)
-    llm_model = data.llm_model or "gemma3:4b"
+    llm_model = data.llm_model or "gemini-flash-lite-latest"
+
+    if not is_gemini_lite_model(llm_model):
+        raise HTTPException(
+            status_code=422,
+            detail="Only gemini-lite class models are allowed for DAG execution",
+        )
 
     # Create DAG record in PLANNING state
     dag = MasterDAG(

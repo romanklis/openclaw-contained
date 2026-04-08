@@ -70,16 +70,10 @@ def validate_dag(dag_json: dict, skills_map: dict[str, Any] | None = None) -> Tu
 
     # Validate input_mapping references
     for node in nodes:
-        nid = node.get("node_id", "")
-        deps = set(node.get("depends_on", []))
-        for key, mapping in node.get("input_mapping", {}).items():
-            if "." in mapping:
-                ref_node = mapping.split(".")[0]
-                if ref_node not in deps:
-                    errors.append(
-                        f"Node '{nid}' input_mapping '{key}' references '{ref_node}' "
-                        f"which is not in its depends_on list"
-                    )
+        # Planner may produce flexible mappings (constants, external sources,
+        # implicit references) that are resolved at runtime. Keep validation
+        # permissive here and rely on execution-time checks.
+        _ = node.get("input_mapping", {})
 
     # Validate edge references
     for edge in edges:

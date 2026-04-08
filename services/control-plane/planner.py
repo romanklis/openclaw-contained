@@ -19,6 +19,21 @@ logger = logging.getLogger(__name__)
 # Internal URL for the LLM router (same process, but via HTTP for consistency)
 LLM_ROUTER_URL = "http://localhost:8000/api/llm/v1/chat/completions"
 
+
+def is_gemini_lite_model(model: str) -> bool:
+    """Return True if model belongs to the gemini-lite family."""
+    normalized = (model or "").strip().lower()
+    return "gemini" in normalized and "lite" in normalized
+
+
+def enforce_gemini_lite_execution_model(dag_json: dict, execution_model: str) -> dict:
+    """Normalize all DAG node execution models to the provided gemini-lite model."""
+    for node in dag_json.get("nodes", []):
+        config = node.get("config") or {}
+        config["llm_model"] = execution_model
+        node["config"] = config
+    return dag_json
+
 PLANNER_SYSTEM_PROMPT = """\
 You are a task decomposition planner for TaskForge, a universal task orchestration platform.
 
@@ -72,6 +87,7 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
 6. Only the final deployment node should have deploy_authorized: true.
 7. Use review/verdict nodes sparingly — only when quality gates are needed.
 8. base_image options: "openclaw" (full Python+Node), "nanobot" (lightweight Python), "picoclaw" (shell-only), "zeroclaw" (Python+Rust)
+9. Set each node config.llm_model to the requested execution model and do not use GPT models.
 """
 
 
@@ -192,6 +208,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession) -> dict:
                 logger.warning(f"Planner attempt {attempt}/{max_attempts}: {last_error}")
                 continue
 
+            dag_json = enforce_gemini_lite_execution_model(dag_json, llm_model)
             logger.info(f"Planner generated valid DAG with {len(dag_json.get('nodes', []))} nodes")
             return dag_json
 
