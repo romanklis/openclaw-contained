@@ -110,13 +110,14 @@ def _build_skills_section(skills: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def plan_dag(objective: str, llm_model: str, db: AsyncSession) -> dict:
+async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None) -> dict:
     """Generate a DAG plan from a user objective using the LLM router.
 
     Args:
         objective: The user's goal/objective.
         llm_model: The LLM model to use for planning.
         db: Database session for fetching skills.
+        base_image: Override base_image for all nodes (e.g. "zeroclaw").
 
     Returns:
         Validated DAG JSON dict with 'nodes' and 'edges'.
@@ -209,6 +210,14 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession) -> dict:
                 continue
 
             dag_json = enforce_gemini_lite_execution_model(dag_json, llm_model)
+
+            # Override base_image on all nodes if the caller specified one
+            if base_image:
+                for node in dag_json.get("nodes", []):
+                    if "config" not in node:
+                        node["config"] = {}
+                    node["config"]["base_image"] = base_image
+
             logger.info(f"Planner generated valid DAG with {len(dag_json.get('nodes', []))} nodes")
             return dag_json
 

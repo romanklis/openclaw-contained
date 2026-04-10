@@ -458,6 +458,7 @@ class DAGCreate(BaseModel):
     """Create a new DAG from an objective (invokes the Planner)."""
     objective: str
     llm_model: Optional[str] = None
+    base_image: Optional[str] = None
     auto_start: bool = False
 
 

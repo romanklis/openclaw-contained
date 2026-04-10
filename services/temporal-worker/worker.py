@@ -10,7 +10,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.client import Client
 from temporalio.worker import Worker
 from datetime import timedelta, datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import os
 
 logging.basicConfig(level=logging.INFO)
@@ -122,6 +122,9 @@ class AgentTaskWorkflow:
         self.llm_model = "gemma3:4b"  # Track LLM model
         self.follow_up = ""  # Follow-up instructions for continuation
         self._capability_feedback = ""  # one-shot feedback after a build (cleared after use)
+        self._trial_failures = 0  # Track trial deployment failures
+        self._trial_rework_pending = False  # True when agent must fix a trial failure
+        self._approved_capabilities = set()  # Track already-approved resource names to prevent loops
     
     @workflow.run
     async def run(
@@ -130,6 +133,7 @@ class AgentTaskWorkflow:
         llm_model: str = "gemma3:4b",
         current_image: str = "",
         follow_up: str = "",
+        dag_id: str = "",
     ) -> Dict[str, Any]:
         """Execute agent task.
 
@@ -139,10 +143,15 @@ class AgentTaskWorkflow:
         For continuation workflows it carries over from the previous run:
         - ``current_image``: the last built agent image (all packages installed)
         - ``follow_up``: user's follow-up instructions
+
+        When ``dag_id`` is set the workflow runs inside a DAG; after the
+        last iteration the agent container is committed to a new image so
+        downstream nodes inherit the file-system state.
         """
         
         self.llm_model = llm_model
         self.follow_up = follow_up
+        self.dag_id = dag_id
 
         # Use the provided base image for both first-run and continuation
         if current_image:
@@ -195,9 +204,17 @@ class AgentTaskWorkflow:
 
             result = await workflow.execute_child_workflow(
                 AgentStepWorkflow.run,
-                args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up],
+                args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id],
                 id=f"agent-step-{task_id}-iter-{iteration}",
             )
+
+            # If a DAG container was committed, update current_image so
+            # subsequent iterations (and eventually the parent DAGNodeWorkflow)
+            # use the enriched image.
+            _committed = result.get("committed_image")
+            if _committed:
+                self.current_image = _committed
+                logger.info(f"📸 DAG image updated from commit: {_committed}")
 
             # Store output in the control-plane database (fire-and-forget, don't block workflow)
             try:
@@ -241,9 +258,56 @@ class AgentTaskWorkflow:
                         f"🚫 DEPLOY_SUPPRESSED | {task_id} — {deploy_info.get('reason')}"
                     )
                     should_deploy = False
+                    # Node finished its work but isn't authorized to deploy.
+                    # Treat as completed — the deploy-app node will handle deployment.
+                    break
 
                 if should_deploy:
-                    # Create deployment record via control plane
+                    # --- Trial deployment: build + health-check before real deploy ---
+                    trial_result = await workflow.execute_activity(
+                        trial_deploy,
+                        args=[task_id, deployment],
+                        start_to_close_timeout=timedelta(minutes=10),
+                    )
+
+                    if not trial_result.get("passed"):
+                        self._trial_failures += 1
+                        trial_error = trial_result.get("error", "Unknown trial error")
+                        trial_phase = trial_result.get("phase") or "unknown"
+                        trial_logs = trial_result.get("logs", "")
+                        logger.warning(
+                            f"🧪 TRIAL_FAILED ({self._trial_failures}/3) | {task_id} | Phase: {trial_phase} | {trial_error[:200]}"
+                        )
+
+                        if self._trial_failures >= 3:
+                            # Max retries — proceed to real deployment anyway
+                            logger.error(f"🧪 Max trial failures reached for {task_id} — proceeding to real deployment")
+                            deploy_result = await workflow.execute_activity(
+                                create_deployment,
+                                args=[task_id, deployment],
+                                start_to_close_timeout=timedelta(seconds=30),
+                            )
+                            logger.info(f"📦 Deployment created (after trial failures): {deploy_result.get('id')}")
+                            self._trial_rework_pending = False
+                            break
+
+                        # Build concise feedback for the agent
+                        feedback_lines = [
+                            "TRIAL DEPLOYMENT FAILED.",
+                            f"Phase: {trial_phase}",
+                            f"Error: {trial_error[:500]}",
+                        ]
+                        if trial_logs:
+                            feedback_lines.append(f"Logs: {trial_logs[:800]}")
+                        feedback_lines.append("Fix the code and emit DEPLOYMENT_REQUEST again.")
+                        self._capability_feedback = "\n".join(feedback_lines)
+                        self._trial_rework_pending = True
+                        continue  # Don't break — let agent fix and retry
+
+                    # Trial passed — create deployment with pre-built image tag
+                    logger.info(f"🧪 ✅ Trial passed — proceeding to real deployment")
+                    self._trial_rework_pending = False
+                    deployment["_trial_image_tag"] = trial_result.get("image_tag")
                     deploy_result = await workflow.execute_activity(
                         create_deployment,
                         args=[task_id, deployment],
@@ -254,13 +318,41 @@ class AgentTaskWorkflow:
             
             # Check if task complete
             if result.get("completed"):
+                if self._trial_rework_pending:
+                    # Agent completed without re-emitting DEPLOYMENT_REQUEST after trial failure.
+                    # Force it to continue — re-inject the trial failure feedback.
+                    logger.warning(
+                        f"🧪 Agent completed without re-deploying after trial failure | {task_id} | Forcing rework"
+                    )
+                    self._capability_feedback = (
+                        "TRIAL DEPLOYMENT FAILED previously. Your app does not start correctly.\n"
+                        "You must fix the issue and emit DEPLOYMENT_REQUEST again."
+                    )
+                    continue
                 break
             
             # Check if capability requested
             if result.get("capability_requested"):
                 capability = result.get("capability")
+                resource_name = capability.get("resource", "") if capability else ""
                 
                 logger.info(f"Capability requested: {capability}")
+                
+                # Guard: skip if the same resource was already approved
+                # (prevents infinite loops from stale results or LLM re-requesting)
+                already_approved = resource_name in self._approved_capabilities
+                if already_approved:
+                    logger.info(
+                        f"⏭️ Skipping duplicate capability request for '{resource_name}' "
+                        f"— already approved this run"
+                    )
+                    # Dismiss any stale pending caps so poll_agent_turns won't kill next container
+                    await workflow.execute_activity(
+                        dismiss_pending_capabilities,
+                        args=[task_id],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    continue
                 
                 # Create capability request
                 await workflow.execute_activity(
@@ -269,6 +361,11 @@ class AgentTaskWorkflow:
                     start_to_close_timeout=timedelta(seconds=30)
                 )
                 
+                # Reset signal flags before waiting (prevents stale signals
+                # from a prior iteration from immediately satisfying the wait)
+                self.approval_received = False
+                self.capability_approved = False
+
                 # Wait for approval signal (workflow pauses here)
                 await workflow.wait_condition(
                     lambda: self.approval_received,
@@ -291,6 +388,10 @@ class AgentTaskWorkflow:
                     # Update current image for subsequent iterations
                     self.current_image = new_image
                     logger.info(f"Updated task image to {new_image}")
+                    
+                    # Track this resource as approved to prevent re-requesting
+                    if resource_name:
+                        self._approved_capabilities.add(resource_name)
 
                     # If the supply chain denied any packages, inject feedback
                     # into the follow-up so the agent learns what's unavailable.
@@ -302,6 +403,14 @@ class AgentTaskWorkflow:
                             + "\n--- END NOTICE ---"
                         )
                     
+                    # Add approved packages to the supply chain allowlist
+                    denied_names = list({d.get("name") for d in build_result.get("denied", [])})
+                    await workflow.execute_activity(
+                        add_to_supply_chain,
+                        args=[capability, denied_names],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+
                     # Update policy
                     await workflow.execute_activity(
                         update_task_policy,
@@ -309,6 +418,14 @@ class AgentTaskWorkflow:
                         start_to_close_timeout=timedelta(seconds=30)
                     )
                     
+                    # Dismiss all remaining pending caps for this task so
+                    # poll_agent_turns won't kill the next container on sight.
+                    await workflow.execute_activity(
+                        dismiss_pending_capabilities,
+                        args=[task_id],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+
                     logger.info(f"Task {task_id} resumed with new capability")
                 else:
                     logger.info(f"Capability request denied for task {task_id}")
@@ -349,6 +466,9 @@ class AgentTaskWorkflow:
             start_to_close_timeout=timedelta(minutes=5)
         )
         
+        # Expose the (possibly capability-enriched) image so parent
+        # DAGNodeWorkflow / DAGWorkflow can propagate it to later nodes.
+        final_result["current_image"] = self.current_image
         return final_result
     
     @workflow.signal
@@ -382,6 +502,7 @@ class AgentStepWorkflow:
         agent_image: str = "localhost:5000/openclaw-agent:openclaw",
         llm_model: str = "gemma3:4b",
         follow_up: str = "",
+        dag_id: str = "",
     ) -> Dict[str, Any]:
         logger.info(
             f"🔬 AgentStepWorkflow | Task: {task_id} | Iteration: {iteration} | "
@@ -434,7 +555,7 @@ class AgentStepWorkflow:
         # 3. Collect the final result from the container
         result = await workflow.execute_activity(
             collect_agent_result,
-            args=[task_id, iteration, container_id, workspace_dir, agent_image, llm_model],
+            args=[task_id, iteration, container_id, workspace_dir, agent_image, llm_model, dag_id],
             start_to_close_timeout=timedelta(minutes=2),
         )
 
@@ -608,6 +729,18 @@ async def start_agent_container(
         os.makedirs(workspace_dir, exist_ok=True)
         os.chmod(workspace_dir, 0o777)
 
+        # --- Remove stale result.json from previous iteration ---
+        # After a capability rebuild the old result.json still contains
+        # capability_requested=true which causes an infinite loop if the
+        # new container exits before writing fresh markers.
+        _stale_result = os.path.join(workspace_dir, "result.json")
+        if os.path.exists(_stale_result):
+            try:
+                os.remove(_stale_result)
+                logger.info(f"🧹 Removed stale result.json from {workspace_dir}")
+            except Exception as _rm_err:
+                logger.warning(f"⚠️ Could not remove stale result.json: {_rm_err}")
+
         # --- service discovery for the agent container ---
         # Agent containers run on DinD's default bridge network with their own
         # network namespace — NOT network_mode="host".  They reach Compose
@@ -747,10 +880,17 @@ async def poll_agent_turns(
     # Each poll cycle is ~3 seconds; we return to the workflow as soon as we have
     # new turns OR the container finishes.
     max_polls = 600  # ~30 min at 3s intervals
+    # If the agent stops producing LLM turns but leaves a long-running process
+    # (e.g. `node server.js`), the container never exits.  After this many
+    # consecutive silent polls (~2 min), we force-stop the container so the
+    # workflow can proceed.
+    silent_polls = 0
+    max_silent_polls = 40  # ~40 * 3s = 2 minutes of no new turns
     for _ in range(max_polls):
         activity.heartbeat(f"turns_seen={turns_seen + len(new_turns)}")
 
         # Check for new interactions from the LLM router
+        batch_count = 0
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
@@ -761,10 +901,37 @@ async def poll_agent_turns(
                     data = resp.json()
                     batch = data.get("interactions", [])
                     if batch:
+                        batch_count = len(batch)
                         new_turns.extend(batch)
-                        logger.info(f"📡 Got {len(batch)} new turn(s) for {task_id} (total seen: {turns_seen + len(new_turns)})")
+                        logger.info(f"📡 Got {batch_count} new turn(s) for {task_id} (total seen: {turns_seen + len(new_turns)})")
         except Exception as e:
             logger.warning(f"⚠️ Poll interactions failed: {e}")
+
+        # Check if the agent posted a capability request to the control plane.
+        # Some adapters (e.g. openclaw) POST directly but don't exit the
+        # container, so we must detect it here and force-stop.
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as cap_client:
+                cap_resp = await cap_client.get(
+                    f"{cp_url}/api/capabilities/requests",
+                    params={"task_id": task_id, "status_filter": "pending"},
+                )
+                if cap_resp.status_code == 200:
+                    pending_caps = cap_resp.json()
+                    if pending_caps:
+                        logger.info(
+                            f"🔐 Capability request detected for {task_id} — "
+                            f"force-stopping container {container_id[:12]}"
+                        )
+                        try:
+                            c = docker_client.containers.get(container_id)
+                            c.stop(timeout=5)
+                        except Exception:
+                            pass
+                        container_done = True
+                        break
+        except Exception as cap_err:
+            logger.debug(f"⚠️ Capability poll failed: {cap_err}")
 
         # Check container status
         try:
@@ -783,6 +950,26 @@ async def poll_agent_turns(
         if new_turns or container_done:
             break
 
+        # Track silent polls — if agent hasn't produced any new LLM turns
+        # for a long time, it likely started a server process.  Force-stop
+        # the container so collect_agent_result can read the output.
+        if batch_count == 0 and not container_done:
+            silent_polls += 1
+            if silent_polls >= max_silent_polls:
+                logger.warning(
+                    f"⏰ Container {container_id[:12]} silent for {silent_polls * 3}s — "
+                    f"force-stopping (agent likely left a server running)"
+                )
+                try:
+                    container = docker_client.containers.get(container_id)
+                    container.stop(timeout=5)
+                except Exception as stop_err:
+                    logger.warning(f"⚠️ Failed to stop container: {stop_err}")
+                container_done = True
+                break
+        else:
+            silent_polls = 0
+
         await asyncio.sleep(3)
 
     return {
@@ -799,11 +986,16 @@ async def collect_agent_result(
     workspace_dir: str,
     agent_image: str,
     llm_model: str,
+    dag_id: str = "",
 ) -> Dict[str, Any]:
     """Collect the final result from the stopped agent container.
 
     Reads the result from stdout markers or result.json, fetches any
     remaining LLM interactions, and cleans up the container.
+
+    When ``dag_id`` is set the stopped container is committed to a new
+    image before removal so that downstream DAG nodes inherit the
+    file-system state (installed packages, generated files, etc.).
     """
     import docker
     import json as json_lib
@@ -814,6 +1006,8 @@ async def collect_agent_result(
     docker_client = get_docker_client()
     cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
+    committed_image = ""
+
     try:
         container = docker_client.containers.get(container_id)
 
@@ -823,6 +1017,22 @@ async def collect_agent_result(
 
         container_output = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
         logger.info(f"📄 Container exited with code {exit_code}, output ({len(container_output)} bytes)")
+
+        # Commit the container to a new image when running inside a DAG
+        # so the next node inherits the full file-system state.
+        if dag_id:
+            try:
+                short_task = task_id[:8]
+                commit_tag = f"dag-{dag_id[:8]}-{short_task}"
+                repo = "registry:5000/openclaw-agent"
+                logger.info(f"📸 Committing container {container_id[:12]} as {repo}:{commit_tag}")
+                container.commit(repository=repo, tag=commit_tag)
+                committed_image = f"{repo}:{commit_tag}"
+                # Push to registry so DinD can pull it for the next node
+                docker_client.images.push(repo, tag=commit_tag)
+                logger.info(f"✅ Committed DAG image pushed: {committed_image}")
+            except Exception as commit_err:
+                logger.warning(f"⚠️ Container commit failed: {commit_err}")
 
         # Clean up
         try:
@@ -867,6 +1077,33 @@ async def collect_agent_result(
             logger.warning(f"⚠️ Failed to read result file: {e}")
 
     if result is not None:
+        # If the agent didn't flag capability_requested in its result,
+        # check the control plane for pending requests the agent may
+        # have posted directly (e.g. the openclaw adapter).
+        if not result.get("capability_requested"):
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as _cc:
+                    _cr = await _cc.get(
+                        f"{cp_url}/api/capabilities/requests",
+                        params={"task_id": task_id, "status_filter": "pending"},
+                    )
+                    if _cr.status_code == 200:
+                        _pending = _cr.json()
+                        if _pending:
+                            cap = _pending[0]
+                            logger.info(
+                                f"🔐 Detected pending cap request from control plane: "
+                                f"{cap.get('capability_type')} / {cap.get('resource_name')}"
+                            )
+                            result["capability_requested"] = True
+                            result["capability"] = {
+                                "type": cap.get("capability_type", "tool_install"),
+                                "resource": cap.get("resource_name", ""),
+                                "justification": cap.get("justification", ""),
+                            }
+            except Exception:
+                pass
+
         if result.get("capability_requested"):
             cap = result.get("capability", {})
             logger.info(f"🔐 CAPABILITY | Task: {task_id} | Type: {cap.get('type')} | Resource: {cap.get('resource')}")
@@ -891,18 +1128,73 @@ async def collect_agent_result(
         except Exception as _e:
             logger.warning(f"⚠️ Could not fetch remaining interactions: {_e}")
 
-        result["agent_logs"] = container_output[:50000]
+        result["agent_logs"] = container_output[:10000]
         result["_temporal_metadata"] = {
             "task_id": task_id,
             "iteration": iteration,
             "image": agent_image,
             "timestamp": str(datetime.now()),
         }
-        result["_remaining_turns"] = remaining_turns
+        # Strip heavy payload from remaining turns to stay under Temporal's
+        # 2 MB result size limit.  Only keep lightweight metadata.
+        slim_turns = []
+        for t in remaining_turns:
+            slim = {
+                "provider": t.get("provider"),
+                "timestamp": t.get("timestamp"),
+                "turn": t.get("turn"),
+            }
+            resp = t.get("response", {})
+            slim["response"] = {
+                "finish_reason": resp.get("finish_reason"),
+                "content": (resp.get("content") or "")[:500],
+                "tool_calls": [
+                    {"name": tc.get("name")} for tc in resp.get("tool_calls", [])
+                ],
+                "usage": resp.get("usage"),
+            }
+            req = t.get("request", {})
+            slim["request"] = {
+                "msg_count": req.get("msg_count"),
+                "tool_results": [{"tool_call_id": tr.get("tool_call_id")} for tr in req.get("tool_results", [])],
+            }
+            slim_turns.append(slim)
+        result["_remaining_turns"] = slim_turns
+        if committed_image:
+            result["committed_image"] = committed_image
         return result
 
-    # Fallback: no structured result
-    logger.warning("⚠️ No result markers or file found, attempting raw parse")
+    # Fallback: no structured result — check control plane for pending
+    # capability requests that the agent may have posted directly.
+    logger.warning("⚠️ No result markers or file found, checking for pending capability requests")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as cap_client:
+            cap_resp = await cap_client.get(
+                f"{cp_url}/api/capabilities/requests",
+                params={"task_id": task_id, "status_filter": "pending"},
+            )
+            if cap_resp.status_code == 200:
+                pending_caps = cap_resp.json()
+                if pending_caps:
+                    cap = pending_caps[0]  # take the first pending request
+                    logger.info(
+                        f"🔐 Found pending capability request for {task_id}: "
+                        f"{cap.get('capability_type')} / {cap.get('resource_name')}"
+                    )
+                    return {
+                        "completed": False,
+                        "capability_requested": True,
+                        "capability": {
+                            "type": cap.get("capability_type", "tool_install"),
+                            "resource": cap.get("resource_name", ""),
+                            "justification": cap.get("justification", ""),
+                        },
+                        "output": container_output[:10000],
+                        "agent_logs": container_output[:10000],
+                    }
+    except Exception as cap_err:
+        logger.warning(f"⚠️ Could not check capability requests: {cap_err}")
+
     error_msg = None
     if "ERROR:" in container_output or "Traceback" in container_output:
         lines = container_output.split('\n')
@@ -914,8 +1206,8 @@ async def collect_agent_result(
     return {
         "completed": False,
         "capability_requested": False,
-        "output": container_output[:50000],
-        "agent_logs": container_output[:50000],
+        "output": container_output[:10000],
+        "agent_logs": container_output[:10000],
         "parse_error": True,
         "error": error_msg[:500] if error_msg else "No result from agent (no markers, no file)",
     }
@@ -1112,6 +1404,32 @@ async def create_capability_request(
 
 
 @activity.defn
+async def dismiss_pending_capabilities(task_id: str) -> Dict[str, Any]:
+    """Dismiss all pending capability requests for a task via the control plane.
+
+    Called after a capability has been processed (approved + image built, or
+    duplicate-skipped) so that ``poll_agent_turns`` won't kill the next
+    container because of stale pending rows.
+    """
+    import httpx
+
+    cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{cp_url}/api/capabilities/requests/dismiss-pending",
+                params={"task_id": task_id},
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info(f"🧹 Dismissed pending caps for {task_id}: {result}")
+            return result
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to dismiss pending caps for {task_id}: {e}")
+        return {"dismissed": 0, "error": str(e)}
+
+
+@activity.defn
 async def build_agent_image(
     task_id: str,
     capability: Dict[str, Any],
@@ -1281,6 +1599,69 @@ async def update_task_policy(
         logger.error(f"❌ Failed to persist image for task {task_id}: {e}")
 
     return {"updated": True, "new_image": new_image}
+
+
+@activity.defn
+async def add_to_supply_chain(
+    capability: Dict[str, Any],
+    denied_names: List[str],
+) -> Dict[str, Any]:
+    """Add approved (non-denied) packages from a capability request to the supply chain allowlist."""
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    cap_type = capability.get("type", "tool_install")
+    resource = capability.get("resource", "")
+
+    # Map capability type to package manager
+    manager_map = {
+        "tool_install": "pip",
+        "pip_package": "pip",
+        "apt_package": "apt",
+        "apk_package": "apk",
+        "npm_package": "npm",
+    }
+    manager = manager_map.get(cap_type, "pip")
+
+    # Split comma-separated resources, exclude denied ones
+    denied_set = set(denied_names)
+    packages = [r.strip() for r in resource.split(",") if r.strip()]
+    approved = [p for p in packages if p not in denied_set]
+
+    if not approved:
+        logger.info("📦 No approved packages to add to supply chain")
+        return {"added": 0, "skipped": 0}
+
+    # Determine image type from the current base image name
+    image_type = "openclaw"  # default
+
+    added = 0
+    skipped = 0
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for pkg in approved:
+            try:
+                resp = await client.post(
+                    f"{control_plane_url}/api/supply-chain/packages",
+                    json={
+                        "image_type": image_type,
+                        "manager": manager,
+                        "package_name": pkg,
+                        "notes": f"Auto-added from approved capability request",
+                        "is_exception": False,
+                    },
+                )
+                if resp.status_code == 201:
+                    added += 1
+                    logger.info(f"📦 Supply chain: added '{pkg}' to {image_type}/{manager}")
+                elif resp.status_code == 409:
+                    skipped += 1  # already exists
+                else:
+                    logger.warning(f"📦 Supply chain: unexpected status {resp.status_code} for '{pkg}'")
+            except Exception as e:
+                logger.error(f"📦 Supply chain: failed to add '{pkg}': {e}")
+
+    logger.info(f"📦 Supply chain update: {added} added, {skipped} already existed")
+    return {"added": added, "skipped": skipped}
 
 
 @activity.defn
@@ -1560,6 +1941,292 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
         except Exception:
             pass
         return {"error": str(e)}
+
+
+@activity.defn
+async def trial_deploy(
+    task_id: str,
+    deployment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Trial deployment — build image, start ephemeral container, health-check.
+
+    Returns:
+      - On success: {passed: True, image_tag: "...", logs: "..."}
+      - On failure: {passed: False, error: "...", phase: "build|start|health", logs: "..."}
+    """
+    import docker
+    import httpx
+
+    image_builder_url = os.getenv("IMAGE_BUILDER_URL", "http://openclaw-image-builder:8002")
+
+    trial_id = f"trial-{task_id[-8:]}"
+    entrypoint = deployment.get("entrypoint", "python app.py")
+    port = deployment.get("port", 5000)
+    container = None
+    image_tag = None
+
+    logger.info(f"🧪 TRIAL_DEPLOY | Task: {task_id} | Port: {port} | Entrypoint: {entrypoint}")
+
+    try:
+        # Phase 1: Build the deployment image via image-builder
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{image_builder_url}/build-deployment",
+                json={
+                    "deployment_id": trial_id,
+                    "task_id": task_id,
+                    "entrypoint": entrypoint,
+                    "port": port,
+                },
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            build_id = result["build_id"]
+            logger.info(f"🧪 Trial build started | Build ID: {build_id}")
+
+            # Poll for build completion
+            max_wait = 300
+            waited = 0
+            while waited < max_wait:
+                await asyncio.sleep(5)
+                waited += 5
+                status_resp = await client.get(f"{image_builder_url}/builds/{build_id}")
+                status_resp.raise_for_status()
+                status = status_resp.json()
+
+                if status["status"] == "success":
+                    image_tag = status["image_tag"]
+                    logger.info(f"🧪 Trial image built: {image_tag}")
+                    break
+                elif status["status"] == "failed":
+                    error = status.get("error", "Unknown build error")
+                    logger.warning(f"🧪 TRIAL_FAILED (build) | {task_id} | {error}")
+                    return {"passed": False, "error": error, "phase": "build", "logs": ""}
+            else:
+                return {"passed": False, "error": "Build timed out after 5 minutes", "phase": "build", "logs": ""}
+
+        # Phase 2: Start ephemeral container
+        docker_client = get_docker_client()
+
+        # Pull image if needed
+        pull_tag = image_tag
+        try:
+            docker_client.images.get(image_tag)
+        except Exception:
+            pull_tag = image_tag.replace("localhost:5000", "registry:5000")
+            docker_client.images.pull(pull_tag)
+
+        # Use ephemeral port range 9200-9220 for trials (separate from real 9100-9120)
+        used_ports = set()
+        for c in docker_client.containers.list(all=True):
+            ports_map = c.attrs.get("NetworkSettings", {}).get("Ports") or {}
+            for bindings in ports_map.values():
+                if bindings:
+                    for b in bindings:
+                        try:
+                            used_ports.add(int(b["HostPort"]))
+                        except (KeyError, ValueError, TypeError):
+                            pass
+
+        host_port = None
+        for p in range(9200, 9221):
+            if p not in used_ports:
+                host_port = p
+                break
+
+        if host_port is None:
+            return {"passed": False, "error": "No available ports for trial (9200-9220)", "phase": "start", "logs": ""}
+
+        container_name = f"trial-{task_id[-12:]}"
+        # Remove any stale trial container with same name
+        try:
+            old = docker_client.containers.get(container_name)
+            old.remove(force=True)
+        except Exception:
+            pass
+
+        container = docker_client.containers.run(
+            pull_tag,
+            detach=True,
+            name=container_name,
+            ports={f"{port}/tcp": host_port},
+            labels={"openclaw.trial": "true", "openclaw.task": task_id},
+        )
+        logger.info(f"🧪 Trial container started: {container.short_id} on port {host_port}")
+
+        # Phase 3: Health check — wait for app to start, then smoke-test functionality
+        health_passed = False
+        smoke_errors = []
+        startup_wait = 15  # seconds to wait for app startup
+        check_attempts = 6  # try 6 times, 5s apart = 30s total
+        base_url = f"http://docker-dind:{host_port}"
+
+        await asyncio.sleep(startup_wait)
+
+        # 3a: Check container is still running (not crash-looping)
+        try:
+            container.reload()
+            cstate = container.status
+            if cstate != "running":
+                early_logs = container.logs(tail=30).decode("utf-8", errors="replace")
+                return {
+                    "passed": False,
+                    "error": f"Container exited during startup (status: {cstate}). Check logs for errors.",
+                    "phase": "health",
+                    "logs": early_logs[:2000],
+                    "image_tag": image_tag,
+                }
+        except Exception:
+            pass
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # 3b: Wait for port to respond
+            main_resp = None
+            for attempt in range(check_attempts):
+                try:
+                    resp = await client.get(f"{base_url}/")
+                    if resp.status_code < 500:
+                        main_resp = resp
+                        health_passed = True
+                        logger.info(f"🧪 Port responding | Status: {resp.status_code}")
+                        break
+                except Exception:
+                    pass
+
+                # Re-check container status each attempt
+                try:
+                    container.reload()
+                    if container.status != "running":
+                        early_logs = container.logs(tail=30).decode("utf-8", errors="replace")
+                        return {
+                            "passed": False,
+                            "error": f"Container crashed during health check (status: {container.status}). Check logs.",
+                            "phase": "health",
+                            "logs": early_logs[:2000],
+                            "image_tag": image_tag,
+                        }
+                except Exception:
+                    pass
+
+                if attempt < check_attempts - 1:
+                    await asyncio.sleep(5)
+
+            if not health_passed:
+                try:
+                    logs = container.logs(tail=50).decode("utf-8", errors="replace")
+                except Exception:
+                    logs = ""
+                logger.warning(f"🧪 ❌ Trial health check FAILED | {task_id}")
+                logger.warning(f"🧪 Container logs:\n{logs[:500]}")
+                return {
+                    "passed": False,
+                    "error": f"App did not respond on port {port} within 45 seconds",
+                    "phase": "health",
+                    "logs": logs[:2000],
+                    "image_tag": image_tag,
+                }
+
+            # 3c: Smoke-test the main page content
+            if main_resp is not None:
+                body = main_resp.text
+                content_type = main_resp.headers.get("content-type", "")
+
+                # Check response has actual content
+                if len(body.strip()) == 0:
+                    smoke_errors.append("Main page returned empty body")
+
+                # For HTML responses, check for basic structure
+                if "text/html" in content_type:
+                    if "<html" not in body.lower() and "<!doctype" not in body.lower():
+                        smoke_errors.append("Main page HTML missing <html> or <!doctype> tag")
+
+                # Check for common error pages served with 200
+                error_indicators = [
+                    "Internal Server Error",
+                    "Traceback (most recent call last)",
+                    "ModuleNotFoundError",
+                    "ImportError",
+                    "SyntaxError",
+                    "NameError",
+                ]
+                for indicator in error_indicators:
+                    if indicator in body:
+                        smoke_errors.append(f"Main page contains error: '{indicator}'")
+                        break
+
+            # 3d: Test additional API/static endpoints
+            # Check /favicon.ico or /static/ — common assets that should not 500
+            for probe_path in ["/favicon.ico", "/static/"]:
+                try:
+                    probe_resp = await client.get(f"{base_url}{probe_path}")
+                    if probe_resp.status_code >= 500:
+                        smoke_errors.append(f"GET {probe_path} returned {probe_resp.status_code}")
+                except Exception:
+                    pass  # 404 or connection resets are fine
+
+            # 3e: If app uses SocketIO, verify the handshake endpoint
+            try:
+                sio_resp = await client.get(
+                    f"{base_url}/socket.io/",
+                    params={"EIO": "4", "transport": "polling"},
+                )
+                if sio_resp.status_code >= 500:
+                    smoke_errors.append(f"SocketIO endpoint returned {sio_resp.status_code}")
+                elif sio_resp.status_code == 200:
+                    logger.info("🧪 SocketIO handshake OK")
+            except Exception:
+                pass  # Not all apps use SocketIO — ignore connection errors
+
+        # Collect container logs for diagnostics
+        try:
+            logs = container.logs(tail=50).decode("utf-8", errors="replace")
+        except Exception:
+            logs = ""
+
+        # Check for error patterns in container logs
+        log_error_patterns = [
+            "Traceback (most recent call last)",
+            "ModuleNotFoundError",
+            "ImportError",
+            "SyntaxError",
+            "RuntimeError",
+            "OSError: [Errno",
+        ]
+        for pattern in log_error_patterns:
+            if pattern in logs:
+                smoke_errors.append(f"Container logs contain: '{pattern}'")
+                break
+
+        if smoke_errors:
+            error_summary = "; ".join(smoke_errors)
+            logger.warning(f"🧪 ❌ Trial smoke test FAILED | {task_id} | {error_summary}")
+            return {
+                "passed": False,
+                "error": f"App starts but smoke test failed: {error_summary}",
+                "phase": "smoke",
+                "logs": logs[:2000],
+                "image_tag": image_tag,
+            }
+
+        logger.info(f"🧪 ✅ Trial smoke test PASSED | {task_id}")
+        return {
+            "passed": True,
+            "image_tag": image_tag,
+            "logs": logs[:1000],
+        }
+
+    except Exception as e:
+        logger.error(f"🧪 TRIAL_ERROR | {task_id} | {type(e).__name__}: {e}")
+        return {"passed": False, "error": str(e), "phase": "unknown", "logs": ""}
+
+    finally:
+        # Always clean up the trial container
+        if container:
+            try:
+                container.remove(force=True)
+                logger.info(f"🧪 Trial container cleaned up")
+            except Exception:
+                pass
 
 
 @activity.defn
@@ -1875,9 +2542,14 @@ class DAGNodeWorkflow:
         input_data = params.get("input_data", {})
         workspace_id = params.get("workspace_id", "")
 
-        agent_image = config.get("base_image", "openclaw")
+        # Prefer the DAG-inherited enriched image over the static base_image
+        # from the node config.  dag_image is injected by DAGWorkflow when a
+        # previous wave already built capabilities.
+        agent_image = config.get("dag_image") or config.get("base_image", "openclaw")
         if "/" not in agent_image:
             agent_image = f"localhost:5000/openclaw-agent:{agent_image}"
+        if config.get("dag_image"):
+            logger.info(f"🔗 DAGNodeWorkflow | Node {node_id} inheriting DAG image: {agent_image}")
         llm_model = config.get("llm_model", "gemini-flash-lite-latest")
         if not is_gemini_lite_model(llm_model):
             logger.warning(
@@ -1908,9 +2580,9 @@ class DAGNodeWorkflow:
                     if logs:
                         preview = logs[:2000] + ("..." if len(logs) > 2000 else "")
                         follow_up_parts.append(f"[{src_node}]: {preview}")
-                        continue
-                # Planner mappings may include literal constants (e.g. port=8080).
-                follow_up_parts.append(f"[{src_node}]: {str(data)[:500]}")
+                else:
+                    # Literal value (int, str, etc.) from input_mapping
+                    follow_up_parts.append(f"[{src_node}]: {data}")
         follow_up = "\n".join(follow_up_parts)
 
         try:
@@ -1940,7 +2612,7 @@ class DAGNodeWorkflow:
 
             result = await workflow.execute_child_workflow(
                 AgentTaskWorkflow.run,
-                args=[task_id, llm_model, agent_image, follow_up],
+                args=[task_id, llm_model, agent_image, follow_up, dag_id],
                 id=child_workflow_id,
             )
 
@@ -1954,6 +2626,9 @@ class DAGNodeWorkflow:
             # Determine final status from AgentTaskWorkflow result
             node_status = "completed" if result.get("status") != "failed" else "failed"
 
+            # Capture the (possibly enriched) image from the agent workflow
+            node_current_image = result.get("current_image", "")
+
             # Update node as completed/failed
             await workflow.execute_activity(
                 update_node_status,
@@ -1965,6 +2640,7 @@ class DAGNodeWorkflow:
                 "node_id": node_id,
                 "status": node_status,
                 "output": output,
+                "current_image": node_current_image,
             }
 
         except Exception as e:
@@ -2033,6 +2709,11 @@ class DAGWorkflow:
         max_waves = len(node_map) + 5  # safety limit
         wave = 0
         failed_nodes = []
+
+        # Track the richest capability-enriched image across waves so
+        # downstream nodes inherit installed packages and file-system
+        # state instead of starting from the bare base image.
+        dag_current_image = ""
 
         while wave < max_waves:
             wave += 1
@@ -2106,7 +2787,7 @@ class DAGWorkflow:
                         )
                     break
                 # Some nodes might still be running — wait
-                await asyncio.sleep(5)
+                await workflow.sleep(5)
                 continue
 
             await workflow.execute_activity(
@@ -2137,11 +2818,15 @@ class DAGWorkflow:
                         if dep in node_outputs:
                             input_data[dep] = node_outputs[dep]
 
+                node_config = dict(node_info.get("config", {}))
+                if dag_current_image:
+                    node_config["dag_image"] = dag_current_image
+
                 child_params = {
                     "dag_id": dag_id,
                     "node_id": nid,
                     "description": node_info.get("description", ""),
-                    "config": node_info.get("config", {}),
+                    "config": node_config,
                     "input_data": input_data,
                     "workspace_id": dag_workspace_id,
                 }
@@ -2162,6 +2847,15 @@ class DAGWorkflow:
                         node_outputs[nid] = result["output"]
                     if node_statuses[nid] == "failed":
                         failed_nodes.append(nid)
+
+                    # Propagate the committed/enriched image to subsequent waves
+                    # so downstream nodes inherit the file-system state.
+                    _node_img = result.get("current_image", "")
+                    if _node_img:
+                        dag_current_image = _node_img
+                        logger.info(
+                            f"🔗 DAG image updated from node {nid}: {dag_current_image}"
+                        )
                 except Exception as e:
                     logger.error(f"❌ Child workflow for node {nid} failed: {e}")
                     node_statuses[nid] = "failed"
@@ -2281,14 +2975,17 @@ async def main():
             store_task_output,
             get_last_iteration,
             create_capability_request,
+            dismiss_pending_capabilities,
             build_agent_image,
             update_task_policy,
+            add_to_supply_chain,
             finalize_task,
             create_deployment,
             build_deployment_image,
             start_deployment_container,
             stop_deployment_container,
             check_deploy_authority,
+            trial_deploy,
             # DAG activities
             load_dag,
             update_node_status,

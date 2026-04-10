@@ -267,6 +267,36 @@ async def approve_capability(
     return capability_request
 
 
+@router.post("/requests/dismiss-pending")
+async def dismiss_pending_capabilities(
+    task_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Bulk-dismiss all pending capability requests for a task.
+
+    Called by the temporal worker after a capability has been processed
+    to prevent stale pending requests from interfering with subsequent
+    container runs.
+    """
+    result = await db.execute(
+        select(CapabilityRequest).where(
+            CapabilityRequest.task_id == task_id,
+            CapabilityRequest.status == RequestStatus.PENDING,
+        )
+    )
+    pending = result.scalars().all()
+    count = 0
+    for cap in pending:
+        cap.status = RequestStatus.APPROVED
+        cap.decision_notes = "auto-dismissed after processing"
+        cap.reviewed_at = datetime.utcnow()
+        cap.reviewed_by = "system"
+        count += 1
+    await db.commit()
+    logger.info(f"Dismissed {count} pending capability request(s) for {task_id}")
+    return {"dismissed": count}
+
+
 @router.get("/requests/{request_id}", response_model=CapabilityRequestResponse)
 async def get_capability_request(
     request_id: int,

@@ -59,7 +59,7 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
 
     # Run the planner
     try:
-        dag_json = await plan_dag(data.objective, llm_model, db)
+        dag_json = await plan_dag(data.objective, llm_model, db, base_image=data.base_image)
     except ValueError as e:
         dag.status = DAGStatus.FAILED
         dag.dag_json = {"error": str(e)}

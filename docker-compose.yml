@@ -31,6 +31,7 @@ services:
       - ./workspaces:/workspaces
       - ./agent-images:/agent-images:ro
       - ./config/supply-chain.yaml:/config/supply-chain.yaml:ro
+      - ./services/control-plane:/app
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -200,6 +201,7 @@ services:
     volumes:
       - ./workspaces:/workspaces
       - ./agent-images:/agent-images
+      - ./services/temporal-worker/worker.py:/app/worker.py
     networks:
       - openclaw-network
     deploy:
