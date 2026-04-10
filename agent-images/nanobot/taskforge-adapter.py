@@ -675,6 +675,48 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]
     return None
 
 
+def _auto_detect_deployment() -> Optional[Dict[str, Any]]:
+    """Scan /workspace for a runnable web app and return deployment info.
+
+    Checks for common web app patterns (Flask, FastAPI, Express, etc.)
+    and returns a deployment dict if found.
+    """
+    workspace = "/workspace"
+
+    # Pattern: (file_glob, content_pattern, entrypoint_template, default_port, app_name)
+    detection_rules = [
+        # Python Flask
+        ("app.py", r"Flask\(__name__\)", "python3 app.py", 5000, "flask-app"),
+        ("run.py", r"app\.run\(", "python3 run.py", 5000, "flask-app"),
+        ("main.py", r"Flask\(__name__\)|uvicorn|FastAPI", "python3 main.py", 8000, "python-app"),
+        ("server.py", r"Flask|FastAPI|uvicorn", "python3 server.py", 8000, "python-app"),
+        # Node.js
+        ("server.js", r"listen\(|createServer", "node server.js", 3000, "node-app"),
+        ("app.js", r"listen\(|createServer|express", "node app.js", 3000, "node-app"),
+        ("index.js", r"listen\(|createServer", "node index.js", 3000, "node-app"),
+    ]
+
+    for filename, pattern, entrypoint, port, name in detection_rules:
+        filepath = os.path.join(workspace, filename)
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r") as f:
+                    content = f.read()
+                if re.search(pattern, content):
+                    # Try to detect port from file content
+                    port_match = re.search(r"\.run\([^)]*port\s*=\s*(\d+)", content)
+                    if not port_match:
+                        port_match = re.search(r"listen\(\s*(\d+)", content)
+                    if port_match:
+                        port = int(port_match.group(1))
+                    print(f"   📁 Found {filename} matching {pattern}")
+                    return {"name": name, "port": port, "entrypoint": entrypoint}
+            except Exception:
+                continue
+
+    return None
+
+
 def parse_deployment_request(output: str) -> Optional[Dict[str, Any]]:
     """Parse output for DEPLOYMENT_REQUEST markers."""
     match = re.search(r"DEPLOYMENT_REQUEST:([^:]+):(\d+):(.+)", output)
@@ -894,6 +936,28 @@ def main():
         result["message"] = f"Deployment requested: {deploy['name']}"
         write_result(result)
         sys.exit(0)
+
+    # Auto-detect deployment: if the task asks for deployment but the agent
+    # didn't emit a DEPLOYMENT_REQUEST marker, scan workspace for a runnable
+    # web app and auto-generate the deployment request.
+    if exit_code == 0 and not deploy:
+        task_text = (prompt + " " + (follow_up or "")).lower()
+        deploy_keywords = ["deploy", "deployment", "containerize", "containerised",
+                           "containerized", "serve", "service", "production"]
+        if any(kw in task_text for kw in deploy_keywords):
+            auto_deploy = _auto_detect_deployment()
+            if auto_deploy:
+                print(f"\n🤖 Auto-detected deployment: {auto_deploy['name']} on port {auto_deploy['port']}")
+                result["completed"] = True
+                result["deployment_requested"] = True
+                result["deployment"] = auto_deploy
+                deliverables = collect_workspace_files()
+                if deliverables:
+                    result["deliverables"] = deliverables
+                    result["deployment"]["files"] = deliverables
+                result["message"] = f"Auto-detected deployment: {auto_deploy['name']}"
+                write_result(result)
+                sys.exit(0)
 
     # Check for capability requests (only if no deployment request)
     cap = parse_capability_request(output)

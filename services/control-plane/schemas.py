@@ -249,6 +249,7 @@ class DeploymentRequestCreate(BaseModel):
     entrypoint: str  # e.g. "python app.py"
     port: int = 5000
     files: Optional[Dict[str, str]] = None  # workspace files snapshot
+    agent_image: Optional[str] = None  # agent's committed image to use as deploy base
 
 
 class DeploymentResponse(BaseModel):
@@ -256,6 +257,7 @@ class DeploymentResponse(BaseModel):
     name: str
     task_id: str
     image_tag: Optional[str]
+    agent_image: Optional[str]
     entrypoint: Optional[str]
     port: Optional[int]
     status: DeploymentStatus

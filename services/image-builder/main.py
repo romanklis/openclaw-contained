@@ -323,6 +323,7 @@ class DeploymentBuildRequest(BaseModel):
     entrypoint: str = "python app.py"
     port: int = 5000
     pip_packages: Optional[List[str]] = None  # extra pip packages
+    agent_image: Optional[str] = None  # use agent's committed image as base (has all deps)
 
 
 # =============================================================================
@@ -645,6 +646,12 @@ FROM {{ base_image }}
 LABEL deployment_id="{{ deployment_id }}"
 LABEL task_id="{{ task_id }}"
 
+{% if agent_image %}
+# Reset agent entrypoint — this is a standalone deployment now
+ENTRYPOINT []
+USER root
+{% endif %}
+
 WORKDIR /app
 
 {% if apk_packages %}
@@ -692,26 +699,40 @@ def generate_deployment_dockerfile(
     image_type: str = "openclaw",
     pip_packages: Optional[List[str]] = None,
     apt_packages: Optional[List[str]] = None,
+    agent_image: Optional[str] = None,
 ) -> str:
     """Generate a minimal Dockerfile for a deployment (no OpenClaw).
 
-    The base image and system package manager are chosen based on *image_type*
-    so that shell-only agents (picoclaw) get an Alpine base with the right
-    tools, while Python-based agents get python:3.11-slim.
-    """
-    base_image = _DEPLOYMENT_BASE_IMAGES.get(image_type, "python:3.11.15-slim-bookworm")
-    is_alpine = "alpine" in base_image
+    When *agent_image* is provided, it is used as the base image directly.
+    This guarantees all approved dependencies (pip, apt, npm, etc.) are
+    already present regardless of language — no dependency guessing needed.
 
-    # For picoclaw deployments, ensure essential shell tools are present
-    apk_packages: List[str] = []
-    if is_alpine:
-        apk_packages = list(_PICOCLAW_DEPLOY_PACKAGES) if image_type == "picoclaw" else []
-        # Move any apt_packages to apk equivalents
-        if apt_packages:
-            for pkg in apt_packages:
-                if pkg not in apk_packages:
-                    apk_packages.append(pkg)
-            apt_packages = []  # clear — we use apk on Alpine
+    Otherwise, falls back to a generic base image chosen by *image_type*
+    and installs detected packages explicitly.
+    """
+    if agent_image:
+        # Use the agent's own image — all deps already installed
+        base_image = agent_image
+        # No need for pip/apt/apk — everything is in the image
+        pip_packages = []
+        apt_packages = []
+        is_alpine = False
+        apk_packages: List[str] = []
+        logger.info(f"Using agent image as deployment base: {agent_image}")
+    else:
+        base_image = _DEPLOYMENT_BASE_IMAGES.get(image_type, "python:3.11.15-slim-bookworm")
+        is_alpine = "alpine" in base_image
+
+        # For picoclaw deployments, ensure essential shell tools are present
+        apk_packages = []
+        if is_alpine:
+            apk_packages = list(_PICOCLAW_DEPLOY_PACKAGES) if image_type == "picoclaw" else []
+            # Move any apt_packages to apk equivalents
+            if apt_packages:
+                for pkg in apt_packages:
+                    if pkg not in apk_packages:
+                        apk_packages.append(pkg)
+                apt_packages = []  # clear — we use apk on Alpine
 
     # Rewrite /workspace/ paths to /app/ since deployment copies files to /app/
     entrypoint = entrypoint.replace("/workspace/", "/app/")
@@ -745,6 +766,7 @@ def generate_deployment_dockerfile(
         pip_packages=pip_packages or [],
         apt_packages=apt_packages or [],
         apk_packages=apk_packages,
+        agent_image=agent_image,
     )
 
 
@@ -1274,100 +1296,115 @@ async def build_deployment_image(
     request: DeploymentBuildRequest,
     background_tasks: BackgroundTasks,
 ):
-    """Build a minimal deployment image from workspace files."""
+    """Build a deployment image from workspace files.
+
+    When *agent_image* is provided, it is used as the base image directly —
+    all approved dependencies (pip, apt, npm, etc.) are already present
+    regardless of language.  No dependency guessing or import scanning is
+    needed.  This is the preferred path.
+
+    When *agent_image* is not provided (legacy), falls back to detecting
+    packages from Dockerfiles, import scanning, etc.
+    """
     build_id = str(uuid.uuid4())[:8]
     image_tag = f"openclaw-deploy:{request.deployment_id}"
 
     logger.info(f"Creating deployment build {build_id} for {request.deployment_id}")
 
-    # Determine pip packages from task capabilities (approved ones)
-    pip_packages = list(request.pip_packages or [])
-    apt_packages = []
-    
-    # Also check if the task's agent image Dockerfile has pip/apt installs
-    task_dir = AGENT_IMAGES_DIR / request.task_id
-    # Check ALL versioned Dockerfiles (Dockerfile.1, Dockerfile.2, etc.)
-    import re
-    for df_path in sorted(task_dir.glob("Dockerfile*")):
-        content = df_path.read_text()
-        
-        # ---- Parse LABEL capabilities (covers both pip and apt) ----
-        # Format: LABEL capabilities="pip_package:flask,pip_package:redis,apt_package:redis-server"
-        for m in re.finditer(r'capabilities="([^"]+)"', content):
-            for cap in m.group(1).split(","):
-                cap = cap.strip()
-                if cap.startswith("pip_package:"):
-                    pkg = cap[len("pip_package:"):]
-                    if pkg and pkg not in pip_packages:
+    pip_packages: List[str] = []
+    apt_packages: List[str] = []
+    image_type = "openclaw"
+
+    if request.agent_image:
+        # ---- Fast path: agent image has all deps ----
+        logger.info(f"Using agent image as deployment base: {request.agent_image}")
+        # Detect image_type for entrypoint formatting only
+        _tag = request.agent_image.rsplit(":", 1)[-1] if ":" in request.agent_image else ""
+        KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
+        for kt in KNOWN_TYPES:
+            if kt in _tag:
+                image_type = kt
+                break
+    else:
+        # ---- Legacy path: guess dependencies from Dockerfiles + imports ----
+        pip_packages = list(request.pip_packages or [])
+
+        # Also check if the task's agent image Dockerfile has pip/apt installs
+        task_dir = AGENT_IMAGES_DIR / request.task_id
+        # Check ALL versioned Dockerfiles (Dockerfile.1, Dockerfile.2, etc.)
+        import re
+        for df_path in sorted(task_dir.glob("Dockerfile*")):
+            content = df_path.read_text()
+
+            # ---- Parse LABEL capabilities (covers both pip and apt) ----
+            for m in re.finditer(r'capabilities="([^"]+)"', content):
+                for cap in m.group(1).split(","):
+                    cap = cap.strip()
+                    if cap.startswith("pip_package:"):
+                        pkg = cap[len("pip_package:"):]
+                        if pkg and pkg not in pip_packages:
+                            pip_packages.append(pkg)
+                    elif cap.startswith("apt_package:"):
+                        pkg = cap[len("apt_package:"):]
+                        if pkg and pkg not in apt_packages:
+                            apt_packages.append(pkg)
+
+            # ---- APT packages from RUN commands ----
+            for m in re.finditer(r"apt-get install\s+-y\s+(.*?)(?:&&|$)", content, re.DOTALL):
+                block = m.group(1)
+                for token in block.split():
+                    token = token.strip().rstrip("\\")
+                    if token and not token.startswith("-") and token not in apt_packages:
+                        apt_packages.append(token)
+
+            # ---- PIP packages from RUN commands ----
+            for m in re.finditer(r"--no-cache-dir\s+(.+?)(?:\s*[;|]|$)", content):
+                for pkg in m.group(1).split():
+                    if not pkg.startswith("-") and pkg not in pip_packages:
                         pip_packages.append(pkg)
-                elif cap.startswith("apt_package:"):
-                    pkg = cap[len("apt_package:"):]
-                    if pkg and pkg not in apt_packages:
-                        apt_packages.append(pkg)
-        
-        # ---- APT packages from RUN commands ----
-        # Handle multi-line: apt-get install -y \<newline>  pkg1 \<newline>  && rm ...
-        for m in re.finditer(r"apt-get install\s+-y\s+(.*?)(?:&&|$)", content, re.DOTALL):
-            block = m.group(1)
-            for token in block.split():
-                token = token.strip().rstrip("\\")
-                if token and not token.startswith("-") and token not in apt_packages:
-                    apt_packages.append(token)
-        
-        # ---- PIP packages from RUN commands ----
-        # Look for packages after --no-cache-dir
-        for m in re.finditer(r"--no-cache-dir\s+(.+?)(?:\s*[;|]|$)", content):
-            for pkg in m.group(1).split():
-                if not pkg.startswith("-") and pkg not in pip_packages:
-                    pip_packages.append(pkg)
-    
-    logger.info(f"Deployment packages from capabilities — pip: {pip_packages}, apt: {apt_packages}")
 
-    # ---- Detect image type from the task's current_image / agent_profile ----
-    image_type = "openclaw"  # default
-    workspace_path = Path("/workspaces")
-    _ws_path = None
-    try:
-        control_plane_url_env = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-        import httpx as _httpx_sync
-        with _httpx_sync.Client(timeout=10.0) as _client:
-            _resp = _client.get(f"{control_plane_url_env}/api/tasks/{request.task_id}")
-            if _resp.status_code == 200:
-                _task_data = _resp.json()
-                _ws_id = _task_data.get("workspace_id", "")
-                _ws_path = workspace_path / _ws_id if _ws_id else None
+        logger.info(f"Deployment packages from capabilities — pip: {pip_packages}, apt: {apt_packages}")
 
-                # Detect image type from current_image tag or agent_profile
-                _cur_img = _task_data.get("current_image", "")
-                _tag = _cur_img.rsplit(":", 1)[-1] if ":" in _cur_img else ""
-                KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
-                if _tag in KNOWN_TYPES:
-                    image_type = _tag
-                else:
-                    # Try from Dockerfile labels in task image dir
-                    _detected = _detect_image_type(_cur_img) if _cur_img else "openclaw"
-                    if _detected in KNOWN_TYPES:
-                        image_type = _detected
-    except Exception as _det_err:
-        logger.warning(f"Image type detection failed (non-fatal): {_det_err}")
-
-    logger.info(f"Detected image type for deployment: {image_type}")
-
-    # ---- Also scan app source files for third-party imports ----
-    # This catches packages that were pre-installed in the agent base image
-    # (e.g. `requests` in ZeroClaw) but never explicitly requested as a capability.
-    if image_type != "picoclaw":  # picoclaw has no Python
+        # ---- Detect image type from the task's current_image / agent_profile ----
+        workspace_path = Path("/workspaces")
+        _ws_path = None
         try:
-            if _ws_path and _ws_path.exists():
-                scanned = _scan_imports_for_pip_packages(_ws_path)
-                for pkg in scanned:
-                    if pkg.lower() not in {p.lower() for p in pip_packages}:
-                        pip_packages.append(pkg)
-                logger.info(f"Import scan found additional packages: {scanned}")
-        except Exception as _scan_err:
-            logger.warning(f"Import scanning failed (non-fatal): {_scan_err}")
+            control_plane_url_env = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+            import httpx as _httpx_sync
+            with _httpx_sync.Client(timeout=10.0) as _client:
+                _resp = _client.get(f"{control_plane_url_env}/api/tasks/{request.task_id}")
+                if _resp.status_code == 200:
+                    _task_data = _resp.json()
+                    _ws_id = _task_data.get("workspace_id", "")
+                    _ws_path = workspace_path / _ws_id if _ws_id else None
 
-    logger.info(f"Final deployment packages — pip: {pip_packages}, apt: {apt_packages}")
+                    _cur_img = _task_data.get("current_image", "")
+                    _tag = _cur_img.rsplit(":", 1)[-1] if ":" in _cur_img else ""
+                    KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
+                    if _tag in KNOWN_TYPES:
+                        image_type = _tag
+                    else:
+                        _detected = _detect_image_type(_cur_img) if _cur_img else "openclaw"
+                        if _detected in KNOWN_TYPES:
+                            image_type = _detected
+        except Exception as _det_err:
+            logger.warning(f"Image type detection failed (non-fatal): {_det_err}")
+
+        logger.info(f"Detected image type for deployment: {image_type}")
+
+        # ---- Also scan app source files for third-party imports ----
+        if image_type != "picoclaw":
+            try:
+                if _ws_path and _ws_path.exists():
+                    scanned = _scan_imports_for_pip_packages(_ws_path)
+                    for pkg in scanned:
+                        if pkg.lower() not in {p.lower() for p in pip_packages}:
+                            pip_packages.append(pkg)
+                    logger.info(f"Import scan found additional packages: {scanned}")
+            except Exception as _scan_err:
+                logger.warning(f"Import scanning failed (non-fatal): {_scan_err}")
+
+        logger.info(f"Final deployment packages — pip: {pip_packages}, apt: {apt_packages}")
 
     dockerfile = generate_deployment_dockerfile(
         deployment_id=request.deployment_id,
@@ -1377,6 +1414,7 @@ async def build_deployment_image(
         image_type=image_type,
         pip_packages=pip_packages if pip_packages else None,
         apt_packages=apt_packages if apt_packages else None,
+        agent_image=request.agent_image,
     )
 
     builds[build_id] = BuildStatus(

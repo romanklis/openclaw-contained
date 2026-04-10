@@ -263,6 +263,10 @@ class AgentTaskWorkflow:
                     break
 
                 if should_deploy:
+                    # Inject the agent's current image so the deployment builder
+                    # can use it as the base — guarantees all approved deps are present.
+                    deployment["agent_image"] = self.current_image
+
                     # --- Trial deployment: build + health-check before real deploy ---
                     trial_result = await workflow.execute_activity(
                         trial_deploy,
@@ -1705,6 +1709,7 @@ async def create_deployment(task_id: str, deployment: Dict[str, Any]) -> Dict[st
         "entrypoint": deployment.get("entrypoint", "python app.py"),
         "port": deployment.get("port", 5000),
         "files": deployment.get("files"),
+        "agent_image": deployment.get("agent_image"),
     }
     
     logger.info(f"📦 CREATE_DEPLOYMENT | Task: {task_id} | Name: {payload['name']} | Port: {payload['port']}")
@@ -1797,6 +1802,7 @@ async def build_deployment_image(deployment_id: str) -> Dict[str, Any]:
                     "task_id": task_id,
                     "entrypoint": deployment.get("entrypoint", "python app.py"),
                     "port": deployment.get("port", 5000),
+                    "agent_image": deployment.get("agent_image"),
                 }
             )
             resp.raise_for_status()
@@ -1977,6 +1983,7 @@ async def trial_deploy(
                     "task_id": task_id,
                     "entrypoint": entrypoint,
                     "port": port,
+                    "agent_image": deployment.get("agent_image"),
                 },
             )
             resp.raise_for_status()

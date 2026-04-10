@@ -224,6 +224,7 @@ class Deployment(Base):
 
     # Image
     image_tag = Column(String)  # registry tag of the deployment image
+    agent_image = Column(String)  # agent's committed image (used as deploy base)
     entrypoint = Column(String)  # e.g. "python app.py"
     port = Column(Integer)  # primary exposed port
 

@@ -45,6 +45,7 @@ async def create_deployment(
         task_id=data.task_id,
         entrypoint=data.entrypoint,
         port=data.port,
+        agent_image=data.agent_image,
         status=DeploymentStatus.PENDING_APPROVAL,
     )
     db.add(deployment)
