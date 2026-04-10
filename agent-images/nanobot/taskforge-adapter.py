@@ -32,10 +32,6 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:4b")
 LLM_ROUTER_URL = os.getenv("LLM_ROUTER_URL", f"{CONTROL_PLANE_URL}/api/llm")
 IMAGE_TYPE = os.getenv("OPENCLAW_IMAGE_TYPE", "nanobot")
 
-# Zep CE memory service
-ZEP_URL = os.getenv("ZEP_URL", "")
-ZEP_SESSION_ID = os.getenv("ZEP_SESSION_ID", "")
-
 MAX_TURNS = int(os.getenv("MAX_AGENT_TURNS", "30"))
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "60"))
 
@@ -56,115 +52,6 @@ def _kill_tree(proc):
         proc.kill()
     except (ProcessLookupError, OSError):
         pass
-
-
-# ---------------------------------------------------------------------------
-# Zep CE memory helpers — inter-iteration & intra-iteration memory
-# ---------------------------------------------------------------------------
-
-def _zep_ok() -> bool:
-    """Return True when Zep env vars are configured."""
-    return bool(ZEP_URL and ZEP_SESSION_ID)
-
-
-def zep_ensure_session(metadata: Optional[Dict[str, Any]] = None) -> bool:
-    """Create the Zep session if it doesn't already exist.
-
-    Zep CE returns 200 even if the session already exists (idempotent).
-    """
-    if not _zep_ok():
-        return False
-    try:
-        with httpx.Client(timeout=10.0) as c:
-            r = c.post(
-                f"{ZEP_URL}/api/v1/sessions",
-                json={
-                    "session_id": ZEP_SESSION_ID,
-                    "metadata": metadata or {
-                        "task_id": TASK_ID,
-                        "iteration": ITERATION,
-                    },
-                },
-            )
-            if r.status_code in (200, 201):
-                print(f"   🧠 Zep session ensured: {ZEP_SESSION_ID}")
-                return True
-            if r.status_code == 400 and "already exists" in r.text:
-                print(f"   🧠 Zep session already exists: {ZEP_SESSION_ID}")
-                return True
-            print(f"   ⚠️ Zep session create → {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"   ⚠️ Zep session create failed: {e}")
-    return False
-
-
-def zep_fetch_memory() -> List[Dict[str, str]]:
-    """Fetch memory messages from Zep for the current session.
-
-    Returns a list of {"role": ..., "content": ...} dicts representing
-    the most recent conversation history from previous iterations.
-    """
-    if not _zep_ok():
-        return []
-    try:
-        with httpx.Client(timeout=15.0) as c:
-            r = c.get(f"{ZEP_URL}/api/v1/sessions/{ZEP_SESSION_ID}/memory")
-            if r.status_code == 200:
-                data = r.json()
-                messages_raw = data.get("messages", [])
-                summary = data.get("summary", {})
-                result = []
-                # If Zep has a summary, include it first
-                if summary and summary.get("content"):
-                    result.append({
-                        "role": "system",
-                        "content": f"[Memory summary from previous iterations]\n{summary['content']}",
-                    })
-                # Add recent messages
-                for m in messages_raw:
-                    role = m.get("role", "user")
-                    content = m.get("content", "")
-                    if content:
-                        result.append({"role": role, "content": content})
-                if result:
-                    print(f"   🧠 Zep: fetched {len(result)} memory message(s)")
-                return result
-            elif r.status_code == 404:
-                return []  # No memory yet
-            else:
-                print(f"   ⚠️ Zep fetch → {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"   ⚠️ Zep fetch failed: {e}")
-    return []
-
-
-def zep_save_messages(messages: List[Dict[str, str]]) -> bool:
-    """Save messages to Zep for the current session.
-
-    Each message should have "role" and "content" keys.
-    """
-    if not _zep_ok() or not messages:
-        return False
-    try:
-        with httpx.Client(timeout=10.0) as c:
-            r = c.post(
-                f"{ZEP_URL}/api/v1/sessions/{ZEP_SESSION_ID}/memory",
-                json={"messages": messages},
-            )
-            if r.status_code in (200, 201):
-                return True
-            print(f"   ⚠️ Zep save → {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"   ⚠️ Zep save failed: {e}")
-    return False
-
-
-import hashlib
-
-def _action_hash(tool_name: str, tool_args: Any) -> str:
-    """Create a deterministic hash for a tool call to detect repetition."""
-    raw = json.dumps({"t": tool_name, "a": tool_args}, sort_keys=True, default=str)
-    return hashlib.md5(raw.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +205,6 @@ def setup_workspace_context():
 
     agent_dockerfile = os.getenv("AGENT_DOCKERFILE", "")
     agent_image = os.getenv("AGENT_IMAGE", IMAGE_TYPE)
-    pre_installed_packages = os.getenv("PRE_INSTALLED_PACKAGES", "")
     installed_packages_section = ""
     if agent_dockerfile:
         installed_packages_section = (
@@ -326,15 +212,6 @@ def setup_workspace_context():
             "The following Dockerfile was used to build the image you are running in.\n"
             "All packages listed here are ALREADY INSTALLED — do NOT request them again.\n\n"
             f"```dockerfile\n{agent_dockerfile.strip()}\n```\n"
-        )
-    if pre_installed_packages:
-        pkg_list = ", ".join(pre_installed_packages.split(","))
-        installed_packages_section += (
-            "\n### Packages installed by previous task iterations\n\n"
-            "These packages are ALREADY INSTALLED in your image from earlier runs.\n"
-            "**Do NOT request them again via CAPABILITY_REQUEST.**\n"
-            "You can import and use them directly.\n\n"
-            f"**Installed:** {pkg_list}\n"
         )
 
     runtime_desc = get_runtime_description()
@@ -625,12 +502,6 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
     This replaces invoke_openclaw_agent() but produces identical output
     format so the rest of main() (capability detection, deliverables, etc.)
     works unchanged.
-
-    Zep CE integration:
-    - At start: fetch memory from previous iterations and inject as context.
-    - Per turn: save assistant/tool messages to Zep for future recall.
-    - Intra-iteration: hash each tool call; if repeated ≥3x consecutively,
-      inject a warning so the agent breaks out of loops.
     """
     router_url = LLM_ROUTER_URL.rstrip("/")
     if not router_url.endswith("/v1"):
@@ -642,48 +513,11 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
     system_prompt = build_system_prompt()
     messages = [
         {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
     ]
-
-    # ── Zep: fetch inter-iteration memory ──
-    if _zep_ok():
-        zep_ensure_session()
-        prior_memory = zep_fetch_memory()
-        if prior_memory:
-            # Build a concise recap from previous iteration messages
-            recap_parts = []
-            for m in prior_memory:
-                role_label = m.get("role", "?")
-                content = m.get("content", "")
-                if role_label == "system":
-                    recap_parts.append(content)
-                else:
-                    recap_parts.append(f"[{role_label}] {content[:500]}")
-            recap = "\n".join(recap_parts[-20:])  # last 20 messages max
-            messages.append({
-                "role": "user",
-                "content": (
-                    "[MEMORY FROM PREVIOUS ITERATIONS]\n"
-                    "The following is a summary of what happened in earlier iterations "
-                    "of this task. Use this context to avoid repeating work or re-requesting "
-                    "capabilities that are already installed.\n\n"
-                    f"{recap}\n\n"
-                    "[END MEMORY]\n\n"
-                    "Now proceed with the current task:"
-                ),
-            })
-            messages.append({
-                "role": "assistant",
-                "content": "I've reviewed the memory from previous iterations. I'll use this context to avoid repeating work. Let me proceed with the current task.",
-            })
-
-    messages.append({"role": "user", "content": prompt})
 
     all_output_parts: List[str] = []
     turn = 0
-
-    # Intra-iteration loop guard — consecutive identical tool-call hashes
-    recent_hashes: List[str] = []
-    LOOP_GUARD_THRESHOLD = 3
 
     print(f"   🔗 LLM endpoint: {completions_url}")
     print(f"   🤖 Model: {LLM_MODEL}")
@@ -753,7 +587,6 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
                     break
 
                 # Execute each tool call
-                loop_broken = False
                 for tc in tool_calls:
                     func = tc.get("function", {})
                     tool_name = func.get("name", "")
@@ -763,28 +596,6 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
                         tool_args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
                     except (json.JSONDecodeError, TypeError):
                         tool_args = {}
-
-                    # ── Intra-iteration loop guard ──
-                    h = _action_hash(tool_name, tool_args)
-                    recent_hashes.append(h)
-                    if len(recent_hashes) >= LOOP_GUARD_THRESHOLD:
-                        tail = recent_hashes[-LOOP_GUARD_THRESHOLD:]
-                        if len(set(tail)) == 1:
-                            warn = (
-                                f"⚠️ LOOP DETECTED: you have called {tool_name} "
-                                f"with the same arguments {LOOP_GUARD_THRESHOLD} "
-                                f"times in a row. Try a DIFFERENT approach or "
-                                f"finish the task."
-                            )
-                            print(f"   {warn}")
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.get("id", f"call_{turn}_{tool_name}"),
-                                "content": warn,
-                            })
-                            all_output_parts.append(f"[LOOP_GUARD] {warn}")
-                            loop_broken = True
-                            break
 
                     print(f"   🔧 Tool: {tool_name}({json.dumps(tool_args)[:120]})")
                     tool_result = execute_tool(tool_name, tool_args)
@@ -802,27 +613,6 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
                         "tool_call_id": tc.get("id", f"call_{turn}_{tool_name}"),
                         "content": tool_result[:10000],
                     })
-
-                # ── Zep: save this turn's messages ──
-                if _zep_ok() and content:
-                    zep_msgs_to_save = [{"role": "assistant", "content": content[:2000]}]
-                    zep_save_messages(zep_msgs_to_save)
-
-                if loop_broken:
-                    # Reset hash tracker after warning; give agent one more chance
-                    recent_hashes.clear()
-
-        # ── Zep: save final summary at end of iteration ──
-        if _zep_ok():
-            combined_preview = "\n".join(all_output_parts)[:3000]
-            zep_save_messages([{
-                "role": "assistant",
-                "content": (
-                    f"[ITERATION {ITERATION} SUMMARY for task {TASK_ID}]\n"
-                    f"{combined_preview}"
-                ),
-            }])
-            print(f"   🧠 Zep: saved iteration summary")
 
         combined = "\n".join(all_output_parts)
         return combined, 0
@@ -1087,7 +877,25 @@ def main():
         "agent_logs": output[:50000],
     }
 
-    # Check for capability requests
+    # Check for deployment request FIRST — if the agent emitted a
+    # DEPLOYMENT_REQUEST it has already resolved any issues (e.g. removed
+    # gunicorn) and we should not let a stale ModuleNotFoundError from
+    # earlier in the log override its final intent.
+    deploy = parse_deployment_request(output)
+    if deploy:
+        print(f"\n🚀 Deployment requested: {deploy['name']} on port {deploy['port']}")
+        result["completed"] = True
+        result["deployment_requested"] = True
+        result["deployment"] = deploy
+        deliverables = collect_workspace_files()
+        if deliverables:
+            result["deliverables"] = deliverables
+            result["deployment"]["files"] = deliverables
+        result["message"] = f"Deployment requested: {deploy['name']}"
+        write_result(result)
+        sys.exit(0)
+
+    # Check for capability requests (only if no deployment request)
     cap = parse_capability_request(output)
     if cap:
         cap_type, packages, cap_reason = cap
@@ -1134,21 +942,6 @@ def main():
             result["error"] = "Required capability denied"
             write_result(result)
             sys.exit(1)
-
-    # Check for deployment request
-    deploy = parse_deployment_request(output)
-    if deploy:
-        print(f"\n🚀 Deployment requested: {deploy['name']} on port {deploy['port']}")
-        result["completed"] = True
-        result["deployment_requested"] = True
-        result["deployment"] = deploy
-        deliverables = collect_workspace_files()
-        if deliverables:
-            result["deliverables"] = deliverables
-            result["deployment"]["files"] = deliverables
-        result["message"] = f"Deployment requested: {deploy['name']}"
-        write_result(result)
-        sys.exit(0)
 
     # Detect LLM-level errors
     LLM_ERROR_MARKERS = ["MALFORMED_FUNCTION_CALL", "Unhandled stop reason", "function_call_filter"]

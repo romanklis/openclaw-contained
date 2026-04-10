@@ -877,7 +877,25 @@ def main():
         "agent_logs": output[:50000],
     }
 
-    # Check for capability requests
+    # Check for deployment request FIRST — if the agent emitted a
+    # DEPLOYMENT_REQUEST it has already resolved any issues (e.g. removed
+    # gunicorn) and we should not let a stale ModuleNotFoundError from
+    # earlier in the log override its final intent.
+    deploy = parse_deployment_request(output)
+    if deploy:
+        print(f"\n🚀 Deployment requested: {deploy['name']} on port {deploy['port']}")
+        result["completed"] = True
+        result["deployment_requested"] = True
+        result["deployment"] = deploy
+        deliverables = collect_workspace_files()
+        if deliverables:
+            result["deliverables"] = deliverables
+            result["deployment"]["files"] = deliverables
+        result["message"] = f"Deployment requested: {deploy['name']}"
+        write_result(result)
+        sys.exit(0)
+
+    # Check for capability requests (only if no deployment request)
     cap = parse_capability_request(output)
     if cap:
         cap_type, packages, cap_reason = cap
@@ -924,21 +942,6 @@ def main():
             result["error"] = "Required capability denied"
             write_result(result)
             sys.exit(1)
-
-    # Check for deployment request
-    deploy = parse_deployment_request(output)
-    if deploy:
-        print(f"\n🚀 Deployment requested: {deploy['name']} on port {deploy['port']}")
-        result["completed"] = True
-        result["deployment_requested"] = True
-        result["deployment"] = deploy
-        deliverables = collect_workspace_files()
-        if deliverables:
-            result["deliverables"] = deliverables
-            result["deployment"]["files"] = deliverables
-        result["message"] = f"Deployment requested: {deploy['name']}"
-        write_result(result)
-        sys.exit(0)
 
     # Detect LLM-level errors
     LLM_ERROR_MARKERS = ["MALFORMED_FUNCTION_CALL", "Unhandled stop reason", "function_call_filter"]
