@@ -940,7 +940,9 @@ def main():
     # Auto-detect deployment: if the task asks for deployment but the agent
     # didn't emit a DEPLOYMENT_REQUEST marker, scan workspace for a runnable
     # web app and auto-generate the deployment request.
-    if exit_code == 0 and not deploy:
+    # Skip if agent emitted a CAPABILITY_REQUEST — deps aren't installed yet.
+    has_capability_request = "CAPABILITY_REQUEST:" in output
+    if exit_code == 0 and not deploy and not has_capability_request:
         task_text = (prompt + " " + (follow_up or "")).lower()
         deploy_keywords = ["deploy", "deployment", "containerize", "containerised",
                            "containerized", "serve", "service", "production"]

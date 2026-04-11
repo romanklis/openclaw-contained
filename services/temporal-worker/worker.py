@@ -377,6 +377,21 @@ class AgentTaskWorkflow:
                 )
                 
                 if self.capability_approved:
+                    # Add approved packages to supply chain BEFORE building
+                    # so the image-builder's supply-chain validation passes.
+                    await workflow.execute_activity(
+                        add_to_supply_chain,
+                        args=[task_id, capability, []],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+
+                    # Reload image-builder's supply chain cache
+                    await workflow.execute_activity(
+                        reload_supply_chain,
+                        args=[],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+
                     # Build new image with capability — use current_image as base
                     # so each version layers on top of the previous (v1 → v2 → v3)
                     build_result = await workflow.execute_activity(
@@ -406,14 +421,6 @@ class AgentTaskWorkflow:
                             + supply_chain_feedback
                             + "\n--- END NOTICE ---"
                         )
-                    
-                    # Add approved packages to the supply chain allowlist
-                    denied_names = list({d.get("name") for d in build_result.get("denied", [])})
-                    await workflow.execute_activity(
-                        add_to_supply_chain,
-                        args=[capability, denied_names],
-                        start_to_close_timeout=timedelta(seconds=30),
-                    )
 
                     # Update policy
                     await workflow.execute_activity(
@@ -1607,6 +1614,7 @@ async def update_task_policy(
 
 @activity.defn
 async def add_to_supply_chain(
+    task_id: str,
     capability: Dict[str, Any],
     denied_names: List[str],
 ) -> Dict[str, Any]:
@@ -1627,6 +1635,16 @@ async def add_to_supply_chain(
     }
     manager = manager_map.get(cap_type, "pip")
 
+    # Auto-detect APT packages by naming convention when type is generic
+    # (tool_install doesn't distinguish pip from apt)
+    APT_PATTERNS = ("-dev", "lib", "build-essential", "cmake", "gcc", "g++",
+                    "make", "pkg-config", "libssl", "libcurl", "zlib")
+    if cap_type == "tool_install":
+        for pkg_name in [r.strip() for r in resource.split(",") if r.strip()]:
+            if any(pkg_name.startswith(p) or pkg_name.endswith(p) for p in APT_PATTERNS):
+                manager = "apt"
+                break
+
     # Split comma-separated resources, exclude denied ones
     denied_set = set(denied_names)
     packages = [r.strip() for r in resource.split(",") if r.strip()]
@@ -1636,8 +1654,37 @@ async def add_to_supply_chain(
         logger.info("📦 No approved packages to add to supply chain")
         return {"added": 0, "skipped": 0}
 
-    # Determine image type from the current base image name
-    image_type = "openclaw"  # default
+    # Detect image type from the task's current image or DAG base_image
+    image_type = "openclaw"  # default fallback
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
+            if resp.status_code == 200:
+                task_data = resp.json()
+                # First try current_image tag
+                cur_img = task_data.get("current_image", "")
+                tag = cur_img.rsplit(":", 1)[-1] if ":" in cur_img else ""
+                for known in ("zeroclaw", "nanobot", "picoclaw", "openclaw"):
+                    if known in tag:
+                        image_type = known
+                        break
+                else:
+                    # Tag is a DAG-specific tag like "dag-dag-745a-task-ddb",
+                    # try the DAG's base_image field instead
+                    dag_id = task_data.get("dag_id", "")
+                    if dag_id:
+                        dag_resp = await client.get(f"{control_plane_url}/api/dags/{dag_id}")
+                        if dag_resp.status_code == 200:
+                            dag_data = dag_resp.json()
+                            base = dag_data.get("base_image", "")
+                            for known in ("zeroclaw", "nanobot", "picoclaw", "openclaw"):
+                                if known in base:
+                                    image_type = known
+                                    break
+    except Exception as e:
+        logger.warning(f"📦 Could not detect image type for {task_id}: {e}")
+
+    logger.info(f"📦 Adding to supply chain for image_type={image_type}: {approved}")
 
     added = 0
     skipped = 0
@@ -1666,6 +1713,23 @@ async def add_to_supply_chain(
 
     logger.info(f"📦 Supply chain update: {added} added, {skipped} already existed")
     return {"added": added, "skipped": skipped}
+
+
+@activity.defn
+async def reload_supply_chain() -> Dict[str, Any]:
+    """Tell the image-builder to hot-reload its supply-chain config."""
+    import httpx
+
+    image_builder_url = os.getenv("IMAGE_BUILDER_URL", "http://openclaw-image-builder:8002")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{image_builder_url}/supply-chain/reload")
+            resp.raise_for_status()
+            logger.info("🔄 Supply chain reloaded on image-builder")
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"🔄 Supply chain reload failed (non-fatal): {e}")
+        return {"status": "failed", "error": str(e)}
 
 
 @activity.defn
@@ -2986,6 +3050,7 @@ async def main():
             build_agent_image,
             update_task_policy,
             add_to_supply_chain,
+            reload_supply_chain,
             finalize_task,
             create_deployment,
             build_deployment_image,
