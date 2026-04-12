@@ -712,7 +712,8 @@ def generate_deployment_dockerfile(
     """
     if agent_image:
         # Use the agent's own image — all deps already installed
-        base_image = agent_image
+        # Normalize registry prefix: DinD resolves "registry:5000" not "localhost:5000"
+        base_image = agent_image.replace("localhost:5000/", "registry:5000/")
         # No need for pip/apt/apk — everything is in the image
         pip_packages = []
         apt_packages = []

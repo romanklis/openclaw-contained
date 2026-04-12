@@ -464,6 +464,12 @@ class DAGCreate(BaseModel):
     auto_start: bool = False
 
 
+class DAGRevise(BaseModel):
+    """Request a revision on a completed/deployed DAG — plans a new DAG."""
+    comments: str
+    llm_model: Optional[str] = None
+
+
 class DAGManualCreate(BaseModel):
     """Create a DAG with an explicit node graph (skip planner)."""
     objective: str

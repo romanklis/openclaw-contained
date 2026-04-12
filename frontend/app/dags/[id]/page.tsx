@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { useParams } from 'next/navigation'
+import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import dynamic from 'next/dynamic'
 import { StatusBadge } from '../../components/StatusComponents'
@@ -71,10 +71,14 @@ interface SBOMData {
 export default function DAGDetailPage() {
   const params = useParams()
   const dagId = params.id as string
+  const router = useRouter()
   const [dag, setDag] = useState<DAGDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 'sbom'>('overview')
+  const [showRevise, setShowRevise] = useState(false)
+  const [reviseComments, setReviseComments] = useState('')
+  const [revising, setRevising] = useState(false)
 
   // Per-node task data cache
   const [nodeTaskData, setNodeTaskData] = useState<Record<string, {
@@ -213,6 +217,31 @@ export default function DAGDetailPage() {
     }
   }
 
+  const reviseDag = async () => {
+    if (!reviseComments.trim()) return
+    setRevising(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/revise`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comments: reviseComments }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || `HTTP ${res.status}`)
+      }
+      const newDag = await res.json()
+      setShowRevise(false)
+      setReviseComments('')
+      // Redirect to the newly created revision DAG
+      router.push(`/dags/${newDag.id}`)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setRevising(false)
+    }
+  }
+
   const getWorkflowLink = (workflowId: string) =>
     `${TEMPORAL_UI}/namespaces/default/workflows/${encodeURIComponent(workflowId)}`
 
@@ -250,8 +279,39 @@ export default function DAGDetailPage() {
           {dag.status === 'running' && (
             <button onClick={cancelDag} className="btn-danger text-sm">&#9209; Cancel</button>
           )}
+          {(dag.status === 'completed' || dag.status === 'failed' || dag.status === 'cancelled') && (
+            <button
+              onClick={() => setShowRevise(!showRevise)}
+              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-md transition-colors"
+            >
+              {showRevise ? 'Cancel' : '♻️ Revise'}
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Revise panel */}
+      {showRevise && (
+        <div className="card p-4 mb-4 border border-indigo-500/30">
+          <label className="block text-sm font-medium text-gray-300 mb-2">Review Comments</label>
+          <textarea
+            value={reviseComments}
+            onChange={e => setReviseComments(e.target.value)}
+            rows={4}
+            className="w-full bg-gray-800 border border-gray-600 rounded-md p-3 text-sm text-gray-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none resize-y"
+            placeholder="Describe what needs to be changed or fixed..."
+          />
+          <div className="flex justify-end mt-3">
+            <button
+              onClick={reviseDag}
+              disabled={revising || !reviseComments.trim()}
+              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm rounded-md transition-colors"
+            >
+              {revising ? 'Starting...' : '🚀 Revise DAG'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Stats bar */}
       <div className="grid grid-cols-6 gap-3 mb-4">

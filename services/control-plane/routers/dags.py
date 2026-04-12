@@ -5,9 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
-from models import MasterDAG, DAGNode, Task, DAGStatus, NodeStatus, TaskStatus
+from models import MasterDAG, DAGNode, Task, DAGStatus, NodeStatus
 from schemas import (
-    DAGCreate, DAGManualCreate, DAGResponse, DAGDetail, DAGNodeResponse,
+    DAGCreate, DAGManualCreate, DAGResponse, DAGDetail, DAGNodeResponse, DAGRevise,
 )
 from dag_validator import validate_dag
 from planner import plan_dag, is_gemini_lite_model
@@ -273,6 +273,116 @@ async def patch_node(dag_id: str, node_id: str, payload: dict, db: AsyncSession 
 
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/{dag_id}/revise", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
+async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(get_db)):
+    """Create a new DAG based on revision comments for an existing DAG.
+
+    Takes the original DAG's objective, appends the user's revision
+    comments as context, and calls the planner to design a fresh DAG
+    that addresses the requested changes.
+    """
+    old_dag = await _get_dag_or_404(dag_id, db)
+
+    if old_dag.status not in (DAGStatus.COMPLETED, DAGStatus.FAILED, DAGStatus.CANCELLED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"DAG must be completed, failed, or cancelled to revise (current: {old_dag.status.value})",
+        )
+
+    # Build a revision objective that gives the planner full context
+    revision_objective = (
+        f"{old_dag.objective}\n\n"
+        f"--- REVISION CONTEXT ---\n"
+        f"A previous attempt (DAG {dag_id}) was made to solve this objective. "
+        f"The user has reviewed the result and requests the following changes:\n\n"
+        f"{body.comments}\n\n"
+        f"Design a new DAG that addresses these revision comments. "
+        f"Reuse working parts of the original approach where appropriate, "
+        f"but make the requested changes."
+    )
+
+    # Find the most recent agent image from the old DAG's nodes
+    old_base_image = None
+    old_nodes_result = await db.execute(
+        select(DAGNode).where(DAGNode.dag_id == dag_id)
+    )
+    old_nodes = list(old_nodes_result.scalars().all())
+
+    # Check tasks for current_image, preferring the most recently completed node
+    candidates = [n for n in old_nodes if n.task_id]
+    candidates.sort(key=lambda n: n.completed_at or datetime.min, reverse=True)
+    for node in candidates:
+        task_result = await db.execute(select(Task).where(Task.id == node.task_id))
+        task = task_result.scalar_one_or_none()
+        if task and task.current_image:
+            old_base_image = task.current_image
+            logger.info(f"Revision base image from node '{node.node_id}': {old_base_image}")
+            break
+
+    # Fall back to config base_image from DAG JSON if no task image found
+    if not old_base_image and old_dag.dag_json and isinstance(old_dag.dag_json, dict):
+        for node_def in old_dag.dag_json.get("nodes", []):
+            cfg = node_def.get("config", {})
+            if cfg.get("base_image"):
+                old_base_image = cfg["base_image"]
+                break
+
+    llm_model = body.llm_model or old_dag.llm_model or "gemini-flash-lite-latest"
+
+    # Create a new DAG in PLANNING state
+    # Reuse the old DAG's workspace so the agent has access to previous outputs
+    new_dag_id = _gen_dag_id()
+    workspace_id = old_dag.workspace_id
+
+    new_dag = MasterDAG(
+        id=new_dag_id,
+        objective=revision_objective,
+        status=DAGStatus.PLANNING,
+        dag_json={},
+        workspace_id=workspace_id,
+        llm_model=llm_model,
+    )
+    db.add(new_dag)
+    await db.commit()
+
+    # Run the planner
+    try:
+        dag_json = await plan_dag(
+            revision_objective, llm_model, db, base_image=old_base_image
+        )
+    except ValueError as e:
+        new_dag.status = DAGStatus.FAILED
+        new_dag.dag_json = {"error": str(e)}
+        await db.commit()
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Store DAG JSON and create node records
+    new_dag.dag_json = dag_json
+    new_dag.status = DAGStatus.READY
+
+    nodes = []
+    for node_def in dag_json.get("nodes", []):
+        node = DAGNode(
+            dag_id=new_dag_id,
+            node_id=node_def["node_id"],
+            skill_id=node_def.get("skill_id"),
+            skill_step_index=node_def.get("skill_step_index"),
+            description=node_def.get("description"),
+            status=NodeStatus.PENDING,
+            depends_on=node_def.get("depends_on", []),
+            config=node_def.get("config", {}),
+            input_mapping=node_def.get("input_mapping", {}),
+        )
+        db.add(node)
+        nodes.append(node)
+
+    await db.commit()
+    await db.refresh(new_dag)
+
+    # Auto-start the revision DAG
+    return await _start_dag(new_dag, db)
 
 
 # ── Helpers ─────────────────────────────────────────────
