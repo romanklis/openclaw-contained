@@ -42,6 +42,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt && \
 COPY agent_runtime.py /opt/openclaw/
 COPY policy_client.py /opt/openclaw/
 COPY config.py /opt/openclaw/
+COPY taskforge-adapter.py /opt/openclaw/
 
 # Set up workspace
 WORKDIR /workspace
@@ -58,5 +59,6 @@ ENV PYTHONUNBUFFERED=1 \
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD python -c "import sys; sys.exit(0)"
 
-# Default command
-CMD ["python", "/opt/openclaw/agent_runtime.py"]
+# Default command — use taskforge-adapter for proper LLM agent loop
+ENTRYPOINT ["python", "/opt/openclaw/taskforge-adapter.py"]
+CMD []

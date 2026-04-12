@@ -369,9 +369,9 @@ RUN apt-get update && apt-get install -y \\
 # Requested: {{ pip_packages | join(', ') }}
 RUN echo "ERROR: pip packages requested but PicoClaw has no Python runtime" >&2 && exit 1
 {% elif image_type == 'openclaw' %}
-# Install Python packages into venv (OpenClaw)
+# Install Python packages (OpenClaw — system pip)
 USER root
-RUN /opt/venv/bin/pip install --no-cache-dir {{ pip_packages | join(' ') }}
+RUN pip install --no-cache-dir {{ pip_packages | join(' ') }}
 {% elif image_type == 'nanobot' %}
 # Install Python packages (NanoBot — Alpine Python)
 USER root
@@ -986,7 +986,7 @@ async def build_image_task(
             dockerfile=f"Dockerfile.{version}",
             tag=image_tag,
             rm=True,
-            pull=False
+            pull=True
         )
         
         # Collect logs

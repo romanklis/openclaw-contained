@@ -129,26 +129,15 @@ class AgentRuntime:
     
     async def execute_iteration(self, iteration: int):
         """Execute one iteration of agent logic"""
-        # Placeholder for actual agent logic
-        logger.info(f"💭 Thinking... (OpenClaw model processing)")
-        
-        # Example: Check if we can read a file
-        if iteration == 3:
-            allowed = await self.check_policy("read", "/workspace/data.csv")
-            if allowed:
-                logger.info("   ✓ Read access granted by policy")
-            else:
-                logger.warning("   ✗ Read access denied by policy")
-        
-        # Example: Request capability if needed
-        if iteration == 5:
-            success = await self.request_capability({
-                "capability_type": "tool_install",
-                "resource_name": "pandas",
-                "justification": "Need pandas for data analysis"
-            })
-            if success:
-                logger.info("   ✓ Capability requested successfully")
+        # This stub should NOT be used in production — the real entrypoint
+        # is taskforge-adapter.py.  If we reach here, exit cleanly so we
+        # don't accidentally create capability requests in a loop.
+        logger.warning(
+            "⚠️ agent_runtime.py stub invoked — this image is missing "
+            "taskforge-adapter.py as its ENTRYPOINT.  Exiting."
+        )
+        import sys
+        sys.exit(0)
 
 
 def main():
