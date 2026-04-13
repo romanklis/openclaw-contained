@@ -110,7 +110,7 @@ export default function DAGGraph({ nodes, onNodeClick }: DAGGraphProps) {
   }, [nodes])
 
   return (
-    <div className="card" style={{ height: Math.max(300, nodes.length * 60 + 100) }}>
+    <div className="card" style={{ height: Math.max(500, nodes.length * 80 + 150) }}>
       <ReactFlow
         nodes={flowNodes}
         edges={flowEdges}

@@ -623,6 +623,16 @@ async def get_audit_turns(
         )
         relevant_task_ids.extend([row[0] for row in sub_result.all()])
 
+    # Pre-fetch workflow_ids for all relevant tasks
+    task_workflow_ids: Dict[str, str] = {task_id: task.workflow_id or ""}
+    if len(relevant_task_ids) > 1:
+        wf_result = await db.execute(
+            select(Task.id, Task.workflow_id)
+            .where(Task.id.in_(relevant_task_ids))
+        )
+        for row in wf_result.all():
+            task_workflow_ids[row[0]] = row[1] or ""
+
     all_iterations_data: List[Dict[str, Any]] = []
 
     for current_task_id in relevant_task_ids:
@@ -631,9 +641,14 @@ async def get_audit_turns(
         # Also check continuation workflows: task-workflow-{task_id}-cont-{N}
         workflow_ids_to_check = []
 
-        # Primary workflow
+        # Primary workflow (standalone tasks)
         primary_wf_id = f"task-workflow-{current_task_id}"
         workflow_ids_to_check.append(primary_wf_id)
+
+        # DAG task workflow (agent-task-{dag_id}-{node_id})
+        actual_wf_id = task_workflow_ids.get(current_task_id, "")
+        if actual_wf_id and actual_wf_id != primary_wf_id:
+            workflow_ids_to_check.append(actual_wf_id)
 
         # Find continuations (cont-1, cont-2, etc.)
         for cont_num in range(1, 20):

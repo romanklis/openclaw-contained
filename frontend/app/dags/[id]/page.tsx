@@ -648,30 +648,82 @@ export default function DAGDetailPage() {
                                     const resp = td.response || {}
                                     const toolCalls = resp.tool_calls || []
                                     const usage = resp.usage || {}
+                                    const req = td.request || {}
                                     return (
-                                      <div key={idx} className="bg-gray-950 rounded p-2 text-[11px]">
-                                        <div className="flex items-center justify-between text-gray-500 mb-1">
-                                          <div className="flex items-center gap-2">
-                                            <span className="font-bold text-indigo-400">Turn {turn.turn_number || idx + 1}</span>
-                                            <span>{td.provider || 'unknown'}</span>
+                                      <details key={idx} className="bg-gray-950 rounded text-[11px]">
+                                        <summary className="p-2 cursor-pointer hover:bg-gray-900/50">
+                                          <div className="flex items-center justify-between text-gray-500">
+                                            <div className="flex items-center gap-2">
+                                              <span className="font-bold text-indigo-400">Turn {turn.turn_number || idx + 1}</span>
+                                              <span>{td.provider || 'unknown'}</span>
+                                              <span className="text-gray-600">{resp.finish_reason || ''}</span>
+                                            </div>
+                                            <div className="flex gap-3">
+                                              {usage.prompt_tokens && (
+                                                <span className="text-indigo-400/70">{usage.prompt_tokens.toLocaleString()} in</span>
+                                              )}
+                                              {usage.completion_tokens && (
+                                                <span className="text-emerald-400/70">{usage.completion_tokens.toLocaleString()} out</span>
+                                              )}
+                                              {td.timestamp && (
+                                                <span className="text-gray-600">{new Date(td.timestamp).toLocaleTimeString()}</span>
+                                              )}
+                                            </div>
                                           </div>
-                                          <div className="flex gap-2">
-                                            {usage.total_tokens && <span>{usage.total_tokens.toLocaleString()} tokens</span>}
-                                          </div>
+                                          {toolCalls.length > 0 && (
+                                            <div className="flex flex-wrap gap-1 mt-1.5">
+                                              {toolCalls.map((tc: any, tci: number) => (
+                                                <span key={tci} className="font-mono bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded">
+                                                  {tc.name}
+                                                  {tc.arguments?.path && (
+                                                    <span className="text-gray-500 ml-1">{tc.arguments.path.split('/').pop()}</span>
+                                                  )}
+                                                  {tc.arguments?.command && (
+                                                    <span className="text-gray-500 ml-1">{String(tc.arguments.command).slice(0, 40)}</span>
+                                                  )}
+                                                </span>
+                                              ))}
+                                            </div>
+                                          )}
+                                        </summary>
+                                        <div className="border-t border-gray-800 p-2 space-y-2">
+                                          {/* Request info */}
+                                          {req.msg_count && (
+                                            <div className="text-gray-600">
+                                              Request: {req.msg_count} messages ({(req.roles || []).join(', ')})
+                                            </div>
+                                          )}
+                                          {/* Tool call details */}
+                                          {toolCalls.map((tc: any, tci: number) => (
+                                            <div key={tci} className="border border-gray-800 rounded p-2">
+                                              <div className="flex items-center gap-2 mb-1">
+                                                <span className="font-mono font-bold text-indigo-400">{tc.name}</span>
+                                                {tc.arguments?.path && (
+                                                  <span className="font-mono text-gray-400">{tc.arguments.path}</span>
+                                                )}
+                                              </div>
+                                              {tc.arguments?.content && (
+                                                <pre className="text-gray-400 mt-1 whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-gray-900 rounded p-1.5 text-[10px] leading-relaxed">
+                                                  {typeof tc.arguments.content === 'string'
+                                                    ? tc.arguments.content.replace(/\.\.\. \(\d+ chars\)$/, '')
+                                                    : JSON.stringify(tc.arguments.content, null, 2)}
+                                                </pre>
+                                              )}
+                                              {tc.arguments?.command && (
+                                                <pre className="text-amber-300/80 mt-1 whitespace-pre-wrap break-words bg-gray-900 rounded p-1.5 text-[10px]">
+                                                  $ {tc.arguments.command}
+                                                </pre>
+                                              )}
+                                            </div>
+                                          ))}
+                                          {/* Text response (no tool calls) */}
+                                          {resp.content && toolCalls.length === 0 && (
+                                            <pre className="text-gray-400 whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-gray-900 rounded p-1.5 text-[10px] leading-relaxed">
+                                              {resp.content}
+                                            </pre>
+                                          )}
                                         </div>
-                                        {toolCalls.length > 0 && (
-                                          <div className="flex flex-wrap gap-1 mt-1">
-                                            {toolCalls.map((tc: any, tci: number) => (
-                                              <span key={tci} className="font-mono bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded">
-                                                {tc.name}
-                                              </span>
-                                            ))}
-                                          </div>
-                                        )}
-                                        {resp.content && toolCalls.length === 0 && (
-                                          <div className="text-gray-400 mt-1 line-clamp-2">{resp.content.slice(0, 200)}</div>
-                                        )}
-                                      </div>
+                                      </details>
                                     )
                                   })}
                                 </div>
