@@ -314,10 +314,16 @@ class Skill(Base):
     description = Column(Text)
     version = Column(Integer, default=1)
 
+    # Full SKILL.md content — install instructions, usage, setup steps
+    instructions = Column(Text, default="")
+
     # Schema definitions
     input_schema = Column(JSON, default=dict)   # required inputs {key: type_description}
     output_artifacts = Column(JSON, default=list)  # expected output file paths/patterns
     steps = Column(JSON, default=list)  # ordered list of sub-steps
+
+    # ClawHub source metadata
+    source_url = Column(String, default="")  # e.g. clawhub.ai slug
 
     # Searchability
     tags = Column(JSON, default=list)  # list of string tags

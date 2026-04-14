@@ -709,6 +709,34 @@ async def start_agent_container(
         if not workspace_id:
             workspace_id = f"workspace-{task_id}"
 
+        # --- skill instructions discovery ---
+        # If this task is a DAG node with a skill_id, fetch the skill's
+        # instructions (SKILL.md content) so the agent knows setup steps.
+        skill_instructions = ""
+        if dag_id and node_id:
+            try:
+                import httpx as _httpx_skill
+                _cp_skill = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+                async with _httpx_skill.AsyncClient(timeout=10.0) as _hc_skill:
+                    _dag_resp = await _hc_skill.get(f"{_cp_skill}/api/dags/{dag_id}")
+                    if _dag_resp.status_code == 200:
+                        _dag_data = _dag_resp.json()
+                        for _n in _dag_data.get("nodes", []):
+                            if _n.get("node_id") == node_id and _n.get("skill_id"):
+                                _skill_resp = await _hc_skill.get(
+                                    f"{_cp_skill}/api/skills/{_n['skill_id']}"
+                                )
+                                if _skill_resp.status_code == 200:
+                                    skill_instructions = _skill_resp.json().get("instructions", "") or ""
+                                    if skill_instructions:
+                                        logger.info(
+                                            f"📚 Skill instructions loaded for {node_id} "
+                                            f"(skill: {_n['skill_id']}, {len(skill_instructions)} chars)"
+                                        )
+                                break
+            except Exception as _skill_err:
+                logger.warning(f"⚠️ Could not fetch skill instructions: {_skill_err}")
+
         # --- pre-installed packages discovery ---
         # Query approved capability requests so the agent knows what's
         # already baked into its image and doesn't re-request them.
@@ -815,6 +843,7 @@ async def start_agent_container(
             "PRE_INSTALLED_PACKAGES": pre_installed_packages[:1000],
             "ZEP_URL": zep_url_for_agent,
             "ZEP_SESSION_ID": zep_session_id,
+            "SKILL_INSTRUCTIONS": skill_instructions[:8000],
         }
 
 

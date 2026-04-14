@@ -876,6 +876,18 @@ def main():
         write_result({"completed": False, "error": "No description in task and no TASK_DESCRIPTION env"})
         sys.exit(1)
 
+    # Prepend skill instructions if available (from ClawHub SKILL.md)
+    skill_instructions = os.getenv("SKILL_INSTRUCTIONS", "").strip()
+    if skill_instructions:
+        print(f"\n📚 Skill instructions loaded ({len(skill_instructions)} chars)")
+        prompt = (
+            f"=== SKILL INSTRUCTIONS ===\n"
+            f"Follow these setup and usage instructions for this task:\n\n"
+            f"{skill_instructions}\n\n"
+            f"=== TASK ===\n"
+            f"{prompt}"
+        )
+
     # Handle continuation / follow-up
     follow_up = os.getenv("FOLLOW_UP", "").strip()
     if follow_up:

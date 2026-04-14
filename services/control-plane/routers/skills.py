@@ -1,7 +1,7 @@
 """
 Skill Registry — CRUD for reusable skill templates.
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
@@ -9,6 +9,10 @@ from models import Skill
 from schemas import SkillCreate, SkillUpdate, SkillResponse
 import uuid
 import logging
+import zipfile
+import io
+import re
+from sqlalchemy import update as sa_update
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -30,10 +34,12 @@ async def create_skill(data: SkillCreate, db: AsyncSession = Depends(get_db)):
         id=_gen_skill_id(),
         name=data.name,
         description=data.description,
+        instructions=data.instructions or "",
         input_schema=data.input_schema,
         output_artifacts=data.output_artifacts,
         steps=[s.model_dump() for s in data.steps],
         tags=data.tags,
+        source_url=data.source_url or "",
     )
     db.add(skill)
     await db.commit()
@@ -79,6 +85,8 @@ async def update_skill(skill_id: str, data: SkillUpdate, db: AsyncSession = Depe
 
     if data.description is not None:
         skill.description = data.description
+    if data.instructions is not None:
+        skill.instructions = data.instructions
     if data.input_schema is not None:
         skill.input_schema = data.input_schema
     if data.output_artifacts is not None:
@@ -87,6 +95,8 @@ async def update_skill(skill_id: str, data: SkillUpdate, db: AsyncSession = Depe
         skill.steps = [s.model_dump() for s in data.steps]
     if data.tags is not None:
         skill.tags = data.tags
+    if data.source_url is not None:
+        skill.source_url = data.source_url
 
     skill.version = (skill.version or 1) + 1
     await db.commit()
@@ -96,11 +106,16 @@ async def update_skill(skill_id: str, data: SkillUpdate, db: AsyncSession = Depe
 
 @router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_skill(skill_id: str, db: AsyncSession = Depends(get_db)):
-    """Delete a skill."""
+    """Delete a skill. Nullifies any DAG node references first."""
     result = await db.execute(select(Skill).where(Skill.id == skill_id))
     skill = result.scalar_one_or_none()
     if not skill:
         raise HTTPException(status_code=404, detail=f"Skill {skill_id} not found")
+    # Nullify FK references in dag_nodes so delete doesn't violate constraint
+    from models import DAGNode
+    await db.execute(
+        sa_update(DAGNode).where(DAGNode.skill_id == skill_id).values(skill_id=None)
+    )
     await db.delete(skill)
     await db.commit()
 
@@ -205,3 +220,106 @@ async def seed_skills(db: AsyncSession = Depends(get_db)):
 
     await db.commit()
     return {"created": created, "skipped": skipped}
+
+
+def _parse_skill_md(content: str) -> dict:
+    """Parse a SKILL.md file to extract name, description from YAML frontmatter and body."""
+    result = {"name": "", "description": "", "instructions": content}
+
+    # Try YAML frontmatter (--- ... ---)
+    fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+    if fm_match:
+        frontmatter = fm_match.group(1)
+        for line in frontmatter.split('\n'):
+            line = line.strip()
+            if line.startswith('name:'):
+                result["name"] = line[5:].strip().strip('"').strip("'")
+            elif line.startswith('description:'):
+                result["description"] = line[12:].strip().strip('"').strip("'")
+
+    # Fallback: extract name from first H1 heading
+    if not result["name"]:
+        h1_match = re.search(r'^#\s+(.+)$', content, re.MULTILINE)
+        if h1_match:
+            result["name"] = h1_match.group(1).strip()
+
+    # Fallback: extract description from first paragraph after H1
+    if not result["description"]:
+        desc_match = re.search(r'^#\s+.+\n+(.+)$', content, re.MULTILINE)
+        if desc_match:
+            result["description"] = desc_match.group(1).strip()[:500]
+
+    return result
+
+
+@router.post("/import", response_model=SkillResponse, status_code=status.HTTP_201_CREATED)
+async def import_skill_zip(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Import a skill from a ClawHub zip file.
+
+    Extracts SKILL.md, parses name/description from frontmatter,
+    stores the full content as instructions.
+    """
+    if not file.filename or not file.filename.endswith('.zip'):
+        raise HTTPException(status_code=400, detail="File must be a .zip archive")
+
+    # Read and validate zip
+    zip_bytes = await file.read()
+    if len(zip_bytes) > 50 * 1024 * 1024:  # 50MB limit (matches ClawHub)
+        raise HTTPException(status_code=400, detail="File too large (max 50MB)")
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid zip file")
+
+    # Find SKILL.md (may be at root or in a subdirectory)
+    skill_md_path = None
+    for name in zf.namelist():
+        if name.endswith('SKILL.md') and not name.startswith('__MACOSX'):
+            skill_md_path = name
+            break
+
+    if not skill_md_path:
+        raise HTTPException(status_code=400, detail="No SKILL.md found in zip")
+
+    skill_content = zf.read(skill_md_path).decode('utf-8', errors='replace')
+    parsed = _parse_skill_md(skill_content)
+
+    if not parsed["name"]:
+        # Use filename as fallback
+        parsed["name"] = file.filename.replace('.zip', '').strip()
+
+    if not parsed["name"]:
+        raise HTTPException(status_code=400, detail="Could not determine skill name from SKILL.md")
+
+    # Slugify the name for uniqueness check
+    slug = re.sub(r'[^a-z0-9-]', '-', parsed["name"].lower()).strip('-')
+    slug = re.sub(r'-+', '-', slug)
+
+    # Check if skill with this name already exists — update it
+    existing = await db.execute(select(Skill).where(Skill.name == slug))
+    existing_skill = existing.scalar_one_or_none()
+    if existing_skill:
+        existing_skill.description = parsed["description"]
+        existing_skill.instructions = parsed["instructions"]
+        existing_skill.version = (existing_skill.version or 1) + 1
+        await db.commit()
+        await db.refresh(existing_skill)
+        logger.info(f"Updated existing skill '{slug}' from zip import")
+        return existing_skill
+
+    skill = Skill(
+        id=_gen_skill_id(),
+        name=slug,
+        description=parsed["description"],
+        instructions=parsed["instructions"],
+        source_url=f"clawhub.ai/{slug}",
+    )
+    db.add(skill)
+    await db.commit()
+    await db.refresh(skill)
+    logger.info(f"Imported new skill '{slug}' from zip")
+    return skill

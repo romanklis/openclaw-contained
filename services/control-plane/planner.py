@@ -101,16 +101,25 @@ def _build_skills_section(skills: list[dict]) -> str:
         steps_str = " → ".join(
             f"{st.get('name', st.get('step_id', '?'))}" for st in s.get("steps", [])
         )
-        lines.append(
+        skill_block = (
             f"- **{s['name']}** (id: {s['id']}): {s.get('description', '')}\n"
             f"  Steps: {steps_str}\n"
             f"  Inputs: {json.dumps(s.get('input_schema', {}))}\n"
             f"  Outputs: {json.dumps(s.get('output_artifacts', []))}"
         )
+        # Include installation/setup instructions if available
+        instructions = s.get('instructions', '')
+        if instructions:
+            # Truncate very long instructions for the planner prompt
+            preview = instructions[:2000]
+            if len(instructions) > 2000:
+                preview += "\n  ... (truncated)"
+            skill_block += f"\n  Instructions: {preview}"
+        lines.append(skill_block)
     return "\n".join(lines)
 
 
-async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None) -> dict:
+async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None, skill_ids: list[str] | None = None) -> dict:
     """Generate a DAG plan from a user objective using the LLM router.
 
     Args:
@@ -118,6 +127,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
         llm_model: The LLM model to use for planning.
         db: Database session for fetching skills.
         base_image: Override base_image for all nodes (e.g. "zeroclaw").
+        skill_ids: If provided, only use these skills (user-selected).
 
     Returns:
         Validated DAG JSON dict with 'nodes' and 'edges'.
@@ -125,14 +135,18 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
     Raises:
         ValueError: If the LLM produces invalid output after retries.
     """
-    # Fetch all skills
-    result = await db.execute(select(Skill))
+    # Fetch skills — either user-selected or all
+    if skill_ids:
+        result = await db.execute(select(Skill).where(Skill.id.in_(skill_ids)))
+    else:
+        result = await db.execute(select(Skill))
     skills = result.scalars().all()
     skills_data = [
         {
             "id": s.id,
             "name": s.name,
             "description": s.description,
+            "instructions": s.instructions or "",
             "steps": s.steps or [],
             "input_schema": s.input_schema or {},
             "output_artifacts": s.output_artifacts or [],

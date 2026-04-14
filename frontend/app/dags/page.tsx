@@ -17,6 +17,12 @@ interface DAG {
   completed_at: string | null
 }
 
+interface Skill {
+  id: string
+  name: string
+  description: string | null
+}
+
 export default function DAGsPage() {
   const [dags, setDags] = useState<DAG[]>([])
   const [loading, setLoading] = useState(false)
@@ -25,6 +31,8 @@ export default function DAGsPage() {
   const [objective, setObjective] = useState('')
   const [llmModel, setLlmModel] = useState('gemma3:4b')
   const [autoStart, setAutoStart] = useState(false)
+  const [skills, setSkills] = useState<Skill[]>([])
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([])
 
   const fetchDags = async () => {
     try {
@@ -36,7 +44,17 @@ export default function DAGsPage() {
     }
   }
 
-  useEffect(() => { fetchDags() }, [])
+  const fetchSkills = async () => {
+    try {
+      const res = await fetch(`${API}/api/skills`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setSkills(await res.json())
+    } catch (err: any) {
+      console.error('Failed to fetch skills:', err)
+    }
+  }
+
+  useEffect(() => { fetchDags(); fetchSkills() }, [])
 
   const createDag = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -46,13 +64,19 @@ export default function DAGsPage() {
       const res = await fetch(`${API}/api/dags`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ objective, llm_model: llmModel, auto_start: autoStart }),
+        body: JSON.stringify({
+          objective,
+          llm_model: llmModel,
+          auto_start: autoStart,
+          skill_ids: selectedSkillIds.length > 0 ? selectedSkillIds : null,
+        }),
       })
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}))
         throw new Error(detail.detail || `HTTP ${res.status}`)
       }
       setObjective('')
+      setSelectedSkillIds([])
       setShowForm(false)
       fetchDags()
     } catch (err: any) {
@@ -115,6 +139,38 @@ export default function DAGsPage() {
               </label>
             </div>
           </div>
+          {skills.length > 0 && (
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">
+                Skills <span className="text-gray-600">(optional — select which skills the planner can use)</span>
+              </label>
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-2 max-h-48 overflow-y-auto bg-gray-800/50 border border-gray-700 rounded p-2">
+                {skills.map((skill) => (
+                  <label key={skill.id} className={`flex items-start gap-2 p-2 rounded cursor-pointer hover:bg-gray-700/50 text-sm ${selectedSkillIds.includes(skill.id) ? 'bg-blue-500/10 border border-blue-500/30' : 'border border-transparent'}`}>
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={selectedSkillIds.includes(skill.id)}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedSkillIds([...selectedSkillIds, skill.id])
+                        } else {
+                          setSelectedSkillIds(selectedSkillIds.filter(id => id !== skill.id))
+                        }
+                      }}
+                    />
+                    <div>
+                      <div className="font-medium text-gray-200">{skill.name}</div>
+                      {skill.description && <div className="text-xs text-gray-500 line-clamp-1">{skill.description}</div>}
+                    </div>
+                  </label>
+                ))}
+              </div>
+              {selectedSkillIds.length > 0 && (
+                <div className="text-xs text-blue-400 mt-1">{selectedSkillIds.length} skill(s) selected</div>
+              )}
+            </div>
+          )}
           <button type="submit" disabled={loading} className="btn-success text-sm">
             {loading ? 'Planning...' : 'Create DAG'}
           </button>

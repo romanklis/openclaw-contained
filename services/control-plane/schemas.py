@@ -381,30 +381,36 @@ class SkillCreate(BaseModel):
     """Create a reusable skill template."""
     name: str
     description: Optional[str] = None
+    instructions: Optional[str] = None  # full SKILL.md content
     input_schema: Dict[str, str] = {}  # {key: type_description}
     output_artifacts: List[str] = []  # expected output file paths
     steps: List[SkillStepCreate] = []
     tags: List[str] = []
+    source_url: Optional[str] = None  # clawhub.ai source URL
 
 
 class SkillUpdate(BaseModel):
     """Update a skill (bumps version)."""
     description: Optional[str] = None
+    instructions: Optional[str] = None
     input_schema: Optional[Dict[str, str]] = None
     output_artifacts: Optional[List[str]] = None
     steps: Optional[List[SkillStepCreate]] = None
     tags: Optional[List[str]] = None
+    source_url: Optional[str] = None
 
 
 class SkillResponse(BaseModel):
     id: str
     name: str
     description: Optional[str]
+    instructions: Optional[str] = None
     version: int
     input_schema: Dict[str, Any]
     output_artifacts: List[str]
     steps: List[Dict[str, Any]]
     tags: List[str]
+    source_url: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime]
 
@@ -462,6 +468,7 @@ class DAGCreate(BaseModel):
     llm_model: Optional[str] = None
     base_image: Optional[str] = None
     auto_start: bool = False
+    skill_ids: Optional[List[str]] = None  # selected skills from registry
 
 
 class DAGRevise(BaseModel):
