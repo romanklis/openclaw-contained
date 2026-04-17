@@ -396,8 +396,8 @@ RUN set -e; \\
 {% endif %}
 
 {% if npm_packages %}
-{% if image_type == 'openclaw' %}
-# Install NPM packages globally (OpenClaw only)
+{% if image_type in ('openclaw', 'zeroclaw') %}
+# Install NPM packages globally
 USER root
 RUN npm install -g \\
 {% for pkg in npm_packages %}
@@ -1075,7 +1075,7 @@ async def build_deployment_image_task(
                         import shutil
                         # Copy all files from workspace to app dir
                         for item in ws_path.iterdir():
-                            if item.name in ("AGENTS.md", "SOUL.md", "result.json", ".openclaw"):
+                            if item.name in ("AGENTS.md", "SOUL.md", "result.json", ".openclaw", "input_prompt.md", "attached_context.md"):
                                 continue
                             dest = app_dir / item.name
                             if item.is_dir():

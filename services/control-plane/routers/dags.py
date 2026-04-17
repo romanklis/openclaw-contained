@@ -10,7 +10,8 @@ from schemas import (
     DAGCreate, DAGManualCreate, DAGResponse, DAGDetail, DAGNodeResponse, DAGRevise,
 )
 from dag_validator import validate_dag
-from planner import plan_dag, is_gemini_lite_model
+from planner import plan_dag
+from routers.openai_dag import MODEL_CONFIGS
 from temporal_client import start_dag_workflow
 import uuid
 import logging
@@ -18,6 +19,12 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# In-memory default model config (persists until container restart)
+_dag_model_defaults: dict[str, str] = {
+    "planning_model": "gemini-flash-lite-latest",
+    "agent_model": "gemini-flash-lite-latest",
+}
 
 
 def _gen_dag_id() -> str:
@@ -37,13 +44,19 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
     """Create a new DAG from an objective using the LLM Planner."""
     dag_id = _gen_dag_id()
     workspace_id = _gen_workspace_id(dag_id)
-    llm_model = data.llm_model or "gemini-flash-lite-latest"
 
-    if not is_gemini_lite_model(llm_model):
-        raise HTTPException(
-            status_code=422,
-            detail="Only gemini-lite class models are allowed for DAG execution",
-        )
+    # Resolve model config: llm_model can be a MODEL_CONFIGS key or a raw model name
+    cfg = MODEL_CONFIGS.get(data.llm_model or "")
+    if cfg:
+        planning_model = cfg["planning_model"]
+        agent_model = cfg["agent_model"]
+    elif data.llm_model:
+        planning_model = data.llm_model
+        agent_model = planning_model
+    else:
+        # Use stored defaults
+        planning_model = _dag_model_defaults["planning_model"]
+        agent_model = _dag_model_defaults["agent_model"]
 
     # Create DAG record in PLANNING state
     dag = MasterDAG(
@@ -52,14 +65,14 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
         status=DAGStatus.PLANNING,
         dag_json={},
         workspace_id=workspace_id,
-        llm_model=llm_model,
+        llm_model=agent_model,
     )
     db.add(dag)
     await db.commit()
 
     # Run the planner
     try:
-        dag_json = await plan_dag(data.objective, llm_model, db, base_image=data.base_image, skill_ids=data.skill_ids)
+        dag_json = await plan_dag(data.objective, planning_model, db, base_image=data.base_image, skill_ids=data.skill_ids, agent_model=agent_model)
     except ValueError as e:
         dag.status = DAGStatus.FAILED
         dag.dag_json = {"error": str(e)}
@@ -143,6 +156,41 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
     await db.commit()
     await db.refresh(dag)
     return _build_dag_detail(dag, nodes)
+
+
+@router.get("/models")
+async def list_dag_models():
+    """List available model configurations for DAG planning + execution."""
+    return [
+        {
+            "id": model_id,
+            "name": cfg["name"],
+            "description": cfg.get("description", ""),
+            "planning_model": cfg["planning_model"],
+            "agent_model": cfg["agent_model"],
+        }
+        for model_id, cfg in MODEL_CONFIGS.items()
+    ]
+
+
+@router.get("/model-defaults")
+async def get_model_defaults():
+    """Return the current default planning + agent model."""
+    return dict(_dag_model_defaults)
+
+
+@router.post("/model-defaults")
+async def set_model_defaults(body: dict):
+    """Update the default planning and/or agent model."""
+    changed = []
+    if "planning_model" in body and body["planning_model"]:
+        _dag_model_defaults["planning_model"] = body["planning_model"]
+        changed.append(f"planning_model={body['planning_model']}")
+    if "agent_model" in body and body["agent_model"]:
+        _dag_model_defaults["agent_model"] = body["agent_model"]
+        changed.append(f"agent_model={body['agent_model']}")
+    logger.info(f"DAG model defaults updated: {', '.join(changed)}")
+    return dict(_dag_model_defaults)
 
 
 @router.get("", response_model=list[DAGResponse])

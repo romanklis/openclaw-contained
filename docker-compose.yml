@@ -289,16 +289,22 @@ services:
     image: ghcr.io/open-webui/open-webui:v0.6.5
     container_name: openclaw-open-webui
     environment:
-      # Point Open WebUI exclusively at our gateway (disable Ollama direct access)
-      - OPENAI_API_BASE_URL=http://api-gateway:8080/v1
-      - OPENAI_API_BASE_URLS=http://api-gateway:8080/v1
-      - OPENAI_API_KEY=sk-openclaw-gateway
+      # Point Open WebUI at the DAG orchestrator endpoint
+      - OPENAI_API_BASE_URL=http://control-plane:8000/api/dag-ui/v1
+      - OPENAI_API_BASE_URLS=http://control-plane:8000/api/dag-ui/v1
+      - OPENAI_API_KEY=sk-openclaw-dag
       - OLLAMA_BASE_URL=
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-open-webui-secret}
       - WEBUI_NAME=OpenClaw Chat
-      - DEFAULT_MODELS=taskforge-iterator
+      - DEFAULT_MODELS=taskforge-dag
       - ENABLE_COMMUNITY_SHARING=false
       - ENABLE_MESSAGE_RATING=false
+      # Send full document content instead of RAG chunks
+      - RAG_FULL_CONTEXT=true
+      # Inject RAG context into system message (we parse it server-side)
+      - RAG_SYSTEM_CONTEXT=true
+      # Disable auxiliary requests that create spurious DAGs
+      - ENABLE_RETRIEVAL_QUERY_GENERATION=false
     depends_on:
       api-gateway:
         condition: service_healthy

@@ -29,10 +29,10 @@ export default function DAGsPage() {
   const [error, setError] = useState<string | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [objective, setObjective] = useState('')
-  const [llmModel, setLlmModel] = useState('gemma3:4b')
   const [autoStart, setAutoStart] = useState(false)
   const [skills, setSkills] = useState<Skill[]>([])
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([])
+  const [modelDefaults, setModelDefaults] = useState<{planning_model: string, agent_model: string} | null>(null)
 
   const fetchDags = async () => {
     try {
@@ -54,7 +54,17 @@ export default function DAGsPage() {
     }
   }
 
-  useEffect(() => { fetchDags(); fetchSkills() }, [])
+  const fetchModelDefaults = async () => {
+    try {
+      const res = await fetch(`${API}/api/dags/model-defaults`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setModelDefaults(await res.json())
+    } catch (err: any) {
+      console.error('Failed to fetch model defaults:', err)
+    }
+  }
+
+  useEffect(() => { fetchDags(); fetchSkills(); fetchModelDefaults() }, [])
 
   const createDag = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -66,7 +76,6 @@ export default function DAGsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           objective,
-          llm_model: llmModel,
           auto_start: autoStart,
           skill_ids: selectedSkillIds.length > 0 ? selectedSkillIds : null,
         }),
@@ -125,12 +134,17 @@ export default function DAGsPage() {
           </div>
           <div className="flex gap-4">
             <div className="flex-1">
-              <label className="block text-sm text-gray-400 mb-1">LLM Model</label>
-              <input
-                value={llmModel}
-                onChange={(e) => setLlmModel(e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm"
-              />
+              <label className="block text-sm text-gray-400 mb-1">LLM Models</label>
+              {modelDefaults ? (
+                <div className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300">
+                  <span className="text-gray-500">Planning:</span> <span className="font-mono">{modelDefaults.planning_model}</span>
+                  <span className="mx-2 text-gray-600">|</span>
+                  <span className="text-gray-500">Agents:</span> <span className="font-mono">{modelDefaults.agent_model}</span>
+                  <span className="ml-2 text-xs text-gray-600">(change in <a href="/llm-providers" className="text-indigo-400 hover:text-indigo-300">LLM Router</a>)</span>
+                </div>
+              ) : (
+                <div className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-500">Loading defaults…</div>
+              )}
             </div>
             <div className="flex items-end">
               <label className="flex items-center gap-2 text-sm text-gray-400">

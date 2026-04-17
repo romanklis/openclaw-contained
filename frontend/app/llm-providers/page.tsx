@@ -61,6 +61,12 @@ export default function LLMProvidersPage() {
   const [savingConfig, setSavingConfig] = useState(false)
   const [configMsg, setConfigMsg] = useState<string | null>(null)
 
+  // DAG model defaults
+  const [dagPlanningModel, setDagPlanningModel] = useState('')
+  const [dagAgentModel, setDagAgentModel] = useState('')
+  const [savingDagDefaults, setSavingDagDefaults] = useState(false)
+  const [dagDefaultsMsg, setDagDefaultsMsg] = useState<string | null>(null)
+
   // API URL imported at top-level
 
   // ─── Fetch config ──────────────────────────────────────────────
@@ -81,6 +87,40 @@ export default function LLMProvidersPage() {
       })
     } catch { /* ignore */ }
   }, [])
+
+  const fetchDagModelDefaults = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/dags/model-defaults`)
+      if (!res.ok) return
+      const data = await res.json()
+      setDagPlanningModel(data.planning_model ?? '')
+      setDagAgentModel(data.agent_model ?? '')
+    } catch { /* ignore */ }
+  }, [])
+
+  const saveDagModelDefaults = async () => {
+    setSavingDagDefaults(true)
+    setDagDefaultsMsg(null)
+    try {
+      const res = await fetch(`${API}/api/dags/model-defaults`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          planning_model: dagPlanningModel,
+          agent_model: dagAgentModel,
+        }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      setDagPlanningModel(data.planning_model)
+      setDagAgentModel(data.agent_model)
+      setDagDefaultsMsg(`✓ Defaults saved — planning: ${data.planning_model}, agents: ${data.agent_model}`)
+    } catch (err) {
+      setDagDefaultsMsg(`✗ ${err instanceof Error ? err.message : 'Failed'}`)
+    } finally {
+      setSavingDagDefaults(false)
+    }
+  }
 
   const saveConfig = async (field: string, value: string) => {
     setSavingConfig(true)
@@ -132,9 +172,10 @@ export default function LLMProvidersPage() {
   useEffect(() => {
     fetchAll()
     fetchConfig()
+    fetchDagModelDefaults()
     const interval = setInterval(fetchAll, 15000)
     return () => clearInterval(interval)
-  }, [fetchAll, fetchConfig])
+  }, [fetchAll, fetchConfig, fetchDagModelDefaults])
 
   // ─── Send message ──────────────────────────────────────────────
 
@@ -397,6 +438,67 @@ export default function LLMProvidersPage() {
             </p>
           </div>
         )}
+      </section>
+
+      {/* ─── DAG Model Defaults ──────────────────────────────── */}
+      <section className="mb-8">
+        <h2 className="section-title">DAG Model Defaults</h2>
+        <p className="text-xs text-gray-500 mb-3">
+          Choose which LLM is used for DAG planning (decomposing objectives) and which runs inside each agent container.
+        </p>
+        <div className="card p-5 space-y-4">
+          {dagDefaultsMsg && (
+            <div className={`p-3 rounded-lg text-sm ${
+              dagDefaultsMsg.startsWith('✓')
+                ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
+                : 'bg-red-500/10 border border-red-500/20 text-red-400'
+            }`}>
+              {dagDefaultsMsg}
+            </div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">📋 Planning Model</label>
+              <select
+                value={dagPlanningModel}
+                onChange={(e) => setDagPlanningModel(e.target.value)}
+                className="input-field w-full text-sm"
+              >
+                {allModels.map((m) => (
+                  <option key={`plan-${m.provider}-${m.id}`} value={m.id}>{m.id}</option>
+                ))}
+                {dagPlanningModel && !allModels.find(m => m.id === dagPlanningModel) && (
+                  <option value={dagPlanningModel}>{dagPlanningModel}</option>
+                )}
+              </select>
+              <p className="text-xs text-gray-600 mt-1">Decomposes objectives into DAG task graphs</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">🤖 Agent Model</label>
+              <select
+                value={dagAgentModel}
+                onChange={(e) => setDagAgentModel(e.target.value)}
+                className="input-field w-full text-sm"
+              >
+                {allModels.map((m) => (
+                  <option key={`agent-${m.provider}-${m.id}`} value={m.id}>{m.id}</option>
+                ))}
+                {dagAgentModel && !allModels.find(m => m.id === dagAgentModel) && (
+                  <option value={dagAgentModel}>{dagAgentModel}</option>
+                )}
+              </select>
+              <p className="text-xs text-gray-600 mt-1">Runs inside each agent container for task execution</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={saveDagModelDefaults} disabled={savingDagDefaults} className="btn-primary text-sm">
+              {savingDagDefaults ? 'Saving…' : 'Save Defaults'}
+            </button>
+            <span className="text-xs text-gray-600">
+              Current: <span className="font-mono text-gray-400">{dagPlanningModel}</span> / <span className="font-mono text-gray-400">{dagAgentModel}</span>
+            </span>
+          </div>
+        </div>
       </section>
 
       {/* ─── All Models ──────────────────────────────────────── */}

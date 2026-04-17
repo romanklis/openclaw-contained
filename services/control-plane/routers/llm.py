@@ -313,7 +313,7 @@ def detect_provider(model: str) -> str:
     """Detect which provider to use based on model name."""
     model_lower = model.lower()
 
-    if model_lower.startswith("gemini"):
+    if model_lower.startswith("gemini") or model_lower.startswith("gemma"):
         return "gemini"
     if model_lower.startswith("claude"):
         return "anthropic"
@@ -1386,20 +1386,77 @@ async def get_llm_providers():
         "name": "ollama", "type": "ollama", "url": ollama_url,
         "available": len(ollama_models) > 0, "models": ollama_models,
     })
+
+    # Google (Gemini + Gemma) — fetch dynamically
+    gemini_key = _gemini_key()
+    google_models: list[str] = []
+    if gemini_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": gemini_key},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("models", []):
+                        model_id = m.get("name", "").removeprefix("models/")
+                        if model_id and any(model_id.startswith(p) for p in ("gemini-", "gemma-")):
+                            google_models.append(model_id)
+        except Exception as e:
+            logger.warning(f"Failed to fetch Google models for providers: {e}")
     providers.append({
         "name": "gemini", "type": "gemini",
-        "available": bool(_gemini_key()),
-        "models": ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"],
+        "available": bool(gemini_key),
+        "models": google_models,
     })
+
+    # Anthropic — fetch dynamically
+    anthropic_key = _anthropic_key()
+    anthropic_models: list[str] = []
+    if anthropic_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={
+                        "x-api-key": anthropic_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        mid = m.get("id", "")
+                        if mid:
+                            anthropic_models.append(mid)
+        except Exception as e:
+            logger.warning(f"Failed to fetch Anthropic models for providers: {e}")
     providers.append({
         "name": "anthropic", "type": "anthropic",
-        "available": bool(_anthropic_key()),
-        "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-haiku-20241022"],
+        "available": bool(anthropic_key),
+        "models": anthropic_models,
     })
+
+    # OpenAI — fetch dynamically
+    openai_key = _openai_key()
+    openai_models: list[str] = []
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        mid = m.get("id", "")
+                        if mid and any(mid.startswith(p) for p in ("gpt-", "o1-", "o3-", "o4-")):
+                            openai_models.append(mid)
+        except Exception as e:
+            logger.warning(f"Failed to fetch OpenAI models for providers: {e}")
     providers.append({
         "name": "openai", "type": "openai",
-        "available": bool(_openai_key()),
-        "models": ["gpt-4o", "gpt-4o-mini", "o1-preview"],
+        "available": bool(openai_key),
+        "models": openai_models,
     })
 
     default = "ollama"
@@ -1426,15 +1483,66 @@ async def list_all_models():
     except Exception:
         pass
 
-    if _gemini_key():
-        for m in ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"]:
-            all_models.append({"id": m, "provider": "gemini"})
-    if _anthropic_key():
-        for m in ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-haiku-20241022"]:
-            all_models.append({"id": m, "provider": "anthropic"})
-    if _openai_key():
-        for m in ["gpt-4o", "gpt-4o-mini", "o1-preview"]:
-            all_models.append({"id": m, "provider": "openai"})
+    # Google (Gemini + Gemma) — fetch dynamically from the API
+    gemini_key = _gemini_key()
+    if gemini_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": gemini_key},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("models", []):
+                        # name is like "models/gemini-2.0-flash"
+                        model_id = m.get("name", "").removeprefix("models/")
+                        if model_id and any(model_id.startswith(p) for p in ("gemini-", "gemma-")):
+                            all_models.append({"id": model_id, "provider": "gemini"})
+                else:
+                    logger.warning(f"Google models API returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch Google models: {e}")
+
+    # Anthropic — fetch from API
+    anthropic_key = _anthropic_key()
+    if anthropic_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={
+                        "x-api-key": anthropic_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        model_id = m.get("id", "")
+                        if model_id:
+                            all_models.append({"id": model_id, "provider": "anthropic"})
+                else:
+                    logger.warning(f"Anthropic models API returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch Anthropic models: {e}")
+
+    # OpenAI — fetch from API
+    openai_key = _openai_key()
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        model_id = m.get("id", "")
+                        if model_id and any(model_id.startswith(p) for p in ("gpt-", "o1-", "o3-", "o4-")):
+                            all_models.append({"id": model_id, "provider": "openai"})
+                else:
+                    logger.warning(f"OpenAI models API returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch OpenAI models: {e}")
 
     return {"models": all_models}
 

@@ -8,6 +8,7 @@ import logging
 from sqlalchemy import text
 
 from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom, supply_chain, skills, environments, dags
+from routers import openai_dag
 from database import engine, Base, async_session
 from config import settings
 
@@ -87,6 +88,7 @@ app.include_router(supply_chain.router)
 app.include_router(skills.router, prefix="/api/skills", tags=["skills"])
 app.include_router(environments.router, prefix="/api/environments", tags=["environments"])
 app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
+app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
 
 
 @app.get("/health")

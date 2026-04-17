@@ -27,7 +27,12 @@ def is_gemini_lite_model(model: str) -> bool:
 
 
 def enforce_gemini_lite_execution_model(dag_json: dict, execution_model: str) -> dict:
-    """Normalize all DAG node execution models to the provided gemini-lite model."""
+    """Normalize all DAG node execution models to the provided model."""
+    return set_node_execution_model(dag_json, execution_model)
+
+
+def set_node_execution_model(dag_json: dict, execution_model: str) -> dict:
+    """Set the LLM model on every DAG node config."""
     for node in dag_json.get("nodes", []):
         config = node.get("config") or {}
         config["llm_model"] = execution_model
@@ -119,15 +124,17 @@ def _build_skills_section(skills: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None, skill_ids: list[str] | None = None) -> dict:
+async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None, skill_ids: list[str] | None = None, agent_model: str | None = None) -> dict:
     """Generate a DAG plan from a user objective using the LLM router.
 
     Args:
         objective: The user's goal/objective.
-        llm_model: The LLM model to use for planning.
+        llm_model: The LLM model to use for planning (the planner LLM).
         db: Database session for fetching skills.
         base_image: Override base_image for all nodes (e.g. "zeroclaw").
         skill_ids: If provided, only use these skills (user-selected).
+        agent_model: The LLM model to set on DAG node configs for agent execution.
+                     If None, defaults to llm_model (backward compat).
 
     Returns:
         Validated DAG JSON dict with 'nodes' and 'edges'.
@@ -135,6 +142,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
     Raises:
         ValueError: If the LLM produces invalid output after retries.
     """
+    agent_model = agent_model or llm_model
     # Fetch skills — either user-selected or all
     if skill_ids:
         result = await db.execute(select(Skill).where(Skill.id.in_(skill_ids)))
@@ -223,7 +231,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
                 logger.warning(f"Planner attempt {attempt}/{max_attempts}: {last_error}")
                 continue
 
-            dag_json = enforce_gemini_lite_execution_model(dag_json, llm_model)
+            dag_json = set_node_execution_model(dag_json, agent_model)
 
             # Override base_image on all nodes if the caller specified one
             if base_image:

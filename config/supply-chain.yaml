@@ -195,31 +195,28 @@ openclaw:
     - jq
     - zip
     - unzip
+    # Chrome/browser shared libraries
+    - libglib2.0-0
+    - libnss3
+    - libnspr4
+    - libatk1.0-0
+    - libatk-bridge2.0-0
+    - libcups2
+    - libdrm2
+    - libxkbcommon0
+    - libatspi2.0-0
+    - libxcomposite1
+    - libxdamage1
+    - libxfixes3
+    - libxrandr2
+    - libgbm1
+    - libpango-1.0-0
+    - libcairo2
+    - libasound2
+    - libxshmfence1
+    - fonts-noto-color-emoji
 
-  npm:
-    - express
-    - typescript
-    - ts-node
-    - prettier
-    - eslint
-    - webpack
-    - vite
-    - tailwindcss
-    - postcss
-    - autoprefixer
-    # Frontend frameworks
-    - react
-    - react-dom
-    # Mapping / geospatial
-    - leaflet
-    - react-leaflet
-    - georaster
-    - georaster-layer-for-leaflet
-    # Charts
-    - recharts
-
-# ---------------------------------------------------------------------------
-# nanobot — Lightweight Alpine + Python
+  npm: — Lightweight Alpine + Python
 # ---------------------------------------------------------------------------
 nanobot:
   notes: >
@@ -428,6 +425,26 @@ zeroclaw:
     - jq
     - zip
     - unzip
+    # Chrome/browser shared libraries
+    - libglib2.0-0
+    - libnss3
+    - libnspr4
+    - libatk1.0-0
+    - libatk-bridge2.0-0
+    - libcups2
+    - libdrm2
+    - libxkbcommon0
+    - libatspi2.0-0
+    - libxcomposite1
+    - libxdamage1
+    - libxfixes3
+    - libxrandr2
+    - libgbm1
+    - libpango-1.0-0
+    - libcairo2
+    - libasound2
+    - libxshmfence1
+    - fonts-noto-color-emoji
 
   npm:
     - express
@@ -450,4 +467,8 @@ zeroclaw:
     - georaster-layer-for-leaflet
     # Charts
     - recharts
+    # Browser automation
+    - agent-browser
+    - puppeteer
+    - playwright
 

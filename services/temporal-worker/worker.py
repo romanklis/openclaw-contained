@@ -1469,6 +1469,38 @@ async def dismiss_pending_capabilities(task_id: str) -> Dict[str, Any]:
         return {"dismissed": 0, "error": str(e)}
 
 
+# Known npm packages / patterns for auto-detecting package type from generic tool_install
+_NPM_KNOWN_PACKAGES = {
+    "agent-browser", "express", "typescript", "ts-node", "prettier", "eslint",
+    "webpack", "vite", "tailwindcss", "postcss", "autoprefixer", "react",
+    "react-dom", "leaflet", "react-leaflet", "recharts", "puppeteer",
+    "playwright", "cypress",
+}
+_APT_PATTERNS = ("-dev", "lib", "build-essential", "cmake", "gcc", "g++",
+                 "make", "pkg-config", "libssl", "libcurl", "zlib")
+
+
+def _detect_package_type(cap_type: str, package_name: str) -> str:
+    """Detect the build capability type for a package.
+
+    When the agent emits a generic 'tool_install' capability, we need to
+    determine whether this is a pip, npm, or apt package.
+    """
+    if cap_type not in ("tool_install",):
+        return cap_type
+    # Check known npm packages
+    if package_name in _NPM_KNOWN_PACKAGES:
+        return "npm_package"
+    # Scoped npm packages (e.g. @scope/pkg)
+    if package_name.startswith("@"):
+        return "npm_package"
+    # APT patterns
+    if any(package_name.startswith(p) or package_name.endswith(p) for p in _APT_PATTERNS):
+        return "apt_package"
+    # Default to pip
+    return "pip_package"
+
+
 @activity.defn
 async def build_agent_image(
     task_id: str,
@@ -1500,7 +1532,7 @@ async def build_agent_image(
         resources = [r.strip() for r in resource.split(",") if r.strip()]
         build_capabilities = [
             {
-                "type": "pip_package" if cap_type == "tool_install" else cap_type,
+                "type": _detect_package_type(cap_type, r),
                 "name": r,
                 "version": None
             }
@@ -1656,23 +1688,25 @@ async def add_to_supply_chain(
 
     # Map capability type to package manager
     manager_map = {
-        "tool_install": "pip",
         "pip_package": "pip",
         "apt_package": "apt",
         "apk_package": "apk",
         "npm_package": "npm",
     }
-    manager = manager_map.get(cap_type, "pip")
 
-    # Auto-detect APT packages by naming convention when type is generic
-    # (tool_install doesn't distinguish pip from apt)
-    APT_PATTERNS = ("-dev", "lib", "build-essential", "cmake", "gcc", "g++",
-                    "make", "pkg-config", "libssl", "libcurl", "zlib")
+    # For generic tool_install, auto-detect the manager per-package
+    # using the same logic as build_agent_image.
     if cap_type == "tool_install":
-        for pkg_name in [r.strip() for r in resource.split(",") if r.strip()]:
-            if any(pkg_name.startswith(p) or pkg_name.endswith(p) for p in APT_PATTERNS):
-                manager = "apt"
-                break
+        # Detect based on first package (all resources in one request
+        # are typically the same type)
+        first_pkg = [r.strip() for r in resource.split(",") if r.strip()]
+        if first_pkg:
+            detected = _detect_package_type(cap_type, first_pkg[0])
+            manager = manager_map.get(detected, "pip")
+        else:
+            manager = "pip"
+    else:
+        manager = manager_map.get(cap_type, "pip")
 
     # Split comma-separated resources, exclude denied ones
     denied_set = set(denied_names)
@@ -2651,15 +2685,8 @@ class DAGNodeWorkflow:
         if config.get("dag_image"):
             logger.info(f"🔗 DAGNodeWorkflow | Node {node_id} inheriting DAG image: {agent_image}")
         llm_model = config.get("llm_model", "gemini-flash-lite-latest")
-        if not is_gemini_lite_model(llm_model):
-            logger.warning(
-                "⚠️ Non gemini-lite model '%s' requested for DAG node %s; overriding to gemini-flash-lite-latest",
-                llm_model,
-                node_id,
-            )
-            llm_model = "gemini-flash-lite-latest"
 
-        logger.info(f"🔧 DAGNodeWorkflow | DAG: {dag_id} | Node: {node_id}")
+        logger.info(f"🔧 DAGNodeWorkflow | DAG: {dag_id} | Node: {node_id} | model: {llm_model}")
 
         # Update node to RUNNING
         await workflow.execute_activity(

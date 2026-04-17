@@ -28,6 +28,11 @@ RUN apt-get update && apt-get install -y \
     supervisor \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js (for npm package support in capability requests)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
 # Create non-root user for agent execution
 RUN useradd -m -u 1001 -s /bin/bash agent && \
     mkdir -p /workspace /workspace/output && \

@@ -93,12 +93,58 @@ def _resolve_package_versions(packages: List[str], capability_type: str) -> Dict
     return versions
 
 
+# ---------------------------------------------------------------------------
+# Package type classification — detect pip vs npm vs apt from package names
+# ---------------------------------------------------------------------------
+_NPM_KNOWN_PACKAGES = {
+    "agent-browser", "express", "typescript", "ts-node", "prettier", "eslint",
+    "webpack", "vite", "tailwindcss", "postcss", "autoprefixer", "react",
+    "react-dom", "leaflet", "react-leaflet", "recharts", "puppeteer",
+    "playwright", "cypress", "axios", "lodash", "next", "nuxt",
+}
+
+_APT_PATTERNS = ("-dev", "lib", "build-essential", "cmake", "gcc", "g++",
+                 "make", "pkg-config", "libssl", "libcurl", "zlib")
+
+
+def _classify_package(pkg_name: str) -> str:
+    """Classify a package name as pip_package, npm_package, or apt_package."""
+    # Scoped npm packages (@scope/pkg)
+    if pkg_name.startswith("@"):
+        return "npm_package"
+    # Known npm packages
+    if pkg_name in _NPM_KNOWN_PACKAGES:
+        return "npm_package"
+    # APT patterns
+    if any(pkg_name.startswith(p) or pkg_name.endswith(p) for p in _APT_PATTERNS):
+        return "apt_package"
+    # Check if npm is available and the package exists there
+    try:
+        r = subprocess.run(["npm", "view", pkg_name, "name"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            # Also check it's NOT a valid pip package (prefer pip for ambiguous names)
+            p = subprocess.run(["pip3", "show", pkg_name],
+                               capture_output=True, text=True, timeout=10)
+            if p.returncode != 0:
+                return "npm_package"
+    except Exception:
+        pass
+    return "pip_package"
+
+
 def request_capability(capability_type: str, packages: List[str], justification: str = "") -> bool:
     """Request a new capability from the control plane."""
+    # The control plane API uses CapabilityType enum which only has
+    # tool_install, network_access, filesystem_access, database_access.
+    # All package install types (pip, npm, apt) map to tool_install.
     TYPE_MAP = {
         "python_packages": "tool_install",
+        "pip_package": "tool_install",
         "npm_packages": "tool_install",
+        "npm_package": "tool_install",
         "system_packages": "tool_install",
+        "apt_package": "tool_install",
         "tool_install": "tool_install",
         "TOOL_INSTALL": "tool_install",
         "network_access": "network_access",
@@ -243,25 +289,35 @@ Already available — do NOT request these:
 
 ### How to request a missing package
 
-**ONLY** if `python3 -c "import <package>"` fails with `ModuleNotFoundError`:
+If any of these errors occur, emit a CAPABILITY_REQUEST and **STOP immediately**:
+
+1. Python `ModuleNotFoundError` or `ImportError`
+2. CLI command "not found" (exit code 127)
+3. Shared library error: `error while loading shared libraries: libXYZ.so`
 
 ```
 CAPABILITY_REQUEST:tool_install:<package_name>:<detailed reason why this package is needed>
 ```
 
-The `<detailed reason>` MUST explain:
-- What functionality the package provides
-- Why it's needed for the current task
-- What will fail without it
+For shared library errors, request the library name from the error message, e.g.:
+```
+CAPABILITY_REQUEST:tool_install:libglib2.0-0:Shared library libglib-2.0.so.0 required by Chrome browser to launch
+CAPABILITY_REQUEST:tool_install:libnss3:Shared library libnss3.so required by Chrome browser
+```
 
-Examples:
+Other examples:
 ```
 CAPABILITY_REQUEST:tool_install:pandas:Data analysis library required to read CSV files and compute statistical aggregations
 CAPABILITY_REQUEST:tool_install:flask:Web microframework needed to build the HTTP API server
+CAPABILITY_REQUEST:tool_install:agent-browser:Browser automation tool required to interact with dynamic web pages
 ```
 
 After this line, STOP. The system will rebuild your container with the package
 and re-run your task automatically.
+
+**IMPORTANT**: Do NOT work around a missing tool or library by using a fallback approach.
+If a command is not found or a library is missing, you MUST request it via
+CAPABILITY_REQUEST and STOP. Do NOT attempt alternative methods.
 
 ## Deployment Request
 
@@ -478,7 +534,7 @@ def build_system_prompt() -> str:
         "IMPORTANT RULES:",
         "1. Always write code to /workspace",
         "2. Always exec your code to verify it works",
-        "3. If you get ModuleNotFoundError, emit: CAPABILITY_REQUEST:tool_install:<pkg>:<reason>",
+        "3. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:<pkg>:<reason> and STOP",
         "4. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>",
         "5. Do NOT try pip install or apt-get — they will fail",
         "",
@@ -672,6 +728,46 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]
         if match:
             return ("python_packages", [match.group(1)], "pip install failure detected")
 
+    # Fallback: "command not found" (exit 127) for CLI tools
+    # Matches patterns like:
+    #   /bin/sh: 1: agent-browser: not found
+    #   bash: agent-browser: command not found
+    #   agent-browser: not found
+    cmd_not_found = re.findall(
+        r"(?:/bin/sh|bash)?:?\s*\d*:?\s*([a-zA-Z0-9_][a-zA-Z0-9_.-]*):\s*(?:command\s+)?not found",
+        normalised, re.IGNORECASE,
+    )
+    if cmd_not_found:
+        # Deduplicate, skip common shell builtins
+        skip = {"sh", "bash", "cd", "echo", "test", "[", "true", "false"}
+        commands = list(dict.fromkeys(c for c in cmd_not_found if c not in skip))
+        if commands:
+            return ("tool_install", commands, "Command not found (exit 127) — CLI tool needs to be installed")
+
+    # Fallback: shared library errors
+    # Matches: error while loading shared libraries: libfoo.so.N: cannot open
+    so_missing = re.findall(
+        r"error while loading shared libraries:\s*(lib[a-zA-Z0-9_.+-]+\.so[.0-9]*):\s*cannot open",
+        normalised, re.IGNORECASE,
+    )
+    if so_missing:
+        # Map .so names to apt package names:
+        #   libglib-2.0.so.0  → libglib2.0-0
+        #   libnss3.so        → libnss3
+        #   libatk-1.0.so.0   → libatk1.0-0
+        apt_packages = []
+        for so in dict.fromkeys(so_missing):  # deduplicate, preserve order
+            # Strip trailing .so.N.N... to get the base name
+            base = re.sub(r'\.so[.0-9]*$', '', so)
+            # Common mapping: libfoo-X.Y → libfooX.Y-0
+            apt_name = re.sub(r'-([0-9])', r'\1', base) + "-0"
+            # If the base already ends with a digit (libnss3), just use it directly
+            if re.search(r'[0-9]$', base):
+                apt_name = base
+            apt_packages.append(apt_name)
+        return ("apt_package", apt_packages,
+                f"Shared library missing: {', '.join(so_missing)} — required by a binary in the container")
+
     return None
 
 
@@ -773,7 +869,7 @@ def collect_workspace_files() -> Dict[str, str]:
     SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm"}
     SKIP_FILES = {"result.json", "AGENTS.md", "SOUL.md", "TOOLS.md",
                   "IDENTITY.md", "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md",
-                  "package-lock.json"}
+                  "package-lock.json", "input_prompt.md", "attached_context.md"}
     MAX_FILE_SIZE = 500_000
     MAX_TOTAL = 2_000_000
     collected: Dict[str, str] = {}
@@ -980,9 +1076,17 @@ def main():
         print(f"\n🔐 Capability needed: {cap_type} → {packages}")
         print(f"   └─ Reason: {cap_reason}")
 
-        if cap_type in ("tool_install", "python_packages", "pip_package"):
-            actually_missing = []
-            for pkg in packages:
+        # Classify each package by its manager type
+        classified = {}
+        for pkg in packages:
+            pkg_type = _classify_package(pkg)
+            classified[pkg] = pkg_type
+            print(f"   📦 {pkg} → {pkg_type}")
+
+        # Only check Python imports for pip packages
+        actually_missing = []
+        for pkg in packages:
+            if classified[pkg] == "pip_package":
                 import_name = pkg.replace("-", "_")
                 try:
                     result_check = subprocess.run(
@@ -990,26 +1094,61 @@ def main():
                         capture_output=True, text=True, timeout=10
                     )
                     if result_check.returncode == 0:
-                        print(f"   ✅ {pkg} is already installed, skipping")
+                        print(f"   ✅ {pkg} is already installed (pip), skipping")
+                        continue
                     else:
-                        actually_missing.append(pkg)
-                        print(f"   ❌ {pkg} is NOT installed")
+                        print(f"   ❌ {pkg} is NOT installed (pip)")
                 except Exception:
-                    actually_missing.append(pkg)
+                    pass
+            elif classified[pkg] == "npm_package":
+                # Check if npm package is available
+                try:
+                    result_check = subprocess.run(
+                        ["which", pkg] if "/" not in pkg else ["npm", "list", "-g", pkg],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if result_check.returncode == 0:
+                        print(f"   ✅ {pkg} is already installed (npm), skipping")
+                        continue
+                    else:
+                        print(f"   ❌ {pkg} is NOT installed (npm)")
+                except Exception:
+                    pass
+            elif classified[pkg] == "apt_package":
+                # Check if apt package is installed
+                try:
+                    result_check = subprocess.run(
+                        ["dpkg", "-s", pkg],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if result_check.returncode == 0:
+                        print(f"   ✅ {pkg} is already installed (apt), skipping")
+                        continue
+                    else:
+                        print(f"   ❌ {pkg} is NOT installed (apt)")
+                except Exception:
+                    pass
+            actually_missing.append(pkg)
 
-            if not actually_missing:
-                print(f"\n✅ All requested packages already installed")
-                cap = None
-            else:
-                packages = actually_missing
+        if not actually_missing:
+            print(f"\n✅ All requested packages already installed")
+            cap = None
+        else:
+            packages = actually_missing
 
     if cap:
         cap_type, packages, cap_reason = cap
-        if request_capability(cap_type, packages, justification=cap_reason):
+
+        # Group packages by detected type for the capability result
+        # Use the dominant type for the capability request
+        pkg_types = [classified.get(p, _classify_package(p)) for p in packages]
+        dominant_type = max(set(pkg_types), key=pkg_types.count) if pkg_types else "pip_package"
+
+        if request_capability(dominant_type, packages, justification=cap_reason):
             print("✅ Capability requested — image rebuild required")
             result["capability_requested"] = True
             result["capability"] = {
-                "type": "pip_package" if cap_type == "python_packages" else cap_type,
+                "type": dominant_type,
                 "resource": ",".join(packages),
                 "justification": cap_reason,
             }
