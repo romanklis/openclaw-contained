@@ -133,7 +133,8 @@ def _classify_package(pkg_name: str) -> str:
     return "pip_package"
 
 
-def request_capability(capability_type: str, packages: List[str], justification: str = "") -> bool:
+def request_capability(capability_type: str, packages: List[str], justification: str = "",
+                       typed_packages: Optional[List[Dict[str, str]]] = None) -> bool:
     """Request a new capability from the control plane."""
     # The control plane API uses CapabilityType enum which only has
     # tool_install, network_access, filesystem_access, database_access.
@@ -187,6 +188,16 @@ def request_capability(capability_type: str, packages: List[str], justification:
 
     try:
         with httpx.Client(timeout=30.0) as client:
+            # Build per-package details — if typed_packages was supplied by
+            # the caller, use it; otherwise fall back to plain name list.
+            if typed_packages:
+                packages_detail = typed_packages
+            else:
+                packages_detail = [
+                    {"name": p, "type": _classify_package(p)}
+                    for p in packages
+                ]
+
             response = client.post(
                 f"{CONTROL_PLANE_URL}/api/capabilities/requests",
                 json={
@@ -195,7 +206,7 @@ def request_capability(capability_type: str, packages: List[str], justification:
                     "resource_name": resource_name,
                     "justification": full_justification,
                     "details": {
-                        "packages": packages,
+                        "packages": packages_detail,
                         "original_type": capability_type,
                         "iteration": ITERATION,
                         "reason": justification,
@@ -295,21 +306,29 @@ If any of these errors occur, emit a CAPABILITY_REQUEST and **STOP immediately**
 2. CLI command "not found" (exit code 127)
 3. Shared library error: `error while loading shared libraries: libXYZ.so`
 
+Format — always include the package type prefix (`pip/`, `npm/`, `apt/`, or `auto/`):
 ```
-CAPABILITY_REQUEST:tool_install:<package_name>:<detailed reason why this package is needed>
+CAPABILITY_REQUEST:tool_install:<type>/<package_name>:<detailed reason why this package is needed>
 ```
 
-For shared library errors, request the library name from the error message, e.g.:
+Where `<type>` is one of:
+- `pip` — Python packages (e.g. pandas, flask, requests)
+- `npm` — Node.js packages (e.g. express, typescript, react)
+- `apt` — System/OS packages and shared libraries (e.g. libglib2.0-0, ffmpeg, gcc)
+- `auto` — Use when unsure (the system will auto-detect)
+
+For shared library errors, use `apt/`:
 ```
-CAPABILITY_REQUEST:tool_install:libglib2.0-0:Shared library libglib-2.0.so.0 required by Chrome browser to launch
-CAPABILITY_REQUEST:tool_install:libnss3:Shared library libnss3.so required by Chrome browser
+CAPABILITY_REQUEST:tool_install:apt/libglib2.0-0:Shared library libglib-2.0.so.0 required by Chrome browser to launch
+CAPABILITY_REQUEST:tool_install:apt/libnss3:Shared library libnss3.so required by Chrome browser
 ```
 
 Other examples:
 ```
-CAPABILITY_REQUEST:tool_install:pandas:Data analysis library required to read CSV files and compute statistical aggregations
-CAPABILITY_REQUEST:tool_install:flask:Web microframework needed to build the HTTP API server
-CAPABILITY_REQUEST:tool_install:agent-browser:Browser automation tool required to interact with dynamic web pages
+CAPABILITY_REQUEST:tool_install:pip/pandas:Data analysis library required to read CSV files and compute statistical aggregations
+CAPABILITY_REQUEST:tool_install:pip/flask:Web microframework needed to build the HTTP API server
+CAPABILITY_REQUEST:tool_install:npm/agent-browser:Browser automation tool required to interact with dynamic web pages
+CAPABILITY_REQUEST:tool_install:apt/ffmpeg:Media processing tool required to convert audio files
 ```
 
 After this line, STOP. The system will rebuild your container with the package
@@ -534,7 +553,7 @@ def build_system_prompt() -> str:
         "IMPORTANT RULES:",
         "1. Always write code to /workspace",
         "2. Always exec your code to verify it works",
-        "3. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:<pkg>:<reason> and STOP",
+        "3. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:<type>/<pkg>:<reason> and STOP (type is pip, npm, apt, or auto)",
         "4. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>",
         "5. Do NOT try pip install or apt-get — they will fail",
         "",
@@ -684,8 +703,39 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
 # Capability / deployment detection  (identical to openclaw-wrapper.py)
 # ---------------------------------------------------------------------------
 
+def _parse_typed_package(raw: str) -> Tuple[str, str]:
+    """Parse a package specifier that may have a type prefix.
+
+    Formats handled:
+      - "pip/pandas"   → ("pip_package", "pandas")
+      - "npm/express"  → ("npm_package", "express")
+      - "apt/libssl"   → ("apt_package", "libssl")
+      - "auto/foo"     → ("auto", "foo")      — will be classified later
+      - "pandas"       → ("auto", "pandas")   — legacy format, classify later
+    """
+    _PREFIX_MAP = {
+        "pip": "pip_package",
+        "npm": "npm_package",
+        "apt": "apt_package",
+        "apk": "apt_package",
+        "auto": "auto",
+    }
+    if "/" in raw:
+        prefix, _, name = raw.partition("/")
+        prefix_lower = prefix.strip().lower()
+        if prefix_lower in _PREFIX_MAP and name.strip():
+            return _PREFIX_MAP[prefix_lower], name.strip()
+    # No recognised prefix — return as-is for heuristic classification
+    return "auto", raw.strip()
+
+
 def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]]:
-    """Parse output for CAPABILITY_REQUEST markers or ModuleNotFoundError."""
+    """Parse output for CAPABILITY_REQUEST markers or ModuleNotFoundError.
+
+    Returns (cap_type, packages, reason) where *packages* may contain a
+    type prefix ("pip/pandas") that callers should process via
+    ``_parse_typed_package``.
+    """
     normalised = output.replace("\\n", "\n").replace("\\r", "\r")
 
     all_packages: List[str] = []
@@ -721,8 +771,9 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]
 
     # pip install failures
     for pattern in [
-        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:error|denied|externally.managed|not allowed)",
-        r"(?:error|denied|permission).*pip3?\s+install\s+([a-zA-Z0-9_-]+)",
+        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:error|denied|externally.managed|not allowed|read.only)",
+        r"(?:error|denied|permission|read.only).*pip3?\s+install\s+([a-zA-Z0-9_-]+)",
+        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:OSError|errno\s*30)",
     ]:
         match = re.search(pattern, normalised, re.IGNORECASE)
         if match:
@@ -1076,16 +1127,21 @@ def main():
         print(f"\n🔐 Capability needed: {cap_type} → {packages}")
         print(f"   └─ Reason: {cap_reason}")
 
-        # Classify each package by its manager type
+        # Classify each package by its manager type — honour type prefix if present
         classified = {}
+        clean_names = []   # package names without the type/ prefix
         for pkg in packages:
-            pkg_type = _classify_package(pkg)
-            classified[pkg] = pkg_type
-            print(f"   📦 {pkg} → {pkg_type}")
+            typed, name = _parse_typed_package(pkg)
+            if typed != "auto":
+                classified[name] = typed
+            else:
+                classified[name] = _classify_package(name)
+            clean_names.append(name)
+            print(f"   📦 {pkg} → {classified[name]}")
 
         # Only check Python imports for pip packages
         actually_missing = []
-        for pkg in packages:
+        for pkg in clean_names:
             if classified[pkg] == "pip_package":
                 import_name = pkg.replace("-", "_")
                 try:
@@ -1134,22 +1190,28 @@ def main():
             print(f"\n✅ All requested packages already installed")
             cap = None
         else:
-            packages = actually_missing
+            clean_names = actually_missing
 
     if cap:
-        cap_type, packages, cap_reason = cap
+        cap_type, _raw_packages, cap_reason = cap
 
-        # Group packages by detected type for the capability result
-        # Use the dominant type for the capability request
-        pkg_types = [classified.get(p, _classify_package(p)) for p in packages]
+        # Build per-package typed list for the details payload
+        typed_packages = [
+            {"name": p, "type": classified.get(p, _classify_package(p))}
+            for p in clean_names
+        ]
+
+        # Use the dominant type for the top-level capability request
+        pkg_types = [tp["type"] for tp in typed_packages]
         dominant_type = max(set(pkg_types), key=pkg_types.count) if pkg_types else "pip_package"
 
-        if request_capability(dominant_type, packages, justification=cap_reason):
+        if request_capability(dominant_type, clean_names, justification=cap_reason,
+                              typed_packages=typed_packages):
             print("✅ Capability requested — image rebuild required")
             result["capability_requested"] = True
             result["capability"] = {
                 "type": dominant_type,
-                "resource": ",".join(packages),
+                "resource": ",".join(clean_names),
                 "justification": cap_reason,
             }
             write_result(result)

@@ -676,9 +676,10 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]
 
     # 3. pip install failures — extract package name from the command
     pip_patterns = [
-        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:error|denied|externally.managed|not allowed)",
-        r"(?:error|denied|permission).*pip3?\s+install\s+([a-zA-Z0-9_-]+)",
+        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:error|denied|externally.managed|not allowed|read.only)",
+        r"(?:error|denied|permission|read.only).*pip3?\s+install\s+([a-zA-Z0-9_-]+)",
         r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*failed",
+        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:OSError|errno\s*30)",
     ]
     for pattern in pip_patterns:
         match = re.search(pattern, normalised, re.IGNORECASE)

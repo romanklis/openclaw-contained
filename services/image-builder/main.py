@@ -327,15 +327,307 @@ class DeploymentBuildRequest(BaseModel):
 
 
 # =============================================================================
+# Package Verification — validate packages against native registries
+# =============================================================================
+
+import httpx as _httpx
+from functools import lru_cache
+
+_PYPI_URL = "https://pypi.org/pypi/{}/json"
+_NPM_URL = "https://registry.npmjs.org/{}"
+
+
+class PackageVerification:
+    """Result of verifying a package name against its native registry."""
+
+    def __init__(self, exists: bool, canonical_name: str, claimed_type: str,
+                 suggested_type: Optional[str] = None,
+                 suggested_name: Optional[str] = None):
+        self.exists = exists
+        self.canonical_name = canonical_name
+        self.claimed_type = claimed_type
+        self.suggested_type = suggested_type
+        self.suggested_name = suggested_name
+
+    def __repr__(self):
+        return (f"PackageVerification(exists={self.exists}, "
+                f"canonical={self.canonical_name!r}, claimed={self.claimed_type}, "
+                f"suggested_type={self.suggested_type})")
+
+
+def _check_pypi(name: str) -> bool:
+    """Check if a package exists on PyPI."""
+    try:
+        resp = _httpx.get(_PYPI_URL.format(name), timeout=10.0, follow_redirects=True)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _check_npm(name: str) -> bool:
+    """Check if a package exists on the npm registry."""
+    try:
+        resp = _httpx.get(_NPM_URL.format(name), timeout=10.0, follow_redirects=True)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _check_apt(name: str) -> bool:
+    """Check if a package exists in the local apt cache (Debian/Ubuntu)."""
+    try:
+        r = subprocess.run(["apt-cache", "show", name],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _check_apk(name: str) -> bool:
+    """Check if a package exists in the Alpine apk index."""
+    try:
+        r = subprocess.run(["apk", "info", "-d", name],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=512)
+def _verify_package_exists(name: str, claimed_type: str, image_type: str = "openclaw") -> PackageVerification:
+    """Verify a package exists in its claimed registry, with cross-type fallback.
+
+    Returns a PackageVerification with suggested_type set when the package
+    was found in a different registry than claimed.
+    """
+    is_alpine = image_type in ("nanobot", "picoclaw")
+
+    # ----- Check in claimed type first -----
+    if claimed_type == "pip_package":
+        if _check_pypi(name):
+            return PackageVerification(True, name, claimed_type)
+        # Cross-check: maybe it's npm?
+        if _check_npm(name):
+            logger.info(f"🔄 Package '{name}' not found on PyPI but exists on npm")
+            return PackageVerification(False, name, claimed_type,
+                                       suggested_type="npm_package", suggested_name=name)
+        # Cross-check: maybe it's a system package?
+        if is_alpine:
+            if _check_apk(name):
+                logger.info(f"🔄 Package '{name}' not found on PyPI but exists in apk")
+                return PackageVerification(False, name, claimed_type,
+                                           suggested_type="apt_package", suggested_name=name)
+        else:
+            if _check_apt(name):
+                logger.info(f"🔄 Package '{name}' not found on PyPI but exists in apt")
+                return PackageVerification(False, name, claimed_type,
+                                           suggested_type="apt_package", suggested_name=name)
+
+    elif claimed_type == "npm_package":
+        if _check_npm(name):
+            return PackageVerification(True, name, claimed_type)
+        # Cross-check: maybe it's pip?
+        if _check_pypi(name):
+            logger.info(f"🔄 Package '{name}' not found on npm but exists on PyPI")
+            return PackageVerification(False, name, claimed_type,
+                                       suggested_type="pip_package", suggested_name=name)
+
+    elif claimed_type in ("apt_package", "apk_package"):
+        if is_alpine:
+            if _check_apk(name):
+                return PackageVerification(True, name, claimed_type)
+            # Try alias
+            aliased = _resolve_alias(name, "apt", "apk")
+            if aliased != name and _check_apk(aliased):
+                return PackageVerification(True, aliased, claimed_type)
+        else:
+            if _check_apt(name):
+                return PackageVerification(True, name, claimed_type)
+            # Try alias
+            aliased = _resolve_alias(name, "apk", "apt")
+            if aliased != name and _check_apt(aliased):
+                return PackageVerification(True, aliased, claimed_type)
+        # Cross-check: maybe it's pip?
+        if _check_pypi(name):
+            logger.info(f"🔄 Package '{name}' not found in system pkgs but exists on PyPI")
+            return PackageVerification(False, name, claimed_type,
+                                       suggested_type="pip_package", suggested_name=name)
+
+    # Nothing found anywhere
+    return PackageVerification(False, name, claimed_type)
+
+
+def verify_and_reclassify(
+    capabilities: List["BuildCapability"],
+    image_type: str,
+) -> List["BuildCapability"]:
+    """Verify each capability's package exists in its claimed registry.
+
+    If a package is misclassified, reclassify it to the suggested type.
+    Returns a new list of BuildCapability with corrected types.
+    """
+    result = []
+    for cap in capabilities:
+        if cap.type not in ("pip_package", "npm_package", "apt_package", "apk_package"):
+            result.append(cap)
+            continue
+
+        v = _verify_package_exists(cap.name, cap.type, image_type)
+        if v.exists:
+            # Possibly use canonical name (e.g. alias-resolved)
+            result.append(BuildCapability(type=cap.type, name=v.canonical_name, version=cap.version))
+        elif v.suggested_type:
+            logger.warning(f"🔄 Reclassifying '{cap.name}' from {cap.type} → {v.suggested_type}")
+            result.append(BuildCapability(
+                type=v.suggested_type,
+                name=v.suggested_name or cap.name,
+                version=cap.version,
+            ))
+        else:
+            # Package not found anywhere — try LLM resolver as last resort
+            resolved = _llm_resolve_package(cap.name, cap.type, image_type)
+            if resolved:
+                logger.info(f"🤖 LLM resolved '{cap.name}' → {resolved['name']} ({resolved['type']})")
+                result.append(BuildCapability(
+                    type=resolved["type"],
+                    name=resolved["name"],
+                    version=cap.version,
+                ))
+            else:
+                # Keep as-is, supply-chain will handle it
+                result.append(cap)
+    return result
+
+
+# =============================================================================
+# LLM-based Package Name Resolver
+# =============================================================================
+
+_LLM_RESOLVE_CACHE: Dict[tuple, Optional[Dict[str, str]]] = {}
+_LLM_CACHE_TTL_POS = 86400  # 24h for positive results
+_LLM_CACHE_TTL_NEG = 3600   # 1h for negative results
+
+_API_GATEWAY_URL = os.getenv("API_GATEWAY_URL", "http://api-gateway:8080")
+_LLM_RESOLVER_MODEL = os.getenv("LLM_RESOLVER_MODEL", "gemini-flash-lite-latest")
+
+_RESOLVE_PROMPT = """You are a package name resolver. Given a package name and the package manager type 
+it was claimed to belong to, determine the correct package name and package manager.
+
+Package name: {name}
+Claimed type: {claimed_type}
+Target OS: {os_type}
+
+The package was NOT found in the {claimed_type} registry. 
+
+Rules:
+- If the name is a Python import name that differs from the pip package name (e.g. "cv2" → "opencv-python", 
+  "PIL" → "Pillow", "sklearn" → "scikit-learn", "bs4" → "beautifulsoup4", "yaml" → "pyyaml"), 
+  return the correct pip package name.
+- If the package belongs to a different manager (e.g. claimed as pip but it's actually npm), correct the type.
+- For system library errors (lib*.so), suggest the apt/apk package that provides it.
+- Only return a result if you are confident. If unsure, return null.
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{"name": "correct-package-name", "type": "pip_package|npm_package|apt_package", "confidence": 0.0-1.0}}
+
+Or if you cannot determine the correct package:
+null"""
+
+
+def _llm_resolve_package(
+    name: str, claimed_type: str, image_type: str = "openclaw"
+) -> Optional[Dict[str, str]]:
+    """Use an LLM to resolve an ambiguous or misnamed package.
+
+    Returns {"name": "correct-name", "type": "pip_package"} or None.
+    Results are cached in-memory.
+    """
+    cache_key = (name, claimed_type, image_type)
+
+    # Check cache (with TTL)
+    if cache_key in _LLM_RESOLVE_CACHE:
+        entry = _LLM_RESOLVE_CACHE[cache_key]
+        cached_result, cached_at = entry  # type: ignore[misc]
+        ttl = _LLM_CACHE_TTL_POS if cached_result else _LLM_CACHE_TTL_NEG
+        if time.time() - cached_at < ttl:
+            return cached_result
+
+    os_type = "Alpine Linux" if image_type in ("nanobot", "picoclaw") else "Debian/Ubuntu"
+    prompt = _RESOLVE_PROMPT.format(
+        name=name, claimed_type=claimed_type, os_type=os_type,
+    )
+
+    try:
+        resp = _httpx.post(
+            f"{_API_GATEWAY_URL}/v1/chat/completions",
+            json={
+                "model": _LLM_RESOLVER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 150,
+            },
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"🤖 LLM resolver: API returned {resp.status_code}")
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+        # Parse JSON response
+        if content.lower() == "null" or not content:
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        # Strip markdown fences if present
+        if content.startswith("```"):
+            content = re.sub(r"^```\w*\n?", "", content)
+            content = re.sub(r"\n?```$", "", content)
+            content = content.strip()
+
+        resolved = json.loads(content)
+        if not isinstance(resolved, dict) or "name" not in resolved or "type" not in resolved:
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        confidence = float(resolved.get("confidence", 0))
+        if confidence < 0.7:
+            logger.info(f"🤖 LLM resolver: low confidence ({confidence}) for '{name}' → {resolved}")
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        valid_types = {"pip_package", "npm_package", "apt_package", "apk_package"}
+        if resolved["type"] not in valid_types:
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        result = {"name": resolved["name"], "type": resolved["type"]}
+        logger.info(f"🤖 LLM resolver: '{name}' ({claimed_type}) → {result} (confidence={confidence})")
+        _LLM_RESOLVE_CACHE[cache_key] = (result, time.time())
+        return result
+
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.warning(f"🤖 LLM resolver: failed to parse response for '{name}': {e}")
+        _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+        return None
+    except Exception as e:
+        logger.warning(f"🤖 LLM resolver: request failed for '{name}': {e}")
+        _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+        return None
+
+
+# =============================================================================
 # Dockerfile Generation
 # =============================================================================
 
 # Per-image-type install strategies
 # ─────────────────────────────────
-#  openclaw  : Debian + /opt/venv/bin/pip + npm + apt-get
-#  nanobot   : Alpine + /usr/local/bin/pip + apk (no npm)
+#  openclaw  : Debian + system pip --break-system-packages + npm + apt-get
+#  nanobot   : Alpine + pip + apk (no npm)
 #  picoclaw  : Alpine + apk only (no Python, no npm)
-#  zeroclaw  : Debian + /usr/bin/pip3 --break-system-packages + apt-get (no npm)
+#  zeroclaw  : Debian + pip3 --break-system-packages + apt-get (no npm)
 
 DOCKERFILE_TEMPLATE = """
 FROM {{ base_image }}
@@ -369,9 +661,10 @@ RUN apt-get update && apt-get install -y \\
 # Requested: {{ pip_packages | join(', ') }}
 RUN echo "ERROR: pip packages requested but PicoClaw has no Python runtime" >&2 && exit 1
 {% elif image_type == 'openclaw' %}
-# Install Python packages (OpenClaw — system pip)
+# Install Python packages (OpenClaw — system pip, no venv)
 USER root
-RUN pip install --no-cache-dir {{ pip_packages | join(' ') }}
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN pip install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
 {% elif image_type == 'nanobot' %}
 # Install Python packages (NanoBot — Alpine Python)
 USER root
@@ -379,18 +672,19 @@ RUN pip install --no-cache-dir {{ pip_packages | join(' ') }}
 {% elif image_type == 'zeroclaw' %}
 # Install Python packages (ZeroClaw — Debian system Python)
 USER root
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN pip3 install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
 {% else %}
-# Install Python packages (generic — auto-detect pip)
+# Install Python packages (generic — system-wide)
 USER root
-RUN set -e; \\
-    PIP=""; \\
-    for p in /opt/venv/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip /usr/bin/pip3; do \\
-        if [ -x "$p" ]; then PIP="$p"; break; fi; \\
-    done; \\
-    if [ -z "$PIP" ]; then echo "ERROR: no pip found" >&2; exit 1; fi; \\
-    echo "Using pip: $PIP"; \\
-    $PIP install --no-cache-dir {{ pip_packages | join(' ') }} || \\
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN set -e; \
+    PIP=""; \
+    for p in /usr/local/bin/pip3 /usr/local/bin/pip /usr/bin/pip3 /usr/bin/pip; do \
+        if [ -x "$p" ]; then PIP="$p"; break; fi; \
+    done; \
+    if [ -z "$PIP" ]; then echo "ERROR: no pip found" >&2; exit 1; fi; \
+    echo "Using pip: $PIP"; \
     $PIP install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
 {% endif %}
 {% endif %}
@@ -685,6 +979,7 @@ RUN find /app -type f \\( -name '*.py' -o -name '*.sh' -o -name '*.yaml' -o -nam
 # Make shell scripts executable
 RUN find /app -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
 
+ENV PORT={{ port }}
 EXPOSE {{ port }}
 
 CMD {{ entrypoint_cmd }}
@@ -1194,8 +1489,11 @@ async def build_image(
     
     logger.info(f"Expanded {len(request.capabilities)} capability entries → {len(expanded_capabilities)} individual packages")
     
-    # ── Supply-chain validation ──────────────────────────────────────────
+    # ── Native package verification & reclassification ───────────────────
     image_type = _detect_image_type(request.base_image)
+    expanded_capabilities = verify_and_reclassify(expanded_capabilities, image_type)
+
+    # ── Supply-chain validation ──────────────────────────────────────────
     verdict = validate_supply_chain(image_type, expanded_capabilities)
 
     supply_chain_denied = verdict.denied if verdict.denied else None

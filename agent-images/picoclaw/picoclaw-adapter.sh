@@ -299,8 +299,14 @@ ${dockerfile_section}
 **ONLY** if a command is not found:
 
 \`\`\`
-CAPABILITY_REQUEST:tool_install:<tool_name>:<detailed reason why this tool is needed>
+CAPABILITY_REQUEST:tool_install:<type>/<tool_name>:<detailed reason why this tool is needed>
 \`\`\`
+
+Where \`<type>\` is one of:
+- \`apt\` — System packages and CLI tools (e.g. apt/ffmpeg, apt/jq)
+- \`pip\` — Python packages (if Python is available)
+- \`npm\` — Node.js packages (if Node.js is available)
+- \`auto\` — Use when unsure (the system will auto-detect)
 
 After this line, STOP. The system will rebuild your container with the tool
 and re-run your task automatically.
@@ -482,7 +488,7 @@ You have these tools: write, read, exec, edit.
 IMPORTANT RULES:
 1. Always write code to /workspace
 2. Always exec your code to verify it works
-3. If a tool is missing, emit: CAPABILITY_REQUEST:tool_install:<tool>:<reason>
+3. If a tool is missing, emit: CAPABILITY_REQUEST:tool_install:<type>/<tool>:<reason> (type is pip, npm, apt, or auto)
 4. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>
 5. Do NOT try apk add or pip install — they will fail
 6. This is a shell-only environment (no Python) — write shell scripts or use available tools"
@@ -668,7 +674,9 @@ write_result() {
 parse_capability_request() {
     local output="$1"
 
-    # Check for CAPABILITY_REQUEST markers
+    # Check for CAPABILITY_REQUEST markers — handle both new typed format
+    # (CAPABILITY_REQUEST:tool_install:pip/pandas:reason) and legacy format
+    # (CAPABILITY_REQUEST:tool_install:pandas:reason)
     local match
     match=$(echo "$output" | grep -oP 'CAPABILITY_REQUEST:\w+:[^:\n]+:[^\n]+' | head -1)
 
@@ -677,6 +685,14 @@ parse_capability_request() {
         cap_type=$(echo "$match" | cut -d: -f2)
         packages=$(echo "$match" | cut -d: -f3)
         reason=$(echo "$match" | cut -d: -f4-)
+
+        # Strip type prefix if present (e.g. "pip/pandas" → "pandas",
+        # "apt/ffmpeg" → "ffmpeg").  The prefix is informational — the
+        # build system reads per-package types from details.packages.
+        if echo "$packages" | grep -qE '^(pip|npm|apt|apk|auto)/'; then
+            packages=$(echo "$packages" | sed 's|^[^/]*/||')
+        fi
+
         echo "${cap_type}|${packages}|${reason}"
         return 0
     fi

@@ -10,15 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     python3 \
     python3-pip \
-    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Install OpenClaw globally (much faster than building from source)
 RUN npm install -g openclaw@latest
 
-# Create Python venv for wrapper dependencies
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Install Python wrapper dependencies (system-wide, no venv)
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN pip install --no-cache-dir httpx
 
 # Create workspace and agent user

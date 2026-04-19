@@ -1337,6 +1337,7 @@ async def clear_task_interactions(task_id: str):
 @router.get("/health")
 async def llm_health():
     """Check backend provider connectivity."""
+    await _load_config_from_db()
     status_map = {}
     ollama_url = _ollama_url()
 
@@ -1350,18 +1351,74 @@ async def llm_health():
     except Exception as e:
         status_map["ollama"] = {"status": "unhealthy", "error": str(e)}
 
-    status_map["gemini"] = {
-        "status": "configured" if _gemini_key() else "not_configured",
-        "models": ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"],
-    }
-    status_map["anthropic"] = {
-        "status": "configured" if _anthropic_key() else "not_configured",
-        "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-haiku-20241022"],
-    }
-    status_map["openai"] = {
-        "status": "configured" if _openai_key() else "not_configured",
-        "models": ["gpt-4o", "gpt-4o-mini", "o1-preview"],
-    }
+    # Gemini — fetch dynamically
+    gemini_key = _gemini_key()
+    gemini_health: dict = {"status": "configured" if gemini_key else "not_configured", "models": []}
+    if gemini_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": gemini_key, "pageSize": 100},
+                )
+                if resp.status_code == 200:
+                    gemini_health["models"] = [
+                        m.get("name", "").removeprefix("models/")
+                        for m in resp.json().get("models", [])
+                        if m.get("name", "").removeprefix("models/").startswith(("gemini-", "gemma-"))
+                    ]
+                else:
+                    gemini_health["status"] = "error"
+                    gemini_health["error"] = f"Google API returned {resp.status_code}"
+        except Exception as e:
+            gemini_health["status"] = "error"
+            gemini_health["error"] = str(e)
+    status_map["gemini"] = gemini_health
+
+    # Anthropic — fetch dynamically
+    anthropic_key = _anthropic_key()
+    anthropic_health: dict = {"status": "configured" if anthropic_key else "not_configured", "models": []}
+    if anthropic_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01"},
+                )
+                if resp.status_code == 200:
+                    anthropic_health["models"] = [
+                        m.get("id", "") for m in resp.json().get("data", []) if m.get("id")
+                    ]
+                else:
+                    anthropic_health["status"] = "error"
+                    anthropic_health["error"] = f"Anthropic API returned {resp.status_code}"
+        except Exception as e:
+            anthropic_health["status"] = "error"
+            anthropic_health["error"] = str(e)
+    status_map["anthropic"] = anthropic_health
+
+    # OpenAI — fetch dynamically
+    openai_key = _openai_key()
+    openai_health: dict = {"status": "configured" if openai_key else "not_configured", "models": []}
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                )
+                if resp.status_code == 200:
+                    openai_health["models"] = [
+                        m.get("id", "") for m in resp.json().get("data", [])
+                        if m.get("id", "").startswith(("gpt-", "o1-", "o3-", "o4-"))
+                    ]
+                else:
+                    openai_health["status"] = "error"
+                    openai_health["error"] = f"OpenAI API returned {resp.status_code}"
+        except Exception as e:
+            openai_health["status"] = "error"
+            openai_health["error"] = str(e)
+    status_map["openai"] = openai_health
 
     return {"providers": status_map}
 
@@ -1369,6 +1426,7 @@ async def llm_health():
 @router.get("/providers")
 async def get_llm_providers():
     """Return available providers for the frontend / agent."""
+    await _load_config_from_db()
     providers = []
 
     # Ollama — always present if reachable
@@ -1395,7 +1453,7 @@ async def get_llm_providers():
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     "https://generativelanguage.googleapis.com/v1beta/models",
-                    params={"key": gemini_key},
+                    params={"key": gemini_key, "pageSize": 100},
                 )
                 if resp.status_code == 200:
                     for m in resp.json().get("models", []):
@@ -1471,6 +1529,7 @@ async def get_llm_providers():
 @router.get("/models")
 async def list_all_models():
     """List models across all configured providers."""
+    await _load_config_from_db()
     all_models = []
 
     ollama_url = _ollama_url()
@@ -1490,7 +1549,7 @@ async def list_all_models():
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     "https://generativelanguage.googleapis.com/v1beta/models",
-                    params={"key": gemini_key},
+                    params={"key": gemini_key, "pageSize": 100},
                 )
                 if resp.status_code == 200:
                     for m in resp.json().get("models", []):

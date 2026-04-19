@@ -267,6 +267,12 @@ class AgentTaskWorkflow:
                     # can use it as the base — guarantees all approved deps are present.
                     deployment["agent_image"] = self.current_image
 
+                    # Ensure common servers bind to 0.0.0.0 (not localhost)
+                    deployment["entrypoint"] = _normalize_deployment_entrypoint(
+                        deployment.get("entrypoint", "python app.py"),
+                        deployment.get("port", 5000),
+                    )
+
                     # --- Trial deployment: build + health-check before real deploy ---
                     trial_result = await workflow.execute_activity(
                         trial_deploy,
@@ -852,6 +858,7 @@ async def start_agent_container(
             environment=agent_env,
             volumes={workspace_dir: {"bind": "/workspace", "mode": "rw"}},
             tmpfs={"/tmp": "size=100m,mode=1777"},
+            read_only=True,
             detach=True,
         )
 
@@ -1528,16 +1535,36 @@ async def build_agent_image(
     
     try:
         # Map capability to build capability format
-        # Split comma-separated resources into individual capabilities
+        # Split comma-separated resources into individual capabilities.
+        #
+        # If the capability request carries per-package type info in
+        # details.packages (new format), use it directly instead of
+        # guessing via _detect_package_type.
         resources = [r.strip() for r in resource.split(",") if r.strip()]
-        build_capabilities = [
-            {
-                "type": _detect_package_type(cap_type, r),
+        details_packages = capability.get("details", {}).get("packages") if isinstance(capability.get("details"), dict) else None
+
+        # Build a lookup from package name → explicit type when available.
+        explicit_types: Dict[str, str] = {}
+        if details_packages and isinstance(details_packages, list):
+            for entry in details_packages:
+                if isinstance(entry, dict) and "name" in entry and "type" in entry:
+                    explicit_types[entry["name"]] = entry["type"]
+
+        build_capabilities = []
+        for r in resources:
+            # Strip version suffix (e.g. "pandas==2.0.1" → "pandas") for lookup
+            bare_name = r.split("==")[0].strip()
+            if bare_name in explicit_types:
+                pkg_type = explicit_types[bare_name]
+                logger.info(f"   📦 {bare_name} → {pkg_type} (from details.packages)")
+            else:
+                pkg_type = _detect_package_type(cap_type, bare_name)
+                logger.info(f"   📦 {bare_name} → {pkg_type} (heuristic fallback)")
+            build_capabilities.append({
+                "type": pkg_type,
                 "name": r,
-                "version": None
-            }
-            for r in resources
-        ]
+                "version": None,
+            })
         
         # Convert current_image to registry:5000 format for docker-dind
         base_image = current_image.replace("localhost:5000/", "registry:5000/")
@@ -1696,7 +1723,15 @@ async def add_to_supply_chain(
 
     # For generic tool_install, auto-detect the manager per-package
     # using the same logic as build_agent_image.
-    if cap_type == "tool_install":
+    # First, try to get typed info from details.packages (new format).
+    details_packages = capability.get("details", {}).get("packages") if isinstance(capability.get("details"), dict) else None
+    explicit_types: Dict[str, str] = {}
+    if details_packages and isinstance(details_packages, list):
+        for entry in details_packages:
+            if isinstance(entry, dict) and "name" in entry and "type" in entry:
+                explicit_types[entry["name"]] = entry["type"]
+
+    if cap_type == "tool_install" and not explicit_types:
         # Detect based on first package (all resources in one request
         # are typically the same type)
         first_pkg = [r.strip() for r in resource.split(",") if r.strip()]
@@ -1705,7 +1740,7 @@ async def add_to_supply_chain(
             manager = manager_map.get(detected, "pip")
         else:
             manager = "pip"
-    else:
+    elif not explicit_types:
         manager = manager_map.get(cap_type, "pip")
 
     # Split comma-separated resources, exclude denied ones
@@ -1753,12 +1788,22 @@ async def add_to_supply_chain(
     skipped = 0
     async with httpx.AsyncClient(timeout=15.0) as client:
         for pkg in approved:
+            # Resolve per-package manager from explicit types if available
+            bare_name = pkg.split("==")[0].strip()
+            if bare_name in explicit_types:
+                pkg_manager = manager_map.get(explicit_types[bare_name], "pip")
+            elif explicit_types:
+                # Have explicit types but this package isn't in the map — heuristic
+                pkg_manager = manager_map.get(_detect_package_type(cap_type, bare_name), "pip")
+            else:
+                pkg_manager = manager  # single manager for whole request (legacy)
+
             try:
                 resp = await client.post(
                     f"{control_plane_url}/api/supply-chain/packages",
                     json={
                         "image_type": image_type,
-                        "manager": manager,
+                        "manager": pkg_manager,
                         "package_name": pkg,
                         "notes": f"Auto-added from approved capability request",
                         "is_exception": False,
@@ -1766,7 +1811,7 @@ async def add_to_supply_chain(
                 )
                 if resp.status_code == 201:
                     added += 1
-                    logger.info(f"📦 Supply chain: added '{pkg}' to {image_type}/{manager}")
+                    logger.info(f"📦 Supply chain: added '{pkg}' to {image_type}/{pkg_manager}")
                 elif resp.status_code == 409:
                     skipped += 1  # already exists
                 else:
@@ -1821,6 +1866,22 @@ async def finalize_task(task_id: str, final_status: str = "completed") -> Dict[s
         "status": final_status,
         "outputs": {}
     }
+
+
+def _normalize_deployment_entrypoint(entrypoint: str, port: int) -> str:
+    """Ensure the entrypoint binds to 0.0.0.0:{port} so it's reachable outside the container.
+
+    Common servers default to 127.0.0.1 which is unreachable from the Docker host.
+    This injects the correct bind flags when they are missing.
+    """
+    if "gunicorn" in entrypoint and "-b" not in entrypoint and "--bind" not in entrypoint:
+        # Insert -b 0.0.0.0:PORT right after 'gunicorn'
+        entrypoint = entrypoint.replace("gunicorn", f"gunicorn -b 0.0.0.0:{port}", 1)
+    elif "uvicorn" in entrypoint and "--host" not in entrypoint:
+        entrypoint += f" --host 0.0.0.0 --port {port}"
+    elif "flask run" in entrypoint and "--host" not in entrypoint:
+        entrypoint += f" --host 0.0.0.0 --port {port}"
+    return entrypoint
 
 
 @activity.defn

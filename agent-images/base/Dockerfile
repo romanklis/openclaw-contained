@@ -55,6 +55,7 @@ USER agent
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     OPENCLAW_WORKSPACE=/workspace \
     OPENCLAW_OUTPUT=/workspace/output \
     OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001 \
