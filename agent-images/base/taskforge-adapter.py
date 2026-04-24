@@ -1122,6 +1122,14 @@ def main():
 
     # Check for capability requests (only if no deployment request)
     cap = parse_capability_request(output)
+    # Guard against stale heuristic hits: the agent may probe imports/tools
+    # early in a run (e.g. require('agent-browser')) and later complete
+    # successfully using the correct CLI path. In that case, do not create
+    # a capability request from fallback ModuleNotFoundError parsing.
+    if cap and exit_code == 0 and cap[2] == "ModuleNotFoundError detected":
+        print("\n⚠️ Ignoring stale ModuleNotFoundError capability signal because task exited successfully")
+        cap = None
+
     if cap:
         cap_type, packages, cap_reason = cap
         print(f"\n🔐 Capability needed: {cap_type} → {packages}")

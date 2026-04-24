@@ -286,7 +286,7 @@ services:
   # the "taskforge-iterator" model, and start chatting.
   # =============================================================================
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.6.5
+    image: ghcr.io/open-webui/open-webui:v0.6.5 
     container_name: openclaw-open-webui
     environment:
       # Point Open WebUI at the DAG orchestrator endpoint

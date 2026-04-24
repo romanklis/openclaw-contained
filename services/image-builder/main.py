@@ -660,7 +660,7 @@ RUN apt-get update && apt-get install -y \\
 # ⚠ PicoClaw has no Python — cannot install pip packages
 # Requested: {{ pip_packages | join(', ') }}
 RUN echo "ERROR: pip packages requested but PicoClaw has no Python runtime" >&2 && exit 1
-{% elif image_type == 'openclaw' %}
+{% elif image_type in ('openclaw', 'browser') %}
 # Install Python packages (OpenClaw — system pip, no venv)
 USER root
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -690,7 +690,7 @@ RUN set -e; \
 {% endif %}
 
 {% if npm_packages %}
-{% if image_type in ('openclaw', 'zeroclaw') %}
+{% if image_type in ('openclaw', 'zeroclaw', 'browser') %}
 # Install NPM packages globally
 USER root
 RUN npm install -g \\
@@ -1619,7 +1619,7 @@ async def build_deployment_image(
         logger.info(f"Using agent image as deployment base: {request.agent_image}")
         # Detect image_type for entrypoint formatting only
         _tag = request.agent_image.rsplit(":", 1)[-1] if ":" in request.agent_image else ""
-        KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
+        KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw", "browser"}
         for kt in KNOWN_TYPES:
             if kt in _tag:
                 image_type = kt

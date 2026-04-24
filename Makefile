@@ -2,7 +2,7 @@
 # Auditable Agent Orchestration for OpenClaw
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
-        backup restore scale-workers build-base build-nanobot build-picoclaw build-zeroclaw build-all-images
+		backup restore scale-workers build-base build-nanobot build-picoclaw build-zeroclaw build-browser build-all-images
 
 # ─────────────────────────────────────────────────────────
 # Help
@@ -116,13 +116,25 @@ build-zeroclaw: ## Build the ZeroClaw agent image and push to registry
 	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:zeroclaw
 	@echo "  ✅  openclaw-agent:zeroclaw built & pushed"
 
-build-all-images: build-base build-nanobot build-picoclaw build-zeroclaw ## Build all 4 agent base images
+build-browser: ## Build the Browser agent image (Chromium + agent-browser) and push to registry
+	@echo "Building Browser agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/browser/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:browser \
+		-f /agent-images/browser/Dockerfile \
+		/agent-images/browser/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser
+	@rm -f agent-images/browser/taskforge-adapter.py
+	@echo "  ✅  openclaw-agent:browser built & pushed"
+
+build-all-images: build-base build-nanobot build-picoclaw build-zeroclaw build-browser ## Build all 5 agent base images
 	@echo ""
 	@echo "  ✅  All agent base images built & pushed to registry:"
 	@echo "      openclaw-agent:openclaw  (Full Python)"
 	@echo "      openclaw-agent:nanobot   (Alpine Python)"
 	@echo "      openclaw-agent:picoclaw  (Shell)"
 	@echo "      openclaw-agent:zeroclaw  (Rust)"
+	@echo "      openclaw-agent:browser   (Chromium + agent-browser)"
 
 # ─────────────────────────────────────────────────────────
 # Logs & Status

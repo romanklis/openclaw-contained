@@ -1,0 +1,38 @@
+{
+  "objective": "End-to-end browser capability test: scrape a live webpage using agent-browser, summarise the content, then verify the browser image works correctly by confirming screenshots were produced.",
+  "default_image": "browser",
+  "default_llm": "gemini-flash-latest",
+  "nodes": [
+    {
+      "node_id": "browser-scrape",
+      "description": "Use agent-browser to open https://example.com, take a screenshot, snapshot the page, and extract the page title and body text. Save results to /workspace/scrape_result.txt and /workspace/screenshot.png.",
+      "depends_on": [],
+      "config": {
+        "base_image": "browser",
+        "llm_model": "gemini-flash-latest",
+        "timeout_minutes": 10
+      }
+    },
+    {
+      "node_id": "summarise",
+      "description": "Read /workspace/scrape_result.txt produced by the previous node. Write a short summary (3-5 sentences) of the page content to /workspace/summary.txt. Also confirm /workspace/screenshot.png exists and report its file size.",
+      "depends_on": ["browser-scrape"],
+      "config": {
+        "base_image": "browser",
+        "llm_model": "gemini-flash-latest",
+        "timeout_minutes": 10
+      }
+    },
+    {
+      "node_id": "verify",
+      "description": "Verify the end-to-end browser test passed:\n1. Read /workspace/scrape_result.txt — confirm it is non-empty.\n2. Check /workspace/screenshot.png exists and is > 1KB.\n3. Read /workspace/summary.txt — confirm it has at least 3 sentences.\n4. Run `agent-browser --version` and record the version.\n5. Write /workspace/BROWSER_TEST_RESULT.md with:\n   - Line 1: exactly PASS or FAIL\n   - Checklist of the 4 checks above with ✅ or ❌\n   - agent-browser version\nIf all checks pass, line 1 must be PASS.",
+      "depends_on": ["summarise"],
+      "config": {
+        "base_image": "browser",
+        "llm_model": "gemini-flash-latest",
+        "timeout_minutes": 10
+      }
+    }
+  ],
+  "edges": []
+}

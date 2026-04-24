@@ -148,6 +148,25 @@ profiles:
     - Minimal overhead
     - Parallel workloads
 base_images:
+- id: web-agent
+  name: Web Agent
+  description: Browser-capable agent with pre-installed Chromium and agent-browser for web scraping and automation tasks.
+  base_image: browser
+  llm_model: gemini-flash-latest
+  tags:
+  - browser
+  - scraping
+  - automation
+  - web
+  icon: 🌐
+  metadata:
+    runtime: Python 3.11 (Debian) + Chromium
+    strengths:
+    - Headless browser automation
+    - Web scraping without capability requests
+    - agent-browser pre-installed
+    - Full Python ecosystem
+base_images:
   openclaw:
     dockerfile: agent-images/base/Dockerfile
     tag: openclaw-agent:openclaw
@@ -172,3 +191,9 @@ base_images:
     runtime: Rust (Debian)
     description: Rust-based runtime for high-security/performance.
     size_estimate: ~120 MB
+  browser:
+    dockerfile: agent-images/browser/Dockerfile
+    tag: openclaw-agent:browser
+    runtime: Python 3.11 (Debian) + Chromium
+    description: Full OpenClaw environment with pre-installed Chromium, browser shared libs, and agent-browser.
+    size_estimate: ~600 MB
