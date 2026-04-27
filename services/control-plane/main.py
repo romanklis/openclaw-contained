@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom, supply_chain, skills, environments, dags
 from routers import openai_dag
+from routers import agent_images as agent_images_router
 from database import engine, Base, async_session
 from config import settings
 
@@ -51,6 +52,39 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Supply-chain auto-seed skipped: {exc}")
 
+    # Auto-seed agent images from agent_profiles.yaml if DB is empty
+    try:
+        from sqlalchemy import select
+        from models import AgentImage
+        from pathlib import Path
+        import yaml as _yaml
+        async with async_session() as session:
+            result = await session.execute(select(AgentImage).limit(1))
+            if not result.scalar_one_or_none():
+                candidates = [
+                    Path("/agent-images/agent_profiles.yaml"),
+                    Path(__file__).resolve().parent.parent.parent / "agent-images" / "agent_profiles.yaml",
+                ]
+                for p in candidates:
+                    if p.is_file():
+                        data = _yaml.safe_load(p.read_text()) or {}
+                        base_images = data.get("base_images", {})
+                        for img_id, info in base_images.items():
+                            if not isinstance(info, dict):
+                                continue
+                            session.add(AgentImage(
+                                id=img_id,
+                                name=img_id.capitalize(),
+                                description=info.get("description", ""),
+                                tag=info.get("tag", f"openclaw-agent:{img_id}"),
+                                enabled=True,
+                            ))
+                        await session.commit()
+                        logger.info("Agent images seeded from %s", p)
+                        break
+    except Exception as exc:
+        logger.warning(f"Agent images auto-seed skipped: {exc}")
+
     yield
     
     # Shutdown
@@ -89,6 +123,7 @@ app.include_router(skills.router, prefix="/api/skills", tags=["skills"])
 app.include_router(environments.router, prefix="/api/environments", tags=["environments"])
 app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
 app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
+app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
 
 
 @app.get("/health")

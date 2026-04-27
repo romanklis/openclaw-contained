@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from models import Skill
+from models import Skill, AgentImage
 from dag_validator import validate_dag
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,25 @@ def set_node_execution_model(dag_json: dict, execution_model: str) -> dict:
         config["llm_model"] = execution_model
         node["config"] = config
     return dag_json
+
+
+async def _build_base_images_section(db: AsyncSession) -> str:
+    """Query agent_images table and build a human-readable list for the planner prompt."""
+    _FALLBACK = (
+        '"openclaw" (full Python+Node), "nanobot" (lightweight Python), '
+        '"picoclaw" (shell-only), "zeroclaw" (Python+Rust)'
+    )
+    try:
+        result = await db.execute(
+            select(AgentImage).where(AgentImage.enabled.is_(True))
+        )
+        images = result.scalars().all()
+        if images:
+            return ", ".join(f'"{img.id}" ({img.description})' for img in images)
+    except Exception:
+        pass
+    return _FALLBACK
+
 
 PLANNER_SYSTEM_PROMPT = """\
 You are a task decomposition planner for TaskForge, a universal task orchestration platform.
@@ -91,7 +110,7 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
 5. depends_on lists the node_ids that must complete before this node starts.
 6. Only the final deployment node should have deploy_authorized: true.
 7. Use review/verdict nodes sparingly — only when quality gates are needed.
-8. base_image options: "openclaw" (full Python+Node), "nanobot" (lightweight Python), "picoclaw" (shell-only), "zeroclaw" (Python+Rust)
+8. base_image options: {base_images_section}. Choose the image whose description best matches the task requirements.
 9. Set each node config.llm_model to the requested execution model and do not use GPT models.
 """
 
@@ -164,7 +183,10 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
     skills_map = {s.id: s for s in skills}
 
     skills_section = _build_skills_section(skills_data)
-    system_prompt = PLANNER_SYSTEM_PROMPT.format(skills_section=skills_section)
+    system_prompt = PLANNER_SYSTEM_PROMPT.format(
+        skills_section=skills_section,
+        base_images_section=await _build_base_images_section(db),
+    )
 
     max_attempts = 3
     last_error = ""

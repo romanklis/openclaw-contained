@@ -16,6 +16,32 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Known image types are loaded lazily from the control-plane API the first time
+# supply-chain detection needs them. Falls back to a built-in default so the
+# worker is functional before the control-plane is reachable.
+_KNOWN_IMAGE_TYPES_CACHE: tuple | None = None
+_KNOWN_IMAGE_TYPES_DEFAULT = ("zeroclaw", "nanobot", "picoclaw", "browser", "openclaw")
+
+
+async def _fetch_known_image_types() -> tuple:
+    """Fetch enabled agent image IDs from the control-plane API."""
+    global _KNOWN_IMAGE_TYPES_CACHE
+    if _KNOWN_IMAGE_TYPES_CACHE is not None:
+        return _KNOWN_IMAGE_TYPES_CACHE
+    try:
+        import httpx as _httpx
+        control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+        async with _httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{control_plane_url}/api/agent-images?enabled_only=true")
+            if resp.status_code == 200:
+                names = tuple(img["id"] for img in resp.json())
+                if names:
+                    _KNOWN_IMAGE_TYPES_CACHE = names
+                    return names
+    except Exception as exc:
+        logger.debug("Could not fetch agent image types from API: %s", exc)
+    return _KNOWN_IMAGE_TYPES_DEFAULT
+
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal:7233")
 TASK_QUEUE = os.getenv("TEMPORAL_TASK_QUEUE", "openclaw-tasks")
 
@@ -1762,7 +1788,8 @@ async def add_to_supply_chain(
                 # First try current_image tag
                 cur_img = task_data.get("current_image", "")
                 tag = cur_img.rsplit(":", 1)[-1] if ":" in cur_img else ""
-                for known in ("zeroclaw", "nanobot", "picoclaw", "openclaw"):
+                known_types = await _fetch_known_image_types()
+                for known in known_types:
                     if known in tag:
                         image_type = known
                         break
@@ -1775,7 +1802,7 @@ async def add_to_supply_chain(
                         if dag_resp.status_code == 200:
                             dag_data = dag_resp.json()
                             base = dag_data.get("base_image", "")
-                            for known in ("zeroclaw", "nanobot", "picoclaw", "openclaw"):
+                            for known in known_types:
                                 if known in base:
                                     image_type = known
                                     break
@@ -2581,8 +2608,7 @@ async def create_node_task(
 
     task_id = f"task-{uuid.uuid4().hex[:8]}"
 
-    # Control-plane /api/tasks expects base_image key values like
-    # openclaw|nanobot|picoclaw|zeroclaw, not a full image URL.
+    # Control-plane /api/tasks expects a base_image key (e.g. "browser", "openclaw"), not a full image URL.
     base_image = (agent_image or "openclaw").strip()
     if "/" in base_image and ":" in base_image:
         base_image = base_image.rsplit(":", 1)[-1]

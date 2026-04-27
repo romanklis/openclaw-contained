@@ -1,7 +1,7 @@
 """
 Database models
 """
-from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text
+from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -473,6 +473,30 @@ class SupplyChainImageType(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     image_type = Column(String, unique=True, nullable=False)
     notes = Column(Text)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class AgentImage(Base):
+    """A named base image that the planner can assign to DAG nodes.
+
+    Rows are seeded from agent_profiles.yaml at startup (if table is empty)
+    and can be added/updated via the /api/agent-images CRUD API.
+    Users nominate post-build images here so the planner can discover them.
+    """
+    __tablename__ = "agent_images"
+
+    # Logical name — used as base_image value in DAG node configs (e.g. "browser")
+    id = Column(String, primary_key=True)
+    # Human-readable label (e.g. "Web Agent")
+    name = Column(String, nullable=False)
+    # Full description shown to the planner LLM for image selection
+    description = Column(Text, default="")
+    # Registry tag (e.g. "openclaw-agent:browser") — informational
+    tag = Column(String, default="")
+    # Whether this image is currently selectable by the planner
+    enabled = Column(Boolean, default=True, nullable=False)
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
