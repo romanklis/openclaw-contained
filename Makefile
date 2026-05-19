@@ -2,7 +2,7 @@
 # Auditable Agent Orchestration for OpenClaw
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
-		backup restore scale-workers build-base build-nanobot build-picoclaw build-zeroclaw build-browser build-all-images
+		backup restore scale-workers build-base build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images
 
 # ─────────────────────────────────────────────────────────
 # Help
@@ -127,7 +127,29 @@ build-browser: ## Build the Browser agent image (Chromium + agent-browser) and p
 	@rm -f agent-images/browser/taskforge-adapter.py
 	@echo "  ✅  openclaw-agent:browser built & pushed"
 
-build-all-images: build-base build-nanobot build-picoclaw build-zeroclaw build-browser ## Build all 5 agent base images
+build-browser-v2: ## Build Browser v2 image (Chromium + agent-browser + obscura) and push to registry
+	@echo "Building Browser v2 agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/browser_v2/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:browser_v2 \
+		-f /agent-images/browser_v2/Dockerfile \
+		/agent-images/browser_v2/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser_v2
+	@rm -f agent-images/browser_v2/taskforge-adapter.py
+	@echo "  ✅  openclaw-agent:browser_v2 built & pushed"
+
+build-browser-v3: ## Build Browser v3 image (Chromium + agent-browser + Lightpanda) and push to registry
+	@echo "Building Browser v3 agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/browser_v3/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:browser_v3 \
+		-f /agent-images/browser_v3/Dockerfile \
+		/agent-images/browser_v3/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser_v3
+	@rm -f agent-images/browser_v3/taskforge-adapter.py
+	@echo "  ✅  openclaw-agent:browser_v3 built & pushed"
+
+build-all-images: build-base build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 ## Build all 7 agent base images
 	@echo ""
 	@echo "  ✅  All agent base images built & pushed to registry:"
 	@echo "      openclaw-agent:openclaw  (Full Python)"
@@ -135,6 +157,8 @@ build-all-images: build-base build-nanobot build-picoclaw build-zeroclaw build-b
 	@echo "      openclaw-agent:picoclaw  (Shell)"
 	@echo "      openclaw-agent:zeroclaw  (Rust)"
 	@echo "      openclaw-agent:browser   (Chromium + agent-browser)"
+	@echo "      openclaw-agent:browser_v2 (Chromium + agent-browser + obscura)"
+	@echo "      openclaw-agent:browser_v3 (Chromium + agent-browser + lightpanda)"
 
 # ─────────────────────────────────────────────────────────
 # Logs & Status

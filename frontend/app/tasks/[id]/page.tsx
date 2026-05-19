@@ -190,6 +190,28 @@ function AuditIterationContent({ iter, iterTurns, iterTokens, taskId, selectedDo
   selectedDockerfile: string | null;
   setSelectedDockerfile: (v: string | null) => void;
 }) {
+  const [mining, setMining] = useState(false);
+  const [mineResult, setMineResult] = useState<string | null>(null);
+
+  const mineSkill = async () => {
+    setMining(true);
+    setMineResult(null);
+    try {
+      const r = await fetch(`${API}/api/skill-learning/mine`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_id: taskId }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const demo = await r.json();
+      setMineResult(`Demo ${demo.id} created — review it in Skill Studio`);
+    } catch (e: any) {
+      setMineResult(`Error: ${e.message}`);
+    } finally {
+      setMining(false);
+    }
+  };
+
   return (
     <>
       {/* Iteration header */}
@@ -212,6 +234,19 @@ function AuditIterationContent({ iter, iterTurns, iterTokens, taskId, selectedDo
           >
             Temporal ↗
           </a>
+          <button
+            disabled={mining}
+            onClick={mineSkill}
+            className="px-2 py-0.5 bg-blue-900/60 hover:bg-blue-800 border border-blue-700 rounded text-blue-300 disabled:opacity-50 transition-colors"
+            title="Extract a skill candidate from this task's audit logs"
+          >
+            {mining ? 'Mining…' : '→ Skill Studio'}
+          </button>
+          {mineResult && (
+            <span className={mineResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}>
+              {mineResult}
+            </span>
+          )}
         </div>
       </div>
 

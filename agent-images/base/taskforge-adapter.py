@@ -246,12 +246,71 @@ def get_runtime_description() -> str:
             "- `curl`, `git`\n"
             "- Rust toolchain available at /opt/openclaw/zeroclaw-agent\n"
         )
+    elif IMAGE_TYPE == "browser_v2":
+        return (
+            "- Python 3 (Debian, standard library)\n"
+            "- `httpx` (HTTP client)\n"
+            "- `curl`, `git`\n"
+            "- `obscura` and `obscura-worker` for stealth browser automation\n"
+            "- Browser-ready runtime inherited from the browser image\n"
+        )
+    elif IMAGE_TYPE == "browser_v3":
+        return (
+            "- Python 3 (Debian, standard library)\n"
+            "- `httpx` (HTTP client)\n"
+            "- `curl`, `git`\n"
+            "- `lightpanda` CLI at /usr/local/bin/lightpanda (fast headless browser)\n"
+            "- `agent-browser` and Chromium available as fallback\n"
+            "- Browser-ready runtime with shared libraries\n"
+        )
+    elif IMAGE_TYPE == "browser":
+        return (
+            "- Python 3 (Debian, standard library)\n"
+            "- `httpx` (HTTP client)\n"
+            "- `curl`, `git`\n"
+            "- `agent-browser` for browser automation\n"
+            "- Browser-ready runtime with Chromium and shared libraries\n"
+        )
     else:
         return (
             "- Python 3 (standard library)\n"
             "- `httpx` (HTTP client)\n"
             "- `curl`, `git`\n"
         )
+
+
+def get_image_specific_guidance() -> str:
+    """Return extra workflow guidance tailored to the active image type."""
+    if IMAGE_TYPE == "browser_v2":
+        return (
+            "## Browser V2 Workflow\n\n"
+            "Use the browser_v2 toolchain deliberately:\n"
+            "- Prefer `obscura fetch --stealth <url>` for dynamic or protected pages.\n"
+            "- Use Obscura first to discover the real report/document URLs from investor sites.\n"
+            "- Once you have the direct PDF or HTML URLs, use `curl -L -o <file>` to download the source files.\n"
+            "- Prefer `curl` for binary artifacts such as PDFs. Do NOT rely on Obscura stdout as a binary downloader.\n"
+            "- For HTML pages, use Obscura `--eval` or `--dump text` to extract readable content.\n"
+            "- For PDF analysis, first download the PDF to `/workspace`, then use local CLI tools or Python code to extract text.\n"
+            "- Unless the task explicitly requires it, do NOT use `agent-browser` on browser_v2; Obscura plus direct downloads is the default path.\n"
+        )
+    if IMAGE_TYPE == "browser_v3":
+        return (
+            "## Browser V3 Workflow (Lightpanda)\n\n"
+            "Lightpanda is a fast, low-memory headless browser. Use it as your primary browsing tool.\n"
+            "- Fetch and render pages: `lightpanda fetch <url>` — outputs rendered HTML to stdout.\n"
+            "- Pipe output to extract links: `lightpanda fetch <url> | grep -oP 'href=\"\\K[^\"]+\\.pdf'`\n"
+            "- For JavaScript-heavy sites, Lightpanda executes JS during render.\n"
+            "- Once you have a direct PDF URL, download it with `curl -L -o /workspace/file.pdf <url>`.\n"
+            "- If Lightpanda cannot render a page (exit non-zero or empty output), fall back to `curl -L` or `agent-browser`.\n"
+            "- Always validate that the URLs returned are absolute (start with http:// or https://). Resolve relative URLs against the base page URL.\n"
+        )
+    if IMAGE_TYPE == "browser":
+        return (
+            "## Browser Workflow\n\n"
+            "Use browser automation only when a normal HTTP fetch is insufficient.\n"
+            "For direct PDFs or static assets, prefer `curl -L -o <file>` over browser tooling.\n"
+        )
+    return ""
 
 
 def setup_workspace_context():
@@ -272,6 +331,7 @@ def setup_workspace_context():
         )
 
     runtime_desc = get_runtime_description()
+    image_guidance = get_image_specific_guidance()
 
     agents_md = f"""# AGENTS.md — Managed Execution Environment
 
@@ -297,6 +357,7 @@ You cannot install packages yourself (`pip install`, `apt-get`, etc. will fail).
 Already available — do NOT request these:
 {runtime_desc}
 {installed_packages_section}
+{image_guidance}
 
 ### How to request a missing package
 

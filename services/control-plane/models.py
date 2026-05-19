@@ -393,6 +393,10 @@ class DAGNode(Base):
     input_mapping = Column(JSON, default=dict)  # maps inputs to dependency outputs
     output_data = Column(JSON)  # captured results after execution
 
+    # v2 Skill selection (planner picks an image-scoped skill for this node)
+    selected_skill_v2_id = Column(String, ForeignKey("skills_v2.id"), nullable=True)
+    skill_selection_reason = Column(Text, nullable=True)
+
     # Runtime
     task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
     container_id = Column(String)
@@ -403,6 +407,7 @@ class DAGNode(Base):
     # Relationships
     dag = relationship("MasterDAG", back_populates="nodes")
     skill = relationship("Skill")
+    selected_skill_v2 = relationship("SkillV2", foreign_keys=[selected_skill_v2_id])
     task = relationship("Task", foreign_keys=[task_id])
 
 
@@ -497,6 +502,165 @@ class AgentImage(Base):
     tag = Column(String, default="")
     # Whether this image is currently selectable by the planner
     enabled = Column(Boolean, default=True, nullable=False)
+    # Runtime summary (e.g. "Python 3.11 (Debian) + Chromium")
+    runtime = Column(String, default="")
+    # High-level capabilities/tools available in this image
+    capabilities = Column(JSON, default=list)
+    # Task categories this image is best suited for
+    best_for = Column(JSON, default=list)
+    # Optional guidance for what this image should avoid
+    avoid_for = Column(JSON, default=list)
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
+
+
+# =========================================================================
+# Skill Learning System v2 — Image-Scoped, Evidence-Based Skill Trees
+# =========================================================================
+
+class SkillV2Status(str, enum.Enum):
+    """Lifecycle state of a v2 skill node."""
+    DRAFT = "draft"         # extracted but not yet reviewed
+    ACTIVE = "active"       # approved and eligible for planner use
+    ARCHIVED = "archived"   # retired; preserved for lineage
+
+
+class SkillV2Source(str, enum.Enum):
+    """How this skill node was originally created."""
+    DEMO = "demo"           # user demonstrated the task interactively
+    AUDIT_MINE = "audit_mine"  # extracted from prior task audit logs
+    MANUAL = "manual"       # written directly by a human operator
+
+
+class SkillV2(Base):
+    """An image-scoped, versioned skill node in the learning tree.
+
+    Skill nodes belong to one agent image and describe a repeatable
+    procedural competency (e.g. "download PDF with httpx on browser_v3").
+    They are extracted from demos or audit logs, reviewed by a human,
+    and then made available to the planner for selection.
+    """
+    __tablename__ = "skills_v2"
+
+    id = Column(String, primary_key=True)           # skv2-<uuid8>
+    image_id = Column(String, ForeignKey("agent_images.id"), nullable=False, index=True)
+
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    instructions = Column(Text, default="")         # injected verbatim at agent start
+
+    status = Column(SQLEnum(SkillV2Status), default=SkillV2Status.DRAFT, nullable=False)
+    source_type = Column(SQLEnum(SkillV2Source), default=SkillV2Source.MANUAL, nullable=False)
+
+    # Hierarchical skill tree: null parent = root competency
+    parent_id = Column(String, ForeignKey("skills_v2.id"), nullable=True)
+
+    # Quality / confidence signals
+    confidence_score = Column(Integer, default=0)   # 0-100; updated by review + outcomes
+    usage_count = Column(Integer, default=0)         # times planner selected this skill
+    success_count = Column(Integer, default=0)       # times execution succeeded with it
+    reviewer_score = Column(Integer, nullable=True)  # explicit human rating 1-5
+
+    # Searchability
+    tags = Column(JSON, default=list)
+
+    # Evidence links (task IDs that contributed to this skill)
+    evidence_task_ids = Column(JSON, default=list)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    created_by = Column(String)
+
+    # Relationships
+    image = relationship("AgentImage", backref="skills_v2")
+    parent = relationship("SkillV2", remote_side="SkillV2.id", backref="children")
+    demos = relationship("SkillDemo", back_populates="skill", cascade="all, delete-orphan")
+    reviews = relationship("SkillReview", back_populates="skill", cascade="all, delete-orphan")
+    selection_events = relationship("SkillSelectionEvent", back_populates="skill")
+
+
+class SkillDemo(Base):
+    """A user-provided demonstration that seeded or refined a SkillV2 node.
+
+    Stores the raw prompt + optional artifact files + extracted procedure
+    from the LLM extraction pass. A SkillV2 node may have multiple demos
+    (accumulated evidence).
+    """
+    __tablename__ = "skill_demos"
+
+    id = Column(String, primary_key=True)           # demo-<uuid8>
+    skill_id = Column(String, ForeignKey("skills_v2.id"), nullable=True)  # set after review
+    image_id = Column(String, ForeignKey("agent_images.id"), nullable=False)
+
+    # User-provided description of what was demonstrated
+    prompt = Column(Text, nullable=False)
+
+    # LLM-extracted structured procedure (JSON steps / free-form text)
+    extracted_procedure = Column(JSON, nullable=True)
+
+    # Optional source task (if demo was captured from a live run)
+    source_task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+
+    # Attached files (filename -> base64 content or S3 ref)
+    artifacts = Column(JSON, default=dict)
+
+    status = Column(String, default="pending")      # pending / extracted / linked / rejected
+
+    created_at = Column(DateTime, server_default=func.now())
+    created_by = Column(String)
+
+    skill = relationship("SkillV2", back_populates="demos")
+    source_task = relationship("Task", foreign_keys=[source_task_id])
+
+
+class SkillReview(Base):
+    """Human review decision for a SkillV2 node or a demo candidate.
+
+    Reviewers can approve (optionally with edits to instructions),
+    reject (with a reason), or request changes.
+    """
+    __tablename__ = "skill_reviews"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(String, ForeignKey("skills_v2.id"), nullable=False)
+
+    decision = Column(String, nullable=False)       # approve / reject / request_changes
+    rating = Column(Integer, nullable=True)         # 1-5 quality rating
+    notes = Column(Text)
+    edited_instructions = Column(Text, nullable=True)  # reviewer-corrected instructions
+
+    reviewed_by = Column(String)
+    reviewed_at = Column(DateTime, server_default=func.now())
+
+    skill = relationship("SkillV2", back_populates="reviews")
+
+
+class SkillSelectionEvent(Base):
+    """Records that the planner selected a skill for a DAG node.
+
+    Used to update usage statistics, track whether the agent followed
+    the skill, and feed back into confidence scoring.
+    """
+    __tablename__ = "skill_selection_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(String, ForeignKey("skills_v2.id"), nullable=False)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=True)
+    node_id = Column(String, nullable=True)         # node_id within the DAG
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+
+    selection_reason = Column(Text)                 # planner's rationale
+    alternatives_considered = Column(JSON, default=list)  # other skill IDs ranked
+
+    # Post-execution outcome (filled in by worker after task completes)
+    followed = Column(Boolean, nullable=True)       # did agent follow the skill?
+    outcome = Column(String, nullable=True)         # success / failure / partial
+    feedback_notes = Column(Text, nullable=True)
+
+    selected_at = Column(DateTime, server_default=func.now())
+    resolved_at = Column(DateTime, nullable=True)
+
+    skill = relationship("SkillV2", back_populates="selection_events")
+    dag = relationship("MasterDAG", foreign_keys=[dag_id])
+    task = relationship("Task", foreign_keys=[task_id])

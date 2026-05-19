@@ -447,6 +447,8 @@ class DAGNodeResponse(BaseModel):
     container_id: Optional[str]
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+    selected_skill_v2_id: Optional[str] = None
+    skill_selection_reason: Optional[str] = None
 
     class Config:
         from_attributes = True

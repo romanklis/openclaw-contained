@@ -10,6 +10,7 @@ from sqlalchemy import text
 from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom, supply_chain, skills, environments, dags
 from routers import openai_dag
 from routers import agent_images as agent_images_router
+from routers import skill_learning as skill_learning_router
 from database import engine, Base, async_session
 from config import settings
 
@@ -34,6 +35,15 @@ async def lifespan(app: FastAPI):
         # Some existing DB volumes were created before the DAG schema landed.
         await conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS dag_id VARCHAR"))
         await conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS node_id VARCHAR"))
+        # Transitional compatibility migration: ensure AgentImage suitability
+        # columns exist so planning can select images by capabilities/use-cases.
+        await conn.execute(text("ALTER TABLE agent_images ADD COLUMN IF NOT EXISTS runtime VARCHAR"))
+        await conn.execute(text("ALTER TABLE agent_images ADD COLUMN IF NOT EXISTS capabilities JSON"))
+        await conn.execute(text("ALTER TABLE agent_images ADD COLUMN IF NOT EXISTS best_for JSON"))
+        await conn.execute(text("ALTER TABLE agent_images ADD COLUMN IF NOT EXISTS avoid_for JSON"))
+        # v2 skill learning system columns
+        await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS selected_skill_v2_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS skill_selection_reason TEXT"))
 
     logger.info("Database initialized")
 
@@ -72,12 +82,17 @@ async def lifespan(app: FastAPI):
                         for img_id, info in base_images.items():
                             if not isinstance(info, dict):
                                 continue
+                            enabled = info.get("enabled", True)
                             session.add(AgentImage(
                                 id=img_id,
-                                name=img_id.capitalize(),
+                                name=info.get("name", img_id.capitalize()),
                                 description=info.get("description", ""),
                                 tag=info.get("tag", f"openclaw-agent:{img_id}"),
-                                enabled=True,
+                                enabled=bool(enabled),
+                                runtime=info.get("runtime", ""),
+                                capabilities=info.get("capabilities", []),
+                                best_for=info.get("best_for", []),
+                                avoid_for=info.get("avoid_for", []),
                             ))
                         await session.commit()
                         logger.info("Agent images seeded from %s", p)
@@ -124,6 +139,7 @@ app.include_router(environments.router, prefix="/api/environments", tags=["envir
 app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
 app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
 app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
+app.include_router(skill_learning_router.router, prefix="/api/skill-learning", tags=["skill-learning"])
 
 
 @app.get("/health")

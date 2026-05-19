@@ -24,6 +24,8 @@ interface DAGNode {
   container_id: string | null
   started_at: string | null
   completed_at: string | null
+  selected_skill_v2_id: string | null
+  skill_selection_reason: string | null
 }
 
 interface DAGDetail {
@@ -384,6 +386,14 @@ export default function DAGDetailPage() {
                   skill: {selectedNode.skill_id}
                 </span>
               )}
+              {selectedNode.selected_skill_v2_id && (
+                <span
+                  className="text-xs bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded cursor-help"
+                  title={selectedNode.skill_selection_reason ?? 'v2 skill selected'}
+                >
+                  v2: {selectedNode.selected_skill_v2_id}
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-3 text-xs">
               {selectedNode.task_id && (
@@ -400,6 +410,13 @@ export default function DAGDetailPage() {
 
           {selectedNode.description && (
             <p className="text-sm text-gray-400 mb-3">{selectedNode.description}</p>
+          )}
+
+          {selectedNode.skill_selection_reason && (
+            <div className="mb-3 p-2 bg-blue-950/40 border border-blue-800/50 rounded text-xs text-blue-300">
+              <span className="font-semibold text-blue-400">Skill rationale: </span>
+              {selectedNode.skill_selection_reason}
+            </div>
           )}
 
           {selectedNode.depends_on.length > 0 && (
@@ -815,6 +832,14 @@ export default function DAGDetailPage() {
                   {node.skill_id && (
                     <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">
                       {node.skill_id}
+                    </span>
+                  )}
+                  {node.selected_skill_v2_id && (
+                    <span
+                      className="text-xs bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded cursor-help"
+                      title={node.skill_selection_reason ?? 'v2 skill selected'}
+                    >
+                      v2✓
                     </span>
                   )}
                 </div>

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
-from models import MasterDAG, DAGNode, Task, DAGStatus, NodeStatus
+from models import MasterDAG, DAGNode, Task, DAGStatus, NodeStatus, SkillSelectionEvent
 from schemas import (
     DAGCreate, DAGManualCreate, DAGResponse, DAGDetail, DAGNodeResponse, DAGRevise,
 )
@@ -85,6 +85,9 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
 
     nodes = []
     for node_def in dag_json.get("nodes", []):
+        node_config = node_def.get("config", {})
+        selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
+        skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
         node = DAGNode(
             dag_id=dag_id,
             node_id=node_def["node_id"],
@@ -93,16 +96,26 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
             description=node_def.get("description"),
             status=NodeStatus.PENDING,
             depends_on=node_def.get("depends_on", []),
-            config=node_def.get("config", {}),
+            config=node_config,
             input_mapping=node_def.get("input_mapping", {}),
+            selected_skill_v2_id=selected_skill_v2_id,
+            skill_selection_reason=skill_selection_reason,
         )
         db.add(node)
         nodes.append(node)
 
+        # Emit selection event for tracking
+        if selected_skill_v2_id:
+            event = SkillSelectionEvent(
+                skill_id=selected_skill_v2_id,
+                dag_id=dag_id,
+                node_id=node_def["node_id"],
+                selection_reason=skill_selection_reason,
+            )
+            db.add(event)
+
     await db.commit()
     await db.refresh(dag)
-
-    # Auto-start if requested
     if data.auto_start:
         return await _start_dag(dag, db)
 
@@ -412,6 +425,9 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
 
     nodes = []
     for node_def in dag_json.get("nodes", []):
+        node_config = node_def.get("config", {})
+        selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
+        skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
         node = DAGNode(
             dag_id=new_dag_id,
             node_id=node_def["node_id"],
@@ -420,11 +436,22 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
             description=node_def.get("description"),
             status=NodeStatus.PENDING,
             depends_on=node_def.get("depends_on", []),
-            config=node_def.get("config", {}),
+            config=node_config,
             input_mapping=node_def.get("input_mapping", {}),
+            selected_skill_v2_id=selected_skill_v2_id,
+            skill_selection_reason=skill_selection_reason,
         )
         db.add(node)
         nodes.append(node)
+
+        if selected_skill_v2_id:
+            event = SkillSelectionEvent(
+                skill_id=selected_skill_v2_id,
+                dag_id=new_dag_id,
+                node_id=node_def["node_id"],
+                selection_reason=skill_selection_reason,
+            )
+            db.add(event)
 
     await db.commit()
     await db.refresh(new_dag)
@@ -489,6 +516,8 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
                 "container_id": n.container_id,
                 "started_at": n.started_at,
                 "completed_at": n.completed_at,
+                "selected_skill_v2_id": n.selected_skill_v2_id,
+                "skill_selection_reason": n.skill_selection_reason,
             }
             for n in nodes
         ],

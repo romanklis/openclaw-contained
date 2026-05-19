@@ -742,8 +742,8 @@ async def start_agent_container(
             workspace_id = f"workspace-{task_id}"
 
         # --- skill instructions discovery ---
-        # If this task is a DAG node with a skill_id, fetch the skill's
-        # instructions (SKILL.md content) so the agent knows setup steps.
+        # If this task is a DAG node with a selected v2 skill, fetch that
+        # skill's instructions first. Fall back to legacy skill_id.
         skill_instructions = ""
         if dag_id and node_id:
             try:
@@ -754,16 +754,34 @@ async def start_agent_container(
                     if _dag_resp.status_code == 200:
                         _dag_data = _dag_resp.json()
                         for _n in _dag_data.get("nodes", []):
-                            if _n.get("node_id") == node_id and _n.get("skill_id"):
+                            if _n.get("node_id") != node_id:
+                                continue
+
+                            _selected_v2 = _n.get("selected_skill_v2_id")
+                            _legacy_skill = _n.get("skill_id")
+
+                            if _selected_v2:
                                 _skill_resp = await _hc_skill.get(
-                                    f"{_cp_skill}/api/skills/{_n['skill_id']}"
+                                    f"{_cp_skill}/api/skill-learning/skills/{_selected_v2}"
                                 )
                                 if _skill_resp.status_code == 200:
                                     skill_instructions = _skill_resp.json().get("instructions", "") or ""
                                     if skill_instructions:
                                         logger.info(
-                                            f"📚 Skill instructions loaded for {node_id} "
-                                            f"(skill: {_n['skill_id']}, {len(skill_instructions)} chars)"
+                                            f"📚 V2 skill instructions loaded for {node_id} "
+                                            f"(skill: {_selected_v2}, {len(skill_instructions)} chars)"
+                                        )
+
+                            if not skill_instructions and _legacy_skill:
+                                _skill_resp = await _hc_skill.get(
+                                    f"{_cp_skill}/api/skills/{_legacy_skill}"
+                                )
+                                if _skill_resp.status_code == 200:
+                                    skill_instructions = _skill_resp.json().get("instructions", "") or ""
+                                    if skill_instructions:
+                                        logger.info(
+                                            f"📚 Legacy skill instructions loaded for {node_id} "
+                                            f"(skill: {_legacy_skill}, {len(skill_instructions)} chars)"
                                         )
                                 break
             except Exception as _skill_err:

@@ -148,52 +148,130 @@ profiles:
     - Minimal overhead
     - Parallel workloads
 base_images:
-- id: web-agent
-  name: Web Agent
-  description: Browser-capable agent with pre-installed Chromium and agent-browser for web scraping and automation tasks.
-  base_image: browser
-  llm_model: gemini-flash-latest
-  tags:
-  - browser
-  - scraping
-  - automation
-  - web
-  icon: 🌐
-  metadata:
-    runtime: Python 3.11 (Debian) + Chromium
-    strengths:
-    - Headless browser automation
-    - Web scraping without capability requests
-    - agent-browser pre-installed
-    - Full Python ecosystem
-base_images:
   openclaw:
     dockerfile: agent-images/base/Dockerfile
     tag: openclaw-agent:openclaw
+    enabled: true
     runtime: Python 3.11 (Debian)
     description: Full Python environment with build tools and networking.
     size_estimate: ~450 MB
+    capabilities:
+    - python
+    - package-install
+    - build-tools
+    - git
+    - network-clients
+    best_for:
+    - general coding
+    - backend services
+    - data processing
+    - sdk integration
+    avoid_for:
+    - browser automation at scale
   nanobot:
     dockerfile: agent-images/nanobot/Dockerfile
     tag: openclaw-agent:nanobot
+    enabled: true
     runtime: Python 3.11 (Alpine)
     description: Lightweight Alpine Python for fast scripts.
     size_estimate: ~80 MB
+    capabilities:
+    - python
+    - lightweight-runtime
+    - fast-startup
+    best_for:
+    - quick scripts
+    - data transforms
+    - short-lived tasks
+    avoid_for:
+    - heavy native builds
+    - browser automation
   picoclaw:
     dockerfile: agent-images/picoclaw/Dockerfile
     tag: openclaw-agent:picoclaw
+    enabled: true
     runtime: Shell (Alpine)
     description: Minimal shell environment for simple tasks.
     size_estimate: ~15 MB
+    capabilities:
+    - shell
+    - cli-tools
+    - text-processing
+    best_for:
+    - shell automation
+    - file operations
+    - ops glue scripts
+    avoid_for:
+    - python package workflows
+    - browser automation
   zeroclaw:
     dockerfile: agent-images/zeroclaw/Dockerfile
     tag: openclaw-agent:zeroclaw
+    enabled: true
     runtime: Rust (Debian)
     description: Rust-based runtime for high-security/performance.
     size_estimate: ~120 MB
+    capabilities:
+    - rust
+    - secure-runtime
+    - high-performance
+    best_for:
+    - security-sensitive jobs
+    - performance-critical tasks
+    - systems programming
+    avoid_for:
+    - rich python ecosystem tasks
   browser:
     dockerfile: agent-images/browser/Dockerfile
     tag: openclaw-agent:browser
+    enabled: false
     runtime: Python 3.11 (Debian) + Chromium
     description: Full OpenClaw environment with pre-installed Chromium, browser shared libs, and agent-browser.
     size_estimate: ~600 MB
+    capabilities:
+    - browser-automation
+    - chromium
+    - screenshots
+    - dynamic-web-scraping
+    best_for:
+    - web navigation
+    - interactive scraping
+    - js-rendered pages
+    avoid_for:
+    - minimal-latency scripting
+  browser_v2:
+    dockerfile: agent-images/browser_v2/Dockerfile
+    tag: openclaw-agent:browser_v2
+    enabled: false
+    runtime: Python 3.11 (Debian) + Chromium + Obscura
+    description: Browser automation image with Chromium, agent-browser, and Obscura for stealthier scraping.
+    size_estimate: ~620 MB
+    capabilities:
+    - browser-automation
+    - chromium
+    - obscura
+    - anti-bot-resilience
+    best_for:
+    - protected-site scraping
+    - dynamic websites
+    - browser-driven extraction
+    avoid_for:
+    - tasks requiring smallest image footprint
+  browser_v3:
+    dockerfile: agent-images/browser_v3/Dockerfile
+    tag: openclaw-agent:browser_v3
+    enabled: true
+    runtime: Python 3.11 (Debian) + Chromium + Lightpanda
+    description: Browser automation image with Chromium, agent-browser, and Lightpanda.
+    size_estimate: ~620 MB
+    capabilities:
+    - browser-automation
+    - chromium
+    - lightpanda
+    - dynamic-content handling
+    best_for:
+    - modern web app interaction
+    - javascript-heavy pages
+    - browser testing/scraping
+    avoid_for:
+    - shell-only workflows

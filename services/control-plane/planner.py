@@ -7,11 +7,12 @@ a DAG JSON plan from a user's objective and the available skill registry.
 import json
 import logging
 import httpx
+import re
 from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from models import Skill, AgentImage
+from models import Skill, AgentImage, SkillV2, SkillV2Status
 from dag_validator import validate_dag
 
 logger = logging.getLogger(__name__)
@@ -52,10 +53,135 @@ async def _build_base_images_section(db: AsyncSession) -> str:
         )
         images = result.scalars().all()
         if images:
-            return ", ".join(f'"{img.id}" ({img.description})' for img in images)
+            formatted = []
+            for img in images:
+                capabilities = ", ".join(img.capabilities or []) or "(none listed)"
+                best_for = ", ".join(img.best_for or []) or "general tasks"
+                avoid_for = ", ".join(img.avoid_for or []) or "(none listed)"
+                runtime = img.runtime or "unspecified runtime"
+                formatted.append(
+                    f'"{img.id}" (runtime: {runtime}; best_for: {best_for}; '
+                    f'capabilities: {capabilities}; avoid_for: {avoid_for}; '
+                    f'description: {img.description})'
+                )
+            return ", ".join(formatted)
     except Exception:
         pass
     return _FALLBACK
+
+
+async def _build_skills_v2_section(db: AsyncSession) -> str:
+    """Build a concise per-image skills section from active v2 skill nodes."""
+    try:
+        result = await db.execute(
+            select(SkillV2).where(SkillV2.status == SkillV2Status.ACTIVE).order_by(
+                SkillV2.image_id, SkillV2.confidence_score.desc()
+            )
+        )
+        skills = result.scalars().all()
+        if not skills:
+            return ""
+
+        by_image: dict[str, list] = {}
+        for s in skills:
+            by_image.setdefault(s.image_id, []).append(s)
+
+        lines = ["## Image-Scoped Skills (v2) — MANDATORY\n"
+                 "IMPORTANT: For every DAG node, check if its base_image matches one of the images below. "
+                 "If a skill matches the node's task, you MUST set config.selected_skill_v2_id to the skill id "
+                 "and config.skill_selection_reason to a brief explanation. "
+                 "Omitting this when a match exists is an error.\n"]
+        for image_id, image_skills in by_image.items():
+            lines.append(f"### Image: {image_id}  ← nodes with base_image=\"{image_id}\" MUST use one of these skills if the task matches")
+            for s in image_skills[:10]:  # cap per image to avoid prompt bloat
+                lines.append(
+                    f"  - SKILL id={s.id} | {s.name} (confidence={s.confidence_score}) "
+                    f"[{', '.join(s.tags or [])}]\n"
+                    f"    What it does: {s.description[:160]}"
+                )
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.debug("Could not build v2 skills section: %s", exc)
+        return ""
+
+
+def _normalize_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+
+def _pick_matching_v2_skill(node: dict, objective: str, candidates: list[SkillV2]) -> SkillV2 | None:
+    """Pick a best-effort matching v2 skill for a DAG node."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    node_text = " ".join([
+        node.get("description", ""),
+        objective or "",
+        json.dumps(node.get("input_mapping", {}) or {}),
+    ])
+    node_tokens = _normalize_tokens(node_text)
+
+    best: SkillV2 | None = None
+    best_score = 0
+    for skill in candidates:
+        skill_text = " ".join([
+            skill.name or "",
+            skill.description or "",
+            " ".join(skill.tags or []),
+        ])
+        skill_tokens = _normalize_tokens(skill_text)
+        overlap = len(node_tokens.intersection(skill_tokens))
+        score = overlap + max(0, (skill.confidence_score or 0) // 20)
+        if score > best_score:
+            best = skill
+            best_score = score
+
+    return best if best_score > 0 else None
+
+
+async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: str) -> dict:
+    """Fill selected_skill_v2_id when model omits it but a matching active v2 skill exists."""
+    try:
+        result = await db.execute(
+            select(SkillV2).where(SkillV2.status == SkillV2Status.ACTIVE).order_by(
+                SkillV2.image_id, SkillV2.confidence_score.desc(), SkillV2.created_at.desc()
+            )
+        )
+        active_skills = result.scalars().all()
+        if not active_skills:
+            return dag_json
+
+        by_image: dict[str, list[SkillV2]] = {}
+        for skill in active_skills:
+            by_image.setdefault(skill.image_id, []).append(skill)
+
+        for node in dag_json.get("nodes", []):
+            config = node.setdefault("config", {})
+            if config.get("selected_skill_v2_id"):
+                continue
+
+            image_id = config.get("base_image")
+            if not image_id:
+                continue
+
+            selected = _pick_matching_v2_skill(node, objective, by_image.get(image_id, []))
+            if not selected:
+                continue
+
+            reason = (
+                f"Auto-selected image-scoped skill '{selected.name}' "
+                f"for node on image '{image_id}'."
+            )
+            config["selected_skill_v2_id"] = selected.id
+            config["skill_selection_reason"] = reason
+            node["selected_skill_v2_id"] = selected.id
+            node["skill_selection_reason"] = reason
+        return dag_json
+    except Exception as exc:
+        logger.debug("Could not apply v2 skill fallback: %s", exc)
+        return dag_json
 
 
 PLANNER_SYSTEM_PROMPT = """\
@@ -69,6 +195,8 @@ These are reusable skill templates. Each skill has steps that can become individ
 Use them when they match the task requirements. For unique tasks, create inline nodes (skill_id: null).
 
 {skills_section}
+
+{skills_v2_section}
 
 ## DAG JSON Schema
 You MUST respond with ONLY a valid JSON object (no markdown, no text before/after):
@@ -85,7 +213,9 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
         "base_image": "openclaw",
         "llm_model": null,
         "timeout_minutes": 15,
-        "deploy_authorized": false
+        "deploy_authorized": false,
+        "selected_skill_v2_id": null,
+        "skill_selection_reason": null
       }},
       "input_mapping": {{
         "input_name": "dependency-node-id.output_key"
@@ -110,8 +240,9 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
 5. depends_on lists the node_ids that must complete before this node starts.
 6. Only the final deployment node should have deploy_authorized: true.
 7. Use review/verdict nodes sparingly — only when quality gates are needed.
-8. base_image options: {base_images_section}. Choose the image whose description best matches the task requirements.
+8. base_image options: {base_images_section}. Choose using runtime + capabilities + best_for, and avoid images whose avoid_for conflicts with the node's task.
 9. Set each node config.llm_model to the requested execution model and do not use GPT models.
+10. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
 """
 
 
@@ -183,8 +314,10 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
     skills_map = {s.id: s for s in skills}
 
     skills_section = _build_skills_section(skills_data)
+    skills_v2_section = await _build_skills_v2_section(db)
     system_prompt = PLANNER_SYSTEM_PROMPT.format(
         skills_section=skills_section,
+        skills_v2_section=skills_v2_section,
         base_images_section=await _build_base_images_section(db),
     )
 
@@ -261,6 +394,8 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
                     if "config" not in node:
                         node["config"] = {}
                     node["config"]["base_image"] = base_image
+
+            dag_json = await _apply_v2_skill_fallback(db, dag_json, objective)
 
             logger.info(f"Planner generated valid DAG with {len(dag_json.get('nodes', []))} nodes")
             return dag_json
