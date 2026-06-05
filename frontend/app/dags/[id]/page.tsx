@@ -70,6 +70,59 @@ interface SBOMData {
   generated_at: string
 }
 
+interface NodeStateSnapshot {
+  id: number
+  dag_id: string
+  node_id: string
+  task_id: string | null
+  phase: string
+  status: string
+  wave: number | null
+  attempt: number
+  input_context: Record<string, any>
+  output_context: Record<string, any>
+  completion_state: Record<string, any>
+  acquisition_log: Record<string, any>[]
+  acceptance_result: Record<string, any>
+  pending_items: any[]
+  created_at: string
+}
+
+interface NodeAuditEvent {
+  id: number
+  dag_id: string
+  node_id: string
+  task_id: string | null
+  event_type: string
+  severity: string
+  message: string
+  event_data: Record<string, any>
+  created_at: string
+}
+
+function summarizeNodeFailureReason(
+  node: DAGNode,
+  stateEntry?: { latest: NodeStateSnapshot | null; events: NodeAuditEvent[] },
+): string | null {
+  const output = node.output_data || {}
+  const candidates: Array<string | null | undefined> = [
+    output.gate_failure,
+    output.error,
+    output.reason,
+    output.message,
+    stateEntry?.latest?.acceptance_result?.reason,
+    stateEntry?.events?.find((e) => e.severity === 'critical')?.message,
+    stateEntry?.events?.[0]?.message,
+  ]
+
+  for (const raw of candidates) {
+    const text = String(raw || '').trim()
+    if (!text) continue
+    return text.length > 260 ? `${text.slice(0, 257)}...` : text
+  }
+  return null
+}
+
 export default function DAGDetailPage() {
   const params = useParams()
   const dagId = params.id as string
@@ -91,6 +144,7 @@ export default function DAGDetailPage() {
     sbom: SBOMData | null | undefined
   }>>({})
   const [nodeDataLoading, setNodeDataLoading] = useState(false)
+  const [nodeState, setNodeState] = useState<Record<string, { latest: NodeStateSnapshot | null; events: NodeAuditEvent[] }>>({})
 
   const fetchDag = useCallback(async () => {
     try {
@@ -201,6 +255,68 @@ export default function DAGDetailPage() {
     fetchSbom()
   }, [selectedNodeId, activeTab, dag?.nodes, nodeTaskData])
 
+  // Load DAG execution state/provenance for selected node
+  useEffect(() => {
+    const node = dag?.nodes.find(n => n.node_id === selectedNodeId)
+    if (!node) return
+    if (nodeState[node.node_id]) return
+
+    const loadNodeState = async () => {
+      try {
+        const [latestRes, eventsRes] = await Promise.all([
+          fetch(`${API}/api/dags/${dagId}/nodes/${node.node_id}/state/latest`),
+          fetch(`${API}/api/dags/${dagId}/nodes/${node.node_id}/audit-events?limit=20`),
+        ])
+        const latest = latestRes.ok ? await latestRes.json() : null
+        const events = eventsRes.ok ? await eventsRes.json() : []
+        setNodeState(prev => ({ ...prev, [node.node_id]: { latest, events } }))
+      } catch {
+        setNodeState(prev => ({ ...prev, [node.node_id]: { latest: null, events: [] } }))
+      }
+    }
+
+    loadNodeState()
+  }, [selectedNodeId, dag?.nodes, dagId, nodeState])
+
+  // Preload failure state for failed nodes so DAG-level summary is visible
+  // even before the user clicks into a specific node.
+  useEffect(() => {
+    if (!dag?.nodes?.length) return
+
+    const failedNodesToLoad = dag.nodes.filter(
+      (node) => node.status === 'failed' && !nodeState[node.node_id],
+    )
+    if (failedNodesToLoad.length === 0) return
+
+    const loadFailedNodeStates = async () => {
+      const entries = await Promise.all(
+        failedNodesToLoad.map(async (node) => {
+          try {
+            const [latestRes, eventsRes] = await Promise.all([
+              fetch(`${API}/api/dags/${dagId}/nodes/${node.node_id}/state/latest`),
+              fetch(`${API}/api/dags/${dagId}/nodes/${node.node_id}/audit-events?limit=20`),
+            ])
+            const latest = latestRes.ok ? await latestRes.json() : null
+            const events = eventsRes.ok ? await eventsRes.json() : []
+            return [node.node_id, { latest, events }] as const
+          } catch {
+            return [node.node_id, { latest: null, events: [] }] as const
+          }
+        }),
+      )
+
+      setNodeState((prev) => {
+        const next = { ...prev }
+        for (const [nodeId, state] of entries) {
+          next[nodeId] = state
+        }
+        return next
+      })
+    }
+
+    loadFailedNodeStates()
+  }, [dag?.nodes, dagId, nodeState])
+
   const startDag = async () => {
     try {
       await fetch(`${API}/api/dags/${dagId}/start`, { method: 'POST' })
@@ -252,6 +368,8 @@ export default function DAGDetailPage() {
 
   const selectedNode = dag?.nodes.find(n => n.node_id === selectedNodeId) || null
   const selectedTaskData = selectedNode?.task_id ? nodeTaskData[selectedNode.task_id] : null
+  const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
+  const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
 
   if (error) return <div className="text-red-400 p-8">Error: {error}</div>
   if (!dag) return <div className="text-gray-500 p-8">Loading...</div>
@@ -260,6 +378,13 @@ export default function DAGDetailPage() {
   const runningNodes = dag.nodes.filter(n => n.status === 'running').length
   const failedNodes = dag.nodes.filter(n => n.status === 'failed').length
   const pendingApproval = dag.nodes.filter(n => n.status === 'pending_approval').length
+  const failedNodeSummaries = dag.nodes
+    .filter(n => n.status === 'failed')
+    .map(n => ({
+      nodeId: n.node_id,
+      reason: summarizeNodeFailureReason(n, nodeState[n.node_id]),
+    }))
+    .filter(entry => entry.reason)
 
   return (
     <div>
@@ -343,6 +468,24 @@ export default function DAGDetailPage() {
         </div>
       </div>
 
+      {failedNodeSummaries.length > 0 && (
+        <div className="mb-4 rounded border border-red-700/50 bg-red-950/40 p-4">
+          <div className="text-sm font-semibold text-red-200 mb-2">DAG Failure Summary</div>
+          <div className="space-y-2">
+            {failedNodeSummaries.map(({ nodeId, reason }) => (
+              <button
+                key={nodeId}
+                onClick={() => { setSelectedNodeId(nodeId); setActiveTab('overview') }}
+                className="block w-full text-left rounded border border-red-800/40 bg-black/10 px-3 py-2 hover:border-red-500/60 transition-colors"
+              >
+                <div className="text-xs font-mono text-red-300 mb-1">{nodeId}</div>
+                <div className="text-sm text-red-100">{reason}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Workflow link */}
       {dag.workflow_id && (
         <div className="mb-4 text-xs text-gray-500">
@@ -408,6 +551,13 @@ export default function DAGDetailPage() {
             </div>
           </div>
 
+          {selectedNode.status === 'failed' && selectedFailureReason && (
+            <div className="mb-3 p-4 rounded border border-red-700/60 bg-red-950/50">
+              <div className="text-[11px] uppercase tracking-wide text-red-300 mb-1">Failure Reason</div>
+              <div className="text-base font-medium text-red-100">{selectedFailureReason}</div>
+            </div>
+          )}
+
           {selectedNode.description && (
             <p className="text-sm text-gray-400 mb-3">{selectedNode.description}</p>
           )}
@@ -446,6 +596,77 @@ export default function DAGDetailPage() {
               )}
             </div>
           )}
+
+          {/* Execution state continuity panel */}
+          <div className="mb-3 rounded border border-cyan-700/40 bg-cyan-950/20 p-3">
+            <div className="text-xs uppercase tracking-wide text-cyan-300 mb-2">Execution State</div>
+            {!selectedNodeState ? (
+              <div className="text-xs text-gray-500">Loading node state...</div>
+            ) : !selectedNodeState.latest ? (
+              <div className="text-xs text-gray-500">No captured state snapshot yet.</div>
+            ) : (
+              <div className="space-y-2 text-xs">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                  <div className="bg-gray-900/40 rounded p-2">
+                    <div className="text-gray-500">Phase</div>
+                    <div className="font-mono text-cyan-300">{selectedNodeState.latest.phase}</div>
+                  </div>
+                  <div className="bg-gray-900/40 rounded p-2">
+                    <div className="text-gray-500">Status</div>
+                    <div className="font-mono text-white">{selectedNodeState.latest.status}</div>
+                  </div>
+                  <div className="bg-gray-900/40 rounded p-2">
+                    <div className="text-gray-500">Wave</div>
+                    <div className="font-mono text-white">{selectedNodeState.latest.wave ?? '-'}</div>
+                  </div>
+                  <div className="bg-gray-900/40 rounded p-2">
+                    <div className="text-gray-500">Acceptance</div>
+                    <div className={`font-mono ${selectedNodeState.latest.acceptance_result?.valid === false ? 'text-red-300' : 'text-emerald-300'}`}>
+                      {selectedNodeState.latest.acceptance_result?.valid === false ? 'failed' : 'passed/na'}
+                    </div>
+                  </div>
+                </div>
+
+                <details className="bg-gray-900/30 rounded p-2">
+                  <summary className="cursor-pointer text-cyan-200">1) Inputs brought into this step</summary>
+                  <pre className="mt-2 text-[11px] text-gray-300 overflow-auto max-h-40">{JSON.stringify(selectedNodeState.latest.input_context, null, 2)}</pre>
+                </details>
+
+                <details className="bg-gray-900/30 rounded p-2">
+                  <summary className="cursor-pointer text-cyan-200">2) Output of this step</summary>
+                  <pre className="mt-2 text-[11px] text-gray-300 overflow-auto max-h-40">{JSON.stringify(selectedNodeState.latest.output_context, null, 2)}</pre>
+                </details>
+
+                <details className="bg-gray-900/30 rounded p-2">
+                  <summary className="cursor-pointer text-cyan-200">3) How output was obtained</summary>
+                  <pre className="mt-2 text-[11px] text-gray-300 overflow-auto max-h-40">{JSON.stringify(selectedNodeState.latest.acquisition_log, null, 2)}</pre>
+                </details>
+
+                <details className="bg-gray-900/30 rounded p-2">
+                  <summary className="cursor-pointer text-cyan-200">4) Acceptance criteria check</summary>
+                  <pre className="mt-2 text-[11px] text-gray-300 overflow-auto max-h-40">{JSON.stringify(selectedNodeState.latest.acceptance_result, null, 2)}</pre>
+                </details>
+
+                {selectedNodeState.events.length > 0 && (
+                  <details className="bg-gray-900/30 rounded p-2">
+                    <summary className="cursor-pointer text-cyan-200">Recent audit events ({selectedNodeState.events.length})</summary>
+                    <div className="mt-2 space-y-1 max-h-40 overflow-auto">
+                      {selectedNodeState.events.map(ev => (
+                        <div key={ev.id} className="text-[11px] text-gray-300 border-b border-gray-800 pb-1">
+                          <span className="font-mono text-gray-500 mr-2">{new Date(ev.created_at).toLocaleTimeString()}</span>
+                          <span className={`mr-2 ${ev.severity === 'critical' ? 'text-red-300' : ev.severity === 'warning' ? 'text-amber-300' : 'text-cyan-300'}`}>
+                            {ev.severity}
+                          </span>
+                          <span className="text-cyan-200 mr-2">{ev.event_type}</span>
+                          <span>{ev.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            )}
+          </div>
 
           {/* Task data tabs */}
           {selectedNode.task_id && (
@@ -825,6 +1046,10 @@ export default function DAGDetailPage() {
               onClick={() => { setSelectedNodeId(node.node_id); setActiveTab('overview') }}
               className="card w-full text-left hover:border-blue-500/50 transition-colors"
             >
+              {(() => {
+                const nodeFailureReason = summarizeNodeFailureReason(node, nodeState[node.node_id])
+                return (
+                  <>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <span className="font-mono text-sm font-semibold">{node.node_id}</span>
@@ -848,9 +1073,17 @@ export default function DAGDetailPage() {
                 </div>
               </div>
               {node.description && <p className="text-sm text-gray-400 mt-1">{node.description}</p>}
+              {node.status === 'failed' && nodeFailureReason && (
+                <p className="text-xs text-red-300 mt-1">
+                  Failure: {nodeFailureReason}
+                </p>
+              )}
               {node.depends_on.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">Depends on: {node.depends_on.join(', ')}</div>
               )}
+                  </>
+                )
+              })()}
             </button>
           ))}
         </div>

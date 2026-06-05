@@ -2612,6 +2612,42 @@ async def post_dag_progress(dag_id: str, message: str) -> bool:
 
 
 @activity.defn
+async def post_node_state_snapshot(dag_id: str, node_id: str, payload: Dict[str, Any]) -> bool:
+    """Persist node execution-state snapshot for provenance and continuity."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{control_plane_url}/api/dags/{dag_id}/nodes/{node_id}/state-snapshots",
+                json=payload,
+            )
+            return resp.status_code in (200, 201)
+    except Exception as exc:
+        logger.warning(f"⚠️ Failed to post node state snapshot for {dag_id}/{node_id}: {exc}")
+        return False
+
+
+@activity.defn
+async def post_node_audit_event(dag_id: str, node_id: str, payload: Dict[str, Any]) -> bool:
+    """Persist a structured audit event for DAG node execution."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{control_plane_url}/api/dags/{dag_id}/nodes/{node_id}/audit-events",
+                json=payload,
+            )
+            return resp.status_code in (200, 201)
+    except Exception as exc:
+        logger.warning(f"⚠️ Failed to post node audit event for {dag_id}/{node_id}: {exc}")
+        return False
+
+
+@activity.defn
 async def create_node_task(
     dag_id: str,
     node_id: str,
@@ -2650,6 +2686,99 @@ async def create_node_task(
         return data.get("id", task_id)
 
 
+def _extract_acquisition_log(agent_logs: str) -> List[Dict[str, Any]]:
+    """Extract a compact, structured acquisition trace from adapter logs."""
+    entries: List[Dict[str, Any]] = []
+    if not agent_logs:
+        return entries
+
+    lines = agent_logs.splitlines()
+    current_tool: Dict[str, Any] | None = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("🧰 Tool:"):
+            tool_call = line.split("🧰 Tool:", 1)[1].strip()
+            tool_name = tool_call.split("(", 1)[0].strip() if "(" in tool_call else tool_call
+            current_tool = {
+                "kind": "tool_call",
+                "tool": tool_name,
+                "invocation": tool_call[:500],
+            }
+            entries.append(current_tool)
+            continue
+
+        if line.startswith("📤 Result:"):
+            result_preview = line.split("📤 Result:", 1)[1].strip()
+            if current_tool is not None:
+                current_tool["result_preview"] = result_preview[:500]
+            else:
+                entries.append({
+                    "kind": "result",
+                    "result_preview": result_preview[:500],
+                })
+            continue
+
+        if "HTTP/" in line:
+            entries.append({
+                "kind": "http_response",
+                "result_preview": line[:500],
+            })
+            continue
+
+        if line.startswith("✅ Written "):
+            entries.append({
+                "kind": "file_write",
+                "result_preview": line[:500],
+            })
+            continue
+
+        if "saved to /workspace/" in line.lower() or "written to /workspace/" in line.lower():
+            entries.append({
+                "kind": "artifact_saved",
+                "result_preview": line[:500],
+            })
+
+    return entries
+
+
+def _extract_task_output_text(task_output: Dict[str, Any]) -> str:
+    """Extract the agent's actual response text from a stored task output."""
+    import json as _json
+
+    _decoder = _json.JSONDecoder()
+    for source in (task_output.get("output"), (task_output.get("raw_result") or {}).get("output")):
+        if not source or not isinstance(source, str):
+            continue
+        stripped = source.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                parsed, _end = _decoder.raw_decode(stripped)
+                if isinstance(parsed, dict):
+                    texts = [
+                        p.get("text", "")
+                        for p in parsed.get("payloads", [])
+                        if isinstance(p, dict) and p.get("text")
+                    ]
+                    if texts:
+                        return "\n".join(texts).strip()
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        if stripped.lower() not in {"task completed successfully", "task failed", "task cancelled"}:
+            return stripped
+
+    preview = (task_output.get("llm_response_preview") or "").strip()
+    if preview and preview.lower() not in {"task completed successfully", "task failed", "task cancelled"}:
+        return preview
+
+    return (task_output.get("agent_logs") or "")[:2000]
+
+
 @activity.defn
 async def collect_node_output(task_id: str) -> Dict[str, Any]:
     """Collect output from a completed node task."""
@@ -2679,6 +2808,7 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
 
         if outputs:
             latest = outputs[-1]
+            result["output"] = _extract_task_output_text(latest)
             result["agent_logs"] = latest.get("agent_logs", "")
             result["completed"] = latest.get("completed")
             result["error"] = latest.get("error")
@@ -2686,8 +2816,88 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
             result["raw_result"] = latest.get("raw_result")
             result["parse_error"] = bool((latest.get("raw_result") or {}).get("parse_error"))
             result["iteration"] = latest.get("iteration")
+            result["acquisition_log"] = _extract_acquisition_log(result["agent_logs"])
 
         return result
+
+
+def _summarize_upstream_state(input_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build compact predecessor-state summaries for downstream review."""
+    summaries: List[Dict[str, Any]] = []
+
+    for src_node, data in input_data.items():
+        if not isinstance(data, dict):
+            summaries.append({
+                "node_id": src_node,
+                "kind": "literal_input",
+                "value": str(data)[:500],
+            })
+            continue
+
+        deliverables = data.get("deliverables")
+        acquisition_log = data.get("acquisition_log") or []
+        acquisition_tools = []
+        output_text = _extract_task_output_text(data)
+        if isinstance(acquisition_log, list):
+            acquisition_tools = [
+                entry.get("tool")
+                for entry in acquisition_log
+                if isinstance(entry, dict) and entry.get("tool")
+            ][:10]
+
+        summary = {
+            "node_id": src_node,
+            "status": data.get("status"),
+            "completed": data.get("completed"),
+            "error": str(data.get("error") or "")[:300],
+            "gate_failure": str(data.get("gate_failure") or "")[:300],
+            "deliverable_keys": sorted(deliverables.keys())[:20] if isinstance(deliverables, dict) else [],
+            "acquisition_tools": acquisition_tools,
+            "output_preview": output_text[:1200],
+            "log_preview": str(data.get("agent_logs") or "")[:800],
+        }
+        summaries.append(summary)
+
+    return summaries
+
+
+def _build_prior_state_review_prompt(upstream_state_review: List[Dict[str, Any]]) -> str:
+    """Render the mandatory predecessor-state review block for downstream nodes."""
+    if not upstream_state_review:
+        return ""
+
+    lines = [
+        "Before you do any new work, review the predecessor state below and use it to guide this step.",
+        "Your first output section must be 'Previous Step Review' and it must state:",
+        "- which predecessor states you reviewed",
+        "- what outputs or failures from those states matter for this step",
+        "- how those reviewed states change your plan for the current step",
+        "If predecessor state is incomplete, contradictory, or failed, call that out explicitly before continuing.",
+        "",
+        "Predecessor state summaries:",
+    ]
+
+    for summary in upstream_state_review:
+        node_id = summary.get("node_id", "unknown")
+        lines.append(f"- Node {node_id}")
+        if summary.get("kind") == "literal_input":
+            lines.append(f"  literal input: {summary.get('value', '')}")
+            continue
+        lines.append(f"  status: {summary.get('status')}")
+        if summary.get("completed") is not None:
+            lines.append(f"  completed: {summary.get('completed')}")
+        if summary.get("gate_failure"):
+            lines.append(f"  gate failure: {summary.get('gate_failure')}")
+        if summary.get("error"):
+            lines.append(f"  error: {summary.get('error')}")
+        if summary.get("deliverable_keys"):
+            lines.append(f"  deliverable keys: {', '.join(summary.get('deliverable_keys', []))}")
+        if summary.get("acquisition_tools"):
+            lines.append(f"  acquisition tools: {', '.join(summary.get('acquisition_tools', []))}")
+        if summary.get("log_preview"):
+            lines.append(f"  log preview: {summary.get('log_preview')}")
+
+    return "\n".join(lines)
 
 
 @activity.defn
@@ -2733,6 +2943,30 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
         deliverables = output.get("deliverables")
         if not isinstance(deliverables, dict) or len(deliverables) == 0:
             return {"valid": False, "reason": "task output has no deliverables"}
+
+    # Source-evidence check: detect hallucination/mock patterns in agent logs.
+    # If the node config declares require_real_sources=true (default for fetch/browse nodes)
+    # the logs must not contain mock/fabricated data signals without any real HTTP/file fetch.
+    require_real_sources = gate_cfg.get("require_real_sources", False)
+    if require_real_sources:
+        logs = str(output.get("agent_logs") or "")
+        _mock_signals = [
+            "mock_data", "mock data", "mocking the respo", "placeholder",
+            "# mocking", "# mock", "Mocking the", "MockData",
+            "fake_data", "simulated_data", "dummy_data",
+        ]
+        _real_signals = [
+            "HTTP/", "http_status", "curl", "requests.get", "httpx",
+            "urllib", "fetch(", "wget ", "lightpanda fetch",
+            "200", "\"status_code\"", "status_code =",
+        ]
+        mock_hit = any(s.lower() in logs.lower() for s in _mock_signals)
+        real_hit = any(s in logs for s in _real_signals)
+        if mock_hit and not real_hit:
+            return {
+                "valid": False,
+                "reason": "hallucination_risk: logs contain mock/placeholder patterns with no evidence of real network fetch",
+            }
 
     return {"valid": True, "reason": "ok"}
 
@@ -2836,6 +3070,7 @@ class DAGNodeWorkflow:
         description = params.get("description", "")
         config = params.get("config", {})
         input_data = params.get("input_data", {})
+        state_context = params.get("state_context", {})
         workspace_id = params.get("workspace_id", "")
 
         # Prefer the DAG-inherited enriched image over the static base_image
@@ -2849,6 +3084,10 @@ class DAGNodeWorkflow:
         llm_model = config.get("llm_model", "gemini-flash-lite-latest")
 
         logger.info(f"🔧 DAGNodeWorkflow | DAG: {dag_id} | Node: {node_id} | model: {llm_model}")
+
+        # Initialize task_id to None so exception handler can always reference it safely
+        task_id: Optional[str] = None
+        upstream_state_review = _summarize_upstream_state(input_data)
 
         # Update node to RUNNING
         await workflow.execute_activity(
@@ -2865,13 +3104,24 @@ class DAGNodeWorkflow:
             follow_up_parts.append("\n--- Input from previous nodes ---")
             for src_node, data in input_data.items():
                 if isinstance(data, dict):
-                    logs = data.get("agent_logs", "")
-                    if logs:
-                        preview = logs[:2000] + ("..." if len(logs) > 2000 else "")
-                        follow_up_parts.append(f"[{src_node}]: {preview}")
+                    output_text = _extract_task_output_text(data)
+                    if output_text:
+                        preview = output_text[:2000] + ("..." if len(output_text) > 2000 else "")
+                        follow_up_parts.append(f"[{src_node}.output]: {preview}")
+                    else:
+                        logs = data.get("agent_logs", "")
+                        if logs:
+                            preview = logs[:2000] + ("..." if len(logs) > 2000 else "")
+                            follow_up_parts.append(f"[{src_node}]: {preview}")
                 else:
                     # Literal value (int, str, etc.) from input_mapping
                     follow_up_parts.append(f"[{src_node}]: {data}")
+        if upstream_state_review:
+            follow_up_parts.append("\n--- Required review of previous step state ---")
+            follow_up_parts.append(_build_prior_state_review_prompt(upstream_state_review))
+        if state_context:
+            follow_up_parts.append("\n--- Execution state context ---")
+            follow_up_parts.append(str(state_context)[:4000])
         follow_up = "\n".join(follow_up_parts)
 
         try:
@@ -2886,6 +3136,28 @@ class DAGNodeWorkflow:
             await workflow.execute_activity(
                 update_node_status,
                 args=[dag_id, node_id, "running", None, task_id],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+
+            await workflow.execute_activity(
+                post_node_state_snapshot,
+                args=[
+                    dag_id,
+                    node_id,
+                    {
+                        "task_id": task_id,
+                        "phase": "running",
+                        "status": "running",
+                        "input_context": {
+                            "input_data": input_data,
+                            "state_context": state_context,
+                            "upstream_state_review": upstream_state_review,
+                        },
+                        "completion_state": {
+                            "description": "Node task started",
+                        },
+                    },
+                ],
                 start_to_close_timeout=timedelta(seconds=15),
             )
 
@@ -2927,6 +3199,50 @@ class DAGNodeWorkflow:
                     args=[dag_id, node_id, "failed", output],
                     start_to_close_timeout=timedelta(seconds=15),
                 )
+                await workflow.execute_activity(
+                    post_node_state_snapshot,
+                    args=[
+                        dag_id,
+                        node_id,
+                        {
+                            "task_id": task_id,
+                            "phase": "gate_failed",
+                            "status": "failed",
+                            "input_context": {
+                                "input_data": input_data,
+                                "state_context": state_context,
+                                "upstream_state_review": upstream_state_review,
+                            },
+                            "output_context": output,
+                            "completion_state": {
+                                "final_status": "failed",
+                                "reason": reason,
+                            },
+                            "acquisition_log": output.get("acquisition_log", []),
+                            "acceptance_result": gate_result,
+                            "pending_items": [{"type": "gate_failure", "reason": reason}],
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+                await workflow.execute_activity(
+                    post_node_audit_event,
+                    args=[
+                        dag_id,
+                        node_id,
+                        {
+                            "task_id": task_id,
+                            "event_type": "acceptance_failed",
+                            "severity": "critical",
+                            "message": f"Node failed acceptance gate: {reason}",
+                            "event_data": {
+                                "gate_result": gate_result,
+                                "task_id": task_id,
+                            },
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
                 return {
                     "node_id": node_id,
                     "status": "failed",
@@ -2948,6 +3264,32 @@ class DAGNodeWorkflow:
                 start_to_close_timeout=timedelta(seconds=15),
             )
 
+            await workflow.execute_activity(
+                post_node_state_snapshot,
+                args=[
+                    dag_id,
+                    node_id,
+                    {
+                        "task_id": task_id,
+                        "phase": "completed" if node_status == "completed" else "failed",
+                        "status": node_status,
+                        "input_context": {
+                            "input_data": input_data,
+                            "state_context": state_context,
+                            "upstream_state_review": upstream_state_review,
+                        },
+                        "output_context": output,
+                        "completion_state": {
+                            "final_status": node_status,
+                            "current_image": node_current_image,
+                        },
+                        "acquisition_log": output.get("acquisition_log", []),
+                        "acceptance_result": gate_result,
+                    },
+                ],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+
             return {
                 "node_id": node_id,
                 "status": node_status,
@@ -2957,9 +3299,57 @@ class DAGNodeWorkflow:
 
         except Exception as e:
             logger.error(f"❌ DAGNodeWorkflow failed | Node: {node_id} | Error: {e}")
+            failure_output = {"error": str(e), "status": "failed"}
             await workflow.execute_activity(
                 update_node_status,
-                args=[dag_id, node_id, "failed", {"error": str(e)}],
+                args=[dag_id, node_id, "failed", failure_output],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            # Write terminal failed state snapshot so UI shows phase=failed with output
+            await workflow.execute_activity(
+                post_node_state_snapshot,
+                args=[
+                    dag_id,
+                    node_id,
+                    {
+                        "task_id": task_id,
+                        "phase": "failed",
+                        "status": "failed",
+                        "input_context": {
+                            "input_data": input_data,
+                            "state_context": state_context,
+                            "upstream_state_review": upstream_state_review,
+                        },
+                        "output_context": failure_output,
+                        "completion_state": {
+                            "final_status": "failed",
+                            "reason": str(e),
+                        },
+                        "acquisition_log": failure_output.get("acquisition_log", []),
+                        "acceptance_result": {
+                            "valid": False,
+                            "reason": f"node_workflow_exception: {str(e)[:300]}",
+                        },
+                        "pending_items": [{"type": "exception", "reason": str(e)[:300]}],
+                    },
+                ],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            await workflow.execute_activity(
+                post_node_audit_event,
+                args=[
+                    dag_id,
+                    node_id,
+                    {
+                        "event_type": "node_workflow_exception",
+                        "severity": "critical",
+                        "message": str(e),
+                        "event_data": {
+                            "input_data": input_data,
+                            "state_context": state_context,
+                        },
+                    },
+                ],
                 start_to_close_timeout=timedelta(seconds=15),
             )
             return {
@@ -3116,21 +3506,180 @@ class DAGWorkflow:
                 node_info = node_map[nid]
                 node_statuses[nid] = "running"
 
-                # Build input data from input_mapping
+                # Build input data from input_mapping with strict resolution checks.
                 input_data = {}
                 input_mapping = node_info.get("input_mapping", {})
-                for key, source_node in input_mapping.items():
-                    if isinstance(source_node, str) and source_node in node_outputs:
-                        input_data[key] = node_outputs[source_node]
-                    elif not isinstance(source_node, str):
-                        # Planner may emit literal constants (e.g. port: 8080).
-                        input_data[key] = source_node
+                resolution_report: Dict[str, Any] = {
+                    "has_explicit_mapping": bool(input_mapping),
+                    "resolved_inputs": [],
+                    "literal_inputs": [],
+                    "missing_required_inputs": [],
+                    "dependency_inputs": [],
+                    "missing_dependency_outputs": [],
+                }
 
-                # If no explicit mapping, pass all dependency outputs
-                if not input_data:
+                for key, source_spec in input_mapping.items():
+                    # Structured mapping support: {"from": "node-a", "optional": false}
+                    if isinstance(source_spec, dict) and source_spec.get("from"):
+                        source_node = str(source_spec.get("from"))
+                        optional = bool(source_spec.get("optional", False))
+                        if source_node in node_outputs:
+                            input_data[key] = node_outputs[source_node]
+                            resolution_report["resolved_inputs"].append({
+                                "key": key,
+                                "source_node": source_node,
+                                "optional": optional,
+                            })
+                        elif not optional:
+                            resolution_report["missing_required_inputs"].append({
+                                "key": key,
+                                "source_node": source_node,
+                                "reason": "missing source node output",
+                            })
+                    elif isinstance(source_spec, str):
+                        source_node = source_spec
+                        source_field = None
+                        if "." in source_spec:
+                            source_node, source_field = source_spec.split(".", 1)
+
+                        if source_node in node_outputs:
+                            source_value = node_outputs[source_node]
+                            if source_field:
+                                if source_field == "output":
+                                    source_value = _extract_task_output_text(source_value)
+                                elif isinstance(source_value, dict) and source_field in source_value:
+                                    source_value = source_value.get(source_field)
+                                else:
+                                    source_value = None
+
+                            if source_value is not None:
+                                input_data[key] = source_value
+                                resolution_report["resolved_inputs"].append({
+                                    "key": key,
+                                    "source_node": source_node,
+                                    "source_field": source_field,
+                                    "optional": False,
+                                })
+                            else:
+                                resolution_report["missing_required_inputs"].append({
+                                    "key": key,
+                                    "source_node": source_spec,
+                                    "reason": "missing source node field",
+                                })
+                        else:
+                            resolution_report["missing_required_inputs"].append({
+                                "key": key,
+                                "source_node": source_spec,
+                                "reason": "missing source node output",
+                            })
+                    else:
+                        # Literal constants are valid explicit inputs.
+                        input_data[key] = source_spec
+                        resolution_report["literal_inputs"].append({
+                            "key": key,
+                            "value": source_spec,
+                        })
+
+                # If no explicit mapping, pass all dependency outputs.
+                if not input_mapping:
                     for dep in node_info.get("depends_on", []):
                         if dep in node_outputs:
                             input_data[dep] = node_outputs[dep]
+                            resolution_report["dependency_inputs"].append(dep)
+                        else:
+                            resolution_report["missing_dependency_outputs"].append(dep)
+
+                if resolution_report["missing_dependency_outputs"]:
+                    for dep in resolution_report["missing_dependency_outputs"]:
+                        resolution_report["missing_required_inputs"].append({
+                            "key": dep,
+                            "source_node": dep,
+                            "reason": "dependency marked completed but output missing",
+                        })
+
+                # Strict fail-fast: unresolved required inputs fail node immediately.
+                if resolution_report["missing_required_inputs"]:
+                    failure_reason = "unresolved required node inputs"
+                    failure_output = {
+                        "status": "failed",
+                        "error": failure_reason,
+                        "input_resolution": resolution_report,
+                    }
+
+                    node_statuses[nid] = "failed"
+                    failed_nodes.append(nid)
+
+                    await workflow.execute_activity(
+                        update_node_status,
+                        args=[dag_id, nid, "failed", failure_output],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    await workflow.execute_activity(
+                        post_node_state_snapshot,
+                        args=[
+                            dag_id,
+                            nid,
+                            {
+                                "phase": "input_resolution_failed",
+                                "status": "failed",
+                                "wave": wave,
+                                "input_context": {
+                                    "input_mapping": input_mapping,
+                                    "resolved_input_data": input_data,
+                                },
+                                "completion_state": {
+                                    "reason": failure_reason,
+                                },
+                                "acceptance_result": {
+                                    "valid": False,
+                                    "reason": failure_reason,
+                                    "unresolved_inputs": resolution_report["missing_required_inputs"],
+                                },
+                                "pending_items": resolution_report["missing_required_inputs"],
+                            },
+                        ],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    await workflow.execute_activity(
+                        post_node_audit_event,
+                        args=[
+                            dag_id,
+                            nid,
+                            {
+                                "event_type": "input_resolution_failed",
+                                "severity": "critical",
+                                "message": failure_reason,
+                                "event_data": resolution_report,
+                            },
+                        ],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    abort_requested = True
+                    abort_reason = f"node '{nid}' failed: {failure_reason}"
+                    continue
+
+                await workflow.execute_activity(
+                    post_node_state_snapshot,
+                    args=[
+                        dag_id,
+                        nid,
+                        {
+                            "phase": "input_resolved",
+                            "status": "ready",
+                            "wave": wave,
+                            "input_context": {
+                                "input_mapping": input_mapping,
+                                "resolved_input_data": input_data,
+                            },
+                            "completion_state": {
+                                "dependencies": node_info.get("depends_on", []),
+                                "resolved": True,
+                            },
+                            "pending_items": [],
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
 
                 node_config = dict(node_info.get("config", {}))
                 if dag_current_image:
@@ -3142,6 +3691,14 @@ class DAGWorkflow:
                     "description": node_info.get("description", ""),
                     "config": node_config,
                     "input_data": input_data,
+                    "state_context": {
+                        "wave": wave,
+                        "input_resolution": resolution_report,
+                        "upstream_state_review_required": bool(input_data),
+                        "completed_nodes": [k for k, v in node_statuses.items() if v == "completed"],
+                        "failed_nodes": [k for k, v in node_statuses.items() if v == "failed"],
+                        "pending_nodes": [k for k, v in node_statuses.items() if v == "pending"],
+                    },
                     "workspace_id": dag_workspace_id,
                 }
 
@@ -3328,6 +3885,8 @@ async def main():
             update_node_status,
             update_dag_status,
             post_dag_progress,
+            post_node_state_snapshot,
+            post_node_audit_event,
             create_node_task,
             collect_node_output,
             evaluate_node_gate,

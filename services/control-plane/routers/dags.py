@@ -5,9 +5,29 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
-from models import MasterDAG, DAGNode, Task, DAGStatus, NodeStatus, SkillSelectionEvent
+from models import (
+    MasterDAG,
+    DAGNode,
+    Task,
+    DAGStatus,
+    NodeStatus,
+    SkillSelectionEvent,
+    DAGNodeStateSnapshot,
+    DAGNodeAuditEvent,
+)
 from schemas import (
-    DAGCreate, DAGManualCreate, DAGResponse, DAGDetail, DAGNodeResponse, DAGRevise, DAGRefine, DAGNodePatch,
+    DAGCreate,
+    DAGManualCreate,
+    DAGResponse,
+    DAGDetail,
+    DAGNodeResponse,
+    DAGRevise,
+    DAGRefine,
+    DAGNodePatch,
+    DAGNodeStateSnapshotCreate,
+    DAGNodeStateSnapshotResponse,
+    DAGNodeAuditEventCreate,
+    DAGNodeAuditEventResponse,
 )
 from dag_validator import validate_dag
 from planner import plan_dag
@@ -38,6 +58,30 @@ def _gen_task_id() -> str:
 
 def _gen_workspace_id(dag_id: str) -> str:
     return f"workspace-{dag_id}"
+
+
+def _normalize_node_skill_fields(node_def: dict, node_config: dict) -> tuple[str | None, str | None, str | None]:
+    """Normalize planner-emitted skill fields.
+
+    Some plans may place a v2 skill id (prefix skv2-) into legacy skill_id,
+    which points to the v1 skills table and causes FK failures.
+    This helper remaps such values to selected_skill_v2_id.
+    """
+    skill_id = node_def.get("skill_id")
+    selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
+    skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
+
+    if isinstance(skill_id, str) and skill_id.startswith("skv2-"):
+        if not selected_skill_v2_id:
+            selected_skill_v2_id = skill_id
+        skill_id = None
+        if not skill_selection_reason:
+            skill_selection_reason = (
+                "Normalized planner output: moved v2 skill id from skill_id "
+                "to selected_skill_v2_id."
+            )
+
+    return skill_id, selected_skill_v2_id, skill_selection_reason
 
 
 @router.post("", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
@@ -87,12 +131,16 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
     nodes = []
     for node_def in dag_json.get("nodes", []):
         node_config = dict(node_def.get("config") or {})
-        selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
-        skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
+        skill_id, selected_skill_v2_id, skill_selection_reason = _normalize_node_skill_fields(node_def, node_config)
+        node_def["skill_id"] = skill_id
+        if selected_skill_v2_id:
+            node_def.setdefault("config", {})["selected_skill_v2_id"] = selected_skill_v2_id
+        if skill_selection_reason:
+            node_def.setdefault("config", {})["skill_selection_reason"] = skill_selection_reason
         node = DAGNode(
             dag_id=dag_id,
             node_id=node_def["node_id"],
-            skill_id=node_def.get("skill_id"),
+            skill_id=skill_id,
             skill_step_index=node_def.get("skill_step_index"),
             description=node_def.get("description"),
             status=NodeStatus.PENDING,
@@ -153,16 +201,32 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
 
     nodes = []
     for node_def in data.nodes:
+        node_config = dict(node_def.config or {})
+        skill_id = node_def.skill_id
+        selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
+        skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
+        if isinstance(skill_id, str) and skill_id.startswith("skv2-"):
+            if not selected_skill_v2_id:
+                selected_skill_v2_id = skill_id
+            skill_id = None
+            if not skill_selection_reason:
+                skill_selection_reason = (
+                    "Normalized manual input: moved v2 skill id from skill_id "
+                    "to selected_skill_v2_id."
+                )
+
         node = DAGNode(
             dag_id=dag_id,
             node_id=node_def.node_id,
-            skill_id=node_def.skill_id,
+            skill_id=skill_id,
             skill_step_index=node_def.skill_step_index,
             description=node_def.description,
             status=NodeStatus.PENDING,
             depends_on=node_def.depends_on,
-            config=node_def.config,
+            config=node_config,
             input_mapping=node_def.input_mapping,
+            selected_skill_v2_id=selected_skill_v2_id,
+            skill_selection_reason=skill_selection_reason,
         )
         db.add(node)
         nodes.append(node)
@@ -295,6 +359,125 @@ async def get_node_logs(dag_id: str, node_id: str, db: AsyncSession = Depends(ge
             for o in outputs.scalars().all()
         ]
     return logs
+
+
+@router.post("/{dag_id}/nodes/{node_id}/state-snapshots", response_model=DAGNodeStateSnapshotResponse, status_code=status.HTTP_201_CREATED)
+async def create_node_state_snapshot(
+    dag_id: str,
+    node_id: str,
+    payload: DAGNodeStateSnapshotCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist a node execution state snapshot for provenance and continuity."""
+    await _get_dag_or_404(dag_id, db)
+    result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id))
+    node = result.scalar_one_or_none()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found in DAG {dag_id}")
+
+    snapshot = DAGNodeStateSnapshot(
+        dag_id=dag_id,
+        node_id=node_id,
+        task_id=payload.task_id,
+        phase=payload.phase,
+        status=payload.status,
+        wave=payload.wave,
+        attempt=payload.attempt,
+        input_context=payload.input_context,
+        output_context=payload.output_context,
+        completion_state=payload.completion_state,
+        acquisition_log=payload.acquisition_log,
+        acceptance_result=payload.acceptance_result,
+        pending_items=payload.pending_items,
+    )
+    db.add(snapshot)
+    await db.commit()
+    await db.refresh(snapshot)
+    return snapshot
+
+
+@router.get("/{dag_id}/nodes/{node_id}/state/latest", response_model=DAGNodeStateSnapshotResponse | None)
+async def get_latest_node_state_snapshot(dag_id: str, node_id: str, db: AsyncSession = Depends(get_db)):
+    """Get the latest execution state snapshot for a DAG node."""
+    await _get_dag_or_404(dag_id, db)
+    result = await db.execute(
+        select(DAGNodeStateSnapshot)
+        .where(DAGNodeStateSnapshot.dag_id == dag_id, DAGNodeStateSnapshot.node_id == node_id)
+        .order_by(DAGNodeStateSnapshot.created_at.desc(), DAGNodeStateSnapshot.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+@router.get("/{dag_id}/nodes/{node_id}/state-snapshots", response_model=list[DAGNodeStateSnapshotResponse])
+async def list_node_state_snapshots(dag_id: str, node_id: str, limit: int = 50, db: AsyncSession = Depends(get_db)):
+    """List execution state snapshots for a DAG node (newest first)."""
+    await _get_dag_or_404(dag_id, db)
+    limit = max(1, min(limit, 200))
+    result = await db.execute(
+        select(DAGNodeStateSnapshot)
+        .where(DAGNodeStateSnapshot.dag_id == dag_id, DAGNodeStateSnapshot.node_id == node_id)
+        .order_by(DAGNodeStateSnapshot.created_at.desc(), DAGNodeStateSnapshot.id.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+@router.post("/{dag_id}/nodes/{node_id}/audit-events", response_model=DAGNodeAuditEventResponse, status_code=status.HTTP_201_CREATED)
+async def create_node_audit_event(
+    dag_id: str,
+    node_id: str,
+    payload: DAGNodeAuditEventCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist a structured audit event for a DAG node."""
+    await _get_dag_or_404(dag_id, db)
+    result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id))
+    node = result.scalar_one_or_none()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found in DAG {dag_id}")
+
+    event = DAGNodeAuditEvent(
+        dag_id=dag_id,
+        node_id=node_id,
+        task_id=payload.task_id,
+        event_type=payload.event_type,
+        severity=payload.severity,
+        message=payload.message,
+        event_data=payload.event_data,
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(event)
+    return event
+
+
+@router.get("/{dag_id}/nodes/{node_id}/audit-events", response_model=list[DAGNodeAuditEventResponse])
+async def list_node_audit_events(dag_id: str, node_id: str, limit: int = 100, db: AsyncSession = Depends(get_db)):
+    """List audit events for a DAG node (newest first)."""
+    await _get_dag_or_404(dag_id, db)
+    limit = max(1, min(limit, 500))
+    result = await db.execute(
+        select(DAGNodeAuditEvent)
+        .where(DAGNodeAuditEvent.dag_id == dag_id, DAGNodeAuditEvent.node_id == node_id)
+        .order_by(DAGNodeAuditEvent.created_at.desc(), DAGNodeAuditEvent.id.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+@router.get("/{dag_id}/audit-log", response_model=list[DAGNodeAuditEventResponse])
+async def list_dag_audit_log(dag_id: str, limit: int = 200, db: AsyncSession = Depends(get_db)):
+    """List DAG-wide audit events across all nodes (newest first)."""
+    await _get_dag_or_404(dag_id, db)
+    limit = max(1, min(limit, 1000))
+    result = await db.execute(
+        select(DAGNodeAuditEvent)
+        .where(DAGNodeAuditEvent.dag_id == dag_id)
+        .order_by(DAGNodeAuditEvent.created_at.desc(), DAGNodeAuditEvent.id.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
 
 
 @router.patch("/{dag_id}")
@@ -493,12 +676,16 @@ async def refine_dag(dag_id: str, body: DAGRefine, db: AsyncSession = Depends(ge
     nodes = []
     for node_def in dag_json.get("nodes", []):
         node_config = dict(node_def.get("config") or {})
-        selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
-        skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
+        skill_id, selected_skill_v2_id, skill_selection_reason = _normalize_node_skill_fields(node_def, node_config)
+        node_def["skill_id"] = skill_id
+        if selected_skill_v2_id:
+            node_def.setdefault("config", {})["selected_skill_v2_id"] = selected_skill_v2_id
+        if skill_selection_reason:
+            node_def.setdefault("config", {})["skill_selection_reason"] = skill_selection_reason
         node = DAGNode(
             dag_id=dag_id,
             node_id=node_def["node_id"],
-            skill_id=node_def.get("skill_id"),
+            skill_id=skill_id,
             skill_step_index=node_def.get("skill_step_index"),
             description=node_def.get("description"),
             status=NodeStatus.PENDING,
@@ -621,12 +808,16 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
     nodes = []
     for node_def in dag_json.get("nodes", []):
         node_config = dict(node_def.get("config") or {})
-        selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
-        skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
+        skill_id, selected_skill_v2_id, skill_selection_reason = _normalize_node_skill_fields(node_def, node_config)
+        node_def["skill_id"] = skill_id
+        if selected_skill_v2_id:
+            node_def.setdefault("config", {})["selected_skill_v2_id"] = selected_skill_v2_id
+        if skill_selection_reason:
+            node_def.setdefault("config", {})["skill_selection_reason"] = skill_selection_reason
         node = DAGNode(
             dag_id=new_dag_id,
             node_id=node_def["node_id"],
-            skill_id=node_def.get("skill_id"),
+            skill_id=skill_id,
             skill_step_index=node_def.get("skill_step_index"),
             description=node_def.get("description"),
             status=NodeStatus.PENDING,

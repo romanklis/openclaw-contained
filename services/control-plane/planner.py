@@ -178,6 +178,33 @@ async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: 
             config["skill_selection_reason"] = reason
             node["selected_skill_v2_id"] = selected.id
             node["skill_selection_reason"] = reason
+        # Auto-set require_real_sources=true for any node whose task signals
+        # a real-world fetch requirement (browsing, API, FRED, annual reports, etc.)
+        # so the gate will reject hallucinated/mocked outputs.
+        _FETCH_SIGNALS = {
+            "browser", "browser_v2", "browser_v3",   # image types
+        }
+        _FETCH_DESC_KEYWORDS = [
+            "fetch", "browse", "scrape", "download", "retrieve",
+            "crawl", "extract from", "visit", "read from url", "get from",
+            "annual report", "investor relation", "fred", "placera",
+            "atlascopco", "html", "http", "https", "web page",
+        ]
+        for node in dag_json.get("nodes", []):
+            config = node.setdefault("config", {})
+            gate_cfg = config.setdefault("deliverable_gate", {})
+            # Skip nodes that already have an explicit setting
+            if "require_real_sources" in gate_cfg:
+                continue
+            image_id = (config.get("base_image") or "").lower()
+            desc = (node.get("description") or "").lower()
+            if image_id in _FETCH_SIGNALS or any(k in desc for k in _FETCH_DESC_KEYWORDS):
+                gate_cfg["require_real_sources"] = True
+                logger.debug(
+                    "Auto-set require_real_sources=true for node %s (image=%s)",
+                    node.get("node_id"), image_id,
+                )
+
         return dag_json
     except Exception as exc:
         logger.debug("Could not apply v2 skill fallback: %s", exc)

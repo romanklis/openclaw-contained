@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan events"""n 
+    """Application lifespan events"""
     # Startup
     logger.info("Starting OpenClaw Control Plane")
     

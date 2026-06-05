@@ -536,6 +536,64 @@ class DAGDetail(DAGResponse):
     nodes: List[DAGNodeResponse] = []
 
 
+class DAGNodeStateSnapshotCreate(BaseModel):
+    task_id: Optional[str] = None
+    phase: str = "runtime"
+    status: str = "pending"
+    wave: Optional[int] = None
+    attempt: int = 1
+    input_context: Dict[str, Any] = {}
+    output_context: Dict[str, Any] = {}
+    completion_state: Dict[str, Any] = {}
+    acquisition_log: List[Dict[str, Any]] = []
+    acceptance_result: Dict[str, Any] = {}
+    pending_items: List[Any] = []
+
+
+class DAGNodeStateSnapshotResponse(BaseModel):
+    id: int
+    dag_id: str
+    node_id: str
+    task_id: Optional[str]
+    phase: str
+    status: str
+    wave: Optional[int]
+    attempt: int
+    input_context: Dict[str, Any]
+    output_context: Dict[str, Any]
+    completion_state: Dict[str, Any]
+    acquisition_log: List[Dict[str, Any]]
+    acceptance_result: Dict[str, Any]
+    pending_items: List[Any]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DAGNodeAuditEventCreate(BaseModel):
+    task_id: Optional[str] = None
+    event_type: str
+    severity: str = "info"
+    message: str
+    event_data: Dict[str, Any] = {}
+
+
+class DAGNodeAuditEventResponse(BaseModel):
+    id: int
+    dag_id: str
+    node_id: str
+    task_id: Optional[str]
+    event_type: str
+    severity: str
+    message: str
+    event_data: Dict[str, Any]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # ── Node Environments ──────────────────────────────────
 
 class NodeEnvironmentCreate(BaseModel):

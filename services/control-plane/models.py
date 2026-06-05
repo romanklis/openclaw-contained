@@ -411,6 +411,48 @@ class DAGNode(Base):
     task = relationship("Task", foreign_keys=[task_id])
 
 
+class DAGNodeStateSnapshot(Base):
+    """Immutable snapshot of a DAG node execution state.
+
+    Captures what inputs were brought into the step, what was produced,
+    how it was obtained, and acceptance outcomes for auditability.
+    """
+    __tablename__ = "dag_node_state_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+    phase = Column(String, nullable=False, default="runtime")  # input_resolved|running|completed|failed
+    status = Column(String, nullable=False, default="pending")
+    wave = Column(Integer, nullable=True)
+    attempt = Column(Integer, nullable=False, default=1)
+
+    input_context = Column(JSON, default=dict)
+    output_context = Column(JSON, default=dict)
+    completion_state = Column(JSON, default=dict)
+    acquisition_log = Column(JSON, default=list)
+    acceptance_result = Column(JSON, default=dict)
+    pending_items = Column(JSON, default=list)
+
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+class DAGNodeAuditEvent(Base):
+    """Structured audit events for DAG node execution and provenance checks."""
+    __tablename__ = "dag_node_audit_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    severity = Column(String, nullable=False, default="info")  # info|warning|critical
+    message = Column(Text, nullable=False)
+    event_data = Column(JSON, default=dict)
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
 class NodeEnvironment(Base):
     """A reusable execution environment with approved capabilities.
 

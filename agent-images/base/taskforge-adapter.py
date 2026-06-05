@@ -632,7 +632,7 @@ def build_system_prompt() -> str:
     return "\n".join(parts)
 
 
-def invoke_native_agent(prompt: str) -> Tuple[str, int]:
+def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
     """Run a native agentic tool-use loop against the LLM router.
 
     This replaces invoke_openclaw_agent() but produces identical output
@@ -653,6 +653,7 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
     ]
 
     all_output_parts: List[str] = []
+    assistant_text_parts: List[str] = []
     turn = 0
 
     print(f"   🔗 LLM endpoint: {completions_url}")
@@ -708,6 +709,7 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
                 if content:
                     print(f"   💬 Assistant: {content[:200]}{'...' if len(content) > 200 else ''}")
                     all_output_parts.append(content)
+                    assistant_text_parts.append(content)
 
                     # Check for capability/deployment markers in text
                     if "CAPABILITY_REQUEST:" in content or "DEPLOYMENT_REQUEST:" in content:
@@ -751,13 +753,19 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
                     })
 
         combined = "\n".join(all_output_parts)
-        return combined, 0
+        agent_output = ""
+        if assistant_text_parts:
+            agent_output = json.dumps(
+                {"payloads": [{"text": text} for text in assistant_text_parts]},
+                ensure_ascii=False,
+            )
+        return combined, 0, agent_output
 
     except Exception as e:
         error = f"Agent loop error: {e}\n{traceback.format_exc()}"
         print(f"   ❌ {error}")
         all_output_parts.append(error)
-        return "\n".join(all_output_parts), 1
+        return "\n".join(all_output_parts), 1, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1120,7 +1128,7 @@ def main():
 
     # Invoke native agent loop
     print(f"\n🚀 Invoking {name} native agent loop...")
-    output, exit_code = invoke_native_agent(prompt)
+    output, exit_code, agent_output = invoke_native_agent(prompt)
 
     print("\n" + "=" * 80)
     print(f"📊 {name} OUTPUT")
@@ -1135,7 +1143,7 @@ def main():
     result: Dict[str, Any] = {
         "completed": False,
         "capability_requested": False,
-        "output": output[:50000],
+        "output": agent_output[:50000] if agent_output else output[:50000],
         "agent_logs": output[:50000],
     }
 
