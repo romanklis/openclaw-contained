@@ -2,7 +2,7 @@
 # Auditable Agent Orchestration for OpenClaw
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
-		backup restore scale-workers build-base build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images
+		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images
 
 # ─────────────────────────────────────────────────────────
 # Help
@@ -83,6 +83,15 @@ build-base: ## Force rebuild the base agent image (openclaw-agent:openclaw)
 	@echo "  Base image rebuild triggered. Watch logs:"
 	@echo "    make logs-service SERVICE=image-builder"
 
+build-octaveclaw: ## Build the OctaveClaw agent image (OpenClaw + GNU Octave) and push to registry
+	@echo "Building OctaveClaw agent image inside DinD..."
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:octaveclaw \
+		-f /agent-images/octaveclaw/Dockerfile \
+		/agent-images/octaveclaw/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:octaveclaw
+	@echo "  ✅  openclaw-agent:octaveclaw built & pushed"
+
 check-base: ## Check if base agent image exists in internal registry
 	@docker exec openclaw-docker-dind docker images registry:5000/openclaw-agent:openclaw --format "{{.Repository}}:{{.Tag}}  {{.Size}}  {{.CreatedAt}}" 2>/dev/null \
 		|| echo "  ❌ Base image not found. It will be auto-built on next startup."
@@ -149,10 +158,11 @@ build-browser-v3: ## Build Browser v3 image (Chromium + agent-browser + Lightpan
 	@rm -f agent-images/browser_v3/taskforge-adapter.py
 	@echo "  ✅  openclaw-agent:browser_v3 built & pushed"
 
-build-all-images: build-base build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 ## Build all 7 agent base images
+build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 ## Build all 8 agent base images
 	@echo ""
 	@echo "  ✅  All agent base images built & pushed to registry:"
 	@echo "      openclaw-agent:openclaw  (Full Python)"
+	@echo "      openclaw-agent:octaveclaw (OpenClaw + GNU Octave)"
 	@echo "      openclaw-agent:nanobot   (Alpine Python)"
 	@echo "      openclaw-agent:picoclaw  (Shell)"
 	@echo "      openclaw-agent:zeroclaw  (Rust)"

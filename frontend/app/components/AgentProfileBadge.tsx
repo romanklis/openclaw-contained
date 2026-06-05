@@ -26,6 +26,7 @@ interface AgentProfileInfo {
 
 const IMAGE_COLORS: Record<string, { bg: string; text: string; border: string }> = {
   openclaw: { bg: 'bg-indigo-500/10', text: 'text-indigo-400', border: 'border-indigo-500/20' },
+  octaveclaw: { bg: 'bg-sky-500/10', text: 'text-sky-400', border: 'border-sky-500/20' },
   nanobot: { bg: 'bg-emerald-500/10', text: 'text-emerald-400', border: 'border-emerald-500/20' },
   picoclaw: { bg: 'bg-amber-500/10', text: 'text-amber-400', border: 'border-amber-500/20' },
   zeroclaw: { bg: 'bg-red-500/10', text: 'text-red-400', border: 'border-red-500/20' },

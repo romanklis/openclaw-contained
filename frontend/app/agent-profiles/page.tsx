@@ -39,12 +39,13 @@ const EMPTY_PROFILE: Omit<AgentProfile, 'image_info'> = {
 
 const IMAGE_COLORS: Record<string, { bg: string; text: string; border: string; glow: string }> = {
   openclaw:  { bg: 'bg-indigo-500/10',  text: 'text-indigo-400',  border: 'border-indigo-500/20',  glow: 'hover:shadow-indigo-500/5' },
+  octaveclaw:{ bg: 'bg-sky-500/10',     text: 'text-sky-400',     border: 'border-sky-500/20',     glow: 'hover:shadow-sky-500/5' },
   nanobot:   { bg: 'bg-emerald-500/10', text: 'text-emerald-400', border: 'border-emerald-500/20', glow: 'hover:shadow-emerald-500/5' },
   picoclaw:  { bg: 'bg-amber-500/10',   text: 'text-amber-400',   border: 'border-amber-500/20',   glow: 'hover:shadow-amber-500/5' },
   zeroclaw:  { bg: 'bg-red-500/10',     text: 'text-red-400',     border: 'border-red-500/20',     glow: 'hover:shadow-red-500/5' },
 }
 
-const BASE_IMAGES = ['openclaw', 'nanobot', 'picoclaw', 'zeroclaw']
+const BASE_IMAGES = ['openclaw', 'octaveclaw', 'nanobot', 'picoclaw', 'zeroclaw']
 
 // ─── Component ───────────────────────────────────────────────────
 

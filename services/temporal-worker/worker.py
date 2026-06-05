@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # supply-chain detection needs them. Falls back to a built-in default so the
 # worker is functional before the control-plane is reachable.
 _KNOWN_IMAGE_TYPES_CACHE: tuple | None = None
-_KNOWN_IMAGE_TYPES_DEFAULT = ("zeroclaw", "nanobot", "picoclaw", "browser", "openclaw")
+_KNOWN_IMAGE_TYPES_DEFAULT = ("zeroclaw", "nanobot", "picoclaw", "browser", "openclaw", "octaveclaw")
 
 
 async def _fetch_known_image_types() -> tuple:
@@ -2665,7 +2665,12 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
 
         # Fetch the latest output
         outputs_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
-        outputs = outputs_resp.json() if outputs_resp.status_code == 200 else []
+        outputs_payload = outputs_resp.json() if outputs_resp.status_code == 200 else {}
+        outputs = []
+        if isinstance(outputs_payload, dict):
+            outputs = outputs_payload.get("outputs", []) or []
+        elif isinstance(outputs_payload, list):
+            outputs = outputs_payload
 
         result = {
             "task_id": task_id,
@@ -2673,11 +2678,63 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
         }
 
         if outputs:
-            latest = outputs[-1] if isinstance(outputs, list) else outputs
+            latest = outputs[-1]
             result["agent_logs"] = latest.get("agent_logs", "")
-            result["files"] = latest.get("files", [])
+            result["completed"] = latest.get("completed")
+            result["error"] = latest.get("error")
+            result["deliverables"] = latest.get("deliverables")
+            result["raw_result"] = latest.get("raw_result")
+            result["parse_error"] = bool((latest.get("raw_result") or {}).get("parse_error"))
+            result["iteration"] = latest.get("iteration")
 
         return result
+
+
+@activity.defn
+async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Evaluate node output quality gate.
+
+    The gate defaults to strict mode:
+    - task status must be completed
+    - latest output.completed must be true
+    - error must be empty
+    - deliverables must be non-empty
+
+    Node config can opt out of deliverables requirement using:
+    config.deliverable_gate.require_deliverables = false
+    config.deliverable_gate.enabled = false
+    """
+
+    def _is_trueish(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in ("1", "true", "yes", "y")
+
+    gate_cfg = ((config or {}).get("deliverable_gate") or {}) if isinstance(config, dict) else {}
+    if gate_cfg.get("enabled") is False:
+        return {"valid": True, "reason": "deliverable gate disabled by node config"}
+
+    if str(output.get("status", "")).lower() != "completed":
+        return {"valid": False, "reason": f"task status is '{output.get('status')}', expected 'completed'"}
+
+    if not _is_trueish(output.get("completed")):
+        return {"valid": False, "reason": "latest task output is not marked completed=true"}
+
+    if output.get("error"):
+        return {"valid": False, "reason": f"task output error: {str(output.get('error'))[:200]}"}
+
+    if output.get("parse_error"):
+        return {"valid": False, "reason": "task output parse_error is true"}
+
+    require_deliverables = gate_cfg.get("require_deliverables", True)
+    if require_deliverables:
+        deliverables = output.get("deliverables")
+        if not isinstance(deliverables, dict) or len(deliverables) == 0:
+            return {"valid": False, "reason": "task output has no deliverables"}
+
+    return {"valid": True, "reason": "ok"}
 
 
 @activity.defn
@@ -2855,6 +2912,29 @@ class DAGNodeWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             )
 
+            gate_result = await workflow.execute_activity(
+                evaluate_node_gate,
+                args=[task_id, output, config],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+
+            if not gate_result.get("valid", False):
+                reason = gate_result.get("reason", "deliverable gate failed")
+                output["gate_failure"] = reason
+                logger.error(f"🛑 NODE_GATE_FAILED | DAG: {dag_id} | Node: {node_id} | Reason: {reason}")
+                await workflow.execute_activity(
+                    update_node_status,
+                    args=[dag_id, node_id, "failed", output],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+                return {
+                    "node_id": node_id,
+                    "status": "failed",
+                    "output": output,
+                    "gate_failure": reason,
+                    "current_image": result.get("current_image", ""),
+                }
+
             # Determine final status from AgentTaskWorkflow result
             node_status = "completed" if result.get("status") != "failed" else "failed"
 
@@ -2949,6 +3029,8 @@ class DAGWorkflow:
 
         while wave < max_waves:
             wave += 1
+            abort_requested = False
+            abort_reason = ""
 
             # Find nodes that are ready: all dependencies completed
             ready_nodes = []
@@ -3079,6 +3161,8 @@ class DAGWorkflow:
                         node_outputs[nid] = result["output"]
                     if node_statuses[nid] == "failed":
                         failed_nodes.append(nid)
+                        abort_requested = True
+                        abort_reason = result.get("gate_failure") or result.get("error") or f"node '{nid}' failed"
 
                     # Propagate the committed/enriched image to subsequent waves
                     # so downstream nodes inherit the file-system state.
@@ -3093,6 +3177,26 @@ class DAGWorkflow:
                     node_statuses[nid] = "failed"
                     failed_nodes.append(nid)
                     node_outputs[nid] = {"error": str(e), "status": "failed"}
+                    abort_requested = True
+                    abort_reason = str(e)
+
+            # Fail-fast gate: stop scheduling new work when any node fails.
+            if abort_requested:
+                pending_nodes = [nid for nid, s in node_statuses.items() if s == "pending"]
+                for pending_id in pending_nodes:
+                    node_statuses[pending_id] = "skipped"
+                    await workflow.execute_activity(
+                        update_node_status,
+                        args=[dag_id, pending_id, "skipped"],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+
+                await workflow.execute_activity(
+                    post_dag_progress,
+                    args=[dag_id, f"🛑 DAG halted after wave {wave}: {abort_reason}"],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+                break
 
         # Determine final DAG status
         completed = sum(1 for s in node_statuses.values() if s == "completed")
@@ -3226,6 +3330,7 @@ async def main():
             post_dag_progress,
             create_node_task,
             collect_node_output,
+            evaluate_node_gate,
             evaluate_edge_condition,
             finalize_dag,
             persist_task_workflow_id,

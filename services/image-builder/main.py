@@ -660,7 +660,7 @@ RUN apt-get update && apt-get install -y \\
 # ⚠ PicoClaw has no Python — cannot install pip packages
 # Requested: {{ pip_packages | join(', ') }}
 RUN echo "ERROR: pip packages requested but PicoClaw has no Python runtime" >&2 && exit 1
-{% elif image_type in ('openclaw', 'browser') %}
+{% elif image_type in ('openclaw', 'browser', 'octaveclaw') %}
 # Install Python packages (OpenClaw — system pip, no venv)
 USER root
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -690,7 +690,7 @@ RUN set -e; \
 {% endif %}
 
 {% if npm_packages %}
-{% if image_type in ('openclaw', 'zeroclaw', 'browser') %}
+{% if image_type in ('openclaw', 'zeroclaw', 'browser', 'octaveclaw') %}
 # Install NPM packages globally
 USER root
 RUN npm install -g \\
@@ -928,6 +928,7 @@ _DEPLOYMENT_BASE_IMAGES = {
     "nanobot":  "python:3.11.15-alpine3.21",
     "zeroclaw": "python:3.11.15-slim-bookworm",
     "openclaw": "python:3.11.15-slim-bookworm",
+    "octaveclaw": "python:3.11.15-slim-bookworm",
 }
 
 # System packages to always include for shell-based deployments (picoclaw)

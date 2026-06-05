@@ -5,7 +5,7 @@ Registry** for the TaskForge platform.
 
 ## Architecture
 
-TaskForge supports 4 distinct **Base Images** (the "body") that are paired with
+TaskForge supports multiple **Base Images** (the "body") that are paired with
 specific LLMs (the "brain") through **Agent Profiles**.
 
 ```
@@ -19,6 +19,8 @@ agent-images/
 │   ├── config.py
 │   ├── VERSION
 │   └── CHANGELOG.md
+├── octaveclaw/              # OctaveClaw — OpenClaw + GNU Octave runtime
+│   └── Dockerfile
 ├── nanobot/                 # NanoBot — Lightweight Alpine Python
 │   ├── Dockerfile
 │   └── requirements.txt
@@ -36,12 +38,13 @@ agent-images/
 
 ## Base Images
 
-| Image      | Runtime             | Use Case                               | Size     |
-|------------|---------------------|----------------------------------------|----------|
-| **OpenClaw**  | Python 3.11 (Debian) | Full coding & automation              | ~450 MB  |
-| **NanoBot**   | Python 3.11 (Alpine) | Fast scripts & data transforms        | ~80 MB   |
-| **PicoClaw**  | Shell (Alpine)       | File manipulation & CLI automation    | ~15 MB   |
-| **ZeroClaw**  | Rust (Debian)        | High-security & performance-critical  | ~120 MB  |
+| Image          | Runtime                          | Use Case                               | Size     |
+|----------------|----------------------------------|----------------------------------------|----------|
+| **OpenClaw**   | Python 3.11 (Debian)            | Full coding & automation               | ~450 MB  |
+| **OctaveClaw** | Python 3.11 (Debian) + Octave   | Numerical simulations & matrix compute | ~1.1 GB  |
+| **NanoBot**    | Python 3.11 (Alpine)            | Fast scripts & data transforms         | ~80 MB   |
+| **PicoClaw**   | Shell (Alpine)                  | File manipulation & CLI automation     | ~15 MB   |
+| **ZeroClaw**   | Rust (Debian)                   | High-security & performance-critical   | ~120 MB  |
 
 ## Agent Profiles
 
@@ -64,11 +67,12 @@ The UI shows badges: `Runtime: Rust (Debian)` · `Model: claude-sonnet-4-2025051
 ## Building Images
 
 ```bash
-# Build all 4 base images
+# Build all base images
 make build-all-images
 
 # Or individually:
 make build-base       # OpenClaw (full Python)
+make build-octaveclaw # OctaveClaw (OpenClaw + GNU Octave)
 make build-nanobot    # NanoBot (Alpine Python)
 make build-picoclaw   # PicoClaw (Shell)
 make build-zeroclaw   # ZeroClaw (Rust)

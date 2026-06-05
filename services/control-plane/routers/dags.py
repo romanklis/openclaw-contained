@@ -7,7 +7,7 @@ from sqlalchemy import select
 from database import get_db
 from models import MasterDAG, DAGNode, Task, DAGStatus, NodeStatus, SkillSelectionEvent
 from schemas import (
-    DAGCreate, DAGManualCreate, DAGResponse, DAGDetail, DAGNodeResponse, DAGRevise,
+    DAGCreate, DAGManualCreate, DAGResponse, DAGDetail, DAGNodeResponse, DAGRevise, DAGRefine, DAGNodePatch,
 )
 from dag_validator import validate_dag
 from planner import plan_dag
@@ -16,6 +16,7 @@ from temporal_client import start_dag_workflow
 import uuid
 import logging
 from datetime import datetime
+from copy import deepcopy
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -85,7 +86,7 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
 
     nodes = []
     for node_def in dag_json.get("nodes", []):
-        node_config = node_def.get("config", {})
+        node_config = dict(node_def.get("config") or {})
         selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
         skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
         node = DAGNode(
@@ -309,9 +310,9 @@ async def patch_dag(dag_id: str, payload: dict, db: AsyncSession = Depends(get_d
 
 
 @router.patch("/{dag_id}/nodes/{node_id}")
-async def patch_node(dag_id: str, node_id: str, payload: dict, db: AsyncSession = Depends(get_db)):
-    """Update DAG node fields (status, output_data, task_id, container_id)."""
-    await _get_dag_or_404(dag_id, db)
+async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: AsyncSession = Depends(get_db)):
+    """Update DAG node runtime fields and pre-run editable fields."""
+    dag = await _get_dag_or_404(dag_id, db)
     result = await db.execute(
         select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id)
     )
@@ -319,21 +320,215 @@ async def patch_node(dag_id: str, node_id: str, payload: dict, db: AsyncSession 
     if not node:
         raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
 
-    if "status" in payload:
-        node.status = NodeStatus(payload["status"])
-        if payload["status"] == "running" and not node.started_at:
+    patch = payload.model_dump(exclude_unset=True)
+    runtime_keys = {"status", "output_data", "task_id", "container_id"}
+    editable_keys = set(patch.keys()) - runtime_keys
+
+    # Runtime updates are allowed while running; user-editable graph changes are not.
+    if editable_keys:
+        _ensure_dag_editable(dag)
+
+    if "status" in patch:
+        node.status = NodeStatus(patch["status"])
+        if node.status == NodeStatus.RUNNING and not node.started_at:
             node.started_at = datetime.utcnow()
-        elif payload["status"] in ("completed", "failed", "skipped"):
+        elif node.status in (NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.SKIPPED):
             node.completed_at = datetime.utcnow()
-    if "output_data" in payload:
-        node.output_data = payload["output_data"]
-    if "task_id" in payload:
-        node.task_id = payload["task_id"]
-    if "container_id" in payload:
-        node.container_id = payload["container_id"]
+    if "output_data" in patch:
+        node.output_data = patch["output_data"]
+    if "task_id" in patch:
+        node.task_id = patch["task_id"]
+    if "container_id" in patch:
+        node.container_id = patch["container_id"]
+
+    # Editable fields (pre-run only)
+    if "skill_id" in patch:
+        node.skill_id = patch["skill_id"]
+    if "skill_step_index" in patch:
+        node.skill_step_index = patch["skill_step_index"]
+    if "selected_skill_v2_id" in patch:
+        node.selected_skill_v2_id = patch["selected_skill_v2_id"]
+    if "skill_selection_reason" in patch:
+        node.skill_selection_reason = patch["skill_selection_reason"]
+    if "description" in patch:
+        node.description = patch["description"]
+    if "depends_on" in patch and patch["depends_on"] is not None:
+        node.depends_on = _dedupe_node_ids(patch["depends_on"])
+    if "input_mapping" in patch and patch["input_mapping"] is not None:
+        node.input_mapping = patch["input_mapping"]
+    if "config" in patch and patch["config"] is not None:
+        merged_config = dict(node.config or {})
+        merged_config.update(patch["config"])
+        node.config = merged_config
+
+    if editable_keys:
+        dag_json = deepcopy(dag.dag_json or {})
+        dag_nodes = dag_json.get("nodes", [])
+        dag_node = next((n for n in dag_nodes if n.get("node_id") == node_id), None)
+        if dag_node is None:
+            raise HTTPException(status_code=500, detail=f"Node '{node_id}' missing from dag_json")
+
+        if "skill_id" in patch:
+            dag_node["skill_id"] = patch["skill_id"]
+        if "skill_step_index" in patch:
+            dag_node["skill_step_index"] = patch["skill_step_index"]
+        if "description" in patch:
+            dag_node["description"] = patch["description"]
+        if "depends_on" in patch and patch["depends_on"] is not None:
+            dag_node["depends_on"] = _dedupe_node_ids(patch["depends_on"])
+        if "input_mapping" in patch and patch["input_mapping"] is not None:
+            dag_node["input_mapping"] = patch["input_mapping"]
+
+        dag_node_config = dict(dag_node.get("config") or {})
+        if "config" in patch and patch["config"] is not None:
+            dag_node_config.update(patch["config"])
+        if "selected_skill_v2_id" in patch:
+            dag_node_config["selected_skill_v2_id"] = patch["selected_skill_v2_id"]
+        if "skill_selection_reason" in patch:
+            dag_node_config["skill_selection_reason"] = patch["skill_selection_reason"]
+        dag_node["config"] = dag_node_config
+
+        is_valid, errors = validate_dag(dag_json)
+        if not is_valid:
+            await db.rollback()
+            raise HTTPException(status_code=422, detail={"errors": errors})
+
+        dag.dag_json = dag_json
 
     await db.commit()
     return {"ok": True}
+
+
+@router.delete("/{dag_id}/nodes/{node_id}", response_model=DAGDetail)
+async def delete_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_db)):
+    """Delete a node from a pre-run DAG and auto-rewire predecessor/successor dependencies."""
+    dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_editable(dag)
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(nodes_result.scalars().all())
+    node = next((n for n in all_nodes if n.node_id == node_id), None)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+    if len(all_nodes) <= 1:
+        raise HTTPException(status_code=400, detail="Cannot delete the last node from a DAG")
+
+    predecessors = _dedupe_node_ids(node.depends_on or [])
+    successors = [n for n in all_nodes if node_id in (n.depends_on or []) and n.node_id != node_id]
+
+    for succ in successors:
+        new_deps = [dep for dep in (succ.depends_on or []) if dep != node_id]
+        for pred in predecessors:
+            if pred != succ.node_id and pred not in new_deps:
+                new_deps.append(pred)
+        succ.depends_on = new_deps
+
+    dag_json = deepcopy(dag.dag_json or {})
+    dag_json_nodes = []
+    for dag_node in dag_json.get("nodes", []):
+        if dag_node.get("node_id") == node_id:
+            continue
+        deps = [dep for dep in (dag_node.get("depends_on") or []) if dep != node_id]
+        for pred in predecessors:
+            if pred != dag_node.get("node_id") and pred not in deps and node_id in (dag_node.get("depends_on") or []):
+                deps.append(pred)
+        dag_node["depends_on"] = deps
+        dag_json_nodes.append(dag_node)
+    dag_json["nodes"] = dag_json_nodes
+
+    # Remove all explicit edges that referenced the deleted node.
+    filtered_edges = []
+    for edge in dag_json.get("edges", []):
+        edge_from = edge.get("from_node", edge.get("from"))
+        edge_to = edge.get("to_node", edge.get("to"))
+        if edge_from == node_id or edge_to == node_id:
+            continue
+        filtered_edges.append(edge)
+    dag_json["edges"] = filtered_edges
+
+    is_valid, errors = validate_dag(dag_json)
+    if not is_valid:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    dag.dag_json = dag_json
+    await db.delete(node)
+    await db.commit()
+    await db.refresh(dag)
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    remaining_nodes = list(nodes_result.scalars().all())
+    return _build_dag_detail(dag, remaining_nodes)
+
+
+@router.post("/{dag_id}/refine", response_model=DAGDetail)
+async def refine_dag(dag_id: str, body: DAGRefine, db: AsyncSession = Depends(get_db)):
+    """Refine a pre-run DAG in-place by re-running planning with additional instructions."""
+    dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_editable(dag)
+
+    planning_model = body.llm_model or dag.llm_model or _dag_model_defaults["planning_model"]
+    base_image = _extract_dag_base_image(dag.dag_json)
+    refinement_objective = (
+        f"{dag.objective}\n\n"
+        f"--- DAG REFINEMENT INSTRUCTIONS ---\n"
+        f"{body.instructions}\n\n"
+        f"Update the DAG plan accordingly while preserving valid dependencies and practical execution order."
+    )
+
+    try:
+        dag_json = await plan_dag(refinement_objective, planning_model, db, base_image=base_image, agent_model=dag.llm_model)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    is_valid, errors = validate_dag(dag_json)
+    if not is_valid:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    # Replace all existing nodes with the refined plan's nodes, preserving DAG identity.
+    existing_nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    for old_node in existing_nodes_result.scalars().all():
+        await db.delete(old_node)
+
+    nodes = []
+    for node_def in dag_json.get("nodes", []):
+        node_config = dict(node_def.get("config") or {})
+        selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
+        skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
+        node = DAGNode(
+            dag_id=dag_id,
+            node_id=node_def["node_id"],
+            skill_id=node_def.get("skill_id"),
+            skill_step_index=node_def.get("skill_step_index"),
+            description=node_def.get("description"),
+            status=NodeStatus.PENDING,
+            depends_on=node_def.get("depends_on", []),
+            config=node_config,
+            input_mapping=node_def.get("input_mapping", {}),
+            selected_skill_v2_id=selected_skill_v2_id,
+            skill_selection_reason=skill_selection_reason,
+        )
+        db.add(node)
+        nodes.append(node)
+
+        if selected_skill_v2_id:
+            event = SkillSelectionEvent(
+                skill_id=selected_skill_v2_id,
+                dag_id=dag_id,
+                node_id=node_def["node_id"],
+                selection_reason=skill_selection_reason,
+            )
+            db.add(event)
+
+    dag.dag_json = dag_json
+    dag.status = DAGStatus.READY
+    dag.workflow_id = None
+    dag.workflow_run_id = None
+    dag.started_at = None
+    dag.completed_at = None
+    await db.commit()
+    await db.refresh(dag)
+    return _build_dag_detail(dag, nodes)
 
 
 @router.post("/{dag_id}/revise", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
@@ -425,7 +620,7 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
 
     nodes = []
     for node_def in dag_json.get("nodes", []):
-        node_config = node_def.get("config", {})
+        node_config = dict(node_def.get("config") or {})
         selected_skill_v2_id = node_config.pop("selected_skill_v2_id", None) or None
         skill_selection_reason = node_config.pop("skill_selection_reason", None) or None
         node = DAGNode(
@@ -461,6 +656,35 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
 
 
 # ── Helpers ─────────────────────────────────────────────
+
+def _ensure_dag_editable(dag: MasterDAG) -> None:
+    editable_statuses = {DAGStatus.READY, DAGStatus.FAILED}
+    if dag.status not in editable_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"DAG is in '{dag.status.value}' state, must be 'ready' or 'failed' for this operation",
+        )
+
+
+def _dedupe_node_ids(node_ids: list[str]) -> list[str]:
+    seen = set()
+    ordered = []
+    for nid in node_ids:
+        if nid in seen:
+            continue
+        seen.add(nid)
+        ordered.append(nid)
+    return ordered
+
+
+def _extract_dag_base_image(dag_json: dict | None) -> str | None:
+    if not dag_json:
+        return None
+    for node_def in dag_json.get("nodes", []):
+        cfg = node_def.get("config", {})
+        if cfg.get("base_image"):
+            return cfg["base_image"]
+    return None
 
 async def _get_dag_or_404(dag_id: str, db: AsyncSession) -> MasterDAG:
     result = await db.execute(select(MasterDAG).where(MasterDAG.id == dag_id))

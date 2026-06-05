@@ -431,6 +431,25 @@ class DAGNodeCreate(BaseModel):
     input_mapping: Dict[str, Any] = {}  # supports dependency refs and literal constants
 
 
+class DAGNodePatch(BaseModel):
+    """Editable fields for a DAG node plus runtime fields from worker updates."""
+    # Runtime fields (used by worker)
+    status: Optional[NodeStatus] = None
+    output_data: Optional[Dict[str, Any]] = None
+    task_id: Optional[str] = None
+    container_id: Optional[str] = None
+
+    # User-editable fields (pre-run)
+    skill_id: Optional[str] = None
+    skill_step_index: Optional[int] = None
+    selected_skill_v2_id: Optional[str] = None
+    skill_selection_reason: Optional[str] = None
+    description: Optional[str] = None
+    depends_on: Optional[List[str]] = None
+    config: Optional[Dict[str, Any]] = None
+    input_mapping: Optional[Dict[str, Any]] = None
+
+
 class DAGNodeResponse(BaseModel):
     id: int
     dag_id: str
@@ -476,6 +495,12 @@ class DAGCreate(BaseModel):
 class DAGRevise(BaseModel):
     """Request a revision on a completed/deployed DAG — plans a new DAG."""
     comments: str
+    llm_model: Optional[str] = None
+
+
+class DAGRefine(BaseModel):
+    """Refine an existing pre-run DAG in-place with additional instructions."""
+    instructions: str = Field(..., min_length=1)
     llm_model: Optional[str] = None
 
 

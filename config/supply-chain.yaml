@@ -216,7 +216,35 @@ openclaw:
     - libxshmfence1
     - fonts-noto-color-emoji
 
-  npm: — Lightweight Alpine + Python
+  npm: []
+
+# ---------------------------------------------------------------------------
+# octaveclaw — OpenClaw + GNU Octave for simulation workloads
+# ---------------------------------------------------------------------------
+octaveclaw:
+  notes: >
+    Debian-based OpenClaw variant with GNU Octave pre-installed for numerical
+    simulations. Allows core Python/Node workflows plus simulation tooling.
+  pip:
+    - flask
+    - requests
+    - pytest
+    - numpy
+    - scipy
+    - pandas
+    - matplotlib
+  apt:
+    - octave
+    - gnuplot
+    - libblas-dev
+    - liblapack-dev
+    - curl
+    - wget
+    - git
+    - jq
+    - build-essential
+  npm: []
+
 # ---------------------------------------------------------------------------
 nanobot:
   notes: >
