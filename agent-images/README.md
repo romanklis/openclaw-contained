@@ -41,7 +41,7 @@ agent-images/
 | Image          | Runtime                          | Use Case                               | Size     |
 |----------------|----------------------------------|----------------------------------------|----------|
 | **OpenClaw**   | Python 3.11 (Debian)            | Full coding & automation               | ~450 MB  |
-| **OctaveClaw** | Python 3.11 (Debian) + Octave   | Numerical simulations & matrix compute | ~1.1 GB  |
+| **OctaveClaw** | Python 3.11 (Debian) + Octave + Flask stack | Numerical simulations, matrix compute, and simulation APIs | ~1.1 GB  |
 | **NanoBot**    | Python 3.11 (Alpine)            | Fast scripts & data transforms         | ~80 MB   |
 | **PicoClaw**   | Shell (Alpine)                  | File manipulation & CLI automation     | ~15 MB   |
 | **ZeroClaw**   | Rust (Debian)                   | High-security & performance-critical   | ~120 MB  |

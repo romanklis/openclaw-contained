@@ -9,7 +9,7 @@ from temporalio import workflow, activity
 from temporalio.exceptions import ApplicationError
 from temporalio.client import Client
 from temporalio.worker import Worker
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from typing import Dict, Any, List, Optional
 import os
 
@@ -49,6 +49,50 @@ TASK_QUEUE = os.getenv("TEMPORAL_TASK_QUEUE", "openclaw-tasks")
 def is_gemini_lite_model(model: str) -> bool:
     normalized = (model or "").strip().lower()
     return "gemini" in normalized and "lite" in normalized
+
+
+def _parse_capability_request_marker(text: str) -> Optional[Dict[str, str]]:
+    """Parse CAPABILITY_REQUEST marker text into a capability payload.
+
+    Expected format:
+    CAPABILITY_REQUEST:<type>:<resource>:<justification>
+    """
+    if not isinstance(text, str):
+        return None
+    marker_line = ""
+    for line in text.splitlines():
+        if "CAPABILITY_REQUEST:" in line:
+            marker_line = line.strip()
+            break
+    if not marker_line:
+        return None
+    payload = marker_line.split("CAPABILITY_REQUEST:", 1)[1].strip()
+    parts = payload.split(":", 2)
+    if len(parts) < 2:
+        return None
+    cap_type = (parts[0] or "tool_install").strip() or "tool_install"
+    resource = (parts[1] or "").strip()
+    justification = (parts[2] if len(parts) > 2 else "Requested by agent").strip()
+    return {
+        "type": cap_type,
+        "resource": resource,
+        "justification": justification,
+    }
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    """Parse common ISO datetime string formats into datetime."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            # Normalize to naive UTC so comparisons with workflow.now()
+            # are deterministic inside workflow sandbox code.
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
 
 # =============================================================================
 # Agent Sandbox Configuration
@@ -151,6 +195,101 @@ class AgentTaskWorkflow:
         self._trial_failures = 0  # Track trial deployment failures
         self._trial_rework_pending = False  # True when agent must fix a trial failure
         self._approved_capabilities = set()  # Track already-approved resource names to prevent loops
+
+    async def _resolve_capability_state(
+        self,
+        task_id: str,
+        iteration_started_at: datetime,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Resolve capability lifecycle state for current iteration.
+
+        Returns one of:
+        - none: no capability evidence for this iteration
+        - requested_pending: capability request exists and should block completion
+        - requested_resolved: capability request was already approved/modified
+        """
+        capability = result.get("capability") if isinstance(result.get("capability"), dict) else {}
+        evidence: List[str] = []
+
+        if result.get("capability_requested"):
+            evidence.append("agent_result")
+
+        deliverables = result.get("deliverables") if isinstance(result.get("deliverables"), dict) else {}
+        request_txt = deliverables.get("request.txt")
+        marker_capability = None
+        if isinstance(request_txt, str) and "CAPABILITY_REQUEST:" in request_txt:
+            evidence.append("request_artifact")
+            marker_capability = _parse_capability_request_marker(request_txt)
+            if marker_capability and not capability:
+                capability = marker_capability
+
+        capability_rows = await workflow.execute_activity(
+            list_task_capability_requests,
+            args=[task_id],
+            start_to_close_timeout=timedelta(seconds=20),
+        )
+
+        pending_row = None
+        resolved_row = None
+        ts_ref = iteration_started_at
+        if ts_ref.tzinfo is not None:
+            ts_ref = ts_ref.astimezone(timezone.utc).replace(tzinfo=None)
+        window_start = ts_ref - timedelta(minutes=5)
+        for row in capability_rows or []:
+            requested_at = _parse_iso_datetime(row.get("requested_at"))
+            if requested_at and requested_at < window_start:
+                continue
+            status = (row.get("status") or "").lower()
+            if status == "pending" and pending_row is None:
+                pending_row = row
+            elif status in {"approved", "modified"} and resolved_row is None:
+                resolved_row = row
+            if pending_row and resolved_row:
+                break
+
+        if pending_row:
+            if not capability:
+                capability = {
+                    "type": pending_row.get("capability_type", "tool_install"),
+                    "resource": pending_row.get("resource_name", ""),
+                    "justification": pending_row.get("justification", ""),
+                }
+            return {
+                "state": "requested_pending",
+                "capability": capability,
+                "source": "control_plane_pending",
+                "should_create_request": False,
+            }
+
+        if resolved_row:
+            if not capability:
+                capability = {
+                    "type": resolved_row.get("capability_type", "tool_install"),
+                    "resource": resolved_row.get("resource_name", ""),
+                    "justification": resolved_row.get("justification", ""),
+                }
+            return {
+                "state": "requested_resolved",
+                "capability": capability,
+                "source": f"control_plane_{(resolved_row.get('status') or '').lower()}",
+                "should_create_request": False,
+            }
+
+        if result.get("capability_requested") or marker_capability:
+            return {
+                "state": "requested_pending",
+                "capability": capability or marker_capability or {},
+                "source": "agent_signal",
+                "should_create_request": True,
+            }
+
+        return {
+            "state": "none",
+            "capability": {},
+            "source": "none",
+            "should_create_request": False,
+        }
     
     @workflow.run
     async def run(
@@ -213,6 +352,7 @@ class AgentTaskWorkflow:
         
         while iteration < max_iterations:
             iteration += 1
+            iteration_started_at = workflow.now()
             
             logger.info(f"Task {task_id} iteration {iteration} with image {self.current_image}")
             
@@ -352,28 +492,34 @@ class AgentTaskWorkflow:
                     logger.info(f"📦 Deployment created: {deploy_result.get('id')}")
                 break
             
-            # Check if task complete
-            if result.get("completed"):
-                if self._trial_rework_pending:
-                    # Agent completed without re-emitting DEPLOYMENT_REQUEST after trial failure.
-                    # Force it to continue — re-inject the trial failure feedback.
-                    logger.warning(
-                        f"🧪 Agent completed without re-deploying after trial failure | {task_id} | Forcing rework"
-                    )
-                    self._capability_feedback = (
-                        "TRIAL DEPLOYMENT FAILED previously. Your app does not start correctly.\n"
-                        "You must fix the issue and emit DEPLOYMENT_REQUEST again."
-                    )
-                    continue
-                break
-            
-            # Check if capability requested
-            if result.get("capability_requested"):
-                capability = result.get("capability")
-                resource_name = capability.get("resource", "") if capability else ""
-                
-                logger.info(f"Capability requested: {capability}")
-                
+            # Resolve capability lifecycle before completion. This prevents
+            # completed=true from skipping capability handling in fast approval paths.
+            capability_state = await self._resolve_capability_state(
+                task_id,
+                iteration_started_at,
+                result,
+            )
+            cap_state = capability_state.get("state", "none")
+            capability = capability_state.get("capability") or {}
+            resource_name = capability.get("resource", "") if isinstance(capability, dict) else ""
+
+            if cap_state == "requested_resolved":
+                logger.info(
+                    f"🔐 Capability already resolved for {task_id} "
+                    f"(source={capability_state.get('source')}, resource={resource_name or 'unknown'})"
+                )
+                if resource_name:
+                    self._approved_capabilities.add(resource_name)
+                # Capability activity happened this iteration; continue so completion
+                # is evaluated on the next clean iteration.
+                continue
+
+            if cap_state == "requested_pending":
+                logger.info(
+                    f"🔐 Capability precedence for {task_id}: source={capability_state.get('source')} "
+                    f"resource={resource_name or 'unknown'}"
+                )
+
                 # Guard: skip if the same resource was already approved
                 # (prevents infinite loops from stale results or LLM re-requesting)
                 already_approved = resource_name in self._approved_capabilities
@@ -382,21 +528,20 @@ class AgentTaskWorkflow:
                         f"⏭️ Skipping duplicate capability request for '{resource_name}' "
                         f"— already approved this run"
                     )
-                    # Dismiss any stale pending caps so poll_agent_turns won't kill next container
                     await workflow.execute_activity(
                         dismiss_pending_capabilities,
                         args=[task_id],
                         start_to_close_timeout=timedelta(seconds=15),
                     )
                     continue
-                
-                # Create capability request
-                await workflow.execute_activity(
-                    create_capability_request,
-                    args=[task_id, capability],
-                    start_to_close_timeout=timedelta(seconds=30)
-                )
-                
+
+                if capability_state.get("should_create_request"):
+                    await workflow.execute_activity(
+                        create_capability_request,
+                        args=[task_id, capability],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+
                 # Reset signal flags before waiting (prevents stale signals
                 # from a prior iteration from immediately satisfying the wait)
                 self.approval_received = False
@@ -407,45 +552,34 @@ class AgentTaskWorkflow:
                     lambda: self.approval_received,
                     timeout=timedelta(hours=24)
                 )
-                
+
                 if self.capability_approved:
-                    # Add approved packages to supply chain BEFORE building
-                    # so the image-builder's supply-chain validation passes.
                     await workflow.execute_activity(
                         add_to_supply_chain,
                         args=[task_id, capability, []],
                         start_to_close_timeout=timedelta(seconds=30),
                     )
 
-                    # Reload image-builder's supply chain cache
                     await workflow.execute_activity(
                         reload_supply_chain,
                         args=[],
                         start_to_close_timeout=timedelta(seconds=15),
                     )
 
-                    # Build new image with capability — use current_image as base
-                    # so each version layers on top of the previous (v1 → v2 → v3)
                     build_result = await workflow.execute_activity(
                         build_agent_image,
                         args=[task_id, capability, self.current_image],
                         start_to_close_timeout=timedelta(minutes=10)
                     )
-                    
-                    # build_result is a dict: {image, feedback, denied}
+
                     new_image = build_result.get("image", self.current_image)
                     supply_chain_feedback = build_result.get("feedback", "")
-
-                    # Update current image for subsequent iterations
                     self.current_image = new_image
                     logger.info(f"Updated task image to {new_image}")
-                    
-                    # Track this resource as approved to prevent re-requesting
+
                     if resource_name:
                         self._approved_capabilities.add(resource_name)
 
-                    # If the supply chain denied any packages, inject feedback
-                    # into the follow-up so the agent learns what's unavailable.
                     if supply_chain_feedback:
                         logger.warning(f"🚫 Supply-chain feedback for agent: {supply_chain_feedback[:200]}")
                         self._capability_feedback = (
@@ -454,15 +588,12 @@ class AgentTaskWorkflow:
                             + "\n--- END NOTICE ---"
                         )
 
-                    # Update policy
                     await workflow.execute_activity(
                         update_task_policy,
                         args=[task_id, capability, new_image],
                         start_to_close_timeout=timedelta(seconds=30)
                     )
-                    
-                    # Dismiss all remaining pending caps for this task so
-                    # poll_agent_turns won't kill the next container on sight.
+
                     await workflow.execute_activity(
                         dismiss_pending_capabilities,
                         args=[task_id],
@@ -472,21 +603,16 @@ class AgentTaskWorkflow:
                     logger.info(f"Task {task_id} resumed with new capability")
                 else:
                     logger.info(f"Capability request denied for task {task_id}")
-                    # Tell the agent its capability request was denied by the user
                     self._capability_feedback = (
                         "--- SYSTEM NOTICE ---\n"
                         + f"CAPABILITY_DENIED: Your request for '{capability.get('resource', '')}' "
                         + "was denied by the operator. Find an alternative approach.\n"
                         + "--- END NOTICE ---"
                     )
-                
-                # Reset approval flags
+
                 self.approval_received = False
                 self.capability_approved = False
 
-                # --- Verdict guard: if this task already wrote a PASS verdict,
-                # stop iterating.  Prevents post-verdict workspace corruption
-                # after capability rebuilds. ---
                 try:
                     guard = await workflow.execute_activity(
                         check_verdict_guard,
@@ -501,6 +627,25 @@ class AgentTaskWorkflow:
                         break
                 except Exception:
                     pass  # guard is best-effort; don't block on failure
+
+                # Capability branch always defers completion to a subsequent
+                # iteration after lifecycle reconciliation.
+                continue
+
+            # Check if task complete
+            if result.get("completed"):
+                if self._trial_rework_pending:
+                    # Agent completed without re-emitting DEPLOYMENT_REQUEST after trial failure.
+                    # Force it to continue — re-inject the trial failure feedback.
+                    logger.warning(
+                        f"🧪 Agent completed without re-deploying after trial failure | {task_id} | Forcing rework"
+                    )
+                    self._capability_feedback = (
+                        "TRIAL DEPLOYMENT FAILED previously. Your app does not start correctly.\n"
+                        "You must fix the issue and emit DEPLOYMENT_REQUEST again."
+                    )
+                    continue
+                break
 
         # Step 3: Finalize task
         final_result = await workflow.execute_activity(
@@ -1169,31 +1314,54 @@ async def collect_agent_result(
 
     if result is not None:
         # If the agent didn't flag capability_requested in its result,
-        # check the control plane for pending requests the agent may
-        # have posted directly (e.g. the openclaw adapter).
+        # check the control plane for recent capability rows the agent may
+        # have posted directly (e.g. openclaw adapter auto-request path).
         if not result.get("capability_requested"):
             try:
                 async with httpx.AsyncClient(timeout=5.0) as _cc:
                     _cr = await _cc.get(
                         f"{cp_url}/api/capabilities/requests",
-                        params={"task_id": task_id, "status_filter": "pending"},
+                        params={"task_id": task_id},
                     )
                     if _cr.status_code == 200:
-                        _pending = _cr.json()
-                        if _pending:
-                            cap = _pending[0]
+                        _requests = _cr.json()
+                        _candidate = None
+                        for row in _requests or []:
+                            row_status = (row.get("status") or "").lower()
+                            if row_status in {"pending", "approved", "modified"}:
+                                _candidate = row
+                                break
+                        if _candidate:
+                            row_status = (_candidate.get("status") or "").lower()
                             logger.info(
-                                f"🔐 Detected pending cap request from control plane: "
-                                f"{cap.get('capability_type')} / {cap.get('resource_name')}"
+                                f"🔐 Detected control-plane capability row: "
+                                f"{_candidate.get('capability_type')} / {_candidate.get('resource_name')} "
+                                f"(status={row_status})"
                             )
                             result["capability_requested"] = True
                             result["capability"] = {
-                                "type": cap.get("capability_type", "tool_install"),
-                                "resource": cap.get("resource_name", ""),
-                                "justification": cap.get("justification", ""),
+                                "type": _candidate.get("capability_type", "tool_install"),
+                                "resource": _candidate.get("resource_name", ""),
+                                "justification": _candidate.get("justification", ""),
                             }
+                            result["capability_status"] = row_status
             except Exception:
                 pass
+
+        if not result.get("capability_requested"):
+            marker_cap = _parse_capability_request_marker(
+                ((result.get("deliverables") or {}).get("request.txt", ""))
+                if isinstance(result.get("deliverables"), dict)
+                else ""
+            )
+            if marker_cap:
+                result["capability_requested"] = True
+                result["capability"] = marker_cap
+                result["capability_status"] = "artifact_marker"
+                logger.info(
+                    f"🔐 Detected capability marker from deliverables: "
+                    f"{marker_cap.get('type')} / {marker_cap.get('resource')}"
+                )
 
         if result.get("capability_requested"):
             cap = result.get("capability", {})
@@ -1495,6 +1663,27 @@ async def create_capability_request(
 
 
 @activity.defn
+async def list_task_capability_requests(task_id: str) -> List[Dict[str, Any]]:
+    """List capability requests for a task, newest first."""
+    import httpx
+
+    cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{cp_url}/api/capabilities/requests",
+                params={"task_id": task_id},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            if isinstance(rows, list):
+                return rows
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to list capability requests for {task_id}: {e}")
+    return []
+
+
+@activity.defn
 async def dismiss_pending_capabilities(task_id: str) -> Dict[str, Any]:
     """Dismiss all pending capability requests for a task via the control plane.
 
@@ -1518,6 +1707,30 @@ async def dismiss_pending_capabilities(task_id: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"⚠️ Failed to dismiss pending caps for {task_id}: {e}")
         return {"dismissed": 0, "error": str(e)}
+
+
+@activity.defn
+async def check_verdict_guard(task_id: str) -> Dict[str, Any]:
+    """Return latest immutable verdict for a task, if available."""
+    import httpx
+
+    cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{cp_url}/api/tasks/{task_id}/verdict")
+            if resp.status_code == 404:
+                return {"verdict": None}
+            resp.raise_for_status()
+            data = resp.json() or {}
+            verdict = (data.get("verdict") or "").strip().lower() or None
+            return {
+                "verdict": verdict,
+                "submitted_at": data.get("submitted_at") or data.get("created_at"),
+                "task_id": task_id,
+            }
+    except Exception as e:
+        logger.debug(f"check_verdict_guard failed for {task_id}: {e}")
+        return {"verdict": None, "error": str(e)}
 
 
 # Known npm packages / patterns for auto-detecting package type from generic tool_install
@@ -3868,11 +4081,13 @@ async def main():
             store_task_output,
             get_last_iteration,
             create_capability_request,
+            list_task_capability_requests,
             dismiss_pending_capabilities,
             build_agent_image,
             update_task_policy,
             add_to_supply_chain,
             reload_supply_chain,
+            check_verdict_guard,
             finalize_task,
             create_deployment,
             build_deployment_image,

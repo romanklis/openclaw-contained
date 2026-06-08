@@ -173,7 +173,7 @@ base_images:
     tag: openclaw-agent:octaveclaw
     enabled: true
     runtime: Python 3.11 (Debian) + GNU Octave
-    description: OpenClaw image with GNU Octave preinstalled for numerical simulations.
+    description: OpenClaw image with GNU Octave and preinstalled Python API stack for simulation services.
     size_estimate: ~1.1 GB
     capabilities:
     - python
@@ -181,10 +181,14 @@ base_images:
     - build-tools
     - octave
     - numerical-simulation
+    - flask
+    - rest-api
+    - python-web-backend
     best_for:
     - scientific simulations
     - matrix-heavy workloads
     - prototyping control systems
+    - simulation-api integration
     avoid_for:
     - minimal image footprint
   nanobot:

@@ -196,6 +196,72 @@ async def seed_skills(db: AsyncSession = Depends(get_db)):
             ],
             "tags": ["scripting", "automation"],
         },
+        {
+            "name": "integrate-octave-simulation-stack",
+            "description": "Integrate an Octave simulation backend with a Python Flask API and a frontend data flow.",
+            "instructions": (
+                "Use this skill when a project needs Octave simulation code served through Python and consumed by a UI.\n\n"
+                "Integration checklist:\n"
+                "1. Define a stable simulation contract (inputs, units, defaults, output schema).\n"
+                "2. Keep Octave computations in dedicated scripts/functions and call them from Python using subprocess or oct2py-style adapters.\n"
+                "3. Convert Octave outputs into JSON-safe structures in Python (lists, dicts, scalar metadata).\n"
+                "4. Expose Flask routes for health, parameter validation, simulation run, and result fetch.\n"
+                "5. Add CORS and versioned API paths for frontend compatibility.\n"
+                "6. Provide frontend integration notes: payload shape, polling/streaming approach, and error states.\n"
+                "7. Ship quick validation artifacts: sample request/response JSON, endpoint tests, and a runbook."
+            ),
+            "input_schema": {
+                "simulation_model_path": "string",
+                "api_requirements": "string",
+                "frontend_data_requirements": "string",
+            },
+            "output_artifacts": [
+                "app.py",
+                "simulation_bridge.py",
+                "octave/",
+                "api_contract.json",
+                "frontend_integration.md",
+                "tests/test_api.py",
+            ],
+            "steps": [
+                {
+                    "step_id": "contract",
+                    "name": "Define Simulation Contract",
+                    "description": "Specify simulation input/output schema and validation rules shared across Octave, API, and frontend.",
+                    "base_image": "octaveclaw",
+                    "tool_hints": ["read", "write"],
+                },
+                {
+                    "step_id": "bridge",
+                    "name": "Implement Octave-Python Bridge",
+                    "description": "Implement Python bridge layer that executes Octave simulation functions and normalizes outputs.",
+                    "base_image": "octaveclaw",
+                    "tool_hints": ["write", "exec"],
+                },
+                {
+                    "step_id": "api",
+                    "name": "Expose Flask API",
+                    "description": "Build Flask endpoints for health, simulation execution, and structured result delivery.",
+                    "base_image": "octaveclaw",
+                    "tool_hints": ["write", "exec"],
+                },
+                {
+                    "step_id": "frontend-handoff",
+                    "name": "Document Frontend Integration",
+                    "description": "Provide frontend payload examples, fetch flow, and UI error/retry behavior for simulation results.",
+                    "base_image": "openclaw",
+                    "tool_hints": ["write"],
+                },
+                {
+                    "step_id": "validate",
+                    "name": "Validate End-to-End",
+                    "description": "Run API checks and sample simulations to verify Octave-to-API-to-frontend data continuity.",
+                    "base_image": "octaveclaw",
+                    "tool_hints": ["exec", "write"],
+                },
+            ],
+            "tags": ["octave", "flask", "simulation", "frontend", "integration"],
+        },
     ]
 
     created = []
@@ -210,6 +276,7 @@ async def seed_skills(db: AsyncSession = Depends(get_db)):
             id=_gen_skill_id(),
             name=skill_def["name"],
             description=skill_def["description"],
+            instructions=skill_def.get("instructions", ""),
             input_schema=skill_def["input_schema"],
             output_artifacts=skill_def["output_artifacts"],
             steps=skill_def["steps"],
