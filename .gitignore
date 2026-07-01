@@ -111,3 +111,6 @@ htmlcov/
 /venture/
 agent-images/task-*
 agent-images/deployments/*
+
+
+.kilo

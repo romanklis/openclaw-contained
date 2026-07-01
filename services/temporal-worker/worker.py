@@ -3449,6 +3449,22 @@ class DAGNodeWorkflow:
             start_to_close_timeout=timedelta(seconds=15),
         )
 
+        # Post start message indicating base image and skill consumed
+        base_img = config.get("base_image", "openclaw")
+        dag_img = config.get("dag_image")
+        if dag_img:
+            dag_img_tag = dag_img.split(":")[-1] if ":" in dag_img else dag_img
+            img_info = f"{base_img} (built: {dag_img_tag})"
+        else:
+            img_info = base_img
+        skill_info = config.get("selected_skill_v2_id") or config.get("skill_id") or "inline/custom"
+        
+        await workflow.execute_activity(
+            post_dag_progress,
+            args=[dag_id, f"🔨 Node '{node_id}' started execution (image: '{img_info}', skill: '{skill_info}')"],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
         # Build explicit objective contract so each step has clear success target.
         node_objective = str(config.get("node_objective") or description or "").strip()
         success_criteria = config.get("success_criteria")
@@ -3641,6 +3657,19 @@ class DAGNodeWorkflow:
                     args=[dag_id, node_id, "failed", output],
                     start_to_close_timeout=timedelta(seconds=15),
                 )
+                base_img = config.get("base_image", "openclaw")
+                dag_img = config.get("dag_image")
+                if dag_img:
+                    dag_img_tag = dag_img.split(":")[-1] if ":" in dag_img else dag_img
+                    img_info = f"{base_img} (built: {dag_img_tag})"
+                else:
+                    img_info = base_img
+                skill_info = config.get("selected_skill_v2_id") or config.get("skill_id") or "inline/custom"
+                await workflow.execute_activity(
+                    post_dag_progress,
+                    args=[dag_id, f"❌ Node '{node_id}' finished with status 'failed' (gate failure: {reason}) (image: '{img_info}', skill: '{skill_info}')"],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
                 await workflow.execute_activity(
                     post_node_state_snapshot,
                     args=[
@@ -3706,6 +3735,21 @@ class DAGNodeWorkflow:
                 start_to_close_timeout=timedelta(seconds=15),
             )
 
+            base_img = config.get("base_image", "openclaw")
+            dag_img = config.get("dag_image") or node_current_image
+            if dag_img:
+                dag_img_tag = dag_img.split(":")[-1] if ":" in dag_img else dag_img
+                img_info = f"{base_img} (built: {dag_img_tag})"
+            else:
+                img_info = base_img
+            skill_info = config.get("selected_skill_v2_id") or config.get("skill_id") or "inline/custom"
+            status_emoji = "✅" if node_status == "completed" else "❌"
+            await workflow.execute_activity(
+                post_dag_progress,
+                args=[dag_id, f"{status_emoji} Node '{node_id}' finished with status '{node_status}' (image: '{img_info}', skill: '{skill_info}')"],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+
             await workflow.execute_activity(
                 post_node_state_snapshot,
                 args=[
@@ -3745,6 +3789,19 @@ class DAGNodeWorkflow:
             await workflow.execute_activity(
                 update_node_status,
                 args=[dag_id, node_id, "failed", failure_output],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            base_img = config.get("base_image", "openclaw")
+            dag_img = config.get("dag_image")
+            if dag_img:
+                dag_img_tag = dag_img.split(":")[-1] if ":" in dag_img else dag_img
+                img_info = f"{base_img} (built: {dag_img_tag})"
+            else:
+                img_info = base_img
+            skill_info = config.get("selected_skill_v2_id") or config.get("skill_id") or "inline/custom"
+            await workflow.execute_activity(
+                post_dag_progress,
+                args=[dag_id, f"❌ Node '{node_id}' finished with status 'failed' (exception: {str(e)[:150]}) (image: '{img_info}', skill: '{skill_info}')"],
                 start_to_close_timeout=timedelta(seconds=15),
             )
             # Write terminal failed state snapshot so UI shows phase=failed with output

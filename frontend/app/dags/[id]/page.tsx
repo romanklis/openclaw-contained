@@ -656,6 +656,19 @@ export default function DAGDetailPage() {
                   v2: {selectedNode.selected_skill_v2_id}
                 </span>
               )}
+              {selectedNode.config?.base_image && (
+                <span className="text-xs bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded">
+                  image: {selectedNode.config.base_image}
+                </span>
+              )}
+              {selectedNode.config?.dag_image && (
+                <span
+                  className="text-xs bg-indigo-500/20 text-indigo-300 px-2 py-0.5 rounded cursor-help"
+                  title={`Inherited built image: ${selectedNode.config.dag_image}`}
+                >
+                  custom build: {selectedNode.config.dag_image.split(':').pop() || selectedNode.config.dag_image}
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-3 text-xs">
               {nodeActionsAllowed && (

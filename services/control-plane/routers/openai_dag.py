@@ -580,11 +580,35 @@ async def _stream_dag_execution(
                 seen_status[node.node_id] = node.status
                 status_val = node.status.value if hasattr(node.status, 'value') else str(node.status)
                 if status_val == "running" and prev is None or (prev and (prev.value if hasattr(prev, 'value') else str(prev)) == "pending"):
-                    yield _sse_chunk(f"🔨 **{node.node_id}** — building agent image...\n")
+                    base_img = node.config.get("base_image", "openclaw")
+                    dag_img = node.config.get("dag_image")
+                    if dag_img:
+                        dag_img_tag = dag_img.split(":")[-1] if ":" in dag_img else dag_img
+                        img_info = f"{base_img} (built: {dag_img_tag})"
+                    else:
+                        img_info = base_img
+                    skill_info = node.selected_skill_v2_id or node.skill_id or "inline/custom"
+                    yield _sse_chunk(f"🔨 **{node.node_id}** — building agent image (image: '{img_info}', skill: '{skill_info}')...\n")
                 elif status_val == "completed":
-                    yield _sse_chunk(f"✅ **{node.node_id}** — done\n")
+                    base_img = node.config.get("base_image", "openclaw")
+                    dag_img = node.config.get("dag_image")
+                    if dag_img:
+                        dag_img_tag = dag_img.split(":")[-1] if ":" in dag_img else dag_img
+                        img_info = f"{base_img} (built: {dag_img_tag})"
+                    else:
+                        img_info = base_img
+                    skill_info = node.selected_skill_v2_id or node.skill_id or "inline/custom"
+                    yield _sse_chunk(f"✅ **{node.node_id}** — done (image: '{img_info}', skill: '{skill_info}')\n")
                 elif status_val == "failed":
-                    yield _sse_chunk(f"❌ **{node.node_id}** — failed\n")
+                    base_img = node.config.get("base_image", "openclaw")
+                    dag_img = node.config.get("dag_image")
+                    if dag_img:
+                        dag_img_tag = dag_img.split(":")[-1] if ":" in dag_img else dag_img
+                        img_info = f"{base_img} (built: {dag_img_tag})"
+                    else:
+                        img_info = base_img
+                    skill_info = node.selected_skill_v2_id or node.skill_id or "inline/custom"
+                    yield _sse_chunk(f"❌ **{node.node_id}** — failed (image: '{img_info}', skill: '{skill_info}')\n")
                 elif status_val == "pending_approval":
                     yield _sse_chunk(f"⏸️ **{node.node_id}** — waiting for approval\n")
 
@@ -604,11 +628,24 @@ async def _stream_dag_execution(
                 # update the status message from "building" to "working"
                 if prev_max == -1 and len(outputs) > 0:
                     node_name = task_id
+                    node_obj = None
                     for n in nodes_now:
                         if n.task_id == task_id:
                             node_name = n.node_id
+                            node_obj = n
                             break
-                    yield _sse_chunk(f"🔄 **{node_name}** — agent is working...\n")
+                    if node_obj:
+                        base_img = node_obj.config.get("base_image", "openclaw")
+                        dag_img = node_obj.config.get("dag_image")
+                        if dag_img:
+                            dag_img_tag = dag_img.split(":")[-1] if ":" in dag_img else dag_img
+                            img_info = f"{base_img} (built: {dag_img_tag})"
+                        else:
+                            img_info = base_img
+                        skill_info = node_obj.selected_skill_v2_id or node_obj.skill_id or "inline/custom"
+                        yield _sse_chunk(f"🔄 **{node_name}** — agent is working (image: '{img_info}', skill: '{skill_info}')...\n")
+                    else:
+                        yield _sse_chunk(f"🔄 **{node_name}** — agent is working...\n")
 
                 for out in outputs:
                     if out.iteration > prev_max:
