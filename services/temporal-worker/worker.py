@@ -1574,6 +1574,18 @@ async def store_task_output(
 
     # Extract deliverables (files created by the agent)
     deliverables = result.get("deliverables")
+    compact_summary = _build_compact_step_summary(
+        {
+            "status": "completed" if str(result.get("completed", "")).lower() == "true" else "running",
+            "completed": result.get("completed", False),
+            "deliverables": deliverables,
+            "error": result.get("error"),
+            "output": output_str,
+        }
+    )
+
+    # Keep raw result for audit, but store compact summary for chat/task readability.
+    result["compact_summary"] = compact_summary
 
     payload = {
         "task_id": task_id,
@@ -1583,7 +1595,7 @@ async def store_task_output(
         "agent_logs": result.get("agent_logs", "")[:50000],
         "output": output_str[:50000] if isinstance(output_str, str) else str(output_str)[:50000],
         "error": result.get("error"),
-        "llm_response_preview": result.get("message", "")[:500],
+        "llm_response_preview": compact_summary[:500],
         "model_used": model_used,
         "image_used": image_used,
         "duration_ms": duration_ms,
@@ -2979,17 +2991,126 @@ def _extract_task_output_text(task_output: Dict[str, Any]) -> str:
                         if isinstance(p, dict) and p.get("text")
                     ]
                     if texts:
-                        return "\n".join(texts).strip()
+                        return "\n".join(texts).strip()[:4000]
             except (_json.JSONDecodeError, TypeError):
                 pass
         if stripped.lower() not in {"task completed successfully", "task failed", "task cancelled"}:
-            return stripped
+            return stripped[:4000]
 
     preview = (task_output.get("llm_response_preview") or "").strip()
     if preview and preview.lower() not in {"task completed successfully", "task failed", "task cancelled"}:
-        return preview
+        return preview[:1200]
 
-    return (task_output.get("agent_logs") or "")[:2000]
+    return (task_output.get("agent_logs") or "")[:1200]
+
+
+def _build_compact_step_summary(output: Dict[str, Any]) -> str:
+    """Build a compact, bounded summary for UI/gating use."""
+    parts: List[str] = []
+    if output.get("status"):
+        parts.append(f"status={output.get('status')}")
+    if output.get("completed") is not None:
+        parts.append(f"completed={output.get('completed')}")
+    if output.get("deliverables") and isinstance(output.get("deliverables"), dict):
+        keys = list((output.get("deliverables") or {}).keys())[:8]
+        if keys:
+            parts.append("deliverables=" + ", ".join(keys))
+    if output.get("error"):
+        parts.append("error=" + str(output.get("error"))[:220])
+    output_text = str(output.get("output") or "").strip()
+    if output_text:
+        parts.append("result=" + output_text[:500].replace("\n", " "))
+    return " | ".join(parts)[:1200]
+
+
+async def _assess_objective_alignment_external(
+    task_id: str,
+    output: Dict[str, Any],
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Assess step outcome against objective using external LLM router."""
+    import httpx
+    import json as _json
+
+    cfg = config or {}
+    assess_cfg = cfg.get("objective_assessment") or {}
+    if assess_cfg.get("enabled") is False:
+        return {"enabled": False, "verdict": "skip", "reason": "disabled by node config"}
+
+    objective_text = (
+        cfg.get("node_objective")
+        or cfg.get("objective")
+        or cfg.get("description")
+        or ""
+    )
+    objective_text = str(objective_text).strip()
+    if not objective_text:
+        return {"enabled": True, "verdict": "skip", "reason": "no objective text"}
+
+    model = assess_cfg.get("model") or "gemini-flash-lite-latest"
+    compact_summary = _build_compact_step_summary(output)
+    deliverable_keys = list(((output.get("deliverables") or {}) if isinstance(output.get("deliverables"), dict) else {}).keys())[:20]
+    acquisition_log = (output.get("acquisition_log") or [])[:20]
+
+    prompt = (
+        "You are a strict workflow step assessor. Compare ACTUAL RESULT to STEP OBJECTIVE. "
+        "Return JSON only with keys: verdict, score, summary, missing_requirements, next_actions, evidence_quality.\n"
+        "verdict must be 'pass' or 'fail'. score must be integer 0-100.\n\n"
+        f"STEP OBJECTIVE:\n{objective_text[:2400]}\n\n"
+        f"RESULT SUMMARY:\n{compact_summary}\n\n"
+        f"DELIVERABLE KEYS:\n{deliverable_keys}\n\n"
+        f"ACQUISITION LOG (truncated):\n{_json.dumps(acquisition_log)[:2400]}\n"
+    )
+
+    cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    req = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You output strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "temperature": 0,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{cp_url}/api/llm/v1/chat/completions", json=req)
+            resp.raise_for_status()
+            data = resp.json()
+            content = (
+                (((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
+                or "{}"
+            )
+            text = str(content).strip()
+            if "```" in text:
+                text = text.replace("```json", "").replace("```", "").strip()
+            start = text.find("{")
+            end = text.rfind("}")
+            parsed = _json.loads(text[start:end + 1] if start != -1 and end != -1 else text)
+            verdict = str(parsed.get("verdict", "fail")).lower()
+            score = int(parsed.get("score", 0) or 0)
+            return {
+                "enabled": True,
+                "verdict": "pass" if verdict == "pass" else "fail",
+                "score": max(0, min(score, 100)),
+                "summary": str(parsed.get("summary", ""))[:400],
+                "missing_requirements": parsed.get("missing_requirements") or [],
+                "next_actions": parsed.get("next_actions") or [],
+                "evidence_quality": str(parsed.get("evidence_quality", ""))[:120],
+                "model": model,
+            }
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "verdict": "error",
+            "score": 0,
+            "summary": f"assessment_error: {str(exc)[:220]}",
+            "missing_requirements": [],
+            "next_actions": [],
+            "evidence_quality": "unknown",
+            "model": model,
+        }
 
 
 @activity.defn
@@ -3030,6 +3151,7 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
             result["parse_error"] = bool((latest.get("raw_result") or {}).get("parse_error"))
             result["iteration"] = latest.get("iteration")
             result["acquisition_log"] = _extract_acquisition_log(result["agent_logs"])
+            result["compact_summary"] = _build_compact_step_summary(result)
 
         return result
 
@@ -3181,7 +3303,25 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
                 "reason": "hallucination_risk: logs contain mock/placeholder patterns with no evidence of real network fetch",
             }
 
-    return {"valid": True, "reason": "ok"}
+    assessment = await _assess_objective_alignment_external(task_id, output, config)
+    if assessment.get("enabled") and assessment.get("verdict") == "fail":
+        missing = assessment.get("missing_requirements") or []
+        missing_text = ", ".join(str(x) for x in missing[:3])
+        reason = "objective_alignment_failed"
+        if missing_text:
+            reason = f"{reason}: missing {missing_text}"
+        return {
+            "valid": False,
+            "reason": reason,
+            "external_assessment": assessment,
+        }
+    if assessment.get("enabled") and assessment.get("verdict") == "error":
+        return {
+            "valid": False,
+            "reason": "objective_assessment_error",
+            "external_assessment": assessment,
+        }
+    return {"valid": True, "reason": "ok", "external_assessment": assessment}
 
 
 @activity.defn
@@ -3281,7 +3421,7 @@ class DAGNodeWorkflow:
         dag_id = params["dag_id"]
         node_id = params["node_id"]
         description = params.get("description", "")
-        config = params.get("config", {})
+        config = dict(params.get("config", {}) or {})
         input_data = params.get("input_data", {})
         state_context = params.get("state_context", {})
         workspace_id = params.get("workspace_id", "")
@@ -3309,10 +3449,22 @@ class DAGNodeWorkflow:
             start_to_close_timeout=timedelta(seconds=15),
         )
 
-        # Build the follow-up prompt from description + input_data
+        # Build explicit objective contract so each step has clear success target.
+        node_objective = str(config.get("node_objective") or description or "").strip()
+        success_criteria = config.get("success_criteria")
+        if not isinstance(success_criteria, list):
+            success_criteria = []
+        config["node_objective"] = node_objective
+
+        # Build the follow-up prompt from objective + input_data
         follow_up_parts = []
-        if description:
-            follow_up_parts.append(description)
+        if node_objective:
+            follow_up_parts.append("--- Step Objective ---")
+            follow_up_parts.append(node_objective)
+        if success_criteria:
+            follow_up_parts.append("--- Success Criteria ---")
+            for criterion in success_criteria[:8]:
+                follow_up_parts.append(f"- {str(criterion)[:240]}")
         if input_data:
             follow_up_parts.append("\n--- Input from previous nodes ---")
             for src_node, data in input_data.items():
@@ -3402,6 +3554,83 @@ class DAGNodeWorkflow:
                 args=[task_id, output, config],
                 start_to_close_timeout=timedelta(seconds=30),
             )
+
+            # Soft-fail retry policy: when objective assessment fails,
+            # run one corrective retry before final failure.
+            should_retry_assessment = (
+                not gate_result.get("valid", False)
+                and str(gate_result.get("reason", "")).startswith("objective_alignment_failed")
+                and ((config.get("objective_assessment") or {}).get("retry_on_fail", True))
+            )
+            if should_retry_assessment:
+                external = gate_result.get("external_assessment") or {}
+                corrective_actions = external.get("next_actions") or []
+                missing_requirements = external.get("missing_requirements") or []
+                assessment_summary = str(external.get("summary") or "").strip()
+                assessment_score = external.get("score")
+                retry_lines = [
+                    "",
+                    "--- External Step Assessment (Retry Required) ---",
+                    "Your previous output did not satisfy the step objective.",
+                    "You must close ALL gaps below before finishing this retry.",
+                ]
+                if assessment_score is not None:
+                    retry_lines.append(f"Assessment score: {assessment_score}/100")
+                if assessment_summary:
+                    retry_lines.append(f"Assessment summary: {assessment_summary[:500]}")
+                if missing_requirements:
+                    retry_lines.append("Missing required deliverables:")
+                    for item in missing_requirements[:20]:
+                        retry_lines.append(f"- {str(item)[:280]}")
+                retry_lines.append("Corrective actions to apply:")
+                for action in corrective_actions[:8]:
+                    retry_lines.append(f"- {str(action)[:280]}")
+                retry_lines.extend(
+                    [
+                        "Before you finish, include an explicit 'Acceptance Criteria Check' section",
+                        "listing each missing requirement and where it was produced.",
+                    ]
+                )
+                retry_follow_up = follow_up + "\n" + "\n".join(retry_lines)
+
+                await workflow.execute_activity(
+                    post_node_audit_event,
+                    args=[
+                        dag_id,
+                        node_id,
+                        {
+                            "task_id": task_id,
+                            "event_type": "objective_assessment_retry",
+                            "severity": "warning",
+                            "message": "Objective assessment failed; running one corrective retry",
+                            "event_data": {
+                                "assessment": external,
+                                "task_id": task_id,
+                            },
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+
+                retry_result = await workflow.execute_child_workflow(
+                    AgentTaskWorkflow.run,
+                    args=[task_id, llm_model, result.get("current_image", agent_image), retry_follow_up, dag_id],
+                    id=f"{child_workflow_id}-assessment-retry",
+                )
+
+                output = await workflow.execute_activity(
+                    collect_node_output,
+                    args=[task_id],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                gate_result = await workflow.execute_activity(
+                    evaluate_node_gate,
+                    args=[task_id, output, config],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+
+                if retry_result.get("current_image"):
+                    result["current_image"] = retry_result.get("current_image")
 
             if not gate_result.get("valid", False):
                 reason = gate_result.get("reason", "deliverable gate failed")
@@ -3611,9 +3840,24 @@ class DAGWorkflow:
             nid = n["node_id"]
             node_map[nid] = n
 
-        # Track node statuses and outputs
-        node_statuses: Dict[str, str] = {nid: "pending" for nid in node_map}
+        # Track node statuses and outputs.
+        # This allows restart/resume flows to preserve completed predecessors.
+        node_statuses: Dict[str, str] = {}
         node_outputs: Dict[str, Dict[str, Any]] = {}
+        for n in nodes_list:
+            nid = n["node_id"]
+            persisted_status = str(n.get("status") or "pending").lower()
+            if persisted_status not in ("pending", "running", "completed", "failed", "skipped"):
+                persisted_status = "pending"
+
+            # Stale running nodes from a previous failed run should be retried.
+            if persisted_status == "running":
+                persisted_status = "pending"
+
+            node_statuses[nid] = persisted_status
+            persisted_output = n.get("output_data")
+            if isinstance(persisted_output, dict) and persisted_status in ("completed", "skipped", "failed"):
+                node_outputs[nid] = persisted_output
 
         await workflow.execute_activity(
             post_dag_progress,

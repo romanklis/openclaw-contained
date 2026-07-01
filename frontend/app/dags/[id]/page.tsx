@@ -134,6 +134,12 @@ export default function DAGDetailPage() {
   const [showRevise, setShowRevise] = useState(false)
   const [reviseComments, setReviseComments] = useState('')
   const [revising, setRevising] = useState(false)
+  const [showNodeActions, setShowNodeActions] = useState(false)
+  const [nodeActionLoading, setNodeActionLoading] = useState(false)
+  const [showEnhanceDialog, setShowEnhanceDialog] = useState(false)
+  const [enhanceMode, setEnhanceMode] = useState<'rewrite' | 'split'>('rewrite')
+  const [enhanceGuidance, setEnhanceGuidance] = useState('')
+  const [enhanceSplitCount, setEnhanceSplitCount] = useState(2)
 
   // Per-node task data cache
   const [nodeTaskData, setNodeTaskData] = useState<Record<string, {
@@ -278,6 +284,11 @@ export default function DAGDetailPage() {
     loadNodeState()
   }, [selectedNodeId, dag?.nodes, dagId, nodeState])
 
+  useEffect(() => {
+    setShowNodeActions(false)
+    setShowEnhanceDialog(false)
+  }, [selectedNodeId])
+
   // Preload failure state for failed nodes so DAG-level summary is visible
   // even before the user clicks into a specific node.
   useEffect(() => {
@@ -360,6 +371,113 @@ export default function DAGDetailPage() {
     }
   }
 
+  const resetSelectedNodeCaches = useCallback((node: DAGNode | null) => {
+    if (!node) return
+
+    if (node.task_id) {
+      setNodeTaskData(prev => {
+        const next = { ...prev }
+        delete next[node.task_id as string]
+        return next
+      })
+    }
+
+    setNodeState(prev => {
+      const next = { ...prev }
+      delete next[node.node_id]
+      return next
+    })
+  }, [])
+
+  const applyDagMutationResult = useCallback(async (updatedDag?: DAGDetail | null, clearSelection?: boolean) => {
+    if (updatedDag?.id) {
+      setDag(updatedDag)
+    } else {
+      await fetchDag()
+    }
+    if (clearSelection) {
+      setSelectedNodeId(null)
+    }
+  }, [fetchDag])
+
+  const deleteSelectedNode = async () => {
+    if (!dag || !selectedNode) return
+    if (!(dag.status === 'failed' || dag.status === 'ready')) return
+
+    const confirmed = window.confirm(`Delete step '${selectedNode.node_id}'? Dependencies will be rewired automatically.`)
+    if (!confirmed) return
+
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes/${selectedNode.node_id}`, {
+        method: 'DELETE',
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error((data as any).detail || `HTTP ${res.status}`)
+      }
+      resetSelectedNodeCaches(selectedNode)
+      setShowNodeActions(false)
+      await applyDagMutationResult(data as DAGDetail, true)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
+  const enhanceSelectedNode = async () => {
+    if (!dag || !selectedNode) return
+    if (!(dag.status === 'failed' || dag.status === 'ready')) return
+
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes/${selectedNode.node_id}/enhance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: enhanceMode,
+          guidance: enhanceGuidance,
+          split_count: enhanceMode === 'split' ? enhanceSplitCount : undefined,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error((data as any).detail || `HTTP ${res.status}`)
+      }
+      resetSelectedNodeCaches(selectedNode)
+      setShowEnhanceDialog(false)
+      setShowNodeActions(false)
+      await applyDagMutationResult(data as DAGDetail, false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
+  const retryFromSelectedNode = async () => {
+    if (!dag || !selectedNode) return
+    if (dag.status !== 'failed') return
+
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/retry-from/${selectedNode.node_id}`, {
+        method: 'POST',
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error((data as any).detail || `HTTP ${res.status}`)
+      }
+      setShowNodeActions(false)
+      await applyDagMutationResult(data as DAGDetail, false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
   const getWorkflowLink = (workflowId: string) =>
     `${TEMPORAL_UI}/namespaces/default/workflows/${encodeURIComponent(workflowId)}`
 
@@ -370,6 +488,7 @@ export default function DAGDetailPage() {
   const selectedTaskData = selectedNode?.task_id ? nodeTaskData[selectedNode.task_id] : null
   const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
   const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
+  const nodeActionsAllowed = !!(selectedNode && (dag?.status === 'failed' || dag?.status === 'ready'))
 
   if (error) return <div className="text-red-400 p-8">Error: {error}</div>
   if (!dag) return <div className="text-gray-500 p-8">Loading...</div>
@@ -539,6 +658,48 @@ export default function DAGDetailPage() {
               )}
             </div>
             <div className="flex items-center gap-3 text-xs">
+              {nodeActionsAllowed && (
+                <div className="relative">
+                  <button
+                    onClick={() => setShowNodeActions(v => !v)}
+                    disabled={nodeActionLoading}
+                    className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
+                    title="Step actions"
+                  >
+                    Actions ▾
+                  </button>
+                  {showNodeActions && (
+                    <div className="absolute right-0 mt-1 w-56 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
+                      <button
+                        onClick={() => {
+                          setShowNodeActions(false)
+                          setShowEnhanceDialog(true)
+                        }}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ✨ Enhance Step
+                      </button>
+                      <button
+                        onClick={deleteSelectedNode}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-red-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🗑 Delete Step
+                      </button>
+                      {dag.status === 'failed' && (
+                        <button
+                          onClick={retryFromSelectedNode}
+                          disabled={nodeActionLoading}
+                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 border-t border-gray-700 disabled:opacity-50"
+                        >
+                          ▶ Retry From This Step
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
               {selectedNode.task_id && (
                 <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400 hover:text-blue-300">
                   Full task view &rarr;
@@ -566,6 +727,59 @@ export default function DAGDetailPage() {
             <div className="mb-3 p-2 bg-blue-950/40 border border-blue-800/50 rounded text-xs text-blue-300">
               <span className="font-semibold text-blue-400">Skill rationale: </span>
               {selectedNode.skill_selection_reason}
+            </div>
+          )}
+
+          {showEnhanceDialog && (
+            <div className="mb-3 rounded border border-indigo-700/40 bg-indigo-950/20 p-3">
+              <div className="text-xs uppercase tracking-wide text-indigo-300 mb-2">Enhance This Step</div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-2">
+                <button
+                  onClick={() => setEnhanceMode('rewrite')}
+                  className={`text-xs px-2 py-1 rounded border ${enhanceMode === 'rewrite' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+                >
+                  Rewrite Same Step
+                </button>
+                <button
+                  onClick={() => setEnhanceMode('split')}
+                  className={`text-xs px-2 py-1 rounded border ${enhanceMode === 'split' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+                >
+                  Split Into Sub-Steps
+                </button>
+                {enhanceMode === 'split' && (
+                  <select
+                    value={enhanceSplitCount}
+                    onChange={(e) => setEnhanceSplitCount(Number(e.target.value))}
+                    className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+                  >
+                    <option value={2}>2 steps</option>
+                    <option value={3}>3 steps</option>
+                    <option value={4}>4 steps</option>
+                  </select>
+                )}
+              </div>
+              <textarea
+                value={enhanceGuidance}
+                onChange={(e) => setEnhanceGuidance(e.target.value)}
+                rows={3}
+                className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                placeholder="Optional guidance (e.g. required deliverables, constraints, acceptance criteria)."
+              />
+              <div className="flex justify-end gap-2 mt-2">
+                <button
+                  onClick={() => setShowEnhanceDialog(false)}
+                  className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={enhanceSelectedNode}
+                  disabled={nodeActionLoading}
+                  className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
+                >
+                  {nodeActionLoading ? 'Applying...' : 'Apply Enhancement'}
+                </button>
+              </div>
             </div>
           )}
 

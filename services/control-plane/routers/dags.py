@@ -23,6 +23,7 @@ from schemas import (
     DAGNodeResponse,
     DAGRevise,
     DAGRefine,
+    DAGNodeEnhanceRequest,
     DAGNodePatch,
     DAGNodeStateSnapshotCreate,
     DAGNodeStateSnapshotResponse,
@@ -35,6 +36,8 @@ from routers.openai_dag import MODEL_CONFIGS
 from temporal_client import start_dag_workflow
 import uuid
 import logging
+import json
+import httpx
 from datetime import datetime
 from copy import deepcopy
 
@@ -605,17 +608,28 @@ async def delete_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_
             if pred != succ.node_id and pred not in new_deps:
                 new_deps.append(pred)
         succ.depends_on = new_deps
+        succ.input_mapping = _rewrite_input_mapping_for_removed_node(
+            succ.input_mapping,
+            node_id,
+            predecessors,
+        )
 
     dag_json = deepcopy(dag.dag_json or {})
     dag_json_nodes = []
     for dag_node in dag_json.get("nodes", []):
         if dag_node.get("node_id") == node_id:
             continue
+        had_removed_dep = node_id in (dag_node.get("depends_on") or [])
         deps = [dep for dep in (dag_node.get("depends_on") or []) if dep != node_id]
         for pred in predecessors:
-            if pred != dag_node.get("node_id") and pred not in deps and node_id in (dag_node.get("depends_on") or []):
+            if pred != dag_node.get("node_id") and pred not in deps and had_removed_dep:
                 deps.append(pred)
         dag_node["depends_on"] = deps
+        dag_node["input_mapping"] = _rewrite_input_mapping_for_removed_node(
+            dag_node.get("input_mapping") or {},
+            node_id,
+            predecessors,
+        )
         dag_json_nodes.append(dag_node)
     dag_json["nodes"] = dag_json_nodes
 
@@ -642,6 +656,227 @@ async def delete_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_
     nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
     remaining_nodes = list(nodes_result.scalars().all())
     return _build_dag_detail(dag, remaining_nodes)
+
+
+@router.post("/{dag_id}/nodes/{node_id}/enhance", response_model=DAGDetail)
+async def enhance_node(
+    dag_id: str,
+    node_id: str,
+    body: DAGNodeEnhanceRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Enhance one node by rewriting it or splitting it into granular sub-steps."""
+    dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_editable(dag)
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(nodes_result.scalars().all())
+    node = next((n for n in all_nodes if n.node_id == node_id), None)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    guidance = (body.guidance or "").strip()
+    llm_model = body.llm_model or dag.llm_model or _dag_model_defaults["planning_model"]
+    proposal: dict = {}
+    try:
+        proposal = await _generate_node_enhancement_proposal(
+            dag,
+            node,
+            body.mode,
+            guidance,
+            llm_model,
+            body.split_count,
+        )
+    except Exception as e:
+        logger.warning(f"Node enhancement proposal failed for {dag_id}/{node_id}: {e}")
+
+    dag_json = deepcopy(dag.dag_json or {})
+    dag_nodes = dag_json.get("nodes", [])
+    dag_node = next((n for n in dag_nodes if n.get("node_id") == node_id), None)
+    if dag_node is None:
+        raise HTTPException(status_code=500, detail=f"Node '{node_id}' missing from dag_json")
+
+    if body.mode == "split":
+        proposal_steps = proposal.get("steps") if isinstance(proposal, dict) else None
+        if not isinstance(proposal_steps, list) or len(proposal_steps) < 2:
+            proposal_steps = [
+                {
+                    "title": "analysis",
+                    "description": (node.description or "") + "\nBreak requirements into explicit deliverables.",
+                },
+                {
+                    "title": "execution",
+                    "description": (node.description or "") + "\nImplement and validate all required outputs.",
+                },
+            ]
+
+        split_steps = proposal_steps[: body.split_count]
+        existing_ids = {n.node_id for n in all_nodes}
+        split_ids: list[str] = []
+        counter = 1
+        for _ in split_steps:
+            candidate = f"{node_id}-{counter}"
+            while candidate in existing_ids or candidate in split_ids:
+                counter += 1
+                candidate = f"{node_id}-{counter}"
+            split_ids.append(candidate)
+            counter += 1
+
+        predecessors = _dedupe_node_ids(node.depends_on or [])
+        successors = [n for n in all_nodes if node_id in (n.depends_on or []) and n.node_id != node_id]
+        base_config = dict(node.config or {})
+
+        for i, step in enumerate(split_steps):
+            step_id = split_ids[i]
+            step_description = str((step or {}).get("description") or (node.description or "")).strip()
+            created = DAGNode(
+                dag_id=dag_id,
+                node_id=step_id,
+                skill_id=node.skill_id,
+                skill_step_index=node.skill_step_index,
+                description=step_description,
+                status=NodeStatus.PENDING,
+                depends_on=predecessors if i == 0 else [split_ids[i - 1]],
+                config=dict(base_config),
+                input_mapping=dict(node.input_mapping or {}) if i == 0 else {},
+                selected_skill_v2_id=node.selected_skill_v2_id,
+                skill_selection_reason=node.skill_selection_reason,
+            )
+            db.add(created)
+
+        tail_id = split_ids[-1]
+        for succ in successors:
+            new_deps = [dep for dep in (succ.depends_on or []) if dep != node_id]
+            if tail_id not in new_deps:
+                new_deps.append(tail_id)
+            succ.depends_on = _dedupe_node_ids(new_deps)
+            succ.input_mapping = _rewrite_input_mapping_for_removed_node(
+                succ.input_mapping,
+                node_id,
+                [tail_id],
+            )
+
+        rewritten_nodes = []
+        for existing in dag_json.get("nodes", []):
+            if existing.get("node_id") == node_id:
+                continue
+            if node_id in (existing.get("depends_on") or []):
+                deps = [dep for dep in (existing.get("depends_on") or []) if dep != node_id]
+                if tail_id not in deps:
+                    deps.append(tail_id)
+                existing["depends_on"] = _dedupe_node_ids(deps)
+                existing["input_mapping"] = _rewrite_input_mapping_for_removed_node(
+                    existing.get("input_mapping") or {},
+                    node_id,
+                    [tail_id],
+                )
+            rewritten_nodes.append(existing)
+
+        for i, step in enumerate(split_steps):
+            rewritten_nodes.append(
+                {
+                    "node_id": split_ids[i],
+                    "skill_id": node.skill_id,
+                    "skill_step_index": node.skill_step_index,
+                    "description": str((step or {}).get("description") or (node.description or "")).strip(),
+                    "depends_on": predecessors if i == 0 else [split_ids[i - 1]],
+                    "config": dict(base_config),
+                    "input_mapping": dict(node.input_mapping or {}) if i == 0 else {},
+                }
+            )
+        dag_json["nodes"] = rewritten_nodes
+
+        rewritten_edges = []
+        seen_edges = set()
+        for edge in dag_json.get("edges", []):
+            edge_from_key = "from_node" if "from_node" in edge else "from"
+            edge_to_key = "to_node" if "to_node" in edge else "to"
+            edge_from = edge.get(edge_from_key)
+            edge_to = edge.get(edge_to_key)
+
+            if edge_to == node_id:
+                edge[edge_to_key] = split_ids[0]
+            if edge_from == node_id:
+                edge[edge_from_key] = tail_id
+
+            normalized = (edge.get(edge_from_key), edge.get(edge_to_key), edge.get("condition"), edge.get("edge_type"))
+            if normalized in seen_edges:
+                continue
+            seen_edges.add(normalized)
+            rewritten_edges.append(edge)
+        dag_json["edges"] = rewritten_edges
+
+        await db.delete(node)
+    else:
+        rewritten_desc = str((proposal or {}).get("description") or "").strip()
+        if not rewritten_desc:
+            rewritten_desc = (node.description or "").strip()
+            if guidance:
+                rewritten_desc = f"{rewritten_desc}\n\nRefinement guidance: {guidance}".strip()
+
+        success_criteria = proposal.get("success_criteria") if isinstance(proposal, dict) else None
+        if not isinstance(success_criteria, list):
+            success_criteria = []
+
+        node.description = rewritten_desc
+        merged_cfg = dict(node.config or {})
+        if success_criteria:
+            merged_cfg["success_criteria"] = [str(x)[:280] for x in success_criteria[:12]]
+        node.config = merged_cfg
+
+        dag_node["description"] = rewritten_desc
+        dag_node_cfg = dict(dag_node.get("config") or {})
+        if success_criteria:
+            dag_node_cfg["success_criteria"] = [str(x)[:280] for x in success_criteria[:12]]
+        dag_node["config"] = dag_node_cfg
+
+    is_valid, errors = validate_dag(dag_json)
+    if not is_valid:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    dag.dag_json = dag_json
+    await db.commit()
+    await db.refresh(dag)
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    updated_nodes = list(nodes_result.scalars().all())
+    return _build_dag_detail(dag, updated_nodes)
+
+
+@router.post("/{dag_id}/retry-from/{node_id}", response_model=DAGDetail)
+async def retry_dag_from_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_db)):
+    """Resume execution from one failed node onward."""
+    dag = await _get_dag_or_404(dag_id, db)
+    if dag.status != DAGStatus.FAILED:
+        raise HTTPException(status_code=400, detail="Retry-from-node is only available for failed DAGs")
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(nodes_result.scalars().all())
+    target = next((n for n in all_nodes if n.node_id == node_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    rerun = {node_id}
+    rerun.update(_compute_descendants(node_id, all_nodes))
+
+    for node in all_nodes:
+        if node.node_id in rerun:
+            node.status = NodeStatus.PENDING
+            node.output_data = None
+            node.task_id = None
+            node.container_id = None
+            node.started_at = None
+            node.completed_at = None
+        elif node.status != NodeStatus.COMPLETED:
+            node.status = NodeStatus.SKIPPED
+
+    dag.status = DAGStatus.READY
+    dag.completed_at = None
+
+    await db.commit()
+    await db.refresh(dag)
+    return await _start_dag(dag, db)
 
 
 @router.post("/{dag_id}/refine", response_model=DAGDetail)
@@ -866,6 +1101,107 @@ def _dedupe_node_ids(node_ids: list[str]) -> list[str]:
         seen.add(nid)
         ordered.append(nid)
     return ordered
+
+
+def _rewrite_input_mapping_for_removed_node(
+    mapping: dict | None,
+    removed_node_id: str,
+    replacement_node_ids: list[str],
+) -> dict:
+    """Repoint or remove input mappings that reference a removed node."""
+    updated = dict(mapping or {})
+    replacement = replacement_node_ids[0] if replacement_node_ids else None
+
+    for key, source in list(updated.items()):
+        if isinstance(source, dict):
+            source_from = str(source.get("from") or "")
+            if source_from == removed_node_id:
+                if replacement:
+                    copied = dict(source)
+                    copied["from"] = replacement
+                    updated[key] = copied
+                else:
+                    updated.pop(key, None)
+            continue
+
+        if isinstance(source, str) and (source == removed_node_id or source.startswith(f"{removed_node_id}.")):
+            if replacement:
+                suffix = source[len(removed_node_id):]
+                updated[key] = f"{replacement}{suffix}"
+            else:
+                updated.pop(key, None)
+
+    return updated
+
+
+def _compute_descendants(target_node_id: str, all_nodes: list[DAGNode]) -> set[str]:
+    """Compute transitive descendants from depends_on relations."""
+    children_map: dict[str, list[str]] = {}
+    for node in all_nodes:
+        for dep in node.depends_on or []:
+            children_map.setdefault(dep, []).append(node.node_id)
+
+    descendants: set[str] = set()
+    stack = list(children_map.get(target_node_id, []))
+    while stack:
+        current = stack.pop()
+        if current in descendants:
+            continue
+        descendants.add(current)
+        stack.extend(children_map.get(current, []))
+    return descendants
+
+
+async def _generate_node_enhancement_proposal(
+    dag: MasterDAG,
+    node: DAGNode,
+    mode: str,
+    guidance: str,
+    llm_model: str,
+    split_count: int,
+) -> dict:
+    """Generate an enhancement proposal through the existing LLM router."""
+    control_plane_url = "http://control-plane:8000"
+    schema_hint = (
+        "Return strict JSON only with keys: steps. "
+        "steps must be an array of objects with keys title and description."
+        if mode == "split"
+        else "Return strict JSON only with keys: description and success_criteria. "
+        "success_criteria must be an array of short strings."
+    )
+
+    prompt = (
+        "You are improving one failed DAG step. Keep the plan pragmatic and compact.\n"
+        f"DAG Objective:\n{dag.objective}\n\n"
+        f"Node ID: {node.node_id}\n"
+        f"Current description:\n{node.description or ''}\n\n"
+        f"Mode: {mode}\n"
+        f"Requested split_count: {split_count}\n"
+        f"User guidance:\n{guidance or 'None'}\n\n"
+        f"{schema_hint}"
+    )
+
+    req = {
+        "model": llm_model,
+        "messages": [
+            {"role": "system", "content": "You output strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "temperature": 0.2,
+    }
+
+    async with httpx.AsyncClient(timeout=40.0) as client:
+        resp = await client.post(f"{control_plane_url}/api/llm/v1/chat/completions", json=req)
+        resp.raise_for_status()
+        data = resp.json()
+        content = ((((data.get("choices") or [{}])[0].get("message") or {}).get("content")) or "{}").strip()
+        if "```" in content:
+            content = content.replace("```json", "").replace("```", "").strip()
+        start = content.find("{")
+        end = content.rfind("}")
+        payload = content[start:end + 1] if start != -1 and end != -1 else content
+        return json.loads(payload)
 
 
 def _extract_dag_base_image(dag_json: dict | None) -> str | None:

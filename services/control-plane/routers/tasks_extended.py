@@ -225,6 +225,14 @@ async def create_task_output(
     if not deliverables and output_data.raw_result:
         deliverables = output_data.raw_result.get("deliverables")
 
+    compact_summary = output_data.compact_summary
+    if not compact_summary and output_data.raw_result and isinstance(output_data.raw_result, dict):
+        compact_summary = output_data.raw_result.get("compact_summary")
+
+    external_assessment = output_data.external_assessment
+    if not external_assessment and output_data.raw_result and isinstance(output_data.raw_result, dict):
+        external_assessment = output_data.raw_result.get("external_assessment")
+
     output = TaskOutput(
         task_id=task_id,
         iteration=output_data.iteration,
@@ -244,10 +252,14 @@ async def create_task_output(
 
     # Also store the agent output as a conversation message for the chat view
     agent_text = ""
+    if compact_summary:
+        agent_text = str(compact_summary)
+
     if output_data.raw_result:
+
         # Extract the LLM's actual text response from OpenClaw payloads
         payloads = output_data.raw_result.get("output", "")
-        if isinstance(payloads, str) and payloads:
+        if not agent_text and isinstance(payloads, str) and payloads:
             # Try to extract actual response from openclaw JSON output
             import json as _json
             try:
@@ -276,6 +288,10 @@ async def create_task_output(
     elif deliverable_summary:
         agent_text += deliverable_summary
 
+    # Keep per-step summary concise in the task conversation panel.
+    if len(agent_text) > 1200:
+        agent_text = agent_text[:1200] + " ..."
+
     if agent_text:
         msg = TaskMessage(
             task_id=task_id,
@@ -285,6 +301,7 @@ async def create_task_output(
                 "iteration": output_data.iteration,
                 "model": output_data.model_used,
                 "completed": output_data.completed,
+                "objective_assessment": external_assessment,
             }
         )
         db.add(msg)
@@ -347,6 +364,8 @@ async def get_task_outputs(
                 "image_used": o.image_used,
                 "duration_ms": o.duration_ms,
                 "deliverables": o.deliverables,
+                "compact_summary": (o.raw_result or {}).get("compact_summary") if isinstance(o.raw_result, dict) else None,
+                "external_assessment": (o.raw_result or {}).get("external_assessment") if isinstance(o.raw_result, dict) else None,
                 "raw_result": o.raw_result,
                 "created_at": o.created_at.isoformat() if o.created_at else None,
                 "source_task_id": o.task_id,

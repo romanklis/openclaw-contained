@@ -2,7 +2,7 @@
 Pydantic schemas for API
 """
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Literal
 from datetime import datetime
 from enum import Enum
 
@@ -176,6 +176,8 @@ class TaskOutputCreate(BaseModel):
     image_used: Optional[str] = None
     duration_ms: Optional[int] = None
     deliverables: Optional[Dict[str, str]] = None
+    compact_summary: Optional[str] = None
+    external_assessment: Optional[Dict[str, Any]] = None
     raw_result: Optional[Dict[str, Any]] = None
 
 
@@ -193,6 +195,8 @@ class TaskOutputResponse(BaseModel):
     image_used: Optional[str]
     duration_ms: Optional[int]
     deliverables: Optional[Dict[str, str]]
+    compact_summary: Optional[str]
+    external_assessment: Optional[Dict[str, Any]]
     raw_result: Optional[Dict[str, Any]]
     created_at: datetime
 
@@ -502,6 +506,14 @@ class DAGRefine(BaseModel):
     """Refine an existing pre-run DAG in-place with additional instructions."""
     instructions: str = Field(..., min_length=1)
     llm_model: Optional[str] = None
+
+
+class DAGNodeEnhanceRequest(BaseModel):
+    """Enhance one specific node with optional extra guidance."""
+    mode: Literal["rewrite", "split"] = "rewrite"
+    guidance: Optional[str] = None
+    llm_model: Optional[str] = None
+    split_count: int = Field(default=2, ge=2, le=4)
 
 
 class DAGManualCreate(BaseModel):
