@@ -307,7 +307,7 @@ async def _extract_procedure_from_demo(demo: SkillDemo, db: AsyncSession):
             {"role": "user", "content": demo.prompt},
         ],
     }
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post("http://localhost:8000/api/llm/chat", json=payload)
         if resp.status_code == 200:
             content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")

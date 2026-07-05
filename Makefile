@@ -158,6 +158,18 @@ build-browser-v3: ## Build Browser v3 image (Chromium + agent-browser + Lightpan
 	@rm -f agent-images/browser_v3/taskforge-adapter.py
 	@echo "  ✅  openclaw-agent:browser_v3 built & pushed"
 
+build-browser-v4: ## Build Browser v4 image (Chromium + agent-browser + Lightpanda) and push to registry
+	@echo "Building Browser v4 agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/browser_v4/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:browser_v4 \
+		-f /agent-images/browser_v4/Dockerfile \
+		/agent-images/browser_v4/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser_v4
+	@rm -f agent-images/browser_v4/taskforge-adapter.py
+	@echo "  ✅  openclaw-agent:browser_v4 built & pushed"
+
+
 build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 ## Build all 8 agent base images
 	@echo ""
 	@echo "  ✅  All agent base images built & pushed to registry:"

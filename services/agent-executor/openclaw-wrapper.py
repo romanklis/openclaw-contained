@@ -21,13 +21,12 @@ from typing import Dict, Any, Optional, Tuple, List
 
 import httpx
 
-# ---------------------------------------------------------------------------
-# Configuration from environment
-# ---------------------------------------------------------------------------
+# Environment variables for DAG context
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 TASK_ID = os.getenv("TASK_ID")
 ITERATION = os.getenv("ITERATION", "0")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:4b")
+NODE_ID = os.getenv("NODE_ID", "")  # For step segregation in workspace
 # The LLM router base URL — OpenClaw will call this as if it were OpenAI
 LLM_ROUTER_URL = os.getenv("LLM_ROUTER_URL", f"{CONTROL_PLANE_URL}/api/llm")
 
@@ -771,30 +770,43 @@ def _is_binary_file(fpath: str) -> bool:
         return True
 
 
-def collect_workspace_files() -> Dict[str, str]:
+def collect_workspace_files(node_id: str | None = None, segregate_steps: bool = False) -> Dict[str, Any]:
     """Scan /workspace for files created/modified by the agent.
 
-    Returns a dict of {relative_path: content} for text files,
-    and {relative_path: "base64:<encoded>"} for binary files.
-    Skips hidden dirs, node_modules, and common non-deliverable files.
+    Returns:
+        If segregate_steps is False: {relative_path: content} (backward compatible)
+        If segregate_steps is True: {
+            "deliverables": {relpath: content},
+            "step_path": "steps/{node_id}/deliverables/" if node_id else None,
+            "deliverables_keys": [relpath, ...]
+        }
+
+    Files in .steps/ or steps/ directories are NOT included in deliverables
+    (they are workspace housekeeping, not step outputs).
     """
     import base64
 
     workspace = "/workspace"
-    SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm"}
+    SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm", "steps"}
     SKIP_FILES = {"result.json", "AGENTS.md", "SOUL.md", "TOOLS.md",
                   "IDENTITY.md", "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md",
-                  "package-lock.json"}
+                  "package-lock.json", "step_manifest.json"}
     MAX_FILE_SIZE = 500_000    # 500 KB per file
-    MAX_TOTAL = 2_000_000     # 2 MB total (base64 inflates ~33%)
+    MAX_TOTAL = 2_000_000      # 2 MB total (base64 inflates ~33%)
     collected: Dict[str, str] = {}
     total_size = 0
 
     if not os.path.isdir(workspace):
+        if segregate_steps:
+            return {
+                "deliverables": {},
+                "step_path": f"steps/{node_id}/deliverables/" if node_id else None,
+                "deliverables_keys": [],
+            }
         return collected
 
     for root, dirs, files in os.walk(workspace):
-        # Prune skip dirs
+        # Prune skip dirs AND segregated step directories (they're housekeeping)
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         for fname in sorted(files):  # sorted for deterministic order
             if fname in SKIP_FILES:
@@ -823,6 +835,14 @@ def collect_workspace_files() -> Dict[str, str]:
                 collected[relpath] = content
             except Exception as e:
                 print(f"  ⚠️  Could not read {relpath}: {e}")
+
+    if segregate_steps and node_id:
+        step_path = f"steps/{node_id}/deliverables/"
+        return {
+            "deliverables": collected,
+            "step_path": step_path,
+            "deliverables_keys": sorted(collected.keys()),
+        }
     return collected
 
 
@@ -840,6 +860,38 @@ def write_result(result: Dict[str, Any]):
     print(f"\n{RESULT_START}")
     print(result_json)
     print(RESULT_END)
+
+
+def _write_step_deliverables(deliverables: Dict[str, str], node_id: str | None = None):
+    """Write deliverables to step-specific directory in workspace.
+
+    Creates /workspace/steps/{node_id}/deliverables/ and writes each file there.
+    Also writes a step_manifest entry for workspace introspection.
+    """
+    if not node_id:
+        return
+
+    steps_dir = "/workspace/steps"
+    step_dir = os.path.join(steps_dir, node_id, "deliverables")
+    os.makedirs(step_dir, exist_ok=True)
+
+    for fname, content in deliverables.items():
+        # Strip leading path separators (fname may include relative path)
+        clean_name = fname.lstrip("/")
+        fpath = os.path.join(step_dir, clean_name)
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        try:
+            if isinstance(content, str) and content.startswith("base64:"):
+                import base64
+                raw = base64.b64decode(content[7:])
+                with open(fpath, "wb") as f:
+                    f.write(raw)
+            else:
+                with open(fpath, "w") as f:
+                    f.write(content)
+            print(f"  📦 Deliverable: {clean_name} → {fpath}")
+        except Exception as e:
+            print(f"  ⚠️ Could not write {clean_name}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -976,7 +1028,8 @@ def main():
         result["deployment_requested"] = True
         result["deployment"] = deploy
         # Collect workspace files for the deployment image
-        deliverables = collect_workspace_files()
+        seg_result = collect_workspace_files(node_id=NODE_ID if segregate else None, segregate_steps=segregate)
+        deliverables = seg_result.get("deliverables", {}) if segregate else seg_result
         if deliverables:
             result["deliverables"] = deliverables
             result["deployment"]["files"] = deliverables
@@ -1016,13 +1069,25 @@ def main():
         result["error"] = result.get("error", output[:1000])
         print(f"\n❌ Task failed")
 
-    # Collect workspace deliverables (files the agent created/modified)
-    deliverables = collect_workspace_files()
+    # Collect workspace deliverables with step segregation for DAG nodes
+    segregate = bool(NODE_ID)
+    workspace_result = collect_workspace_files(node_id=NODE_ID if segregate else None, segregate_steps=segregate)
+    if segregate:
+        deliverables = workspace_result.get("deliverables", {})
+        step_path = workspace_result.get("step_path")
+        result["workspace_step_path"] = step_path
+    else:
+        deliverables = workspace_result if isinstance(workspace_result, dict) and "deliverables" not in workspace_result else workspace_result
+        step_path = None
+
     if deliverables:
         result["deliverables"] = deliverables
+        result["deliverables_keys"] = sorted(deliverables.keys())
         print(f"\n📦 Collected {len(deliverables)} deliverable file(s):")
         for fp in deliverables:
             print(f"   📄 {fp}")
+        # Write deliverables to step-specific directory
+        _write_step_deliverables(deliverables, NODE_ID)
     else:
         print("\n📭 No deliverable files found in /workspace")
 

@@ -100,6 +100,26 @@ interface NodeAuditEvent {
   created_at: string
 }
 
+interface NodeAcceptanceResponse {
+  node_id: string
+  status: string
+  acceptance_verdict: string | null
+  acceptance_score: number
+  success_criteria: string[]
+  criteria_met: Record<string, boolean>
+  skill_id: string | null
+  skill_followed: boolean | null
+  deliverables_keys: string[]
+  workspace_step_path: string | null
+}
+
+interface WorkspaceManifestResponse {
+  workspace_id: string
+  step_manifest: Record<string, string[]>
+  total_files: number
+  steps_with_deliverables: string[]
+}
+
 function summarizeNodeFailureReason(
   node: DAGNode,
   stateEntry?: { latest: NodeStateSnapshot | null; events: NodeAuditEvent[] },
@@ -130,8 +150,8 @@ export default function DAGDetailPage() {
   const [dag, setDag] = useState<DAGDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 'sbom'>('overview')
-  const [showRevise, setShowRevise] = useState(false)
+const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 'sbom' | 'workspace'>('overview')
+   const [showRevise, setShowRevise] = useState(false)
   const [reviseComments, setReviseComments] = useState('')
   const [revising, setRevising] = useState(false)
   const [showNodeActions, setShowNodeActions] = useState(false)
@@ -151,6 +171,8 @@ export default function DAGDetailPage() {
   }>>({})
   const [nodeDataLoading, setNodeDataLoading] = useState(false)
   const [nodeState, setNodeState] = useState<Record<string, { latest: NodeStateSnapshot | null; events: NodeAuditEvent[] }>>({})
+  const [nodeAcceptance, setNodeAcceptance] = useState<Record<string, NodeAcceptanceResponse | null>>({})
+  const [workspaceManifest, setWorkspaceManifest] = useState<WorkspaceManifestResponse | null>(null)
 
   const fetchDag = useCallback(async () => {
     try {
@@ -325,10 +347,49 @@ export default function DAGDetailPage() {
       })
     }
 
-    loadFailedNodeStates()
-  }, [dag?.nodes, dagId, nodeState])
+loadFailedNodeStates()
+   }, [dag?.nodes, dagId, nodeState])
 
-  const startDag = async () => {
+   // Load structured acceptance data for selected node
+   useEffect(() => {
+     const node = dag?.nodes.find(n => n.node_id === selectedNodeId)
+     if (!node || nodeAcceptance[node.node_id]) return
+
+     const fetchAcceptance = async () => {
+       try {
+         const res = await fetch(`${API}/api/dags/${dagId}/nodes/${node.node_id}/acceptance`)
+         if (res.ok) {
+           const data: NodeAcceptanceResponse = await res.json()
+           setNodeAcceptance(prev => ({ ...prev, [node.node_id]: data }))
+         } else {
+           setNodeAcceptance(prev => ({ ...prev, [node.node_id]: null }))
+         }
+       } catch {
+         setNodeAcceptance(prev => ({ ...prev, [node.node_id]: null }))
+       }
+     }
+     fetchAcceptance()
+   }, [selectedNodeId, dag?.nodes, dagId, nodeAcceptance])
+
+   // Load workspace manifest when workspace tab is active
+   useEffect(() => {
+     if (!dag || activeTab !== 'workspace' || workspaceManifest) return
+
+     const fetchWorkspaceManifest = async () => {
+       try {
+         const res = await fetch(`${API}/api/dags/${dagId}/workspace/manifest`)
+         if (res.ok) {
+           const data: WorkspaceManifestResponse = await res.json()
+           setWorkspaceManifest(data)
+         }
+       } catch {
+         setWorkspaceManifest(null)
+       }
+     }
+     fetchWorkspaceManifest()
+   }, [dag, dagId, activeTab, workspaceManifest])
+
+   const startDag = async () => {
     try {
       await fetch(`${API}/api/dags/${dagId}/start`, { method: 'POST' })
       fetchDag()
@@ -382,12 +443,18 @@ export default function DAGDetailPage() {
       })
     }
 
-    setNodeState(prev => {
-      const next = { ...prev }
-      delete next[node.node_id]
-      return next
-    })
-  }, [])
+setNodeState(prev => {
+       const next = { ...prev }
+       delete next[node.node_id]
+       return next
+     })
+
+     setNodeAcceptance(prev => {
+       const next = { ...prev }
+       delete next[node.node_id]
+       return next
+     })
+   }, [])
 
   const applyDagMutationResult = useCallback(async (updatedDag?: DAGDetail | null, clearSelection?: boolean) => {
     if (updatedDag?.id) {
@@ -486,8 +553,9 @@ export default function DAGDetailPage() {
 
   const selectedNode = dag?.nodes.find(n => n.node_id === selectedNodeId) || null
   const selectedTaskData = selectedNode?.task_id ? nodeTaskData[selectedNode.task_id] : null
-  const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
-  const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
+const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
+   const selectedNodeAcceptance = selectedNode ? nodeAcceptance[selectedNode.node_id] : null
+   const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
   const nodeActionsAllowed = !!(selectedNode && (dag?.status === 'failed' || dag?.status === 'ready'))
 
   if (error) return <div className="text-red-400 p-8">Error: {error}</div>
@@ -869,10 +937,56 @@ export default function DAGDetailPage() {
                   <pre className="mt-2 text-[11px] text-gray-300 overflow-auto max-h-40">{JSON.stringify(selectedNodeState.latest.acquisition_log, null, 2)}</pre>
                 </details>
 
-                <details className="bg-gray-900/30 rounded p-2">
-                  <summary className="cursor-pointer text-cyan-200">4) Acceptance criteria check</summary>
-                  <pre className="mt-2 text-[11px] text-gray-300 overflow-auto max-h-40">{JSON.stringify(selectedNodeState.latest.acceptance_result, null, 2)}</pre>
-                </details>
+<details className="bg-gray-900/30 rounded p-2">
+                   <summary className="cursor-pointer text-cyan-200">4) Acceptance criteria check</summary>
+                   {selectedNodeAcceptance ? (
+                     <div className="mt-2 text-[11px] text-gray-300 space-y-1">
+                       <div className="flex items-center gap-2">
+                         <span className="font-semibold">Verdict:</span>
+                         <span className={selectedNodeAcceptance.acceptance_verdict === 'fail' ? 'text-red-300' : selectedNodeAcceptance.acceptance_verdict === 'partial' ? 'text-amber-300' : 'text-emerald-300'}>
+                           {selectedNodeAcceptance.acceptance_verdict || 'pending'}
+                         </span>
+                         <span className="ml-auto font-mono">Score: {selectedNodeAcceptance.acceptance_score}</span>
+                       </div>
+                       {selectedNodeAcceptance.success_criteria?.length > 0 && (
+                         <div>
+                           <span className="font-semibold">Success Criteria:</span>
+                           <ul className="ml-4 mt-1 list-disc">
+                             {selectedNodeAcceptance.success_criteria.map((c, i) => (
+                               <li key={i} className={selectedNodeAcceptance.criteria_met?.[c] ? 'text-emerald-300' : 'text-gray-400'}>
+                                 {c}
+                               </li>
+                             ))}
+                           </ul>
+                         </div>
+                       )}
+                       {selectedNodeAcceptance.skill_id && (
+                         <div>
+                           <span className="font-semibold">Skill:</span> {selectedNodeAcceptance.skill_id}
+                           {selectedNodeAcceptance.skill_followed !== null && (
+                             <span className={selectedNodeAcceptance.skill_followed ? 'text-emerald-300 ml-2' : 'text-red-300 ml-2'}>
+                               {selectedNodeAcceptance.skill_followed ? 'followed' : 'not followed'}
+                             </span>
+                           )}
+                         </div>
+                       )}
+                       {selectedNodeAcceptance.deliverables_keys?.length > 0 && (
+                         <div>
+                           <span className="font-semibold">Deliverables:</span>
+                           <div className="flex flex-wrap gap-1 mt-1">
+                             {selectedNodeAcceptance.deliverables_keys.map(f => (
+                               <span key={f} className="font-mono bg-emerald-900/30 text-emerald-400 px-1.5 py-0.5 rounded text-[10px]">
+                                 {f.split('/').pop() || f}
+                               </span>
+                             ))}
+                           </div>
+                         </div>
+                       )}
+                     </div>
+                   ) : (
+                     <pre className="mt-2 text-[11px] text-gray-300 overflow-auto max-h-40">{JSON.stringify(selectedNodeState.latest.acceptance_result, null, 2)}</pre>
+                   )}
+                 </details>
 
                 {selectedNodeState.events.length > 0 && (
                   <details className="bg-gray-900/30 rounded p-2">
@@ -899,22 +1013,22 @@ export default function DAGDetailPage() {
           {selectedNode.task_id && (
             <>
               <div className="flex border-b border-gray-700 mb-3 gap-1">
-                {(['overview', 'outputs', 'audit', 'sbom'] as const).map(tab => (
-                  <button
-                    key={tab}
-                    onClick={() => setActiveTab(tab)}
-                    className={`px-3 py-1.5 text-xs font-medium capitalize rounded-t transition-colors ${
-                      activeTab === tab
-                        ? 'bg-gray-700 text-white border-b-2 border-blue-500'
-                        : 'text-gray-500 hover:text-gray-300'
-                    }`}
-                  >
-                    {tab === 'overview' ? 'Overview' :
-                     tab === 'outputs' ? `Outputs${selectedTaskData ? ` (${selectedTaskData.outputs.length})` : ''}` :
-                     tab === 'audit' ? 'Audit' :
-                     'SBOM'}
-                  </button>
-                ))}
+{(['overview', 'outputs', 'audit', 'sbom'] as const).map(tab => (
+                    <button
+                      key={tab}
+                      onClick={() => setActiveTab(tab)}
+                      className={`px-3 py-1.5 text-xs font-medium capitalize rounded-t transition-colors ${
+                        activeTab === tab
+                          ? 'bg-gray-700 text-white border-b-2 border-blue-500'
+                          : 'text-gray-500 hover:text-gray-300'
+                      }`}
+                    >
+                      {tab === 'overview' ? 'Overview' :
+                       tab === 'outputs' ? `Outputs${selectedTaskData ? ` (${selectedTaskData.outputs.length})` : ''}` :
+                       tab === 'audit' ? 'Audit' :
+                       'SBOM'}
+                    </button>
+                  ))}
               </div>
 
               {nodeDataLoading && !selectedTaskData && (
@@ -1238,32 +1352,70 @@ export default function DAGDetailPage() {
                               ))}
                             </tbody>
                           </table>
-                          {selectedTaskData.sbom.packages.length > 50 && (
-                            <div className="text-xs text-gray-600 mt-2">
-                              Showing 50 of {selectedTaskData.sbom.packages.length}{' '}
-                              {selectedNode.task_id && (
-                                <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400">view all &rarr;</Link>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </>
-              )}
+{selectedTaskData.sbom.packages.length > 50 && (
+                             <div className="text-xs text-gray-600 mt-2">
+                               Showing 50 of {selectedTaskData.sbom.packages.length}{' '}
+                               {selectedNode.task_id && (
+                                 <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400">view all &rarr;</Link>
+                               )}
+                             </div>
+                           )}
+                         </div>
+                       )}
+                     </div>
+                   )}
+                 </>
+               )}
 
-              {!selectedNode.task_id && (
-                <div className="text-gray-500 text-sm py-3">
-                  This node has not started yet &mdash; no task data available.
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
+               {!selectedNode.task_id && (
+                 <div className="text-gray-500 text-sm py-3">
+                   This node has not started yet &mdash; no task data available.
+                 </div>
+               )}
+             </>
+           )}
 
-      {/* Node list (compact, when no node selected) */}
+           {/* Workspace manifest (outside task_id condition) */}
+           {selectedNode && activeTab === 'workspace' && (
+             <div className="card border-blue-500/30 mb-4">
+               <div className="p-3">
+                 <div className="text-xs uppercase tracking-wide text-cyan-300 mb-2">Workspace Manifest</div>
+                 {!workspaceManifest ? (
+                   <div className="text-gray-500 text-sm py-4">No workspace data available</div>
+                 ) : (
+                   <div>
+                     <div className="flex items-center gap-3 mb-3 text-xs text-gray-500">
+                       <span className="font-mono">{workspaceManifest.workspace_id}</span>
+                       <span>{workspaceManifest.total_files} files</span>
+                       <span>{workspaceManifest.steps_with_deliverables.length} steps</span>
+                     </div>
+                     {workspaceManifest.steps_with_deliverables.length === 0 ? (
+                       <div className="text-gray-500 text-sm">No deliverables captured</div>
+                     ) : (
+                       <div className="space-y-2 max-h-64 overflow-y-auto">
+                         {workspaceManifest.steps_with_deliverables.map(nodeId => (
+                           <div key={nodeId} className="border border-gray-700 rounded bg-gray-900/30 p-2">
+                             <div className="font-mono text-xs text-blue-300 mb-1">{nodeId}</div>
+                             <div className="flex flex-wrap gap-1">
+                               {(workspaceManifest.step_manifest[nodeId] || []).map(f => (
+                                 <span key={f} className="font-mono text-[10px] bg-emerald-900/30 text-emerald-400 px-1.5 py-0.5 rounded">
+                                   {f.split('/').pop() || f}
+                                 </span>
+                               ))}
+                             </div>
+                           </div>
+                         ))}
+                       </div>
+                     )}
+                   </div>
+                 )}
+               </div>
+             </div>
+           )}
+         </div>
+       )}
+
+       {/* Node list (compact, when no node selected) */}
       {!selectedNodeId && (
         <div className="space-y-2">
           <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">All Nodes ({dag.nodes.length})</h2>

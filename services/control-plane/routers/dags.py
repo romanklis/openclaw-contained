@@ -14,6 +14,7 @@ from models import (
     SkillSelectionEvent,
     DAGNodeStateSnapshot,
     DAGNodeAuditEvent,
+    DAGNodeOutput,
 )
 from schemas import (
     DAGCreate,
@@ -29,6 +30,9 @@ from schemas import (
     DAGNodeStateSnapshotResponse,
     DAGNodeAuditEventCreate,
     DAGNodeAuditEventResponse,
+    DAGNodeOutputResponse,
+    NodeAcceptanceResponse,
+    WorkspaceManifestResponse,
 )
 from dag_validator import validate_dag
 from planner import plan_dag
@@ -481,6 +485,146 @@ async def list_dag_audit_log(dag_id: str, limit: int = 200, db: AsyncSession = D
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+# ── Structured Node Output Endpoints ──────────────────────────────────────────
+
+@router.post("/{dag_id}/nodes/{node_id}/output", status_code=status.HTTP_201_CREATED)
+async def create_node_structured_output(
+    dag_id: str,
+    node_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist a structured node output with acceptance and skill compliance data."""
+    from models import DAGNodeOutput
+    from schemas import DAGNodeOutputResponse
+
+    dag = await _get_dag_or_404(dag_id, db)
+    node = await db.execute(
+        select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id)
+    )
+    node = node.scalar_one_or_none()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found in DAG {dag_id}")
+
+    output = DAGNodeOutput(
+        dag_id=dag_id,
+        node_id=node_id,
+        task_id=payload.get("task_id"),
+        status=payload.get("status", "completed"),
+        objective=payload.get("objective"),
+        success_criteria=payload.get("success_criteria", []),
+        criteria_met=payload.get("criteria_met", {}),
+        acceptance_verdict=payload.get("acceptance_verdict"),
+        acceptance_score=payload.get("acceptance_score", 0),
+        skill_id=payload.get("skill_id"),
+        skill_followed=payload.get("skill_followed"),
+        skill_instruction_sections_used=payload.get("skill_instruction_sections_used", []),
+        deliverables_count=payload.get("deliverables_count", 0),
+        deliverables_keys=payload.get("deliverables_keys", []),
+        acquisition_log=payload.get("acquisition_log", []),
+        llm_interaction_count=payload.get("llm_interaction_count", 0),
+        output_text=payload.get("output_text"),
+        error_text=payload.get("error_text"),
+        workspace_step_path=payload.get("workspace_step_path"),
+    )
+    db.add(output)
+    await db.commit()
+    await db.refresh(output)
+    return output
+
+
+@router.get("/{dag_id}/nodes/{node_id}/acceptance", response_model=dict)
+async def get_node_acceptance(dag_id: str, node_id: str, db: AsyncSession = Depends(get_db)):
+    """Get structured acceptance data for a DAG node."""
+    from models import DAGNodeOutput
+    from schemas import NodeAcceptanceResponse
+
+    dag = await _get_dag_or_404(dag_id, db)
+
+    # Get the latest structured output
+    result = await db.execute(
+        select(DAGNodeOutput)
+        .where(DAGNodeOutput.dag_id == dag_id, DAGNodeOutput.node_id == node_id)
+        .order_by(DAGNodeOutput.created_at.desc())
+        .limit(1)
+    )
+    output = result.scalar_one_or_none()
+    if output:
+        return {
+            "node_id": node_id,
+            "status": output.status,
+            "acceptance_verdict": output.acceptance_verdict,
+            "acceptance_score": output.acceptance_score,
+            "success_criteria": output.success_criteria,
+            "criteria_met": output.criteria_met,
+            "skill_id": output.skill_id,
+            "skill_followed": output.skill_followed,
+            "deliverables_keys": output.deliverables_keys,
+            "workspace_step_path": output.workspace_step_path,
+        }
+
+    # Fallback: derive from node output_data if no structured output exists
+    node_result = await db.execute(
+        select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id)
+    )
+    node = node_result.scalar_one_or_none()
+    if node and node.output_data:
+        gate_result = node.output_data.get("gate_result", {})
+        return {
+            "node_id": node_id,
+            "status": node.status.value if node.status else "unknown",
+            "acceptance_verdict": "pass" if gate_result.get("valid") else "fail",
+            "acceptance_score": gate_result.get("external_assessment", {}).get("score", 0),
+            "success_criteria": node.config.get("success_criteria", []) if node.config else [],
+            "criteria_met": {},
+            "skill_id": node.selected_skill_v2_id,
+            "skill_followed": None,
+            "deliverables_keys": list((node.output_data or {}).get("deliverables", {}).keys()),
+            "workspace_step_path": None,
+        }
+
+    return {
+        "node_id": node_id,
+        "status": "unknown",
+        "acceptance_verdict": None,
+        "acceptance_score": 0,
+        "success_criteria": [],
+        "criteria_met": {},
+        "skill_id": None,
+        "skill_followed": None,
+        "deliverables_keys": [],
+        "workspace_step_path": None,
+    }
+
+
+@router.get("/{dag_id}/workspace/manifest", response_model=dict)
+async def get_dag_workspace_manifest(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Get workspace file-to-node mapping for a DAG."""
+    from models import DAGNodeOutput
+
+    dag = await _get_dag_or_404(dag_id, db)
+
+    # Get all node outputs for this DAG
+    result = await db.execute(
+        select(DAGNodeOutput)
+        .where(DAGNodeOutput.dag_id == dag_id)
+        .order_by(DAGNodeOutput.node_id)
+    )
+    outputs = result.scalars().all()
+
+    step_manifest: dict[str, list[str]] = {}
+    for output in outputs:
+        if output.deliverables_keys:
+            step_manifest[output.node_id] = output.deliverables_keys
+
+    return {
+        "workspace_id": dag.workspace_id,
+        "step_manifest": step_manifest,
+        "total_files": sum(len(v) for v in step_manifest.values()),
+        "steps_with_deliverables": list(step_manifest.keys()),
+    }
 
 
 @router.patch("/{dag_id}")
@@ -1269,6 +1413,7 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
                 "completed_at": n.completed_at,
                 "selected_skill_v2_id": n.selected_skill_v2_id,
                 "skill_selection_reason": n.skill_selection_reason,
+                "deliverables_keys": (n.output_data or {}).get("deliverables_keys"),
             }
             for n in nodes
         ],

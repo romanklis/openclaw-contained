@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { API } from '../lib/api'
 
 interface SkillStep {
@@ -29,25 +29,29 @@ export default function SkillsPage() {
   const [expandedSkill, setExpandedSkill] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const fetchSkills = async () => {
+  const fetchSkills = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/skills`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setSkills(await res.json())
-    } catch (err: any) {
-      setError(err.message)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
     }
-  }
+  }, [])
 
-  useEffect(() => { fetchSkills() }, [])
+  useEffect(() => {
+    fetchSkills()
+  }, [fetchSkills])
 
   const seedSkills = async () => {
     setSeeding(true)
+    setError(null)
     try {
-      await fetch(`${API}/api/skills/seed`, { method: 'POST' })
-      fetchSkills()
-    } catch (err: any) {
-      setError(err.message)
+      const res = await fetch(`${API}/api/skills/seed`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await fetchSkills()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
     } finally {
       setSeeding(false)
     }
@@ -68,10 +72,10 @@ export default function SkillsPage() {
         throw new Error(detail.detail || `HTTP ${res.status}`)
       }
       const imported = await res.json()
-      fetchSkills()
-      alert(`Imported skill: ${imported.name}`)
-    } catch (err: any) {
-      setError(err.message)
+      await fetchSkills()
+      window.alert(`Imported skill: ${imported.name}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
     } finally {
       setImporting(false)
       if (fileInputRef.current) fileInputRef.current.value = ''
@@ -79,13 +83,14 @@ export default function SkillsPage() {
   }
 
   const deleteSkill = async (skillId: string, skillName: string) => {
-    if (!confirm(`Delete skill "${skillName}"?`)) return
+    if (!window.confirm(`Delete skill "${skillName}"?`)) return
+    setError(null)
     try {
       const res = await fetch(`${API}/api/skills/${skillId}`, { method: 'DELETE' })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      fetchSkills()
-    } catch (err: any) {
-      setError(err.message)
+      await fetchSkills()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
     }
   }
 
@@ -156,7 +161,7 @@ export default function SkillsPage() {
                 )}
               </div>
             )}
-            {skill.steps.length > 0 && (
+            {skill.steps && skill.steps.length > 0 && (
               <div className="space-y-1">
                 {skill.steps.map((step, i) => (
                   <div key={i} className="flex items-start gap-2 text-xs">
@@ -166,7 +171,7 @@ export default function SkillsPage() {
                 ))}
               </div>
             )}
-            {skill.tags.length > 0 && (
+            {skill.tags && skill.tags.length > 0 && (
               <div className="flex gap-1 mt-3">
                 {skill.tags.map((tag) => (
                   <span key={tag} className="text-xs bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded">{tag}</span>

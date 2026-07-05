@@ -1027,6 +1027,7 @@ async def start_agent_container(
         agent_env = {
             "TASK_ID": task_id,
             "ITERATION": str(iteration),
+            "NODE_ID": node_id or "",  # For step segregation
             "CONTROL_PLANE_URL": cp_url_for_agent,
             "LLM_ROUTER_URL": llm_router_url,
             "OLLAMA_URL": os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"),
@@ -2873,6 +2874,44 @@ async def post_node_audit_event(dag_id: str, node_id: str, payload: Dict[str, An
 
 
 @activity.defn
+async def post_node_structured_output(dag_id: str, node_id: str, task_id: str, output: Dict[str, Any]) -> bool:
+    """Persist structured node output with acceptance and skill compliance data."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    # Build structured payload from the collected output
+    structured_payload = {
+        "task_id": task_id,
+        "status": "completed" if output.get("completed") else "failed",
+        "objective": output.get("node_objective", ""),
+        "success_criteria": output.get("success_criteria", []),
+        "acceptance_verdict": "pass" if output.get("gate_result", {}).get("valid") else "fail",
+        "acceptance_score": output.get("gate_result", {}).get("external_assessment", {}).get("score", 0),
+        "criteria_met": {c: True for c in output.get("success_criteria", [])} if output.get("gate_result", {}).get("valid") else {},
+        "skill_id": output.get("skill_id"),
+        "skill_followed": None,  # Will be populated by skill reference extraction
+        "deliverables_count": len(output.get("deliverables") or {}),
+        "deliverables_keys": list((output.get("deliverables") or {}).keys()),
+        "acquisition_log": output.get("acquisition_log", []),
+        "llm_interaction_count": output.get("llm_interaction_count", 0),
+        "output_text": output.get("output", ""),
+        "error_text": output.get("error"),
+        "workspace_step_path": output.get("workspace_step_path"),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{control_plane_url}/api/dags/{dag_id}/nodes/{node_id}/output",
+                json=structured_payload,
+            )
+            return resp.status_code in (200, 201)
+    except Exception as exc:
+        logger.warning(f"⚠️ Failed to post structured output for {dag_id}/{node_id}: {exc}")
+        return False
+
+
+@activity.defn
 async def create_node_task(
     dag_id: str,
     node_id: str,
@@ -3125,6 +3164,7 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
             return {"error": f"Failed to fetch task {task_id}"}
 
         task = resp.json()
+        node_id = task.get("node_id") or ""
 
         # Fetch the latest output
         outputs_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
@@ -3137,6 +3177,7 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
 
         result = {
             "task_id": task_id,
+            "node_id": node_id,
             "status": task.get("status"),
         }
 
@@ -3147,9 +3188,11 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
             result["completed"] = latest.get("completed")
             result["error"] = latest.get("error")
             result["deliverables"] = latest.get("deliverables")
+            result["deliverables_keys"] = latest.get("deliverables_keys")
             result["raw_result"] = latest.get("raw_result")
             result["parse_error"] = bool((latest.get("raw_result") or {}).get("parse_error"))
             result["iteration"] = latest.get("iteration")
+            result["workspace_step_path"] = latest.get("raw_result", {}).get("workspace_step_path")
             result["acquisition_log"] = _extract_acquisition_log(result["agent_logs"])
             result["compact_summary"] = _build_compact_step_summary(result)
 
@@ -3771,8 +3814,26 @@ class DAGNodeWorkflow:
                         },
                         "acquisition_log": output.get("acquisition_log", []),
                         "acceptance_result": gate_result,
+                        "acceptance_state": {
+                            "verdict": "pass" if gate_result.get("valid") else "fail",
+                            "score": gate_result.get("external_assessment", {}).get("score", 0),
+                            "criteria_results": [],
+                            "checked_at": datetime.utcnow().isoformat(),
+                        },
                     },
                 ],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+
+            # Post structured output for testability
+            await workflow.execute_activity(
+                post_node_structured_output,
+                args=[dag_id, node_id, task_id, {
+                    "gate_result": gate_result,
+                    "node_objective": node_objective,
+                    "success_criteria": success_criteria,
+                    "skill_id": config.get("selected_skill_v2_id") or config.get("skill_id"),
+                }],
                 start_to_close_timeout=timedelta(seconds=15),
             )
 
@@ -3829,9 +3890,25 @@ class DAGNodeWorkflow:
                             "valid": False,
                             "reason": f"node_workflow_exception: {str(e)[:300]}",
                         },
+                        "acceptance_state": {
+                            "verdict": "fail",
+                            "score": 0,
+                            "criteria_results": [],
+                            "checked_at": datetime.utcnow().isoformat(),
+                            "reason": str(e),
+                        },
                         "pending_items": [{"type": "exception", "reason": str(e)[:300]}],
                     },
                 ],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            # Post structured output for failed node
+            await workflow.execute_activity(
+                post_node_structured_output,
+                args=[dag_id, node_id, task_id, {
+                    "gate_result": {"valid": False, "reason": str(e)},
+                    "error_text": str(e),
+                }],
                 start_to_close_timeout=timedelta(seconds=15),
             )
             await workflow.execute_activity(
@@ -4403,6 +4480,7 @@ async def main():
             post_dag_progress,
             post_node_state_snapshot,
             post_node_audit_event,
+            post_node_structured_output,
             create_node_task,
             collect_node_output,
             evaluate_node_gate,

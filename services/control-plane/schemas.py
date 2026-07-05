@@ -472,6 +472,7 @@ class DAGNodeResponse(BaseModel):
     completed_at: Optional[datetime]
     selected_skill_v2_id: Optional[str] = None
     skill_selection_reason: Optional[str] = None
+    deliverables_keys: Optional[List[str]] = None  # quick lookup for node deliverables
 
     class Config:
         from_attributes = True
@@ -560,6 +561,7 @@ class DAGNodeStateSnapshotCreate(BaseModel):
     acquisition_log: List[Dict[str, Any]] = []
     acceptance_result: Dict[str, Any] = {}
     pending_items: List[Any] = []
+    acceptance_state: Dict[str, Any] = {}  # structured acceptance data
 
 
 class DAGNodeStateSnapshotResponse(BaseModel):
@@ -577,6 +579,7 @@ class DAGNodeStateSnapshotResponse(BaseModel):
     acquisition_log: List[Dict[str, Any]]
     acceptance_result: Dict[str, Any]
     pending_items: List[Any]
+    acceptance_state: Dict[str, Any]
     created_at: datetime
 
     class Config:
@@ -604,6 +607,70 @@ class DAGNodeAuditEventResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DAGNodeOutputResponse(BaseModel):
+    """Structured output envelope for DAG node execution."""
+    id: int
+    dag_id: str
+    node_id: str
+    task_id: Optional[str]
+    status: str  # "completed" | "failed" | "skipped"
+    completed_at: Optional[datetime]
+
+    # Acceptance verification
+    objective: Optional[str]
+    success_criteria: List[str]
+    criteria_met: Dict[str, bool]
+    acceptance_verdict: Optional[str]  # "pass" | "fail" | "partial"
+    acceptance_score: int
+
+    # Evidence of skill usage
+    skill_id: Optional[str]
+    skill_followed: Optional[bool]
+    skill_instruction_sections_used: List[str]
+
+    # Deterministic deliverables
+    deliverables_count: int
+    deliverables_keys: List[str]
+
+    # Links to provenance
+    acquisition_log: List[Dict[str, Any]]
+    llm_interaction_count: int
+
+    # Primary content
+    output_text: Optional[str]
+    error_text: Optional[str]
+
+    # Workspace provenance
+    workspace_step_path: Optional[str]
+
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class NodeAcceptanceResponse(BaseModel):
+    """Acceptance check result for a DAG node."""
+    node_id: str
+    status: str
+    acceptance_verdict: str  # "pass" | "fail" | "partial"
+    acceptance_score: int
+    success_criteria: List[str]
+    criteria_met: Dict[str, bool]
+    skill_id: Optional[str]
+    skill_followed: Optional[bool]
+    deliverables_keys: List[str]
+    workspace_step_path: Optional[str]
+
+
+class WorkspaceManifestResponse(BaseModel):
+    """Workspace file-to-node mapping."""
+    workspace_id: str
+    step_manifest: Dict[str, List[str]]  # {node_id: [deliverable_filepaths]}
+    total_files: int
+    steps_with_deliverables: List[str]
 
 
 # ── Node Environments ──────────────────────────────────

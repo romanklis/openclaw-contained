@@ -144,7 +144,19 @@ export default function SkillStudioPage() {
     } catch (e: any) { setError(e.message) } finally { setLoading(false) }
   }
 
-  async function loadDemos() {
+  async function handleDelete(skillId: string) {
+  if (!window.confirm('Are you sure you want to remove this skill?')) return;
+  
+  fetch(`/api/skills/${skillId}`, { method: 'DELETE' })
+    .then(response => {
+      if (response.ok) {
+        loadTree(); // Refresh skills list
+      }
+    })
+    .catch(error => console.error('Error deleting skill:', error));
+}
+
+async function loadDemos() {
     setLoading(true)
     setError(null)
     try {
@@ -551,7 +563,7 @@ export default function SkillStudioPage() {
 
 // ── SkillCard component ───────────────────────────────────────────────────────
 
-function SkillCard({ skill, onReview }: { skill: SkillV2; onReview: () => void }) {
+function SkillCard({ skill, onReview, onDelete }: { skill: SkillV2; onReview: () => void; onDelete?: (id: string) => void }) {
   const [expanded, setExpanded] = useState(false)
 
   return (
@@ -566,10 +578,22 @@ function SkillCard({ skill, onReview }: { skill: SkillV2; onReview: () => void }
         <div className="flex items-center gap-2 flex-shrink-0 ml-4">
           {statusBadge(skill.status)}
           {skill.status === 'draft' && (
-            <button
-              onClick={onReview}
-              className="px-2 py-0.5 bg-yellow-800 hover:bg-yellow-700 rounded text-xs font-medium"
-            >Review</button>
+            <>
+              <button
+                onClick={onReview}
+                className="px-2 py-0.5 bg-yellow-800 hover:bg-yellow-700 rounded text-xs font-medium"
+              >
+                Review
+              </button>
+              {onDelete && (
+                <button
+                  onClick={() => onDelete(skill.id)}
+                  className="px-2 py-0.5 bg-red-800 hover:bg-red-700 rounded text-xs font-medium"
+                >
+                  Remove
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>

@@ -435,6 +435,15 @@ class DAGNodeStateSnapshot(Base):
     acceptance_result = Column(JSON, default=dict)
     pending_items = Column(JSON, default=list)
 
+    # Structured acceptance state for deterministic testing
+    acceptance_state = Column(JSON, default=dict)
+    # Structure: {
+    #   "verdict": "pass|fail|partial",
+    #   "score": 0-100,
+    #   "criteria_results": [{"criterion": "...", "met": true, "evidence": "..."}],
+    #   "checked_at": "ISO timestamp"
+    # }
+
     created_at = Column(DateTime, server_default=func.now(), index=True)
 
 
@@ -451,6 +460,57 @@ class DAGNodeAuditEvent(Base):
     message = Column(Text, nullable=False)
     event_data = Column(JSON, default=dict)
     created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+class DAGNodeOutput(Base):
+    """Structured output envelope for DAG node execution.
+
+    Provides a fixed schema for node outputs, enabling deterministic
+    acceptance testing and skill compliance verification.
+    """
+    __tablename__ = "dag_node_outputs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+
+    # Fixed structure fields
+    status = Column(String, nullable=False)  # "completed" | "failed" | "skipped"
+    completed_at = Column(DateTime)
+
+    # Acceptance verification
+    objective = Column(Text)  # What this step was supposed to achieve
+    success_criteria = Column(JSON, default=list)  # The criteria that should be met
+    criteria_met = Column(JSON, default=dict)  # {criterion_text: bool, ...}
+    acceptance_verdict = Column(String)  # "pass" | "fail" | "partial"
+    acceptance_score = Column(Integer, default=0)  # 0-100
+
+    # Evidence of skill usage (if applicable)
+    skill_id = Column(String)  # v2 skill that was selected for this node
+    skill_followed = Column(Boolean, nullable=True)  # Did agent follow skill?
+    skill_instruction_sections_used = Column(JSON, default=list)  # Which instructions were referenced
+
+    # Deterministic deliverables
+    deliverables_count = Column(Integer, default=0)
+    deliverables_keys = Column(JSON, default=list)  # sorted list of deliverable filenames
+
+    # Links to provenance
+    acquisition_log = Column(JSON, default=list)  # tool calls made during execution
+    llm_interaction_count = Column(Integer, default=0)
+
+    # Primary content
+    output_text = Column(Text)  # extracted main output
+    error_text = Column(Text)  # extracted error if any
+
+    # Workspace provenance
+    workspace_step_path = Column(String)  # relative path to this node's deliverables in workspace
+
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+    # Relationships
+    dag = relationship("MasterDAG", backref="node_outputs")
+    task = relationship("Task", foreign_keys=[task_id])
 
 
 class NodeEnvironment(Base):

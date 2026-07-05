@@ -296,5 +296,23 @@ base_images:
     - modern web app interaction
     - javascript-heavy pages
     - browser testing/scraping
+  browser_v4:
+    dockerfile: agent-images/browser_v4/Dockerfile
+    tag: openclaw-agent:browser_v4
+    enabled: true
+    runtime: Python 3.11 (Debian) + Camoufox
+    description: Browser automation image with Camoufox (custom headless Firefox) for agentic browsing.
+    size_estimate: ~650 MB
+    capabilities:
+    - browser-automation
+    - camoufox
+    - firefox
+    - dynamic-content handling
+    - web-scraping
+    best_for:
+    - web navigation
+    - interactive scraping
+    - javascript-heavy pages
+    - browser testing
     avoid_for:
-    - shell-only workflows
+    - tasks requiring smallest image footprint
