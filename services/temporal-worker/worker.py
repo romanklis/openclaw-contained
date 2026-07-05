@@ -87,7 +87,7 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if dt.tzinfo is not None:
-            # Normalize to naive UTC so comparisons with workflow.now()
+            # Normalize to naive UTC so comparisons with datetime.now(timezone.utc)
             # are deterministic inside workflow sandbox code.
             return dt.astimezone(timezone.utc).replace(tzinfo=None)
         return dt
@@ -352,7 +352,7 @@ class AgentTaskWorkflow:
         
         while iteration < max_iterations:
             iteration += 1
-            iteration_started_at = workflow.now()
+            iteration_started_at = datetime.now(timezone.utc)
             
             logger.info(f"Task {task_id} iteration {iteration} with image {self.current_image}")
             
@@ -3418,7 +3418,7 @@ async def finalize_dag(dag_id: str, status: str) -> bool:
             f"{control_plane_url}/api/dags/{dag_id}",
             json={
                 "status": status,
-                "completed_at": datetime.utcnow().isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
             },
         )
         return resp.status_code in (200, 204)
@@ -3818,7 +3818,7 @@ class DAGNodeWorkflow:
                             "verdict": "pass" if gate_result.get("valid") else "fail",
                             "score": gate_result.get("external_assessment", {}).get("score", 0),
                             "criteria_results": [],
-                            "checked_at": datetime.utcnow().isoformat(),
+                            "checked_at": datetime.now(timezone.utc).isoformat(),
                         },
                     },
                 ],
@@ -3894,7 +3894,7 @@ class DAGNodeWorkflow:
                             "verdict": "fail",
                             "score": 0,
                             "criteria_results": [],
-                            "checked_at": datetime.utcnow().isoformat(),
+                            "checked_at": datetime.now(timezone.utc).isoformat(),
                             "reason": str(e),
                         },
                         "pending_items": [{"type": "exception", "reason": str(e)[:300]}],
