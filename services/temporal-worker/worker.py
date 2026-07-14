@@ -3418,7 +3418,7 @@ async def finalize_dag(dag_id: str, status: str) -> bool:
             f"{control_plane_url}/api/dags/{dag_id}",
             json={
                 "status": status,
-                "completed_at": workflow.now().isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
             },
         )
         return resp.status_code in (200, 204)
