@@ -48,6 +48,25 @@ RUN python3 -m pip install --no-cache-dir \
     "camoufox[geoip]==0.4.11" \
     "curl_cffi[cli]"
 
+# Install web processing libraries
+RUN python3 -m pip install --no-cache-dir \
+    beautifulsoup4 \
+    lxml \
+    html5lib \
+    cssselect \
+    pyquery \
+    readability-lxml \
+    trafilatura \
+    newspaper3k \
+    goose3 \
+    extruct \
+    w3lib \
+    scrapy \
+    feedparser \
+    lxml-html-clean \
+    html-sanitizer \
+    fake-useragent
+
 # Copy adapter
 COPY taskforge-adapter.py /opt/openclaw/taskforge-adapter.py
 COPY test /opt/openclaw

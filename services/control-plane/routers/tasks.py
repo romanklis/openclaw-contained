@@ -408,6 +408,32 @@ async def update_task(
     return {"task_id": task_id, "updated": list(body.keys())}
 
 
+@router.patch("/{task_id}/status")
+async def update_task_status(
+    task_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update task status (called by temporal worker for real-time state sync)."""
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    new_status = body.get("status")
+    if not new_status:
+        raise HTTPException(status_code=400, detail="status is required")
+
+    try:
+        task.status = TaskStatus(new_status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {new_status}")
+
+    await db.commit()
+    await db.refresh(task)
+    return {"task_id": task_id, "status": task.status.value}
+
+
 @router.post("/{task_id}/fail")
 async def fail_task(
     task_id: str,

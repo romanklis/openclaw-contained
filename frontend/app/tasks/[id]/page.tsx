@@ -773,7 +773,10 @@ export default function TaskDetailPage() {
             <span className={`px-2 py-0.5 rounded text-xs font-medium ${
               timeline.task.status === 'completed' ? 'bg-green-900/60 text-green-300' :
               timeline.task.status === 'running'   ? 'bg-blue-900/60 text-blue-300' :
+              timeline.task.status === 'waiting_approval' ? 'bg-yellow-900/60 text-yellow-300' :
+              timeline.task.status === 'building_image' ? 'bg-indigo-900/60 text-indigo-300' :
               timeline.task.status === 'failed'    ? 'bg-red-900/60 text-red-300' :
+              timeline.task.status === 'paused'    ? 'bg-gray-900/60 text-gray-300' :
               'bg-gray-700 text-gray-300'
             }`}>
               {timeline.task.status}
@@ -874,6 +877,8 @@ export default function TaskDetailPage() {
                   <span className={`w-2 h-2 mt-1.5 rounded-full shrink-0 ${
                     st.status === 'completed' ? 'bg-green-400' :
                     st.status === 'running' ? 'bg-blue-400 animate-pulse' :
+                    st.status === 'waiting_approval' ? 'bg-yellow-400 animate-pulse' :
+                    st.status === 'building_image' ? 'bg-indigo-400 animate-pulse' :
                     st.status === 'failed' ? 'bg-red-400' :
                     st.status === 'paused' ? 'bg-yellow-400 animate-pulse' :
                     'bg-gray-500'
@@ -885,7 +890,9 @@ export default function TaskDetailPage() {
                       </span>
                       <span className="text-[10px] text-gray-500 font-mono">{st.id}</span>
                       <span className="capitalize text-[10px] text-gray-500">
-                        {st.status === 'paused' ? 'awaiting approval' : st.status}
+                        {st.status === 'waiting_approval' ? 'awaiting approval' :
+                         st.status === 'building_image' ? 'building image' :
+                         st.status === 'paused' ? 'awaiting approval' : st.status}
                       </span>
                     </div>
                     {st.has_pending_approval && st.capability_requests && (

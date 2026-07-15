@@ -186,11 +186,15 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
 
   useEffect(() => { fetchDag() }, [fetchDag])
 
-  // Auto-refresh while running
+  // Auto-refresh while running, and fetch once more when status changes from running
   useEffect(() => {
     if (dag?.status === 'running') {
       const interval = setInterval(fetchDag, 4000)
       return () => clearInterval(interval)
+    }
+    // When status changes from running -> completed/failed, do one final fetch
+    if (dag && dag.status !== 'running') {
+      fetchDag()
     }
   }, [dag?.status, fetchDag])
 

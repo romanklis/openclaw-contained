@@ -12,6 +12,8 @@ class TaskStatus(str, Enum):
     CREATED = "created"
     RUNNING = "running"
     PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
+    BUILDING_IMAGE = "building_image"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

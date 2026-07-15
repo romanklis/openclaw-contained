@@ -354,6 +354,13 @@ class AgentTaskWorkflow:
             iteration += 1
             iteration_started_at = workflow.now()
             
+            # Heartbeat: update task status to RUNNING at start of each iteration
+            await workflow.execute_activity(
+                update_task_status,
+                args=[task_id, "running"],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+
             logger.info(f"Task {task_id} iteration {iteration} with image {self.current_image}")
             
             # Execute agent step as a child workflow so every LLM turn
@@ -547,6 +554,13 @@ class AgentTaskWorkflow:
                 self.approval_received = False
                 self.capability_approved = False
 
+                # Update status: waiting for human approval
+                await workflow.execute_activity(
+                    update_task_status,
+                    args=[task_id, "waiting_approval"],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+
                 # Wait for approval signal (workflow pauses here)
                 await workflow.wait_condition(
                     lambda: self.approval_received,
@@ -554,6 +568,13 @@ class AgentTaskWorkflow:
                 )
 
                 if self.capability_approved:
+                    # Update status: building new agent image
+                    await workflow.execute_activity(
+                        update_task_status,
+                        args=[task_id, "building_image"],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+
                     await workflow.execute_activity(
                         add_to_supply_chain,
                         args=[task_id, capability, []],
@@ -576,6 +597,13 @@ class AgentTaskWorkflow:
                     supply_chain_feedback = build_result.get("feedback", "")
                     self.current_image = new_image
                     logger.info(f"Updated task image to {new_image}")
+
+                    # Update status: back to running after build
+                    await workflow.execute_activity(
+                        update_task_status,
+                        args=[task_id, "running"],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
 
                     if resource_name:
                         self._approved_capabilities.add(resource_name)
@@ -608,6 +636,13 @@ class AgentTaskWorkflow:
                         + f"CAPABILITY_DENIED: Your request for '{capability.get('resource', '')}' "
                         + "was denied by the operator. Find an alternative approach.\n"
                         + "--- END NOTICE ---"
+                    )
+
+                    # Update status: back to running after denial
+                    await workflow.execute_activity(
+                        update_task_status,
+                        args=[task_id, "running"],
+                        start_to_close_timeout=timedelta(seconds=15),
                     )
 
                 self.approval_received = False
@@ -1968,6 +2003,27 @@ async def update_task_policy(
         logger.error(f"❌ Failed to persist image for task {task_id}: {e}")
 
     return {"updated": True, "new_image": new_image}
+
+
+@activity.defn
+async def update_task_status(task_id: str, status: str) -> Dict[str, Any]:
+    """Update task status in control-plane DB for real-time frontend sync."""
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(
+                f"{control_plane_url}/api/tasks/{task_id}/status",
+                json={"status": status},
+            )
+            resp.raise_for_status()
+            logger.info(f"📊 TASK_STATUS_UPDATED | Task: {task_id} | Status: {status}")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to update task status for {task_id}: {e}")
+    
+    return {"updated": True, "status": status}
 
 
 @activity.defn
@@ -4487,6 +4543,7 @@ async def main():
             evaluate_edge_condition,
             finalize_dag,
             persist_task_workflow_id,
+            update_task_status,
         ],
     )
     
