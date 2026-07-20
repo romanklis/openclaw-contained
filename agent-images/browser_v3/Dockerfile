@@ -32,6 +32,7 @@ WORKDIR /workspace
 USER agent
 
 ENV OPENCLAW_IMAGE_TYPE=browser_v3
+ENV OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`curl\`, \`git\`\n- \`lightpanda\` CLI at /usr/local/bin/lightpanda (fast headless browser)\n- \`agent-browser\` and Chromium available as fallback\n- Browser-ready runtime with shared libraries"
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD python -c "import sys; sys.exit(0)"

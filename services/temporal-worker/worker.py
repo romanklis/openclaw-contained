@@ -1364,7 +1364,9 @@ async def collect_agent_result(
                         _candidate = None
                         for row in _requests or []:
                             row_status = (row.get("status") or "").lower()
-                            if row_status in {"pending", "approved", "modified"}:
+                            # Only consider PENDING as active capability request.
+                            # "approved"/"modified" are already resolved and should not re-trigger.
+                            if row_status == "pending":
                                 _candidate = row
                                 break
                         if _candidate:
@@ -2845,8 +2847,8 @@ async def update_node_status(
             json=payload,
         )
         if resp.status_code not in (200, 204):
-            logger.warning(f"⚠️ Failed to update node {node_id} status: {resp.status_code}")
-            return False
+            logger.error(f"❌ update_node_status failed for {dag_id}/{node_id}: status={resp.status_code}, body={resp.text}")
+        resp.raise_for_status()
         return True
 
 
@@ -2862,8 +2864,8 @@ async def update_dag_status(dag_id: str, status: str) -> bool:
             json={"status": status},
         )
         if resp.status_code not in (200, 204):
-            logger.warning(f"⚠️ Failed to update DAG {dag_id} status: {resp.status_code}")
-            return False
+            logger.error(f"❌ update_dag_status failed for {dag_id}: status={resp.status_code}, body={resp.text}")
+        resp.raise_for_status()
         return True
 
 
@@ -3245,10 +3247,30 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
             result["error"] = latest.get("error")
             result["deliverables"] = latest.get("deliverables")
             result["deliverables_keys"] = latest.get("deliverables_keys")
-            result["raw_result"] = latest.get("raw_result")
-            result["parse_error"] = bool((latest.get("raw_result") or {}).get("parse_error"))
+            # Add output_path for downstream input mappings (e.g., "fetch-investor-pdf.output_path")
+            deliverables = latest.get("deliverables") or {}
+            if deliverables:
+                # Prefer non-script PDF files (actual data outputs like latest_report.pdf over fetch_report.py)
+                pdf_files = [k for k in deliverables.keys() if k.lower().endswith('.pdf')]
+                # Filter out Python script files that happen to be named *.pdf.py or similar
+                data_pdfs = [k for k in pdf_files if not k.endswith('.py')]
+                if data_pdfs:
+                    result["output_path"] = data_pdfs[0]
+                elif pdf_files:
+                    result["output_path"] = pdf_files[0]
+                else:
+                    # Prefer non-Python files as primary output
+                    non_py = [k for k in deliverables.keys() if not k.endswith('.py')]
+                    if non_py:
+                        result["output_path"] = sorted(non_py)[0]
+                    else:
+                        result["output_path"] = sorted(deliverables.keys())[0]
+            # Don't include full raw_result - it can be huge (base64 PDFs, full LLM responses)
+            # Useful fields are already extracted above
+            raw = latest.get("raw_result") or {}
+            result["parse_error"] = bool(raw.get("parse_error"))
             result["iteration"] = latest.get("iteration")
-            result["workspace_step_path"] = latest.get("raw_result", {}).get("workspace_step_path")
+            result["workspace_step_path"] = raw.get("workspace_step_path")
             result["acquisition_log"] = _extract_acquisition_log(result["agent_logs"])
             result["compact_summary"] = _build_compact_step_summary(result)
 
@@ -3477,7 +3499,10 @@ async def finalize_dag(dag_id: str, status: str) -> bool:
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return resp.status_code in (200, 204)
+        if resp.status_code not in (200, 204):
+            logger.error(f"❌ finalize_dag failed for {dag_id}: status={resp.status_code}, body={resp.text}")
+        resp.raise_for_status()
+        return True
 
 
 @activity.defn
@@ -4196,6 +4221,8 @@ class DAGWorkflow:
                                     source_value = _extract_task_output_text(source_value)
                                 elif isinstance(source_value, dict) and source_field in source_value:
                                     source_value = source_value.get(source_field)
+                                elif isinstance(source_value, dict) and source_value.get("deliverables") and source_field in source_value["deliverables"]:
+                                    source_value = source_value["deliverables"][source_field]
                                 else:
                                     source_value = None
 
@@ -4329,7 +4356,9 @@ class DAGWorkflow:
                 )
 
                 node_config = dict(node_info.get("config", {}))
-                if dag_current_image:
+                generic_base_images = {"openclaw", "nanobot", "taskforge"}
+                node_base = node_config.get("base_image", "openclaw")
+                if node_base in generic_base_images and dag_current_image:
                     node_config["dag_image"] = dag_current_image
 
                 child_params = {

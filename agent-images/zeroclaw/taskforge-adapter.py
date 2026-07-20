@@ -32,6 +32,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:4b")
 LLM_ROUTER_URL = os.getenv("LLM_ROUTER_URL", f"{CONTROL_PLANE_URL}/api/llm")
 IMAGE_TYPE = os.getenv("OPENCLAW_IMAGE_TYPE", "nanobot")
 
+# Runtime description can be overridden via OPENCLAW_RUNTIME_DESCRIPTION env var
+# (set in each image's Dockerfile). Falls back to get_runtime_description().
+RUNTIME_DESCRIPTION_OVERRIDE = os.getenv("OPENCLAW_RUNTIME_DESCRIPTION")
+
 MAX_TURNS = int(os.getenv("MAX_AGENT_TURNS", "30"))
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "60"))
 
@@ -229,6 +233,9 @@ def request_capability(capability_type: str, packages: List[str], justification:
 
 def get_runtime_description() -> str:
     """Return the pre-installed packages description for this image type."""
+    # Allow override via OPENCLAW_RUNTIME_DESCRIPTION env var (set in Dockerfile)
+    if RUNTIME_DESCRIPTION_OVERRIDE:
+        return RUNTIME_DESCRIPTION_OVERRIDE
     if IMAGE_TYPE == "nanobot":
         return (
             "- Python 3.11 (Alpine, standard library)\n"
@@ -246,12 +253,71 @@ def get_runtime_description() -> str:
             "- `curl`, `git`\n"
             "- Rust toolchain available at /opt/openclaw/zeroclaw-agent\n"
         )
+    elif IMAGE_TYPE == "browser_v2":
+        return (
+            "- Python 3 (Debian, standard library)\n"
+            "- `httpx` (HTTP client)\n"
+            "- `curl`, `git`\n"
+            "- `obscura` and `obscura-worker` for stealth browser automation\n"
+            "- Browser-ready runtime inherited from the browser image\n"
+        )
+    elif IMAGE_TYPE == "browser_v3":
+        return (
+            "- Python 3 (Debian, standard library)\n"
+            "- `httpx` (HTTP client)\n"
+            "- `curl`, `git`\n"
+            "- `lightpanda` CLI at /usr/local/bin/lightpanda (fast headless browser)\n"
+            "- `agent-browser` and Chromium available as fallback\n"
+            "- Browser-ready runtime with shared libraries\n"
+        )
+    elif IMAGE_TYPE == "browser":
+        return (
+            "- Python 3 (Debian, standard library)\n"
+            "- `httpx` (HTTP client)\n"
+            "- `curl`, `git`\n"
+            "- `agent-browser` for browser automation\n"
+            "- Browser-ready runtime with Chromium and shared libraries\n"
+        )
     else:
         return (
             "- Python 3 (standard library)\n"
             "- `httpx` (HTTP client)\n"
             "- `curl`, `git`\n"
         )
+
+
+def get_image_specific_guidance() -> str:
+    """Return extra workflow guidance tailored to the active image type."""
+    if IMAGE_TYPE == "browser_v2":
+        return (
+            "## Browser V2 Workflow\n\n"
+            "Use the browser_v2 toolchain deliberately:\n"
+            "- Prefer `obscura fetch --stealth <url>` for dynamic or protected pages.\n"
+            "- Use Obscura first to discover the real report/document URLs from investor sites.\n"
+            "- Once you have the direct PDF or HTML URLs, use `curl -L -o <file>` to download the source files.\n"
+            "- Prefer `curl` for binary artifacts such as PDFs. Do NOT rely on Obscura stdout as a binary downloader.\n"
+            "- For HTML pages, use Obscura `--eval` or `--dump text` to extract readable content.\n"
+            "- For PDF analysis, first download the PDF to `/workspace`, then use local CLI tools or Python code to extract text.\n"
+            "- Unless the task explicitly requires it, do NOT use `agent-browser` on browser_v2; Obscura plus direct downloads is the default path.\n"
+        )
+    if IMAGE_TYPE == "browser_v3":
+        return (
+            "## Browser V3 Workflow (Lightpanda)\n\n"
+            "Lightpanda is a fast, low-memory headless browser. Use it as your primary browsing tool.\n"
+            "- Fetch and render pages: `lightpanda fetch <url>` — outputs rendered HTML to stdout.\n"
+            "- Pipe output to extract links: `lightpanda fetch <url> | grep -oP 'href=\"\\K[^\"]+\\.pdf'`\n"
+            "- For JavaScript-heavy sites, Lightpanda executes JS during render.\n"
+            "- Once you have a direct PDF URL, download it with `curl -L -o /workspace/file.pdf <url>`.\n"
+            "- If Lightpanda cannot render a page (exit non-zero or empty output), fall back to `curl -L` or `agent-browser`.\n"
+            "- Always validate that the URLs returned are absolute (start with http:// or https://). Resolve relative URLs against the base page URL.\n"
+        )
+    if IMAGE_TYPE == "browser":
+        return (
+            "## Browser Workflow\n\n"
+            "Use browser automation only when a normal HTTP fetch is insufficient.\n"
+            "For direct PDFs or static assets, prefer `curl -L -o <file>` over browser tooling.\n"
+        )
+    return ""
 
 
 def setup_workspace_context():
@@ -272,6 +338,7 @@ def setup_workspace_context():
         )
 
     runtime_desc = get_runtime_description()
+    image_guidance = get_image_specific_guidance()
 
     agents_md = f"""# AGENTS.md — Managed Execution Environment
 
@@ -297,6 +364,7 @@ You cannot install packages yourself (`pip install`, `apt-get`, etc. will fail).
 Already available — do NOT request these:
 {runtime_desc}
 {installed_packages_section}
+{image_guidance}
 
 ### How to request a missing package
 
@@ -571,7 +639,7 @@ def build_system_prompt() -> str:
     return "\n".join(parts)
 
 
-def invoke_native_agent(prompt: str) -> Tuple[str, int]:
+def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
     """Run a native agentic tool-use loop against the LLM router.
 
     This replaces invoke_openclaw_agent() but produces identical output
@@ -592,6 +660,7 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
     ]
 
     all_output_parts: List[str] = []
+    assistant_text_parts: List[str] = []
     turn = 0
 
     print(f"   🔗 LLM endpoint: {completions_url}")
@@ -647,6 +716,7 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
                 if content:
                     print(f"   💬 Assistant: {content[:200]}{'...' if len(content) > 200 else ''}")
                     all_output_parts.append(content)
+                    assistant_text_parts.append(content)
 
                     # Check for capability/deployment markers in text
                     if "CAPABILITY_REQUEST:" in content or "DEPLOYMENT_REQUEST:" in content:
@@ -690,13 +760,19 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int]:
                     })
 
         combined = "\n".join(all_output_parts)
-        return combined, 0
+        agent_output = ""
+        if assistant_text_parts:
+            agent_output = json.dumps(
+                {"payloads": [{"text": text} for text in assistant_text_parts]},
+                ensure_ascii=False,
+            )
+        return combined, 0, agent_output
 
     except Exception as e:
         error = f"Agent loop error: {e}\n{traceback.format_exc()}"
         print(f"   ❌ {error}")
         all_output_parts.append(error)
-        return "\n".join(all_output_parts), 1
+        return "\n".join(all_output_parts), 1, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1059,7 +1135,7 @@ def main():
 
     # Invoke native agent loop
     print(f"\n🚀 Invoking {name} native agent loop...")
-    output, exit_code = invoke_native_agent(prompt)
+    output, exit_code, agent_output = invoke_native_agent(prompt)
 
     print("\n" + "=" * 80)
     print(f"📊 {name} OUTPUT")
@@ -1074,7 +1150,7 @@ def main():
     result: Dict[str, Any] = {
         "completed": False,
         "capability_requested": False,
-        "output": output[:50000],
+        "output": agent_output[:50000] if agent_output else output[:50000],
         "agent_logs": output[:50000],
     }
 
@@ -1122,6 +1198,14 @@ def main():
 
     # Check for capability requests (only if no deployment request)
     cap = parse_capability_request(output)
+    # Guard against stale heuristic hits: the agent may probe imports/tools
+    # early in a run (e.g. require('agent-browser')) and later complete
+    # successfully using the correct CLI path. In that case, do not create
+    # a capability request from fallback ModuleNotFoundError parsing.
+    if cap and exit_code == 0 and cap[2] == "ModuleNotFoundError detected":
+        print("\n⚠️ Ignoring stale ModuleNotFoundError capability signal because task exited successfully")
+        cap = None
+
     if cap:
         cap_type, packages, cap_reason = cap
         print(f"\n🔐 Capability needed: {cap_type} → {packages}")

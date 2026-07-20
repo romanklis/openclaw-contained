@@ -10,7 +10,7 @@ LABEL image_type="browser_v4"
 
 USER root
 
-# Ensure agent user exists
+# Ensure agent user exists (base image may not have it in registry)
 RUN if ! id -u agent >/dev/null 2>&1; then \
         groupadd -g 1001 agent && \
         useradd -u 1001 -g agent -m -s /bin/bash agent; \
@@ -79,6 +79,7 @@ ENV HOME=/home/agent
 ENV XDG_CACHE_HOME=/home/agent/.cache
 ENV OPENCLAW_IMAGE_TYPE=browser_v4
 ENV DBUS_SESSION_BUS_ADDRESS=/dev/null
+ENV OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`curl\`, \`git\`\n- Camoufox (Firefox-based stealth browser) with GeoIP\n- \`curl_cffi\` for TLS fingerprinting\n- Web processing: beautifulsoup4, lxml, html5lib, cssselect, pyquery\n- Content extraction: readability-lxml, trafilatura, newspaper3k, goose3, extruct\n- \`scrapy\`, \`feedparser\`, \`w3lib\`, \`fake-useragent`"
 
 WORKDIR /workspace
 

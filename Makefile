@@ -170,7 +170,7 @@ build-browser-v4: ## Build Browser v4 image (Chromium + agent-browser + Lightpan
 	@echo "  ✅  openclaw-agent:browser_v4 built & pushed"
 
 
-build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 ## Build all 8 agent base images
+build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 ## Build all 8 agent base images
 	@echo ""
 	@echo "  ✅  All agent base images built & pushed to registry:"
 	@echo "      openclaw-agent:openclaw  (Full Python)"

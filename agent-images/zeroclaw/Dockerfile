@@ -80,7 +80,8 @@ ENV OPENCLAW_WORKSPACE=/workspace \
     OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001 \
     OPENCLAW_IMAGE_TYPE=zeroclaw \
     RUST_LOG=info \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`pydantic\` (data validation)\n- \`requests\`, \`structlog\`, \`pytest\`\n- \`curl\`, \`git\`\n- Rust toolchain available at /opt/openclaw/zeroclaw-agent\n- Node.js for npm package support"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \

@@ -32,6 +32,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:4b")
 LLM_ROUTER_URL = os.getenv("LLM_ROUTER_URL", f"{CONTROL_PLANE_URL}/api/llm")
 IMAGE_TYPE = os.getenv("OPENCLAW_IMAGE_TYPE", "nanobot")
 
+# Runtime description can be overridden via OPENCLAW_RUNTIME_DESCRIPTION env var
+# (set in each image's Dockerfile). Falls back to get_runtime_description().
+RUNTIME_DESCRIPTION_OVERRIDE = os.getenv("OPENCLAW_RUNTIME_DESCRIPTION")
+
 MAX_TURNS = int(os.getenv("MAX_AGENT_TURNS", "30"))
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "60"))
 
@@ -229,6 +233,9 @@ def request_capability(capability_type: str, packages: List[str], justification:
 
 def get_runtime_description() -> str:
     """Return the pre-installed packages description for this image type."""
+    # Allow override via OPENCLAW_RUNTIME_DESCRIPTION env var (set in Dockerfile)
+    if RUNTIME_DESCRIPTION_OVERRIDE:
+        return RUNTIME_DESCRIPTION_OVERRIDE
     if IMAGE_TYPE == "nanobot":
         return (
             "- Python 3.11 (Alpine, standard library)\n"

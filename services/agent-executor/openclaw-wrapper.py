@@ -791,8 +791,8 @@ def collect_workspace_files(node_id: str | None = None, segregate_steps: bool = 
     SKIP_FILES = {"result.json", "AGENTS.md", "SOUL.md", "TOOLS.md",
                   "IDENTITY.md", "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md",
                   "package-lock.json", "step_manifest.json"}
-    MAX_FILE_SIZE = 500_000    # 500 KB per file
-    MAX_TOTAL = 2_000_000      # 2 MB total (base64 inflates ~33%)
+    MAX_FILE_SIZE = 100_000_000   # 100 MB per file (allows large PDFs)
+    MAX_TOTAL = 200_000_000      # 200 MB total
     collected: Dict[str, str] = {}
     total_size = 0
 

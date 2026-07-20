@@ -12,6 +12,12 @@ LABEL image_type="octaveclaw"
 
 USER root
 
+# Ensure agent user exists (base image may not have it in registry)
+RUN if ! id -u agent >/dev/null 2>&1; then \
+        groupadd -g 1001 agent && \
+        useradd -u 1001 -g agent -m -s /bin/bash agent; \
+    fi
+
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
@@ -47,15 +53,22 @@ RUN pip install --no-cache-dir \
 RUN octave --quiet --eval "pkg load financial; pkg load econometrics; pkg load statistics; pkg load tsa; pkg load io; pkg load sockets; pkg load cgi; pkg load jsonlab; disp('octaveclaw package check: OK')"
 
 # Validate Python web stack is available at build time.
-RUN python -c "import flask, flask_cors, requests; print('octaveclaw python web stack check: OK')"
+RUN python3 -c "import flask, flask_cors, requests; print('octaveclaw python web stack check: OK')"
 
 WORKDIR /workspace
 USER agent
 
-ENV OPENCLAW_IMAGE_TYPE=octaveclaw
-ENV QT_QPA_PLATFORM=offscreen
-ENV GNUTERM=dumb
-ENV OCTAVE_DEFAULT_PLOT_TOOLKIT=gnuplot
+# Copy TaskForge adapter for native agentic loop
+COPY taskforge-adapter.py /opt/openclaw/taskforge-adapter.py
+
+ENV OPENCLAW_IMAGE_TYPE=octaveclaw \
+    QT_QPA_PLATFORM=offscreen \
+    GNUTERM=dumb \
+    OCTAVE_DEFAULT_PLOT_TOOLKIT=gnuplot \
+    OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`flask\`, \`flask-cors\`, \`gunicorn\`, \`requests\` (web framework)\n- GNU Octave with packages: financial, econometrics, statistics, tsa, io, sockets, cgi, jsonlab, control, dataframe, optim, signal, parallel\n- \`gnuplot\` for plotting\n- \`curl\`, \`git\`"
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD python -c "import sys; sys.exit(0)"
+
+# Use TaskForge adapter instead of openclaw-wrapper
+ENTRYPOINT ["python3", "/opt/openclaw/taskforge-adapter.py"]

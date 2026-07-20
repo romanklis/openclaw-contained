@@ -675,6 +675,59 @@ export default function TaskDetailPage() {
     }
   };
 
+  const getStatusBadge = (status: string) => {
+    switch (status) {
+      case 'waiting_approval':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-yellow-900/60 text-yellow-300 border border-yellow-500/40 text-xs font-medium">
+            ⏳ Waiting for Approval
+          </span>
+        );
+      case 'building_image':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-indigo-900/60 text-indigo-300 border border-indigo-500/40 text-xs font-medium animate-pulse">
+            🔨 Building Image
+          </span>
+        );
+      case 'running':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-blue-900/60 text-blue-300 border border-blue-500/40 text-xs font-medium animate-pulse">
+            ▶ Running
+          </span>
+        );
+      case 'completed':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-green-900/60 text-green-300 border border-green-500/40 text-xs font-medium">
+            ✓ Completed
+          </span>
+        );
+      case 'failed':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-red-900/60 text-red-300 border border-red-500/40 text-xs font-medium">
+            ✗ Failed
+          </span>
+        );
+      case 'paused':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-gray-700 text-gray-300 border border-gray-500/40 text-xs font-medium">
+            ⏸ Paused
+          </span>
+        );
+      case 'created':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-gray-800 text-gray-400 border border-gray-600 text-xs font-medium">
+            📝 Created
+          </span>
+        );
+      default:
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-gray-700 text-gray-400 border border-gray-500 text-xs font-medium">
+            {status}
+          </span>
+        );
+    }
+  };
+
   const extractLlmPreview = (o: TaskOutput): string | null => {
     if (o.llm_response_preview) return o.llm_response_preview;
     if (!o.output) return null;
@@ -1014,7 +1067,7 @@ export default function TaskDetailPage() {
             <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-center">
               <div className="bg-gray-800/50 rounded p-3">
                 <div className="text-xs text-gray-500 uppercase tracking-wider">Status</div>
-                <div className="text-lg font-bold mt-1">{currentState.status || timeline.task.status}</div>
+                <div className="mt-1">{getStatusBadge(currentState.status || timeline.task.status)}</div>
               </div>
               <div className="bg-gray-800/50 rounded p-3">
                 <div className="text-xs text-gray-500 uppercase tracking-wider">Iterations</div>

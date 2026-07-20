@@ -21,6 +21,12 @@ LABEL image_type="browser"
 
 USER root
 
+# Ensure agent user exists (base image may not have it in registry)
+RUN if ! id -u agent >/dev/null 2>&1; then \
+        groupadd -g 1001 agent && \
+        useradd -u 1001 -g agent -m -s /bin/bash agent; \
+    fi
+
 # Install Chromium and all shared libraries required by headless Chrome
 RUN apt-get update && apt-get install -y \
     chromium \
@@ -69,6 +75,7 @@ WORKDIR /workspace
 USER agent
 
 ENV OPENCLAW_IMAGE_TYPE=browser
+ENV OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`curl\`, \`git\`\n- \`agent-browser\` for browser automation\n- Chromium at /usr/bin/chromium with all required shared libraries\n- \`puppeteer\` with system Chromium\n- Browser-ready runtime with Chromium and shared libraries"
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD python -c "import sys; sys.exit(0)"

@@ -634,7 +634,19 @@ async def patch_dag(dag_id: str, payload: dict, db: AsyncSession = Depends(get_d
     if "status" in payload:
         dag.status = DAGStatus(payload["status"])
     if "completed_at" in payload:
-        dag.completed_at = datetime.fromisoformat(payload["completed_at"])
+        # Handle ISO format with timezone (e.g., "2026-07-16T21:02:20.123456+00:00")
+        # Convert to offset-naive UTC for DB storage
+        completed_at_str = payload["completed_at"]
+        try:
+            dt = datetime.fromisoformat(completed_at_str.replace('Z', '+00:00'))
+            # If offset-aware, convert to UTC and strip timezone
+            if dt.tzinfo is not None:
+                dt = dt.utctimetuple()
+                dt = datetime(*dt[:6])
+            dag.completed_at = dt
+        except ValueError:
+            # Fallback: parse without timezone, assume UTC
+            dag.completed_at = datetime.fromisoformat(completed_at_str.split('.')[0])
     await db.commit()
     return {"ok": True}
 

@@ -35,6 +35,7 @@ WORKDIR /workspace
 USER agent
 
 ENV OPENCLAW_IMAGE_TYPE=browser_v2
+ENV OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`curl\`, \`git\`\n- \`obscura\` and \`obscura-worker\` for stealth browser automation\n- Browser-ready runtime inherited from the browser image\n- Chromium at /usr/bin/chromium with all required shared libraries"
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD python -c "import sys; sys.exit(0)"
