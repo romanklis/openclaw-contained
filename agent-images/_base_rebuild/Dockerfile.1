@@ -3,7 +3,7 @@ FROM python:3.11-slim
 
 # Build metadata
 LABEL task_id="_base_rebuild"
-LABEL build_id="476fc6e8"
+LABEL build_id="1475dcaf"
 LABEL capabilities=""
 LABEL image_type="openclaw"
 
