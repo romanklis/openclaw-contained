@@ -104,6 +104,15 @@ export default function SkillStudioPage() {
   const [newSkillTags, setNewSkillTags] = useState('')
   const [createSubmitting, setCreateSubmitting] = useState(false)
 
+  // Skill edit modal
+  const [editingSkill, setEditingSkill] = useState<SkillV2 | null>(null)
+  const [editName, setEditName] = useState('')
+  const [editDescription, setEditDescription] = useState('')
+  const [editInstructions, setEditInstructions] = useState('')
+  const [editTags, setEditTags] = useState('')
+  const [editSubmitting, setEditSubmitting] = useState(false)
+  const [editError, setEditError] = useState<string | null>(null)
+
   // Load images on mount
   useEffect(() => {
     fetch(`${API}/api/agent-images`)
@@ -235,6 +244,37 @@ async function loadDemos() {
     } catch (e: any) { setError(e.message) } finally { setCreateSubmitting(false) }
   }
 
+  const openEditor = (skill: SkillV2) => {
+    setEditingSkill(skill)
+    setEditName(skill.name)
+    setEditDescription(skill.description || '')
+    setEditInstructions(skill.instructions || '')
+    setEditTags((skill.tags || []).join(', '))
+    setEditError(null)
+  }
+
+  async function handleEditSave() {
+    if (!editingSkill) return
+    setEditSubmitting(true)
+    setEditError(null)
+    try {
+      const r = await fetch(`${API}/api/skill-learning/skills/${editingSkill.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: editName.trim() || undefined,
+          description: editDescription.trim() || undefined,
+          instructions: editInstructions.trim() || undefined,
+          tags: editTags.split(',').map(t => t.trim()).filter(Boolean),
+        }),
+      })
+      if (!r.ok) throw new Error(await r.text())
+      setEditingSkill(null)
+      loadTree()
+      if (tab === 'review-queue') loadReviewQueue()
+    } catch (e: any) { setEditError(e.message) } finally { setEditSubmitting(false) }
+  }
+
   async function mineFromTask(taskId: string) {
     try {
       const r = await fetch(`${API}/api/skill-learning/mine`, {
@@ -333,7 +373,7 @@ async function loadDemos() {
                   setReviewingSkill(skill)
                   setEditedInstructions(skill.instructions)
                   setTab('review-queue')
-                }} />
+                }} onEdit={() => openEditor(skill)} onDelete={handleDelete} />
               ))}
             </div>
           )}
@@ -557,13 +597,71 @@ async function loadDemos() {
           </div>
         </div>
       )}
+      {editingSkill && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-lg p-6 space-y-4">
+            <h2 className="text-lg font-bold">Edit Skill</h2>
+            <div>
+              <label className="text-sm text-gray-400 block mb-1">Name *</label>
+              <input
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-white"
+                value={editName}
+                onChange={e => setEditName(e.target.value)}
+                placeholder="e.g. Download PDF with Playwright"
+              />
+            </div>
+            <div>
+              <label className="text-sm text-gray-400 block mb-1">Description</label>
+              <input
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-white"
+                value={editDescription}
+                onChange={e => setEditDescription(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="text-sm text-gray-400 block mb-1">Instructions (injected at agent start)</label>
+              <textarea
+                className="w-full bg-gray-800 border border-gray-700 rounded p-3 text-sm text-white resize-none h-32"
+                value={editInstructions}
+                onChange={e => setEditInstructions(e.target.value)}
+                placeholder="Step-by-step instructions for the agent…"
+              />
+            </div>
+            <div>
+              <label className="text-sm text-gray-400 block mb-1">Tags (comma separated)</label>
+              <input
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-white"
+                value={editTags}
+                onChange={e => setEditTags(e.target.value)}
+                placeholder="browser, pdf, download"
+              />
+            </div>
+            {editError && (
+              <div className="bg-red-900/40 border border-red-700 rounded text-red-300 text-sm p-3">
+                {editError}
+              </div>
+            )}
+            <div className="flex gap-3 pt-2">
+              <button
+                disabled={editSubmitting || !editName.trim()}
+                onClick={handleEditSave}
+                className="px-5 py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium disabled:opacity-50"
+              >{editSubmitting ? 'Saving…' : 'Save Changes'}</button>
+              <button
+                onClick={() => setEditingSkill(null)}
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+              >Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
 // ── SkillCard component ───────────────────────────────────────────────────────
 
-function SkillCard({ skill, onReview, onDelete }: { skill: SkillV2; onReview: () => void; onDelete?: (id: string) => void }) {
+function SkillCard({ skill, onReview, onEdit, onDelete }: { skill: SkillV2; onReview: () => void; onEdit: () => void; onDelete?: (id: string) => void }) {
   const [expanded, setExpanded] = useState(false)
 
   return (
@@ -577,6 +675,12 @@ function SkillCard({ skill, onReview, onDelete }: { skill: SkillV2; onReview: ()
         </button>
         <div className="flex items-center gap-2 flex-shrink-0 ml-4">
           {statusBadge(skill.status)}
+          <button
+            onClick={onEdit}
+            className="px-2 py-0.5 bg-blue-800 hover:bg-blue-700 rounded text-xs font-medium"
+          >
+            Edit
+          </button>
           {skill.status === 'draft' && (
             <>
               <button
