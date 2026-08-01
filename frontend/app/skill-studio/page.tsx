@@ -154,15 +154,20 @@ export default function SkillStudioPage() {
   }
 
   async function handleDelete(skillId: string) {
-  if (!window.confirm('Are you sure you want to remove this skill?')) return;
+  if (!window.confirm('Are you sure you want to archive this skill?')) return;
   
-  fetch(`/api/skills/${skillId}`, { method: 'DELETE' })
-    .then(response => {
-      if (response.ok) {
-        loadTree(); // Refresh skills list
-      }
-    })
-    .catch(error => console.error('Error deleting skill:', error));
+  try {
+    const response = await fetch(`${API}/api/skill-learning/skills/${skillId}`, { method: 'DELETE' });
+    if (response.ok) {
+      loadTree();
+      if (tab === 'review-queue') loadReviewQueue();
+    } else {
+      const error = await response.json().catch(() => ({ detail: `HTTP ${response.status}` }));
+      setError(error.detail || 'Failed to archive skill');
+    }
+  } catch (error) {
+    setError('Error archiving skill: ' + (error instanceof Error ? error.message : String(error)));
+  }
 }
 
 async function loadDemos() {
@@ -681,23 +686,21 @@ function SkillCard({ skill, onReview, onEdit, onDelete }: { skill: SkillV2; onRe
           >
             Edit
           </button>
+          {onDelete && (
+            <button
+              onClick={() => onDelete(skill.id)}
+              className="px-2 py-0.5 bg-red-800 hover:bg-red-700 rounded text-xs font-medium"
+            >
+              Archive
+            </button>
+          )}
           {skill.status === 'draft' && (
-            <>
-              <button
-                onClick={onReview}
-                className="px-2 py-0.5 bg-yellow-800 hover:bg-yellow-700 rounded text-xs font-medium"
-              >
-                Review
-              </button>
-              {onDelete && (
-                <button
-                  onClick={() => onDelete(skill.id)}
-                  className="px-2 py-0.5 bg-red-800 hover:bg-red-700 rounded text-xs font-medium"
-                >
-                  Remove
-                </button>
-              )}
-            </>
+            <button
+              onClick={onReview}
+              className="px-2 py-0.5 bg-yellow-800 hover:bg-yellow-700 rounded text-xs font-medium"
+            >
+              Review
+            </button>
           )}
         </div>
       </div>

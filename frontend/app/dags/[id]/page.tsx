@@ -161,6 +161,10 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [enhanceGuidance, setEnhanceGuidance] = useState('')
   const [enhanceSplitCount, setEnhanceSplitCount] = useState(2)
 
+  // Skill extraction state
+  const [miningSkill, setMiningSkill] = useState(false)
+  const [mineResult, setMineResult] = useState<string | null>(null)
+
   // Per-node task data cache
   const [nodeTaskData, setNodeTaskData] = useState<Record<string, {
     timeline: any
@@ -549,6 +553,72 @@ setNodeState(prev => {
     }
   }
 
+  const downloadAuditLogs = async (taskId: string) => {
+    try {
+      // Use the new dedicated export endpoint for complete data
+      const res = await fetch(`${API}/api/tasks/${taskId}/audit-logs/export`)
+      if (!res.ok) throw new Error('Failed to fetch audit logs')
+      const data = await res.json()
+
+      // Create downloadable JSON
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `audit-logs-${taskId}-${Date.now()}.json`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      alert(`Download failed: ${(e as Error).message}`)
+    }
+  }
+
+  const downloadAuditSummary = async (taskId: string) => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/audit-logs/summary`)
+      if (!res.ok) throw new Error("Failed to fetch audit summary")
+      const data = await res.json()
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `audit-summary-${taskId}-${Date.now()}.json`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      alert(`Download failed: ${(e as Error).message}`)
+    }
+  }
+
+  const examineAndLearnSkill = async (taskId: string, nodeId: string) => {
+    setMiningSkill(true)
+    setMineResult(null)
+    try {
+      // Call existing mine endpoint with node/DAG context
+      const res = await fetch(`${API}/api/skill-learning/mine`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_id: taskId,
+          node_id: nodeId,
+          dag_id: dag?.id,
+          created_by: 'dag-review',
+        }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const demo = await res.json()
+      setMineResult(`✅ Demo ${demo.id} created — extracted procedure available`)
+    } catch (e: any) {
+      setMineResult(`❌ Error: ${e.message}`)
+    } finally {
+      setMiningSkill(false)
+    }
+  }
+
   const getWorkflowLink = (workflowId: string) =>
     `${TEMPORAL_UI}/namespaces/default/workflows/${encodeURIComponent(workflowId)}`
 
@@ -560,7 +630,17 @@ setNodeState(prev => {
 const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
    const selectedNodeAcceptance = selectedNode ? nodeAcceptance[selectedNode.node_id] : null
    const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
-  const nodeActionsAllowed = !!(selectedNode && (dag?.status === 'failed' || dag?.status === 'ready'))
+  // Read actions (download logs, examine logs) allowed on completed/failed/ready DAGs
+  const nodeReadActionsAllowed = !!(
+    selectedNode &&
+    (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'completed')
+  )
+  // Write actions (delete, enhance, retry) only on failed/ready DAGs
+  const nodeWriteActionsAllowed = !!(
+    selectedNode && (dag?.status === 'failed' || dag?.status === 'ready')
+  )
+  // Legacy alias for backward compat (used in some places)
+  const nodeActionsAllowed = nodeWriteActionsAllowed
 
   if (error) return <div className="text-red-400 p-8">Error: {error}</div>
   if (!dag) return <div className="text-gray-500 p-8">Loading...</div>
@@ -785,6 +865,109 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   )}
                 </div>
               )}
+              {/* Read-only actions available on completed/failed/ready DAGs */}
+              {selectedNode.task_id && nodeReadActionsAllowed && !nodeWriteActionsAllowed && (
+                <div className="relative">
+                  <button
+                    onClick={() => setShowNodeActions(v => !v)}
+                    disabled={nodeActionLoading}
+                    className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
+                    title="Step actions"
+                  >
+                    Actions ▾
+                  </button>
+                  {showNodeActions && (
+                    <div className="absolute right-0 mt-1 w-64 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
+                      <button
+                        onClick={() => downloadAuditLogs(selectedNode.task_id!)}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        📥 Download Execution Logs
+                      </button>
+                      <button
+                        onClick={() => downloadAuditSummary(selectedNode.task_id!)}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        📋 Download Summary
+                      </button>
+                      <button
+                        onClick={() => examineAndLearnSkill(selectedNode.task_id!, selectedNode.node_id)}
+                        disabled={nodeActionLoading || miningSkill}
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🧠 Examine Logs → Learn Skill
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* Read-write actions on failed/ready DAGs (both read and write) */}
+              {selectedNode.task_id && nodeWriteActionsAllowed && (
+                <div className="relative">
+                  <button
+                    onClick={() => setShowNodeActions(v => !v)}
+                    disabled={nodeActionLoading}
+                    className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
+                    title="Step actions"
+                  >
+                    Actions ▾
+                  </button>
+                  {showNodeActions && (
+                    <div className="absolute right-0 mt-1 w-64 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
+                      <button
+                        onClick={() => downloadAuditLogs(selectedNode.task_id!)}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        📥 Download Execution Logs
+                      </button>
+                      <button
+                        onClick={() => downloadAuditSummary(selectedNode.task_id!)}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        📋 Download Summary
+                      </button>
+                      <button
+                        onClick={() => examineAndLearnSkill(selectedNode.task_id!, selectedNode.node_id)}
+                        disabled={nodeActionLoading || miningSkill}
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🧠 Examine Logs → Learn Skill
+                      </button>
+                      <div className="border-t border-gray-700 my-1" />
+                      <button
+                        onClick={() => {
+                          setShowNodeActions(false)
+                          setShowEnhanceDialog(true)
+                        }}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ✨ Enhance Step
+                      </button>
+                      <button
+                        onClick={deleteSelectedNode}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-red-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🗑 Delete Step
+                      </button>
+                      {dag.status === 'failed' && (
+                        <button
+                          onClick={retryFromSelectedNode}
+                          disabled={nodeActionLoading}
+                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 border-t border-gray-700 disabled:opacity-50"
+                        >
+                          ▶ Retry From This Step
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
               {selectedNode.task_id && (
                 <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400 hover:text-blue-300">
                   Full task view &rarr;
@@ -812,6 +995,16 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             <div className="mb-3 p-2 bg-blue-950/40 border border-blue-800/50 rounded text-xs text-blue-300">
               <span className="font-semibold text-blue-400">Skill rationale: </span>
               {selectedNode.skill_selection_reason}
+            </div>
+          )}
+
+          {mineResult && (
+            <div className="mb-3 p-2 rounded text-xs border border-gray-700 ${
+              mineResult.startsWith('✅')
+                ? 'bg-emerald-900/30 border-emerald-500/30 text-emerald-300'
+                : 'bg-red-900/30 border-red-500/30 text-red-300'
+            }">
+              {mineResult}
             </div>
           )}
 

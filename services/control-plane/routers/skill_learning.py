@@ -114,6 +114,8 @@ class ReviewResponse(BaseModel):
 
 class AuditMineRequest(BaseModel):
     task_id: str
+    node_id: Optional[str] = None
+    dag_id: Optional[str] = None
     created_by: Optional[str] = None
 
 
@@ -414,17 +416,27 @@ async def mine_task_audit(data: AuditMineRequest, db: AsyncSession = Depends(get
     log_summary = "\n---\n".join(log_summary_parts[:5])  # cap at 5 iterations
 
     image_id = task.agent_profile or "openclaw"
-    prompt = (
-        f"Task: {task.name}\n"
-        f"Description: {task.description or ''}\n\n"
-        f"Execution logs (tool calls and outputs):\n{log_summary}"
-    )
+    prompt_parts = [
+        f"Task: {task.name}",
+        f"Description: {task.description or ''}",
+    ]
+    if data.node_id:
+        prompt_parts.append(f"DAG Node: {data.node_id}")
+    if data.dag_id:
+        prompt_parts.append(f"Parent DAG: {data.dag_id}")
+    prompt_parts.append(f"\nExecution logs (tool calls and outputs):\n{log_summary}")
+    prompt = "\n".join(prompt_parts)
 
     demo = SkillDemo(
         id=_demo_id(),
         image_id=image_id,
         prompt=prompt,
         source_task_id=data.task_id,
+        artifacts={
+            "source_task_id": data.task_id,
+            "source_node_id": data.node_id,
+            "source_dag_id": data.dag_id,
+        },
         created_by=data.created_by,
         status="pending",
     )

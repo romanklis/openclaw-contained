@@ -270,6 +270,7 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
 8. base_image options: {base_images_section}. Choose using runtime + capabilities + best_for, and avoid images whose avoid_for conflicts with the node's task.
 9. Set each node config.llm_model to the requested execution model and do not use GPT models.
 10. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
+11. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
 """
 
 
