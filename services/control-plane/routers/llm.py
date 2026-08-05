@@ -44,10 +44,11 @@ _config: Dict[str, str] = {
     "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
     "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
     "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
+    "DEEPSEEK_API_KEY": os.getenv("DEEPSEEK_API_KEY", ""),
 }
 _config_loaded = False  # Whether we've loaded from DB yet
 
-_CONFIG_KEYS = ["OLLAMA_URL", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+_CONFIG_KEYS = ["OLLAMA_URL", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"]
 
 # ---------------------------------------------------------------------------
 # Gemini thought_signature cache
@@ -229,6 +230,7 @@ def _ollama_url() -> str: return _config["OLLAMA_URL"]
 def _gemini_key() -> str: return _config["GEMINI_API_KEY"]
 def _anthropic_key() -> str: return _config["ANTHROPIC_API_KEY"]
 def _openai_key() -> str: return _config["OPENAI_API_KEY"]
+def _deepseek_key() -> str: return _config["DEEPSEEK_API_KEY"]
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +321,8 @@ def detect_provider(model: str) -> str:
         return "anthropic"
     if any(model_lower.startswith(p) for p in ("gpt-", "o1-", "o3-", "o4-")):
         return "openai"
+    if model_lower.startswith("deepseek"):
+        return "deepseek"
 
     # Everything else → Ollama (local)
     return "ollama"
@@ -1073,6 +1077,85 @@ async def call_openai(req: ChatCompletionRequest) -> ChatCompletionResponse:
     )
 
 
+
+
+async def call_deepseek(req: ChatCompletionRequest) -> ChatCompletionResponse:
+    """Forward to DeepSeek Chat Completions API (OpenAI-compatible), preserving tool_calls."""
+    api_key = _deepseek_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY not configured — add it via /llm-providers in the UI")
+
+    url = "https://api.deepseek.com/chat/completions"
+
+    messages = []
+    for m in req.messages:
+        msg_dict: Dict[str, Any] = {"role": m.role, "content": m.content}
+        if m.tool_calls:
+            msg_dict["tool_calls"] = m.tool_calls
+        if m.function_call:
+            msg_dict["function_call"] = m.function_call
+        extras = m.model_extra or {}
+        for k, v in extras.items():
+            if k not in msg_dict:
+                msg_dict[k] = v
+        messages.append(msg_dict)
+
+    payload: Dict[str, Any] = {
+        "model": req.model,
+        "messages": messages,
+        "temperature": req.temperature,
+        "max_tokens": req.max_tokens,
+        "stream": False,
+    }
+    extras = req.model_extra or {}
+    if "tools" in extras:
+        payload["tools"] = extras["tools"]
+    if "tool_choice" in extras:
+        payload["tool_choice"] = extras["tool_choice"]
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+    choices = []
+    for c in data.get("choices", []):
+        msg = c.get("message", {})
+        content = msg.get("content")
+        # DeepSeek reasoning models return chain-of-thought in `reasoning_content`
+        # and may leave `content` empty/null. Use reasoning_content as a fallback.
+        if content is None or (isinstance(content, str) and not content.strip()):
+            content = msg.get("reasoning_content")
+        choices.append(ChatCompletionChoice(
+            index=c.get("index", 0),
+            message=ChatMessage(
+                role=msg.get("role", "assistant"),
+                content=content,
+                tool_calls=msg.get("tool_calls"),
+                function_call=msg.get("function_call"),
+            ),
+            finish_reason=c.get("finish_reason", "stop"),
+        ))
+
+    usage = data.get("usage", {})
+    return ChatCompletionResponse(
+        id=data.get("id", "chatcmpl-deepseek"),
+        created=data.get("created", int(time.time())),
+        model=req.model,
+        choices=choices,
+        usage=UsageInfo(
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Provider dispatch map
 # ---------------------------------------------------------------------------
@@ -1082,6 +1165,7 @@ PROVIDER_HANDLERS = {
     "gemini": call_gemini,
     "anthropic": call_anthropic,
     "openai": call_openai,
+    "deepseek": call_deepseek,
 }
 
 
@@ -1420,6 +1504,29 @@ async def llm_health():
             openai_health["error"] = str(e)
     status_map["openai"] = openai_health
 
+    # DeepSeek — OpenAI-compatible API
+    deepseek_key = _deepseek_key()
+    deepseek_health: dict = {"status": "configured" if deepseek_key else "not_configured", "models": []}
+    if deepseek_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.deepseek.com/models",
+                    headers={"Authorization": f"Bearer {deepseek_key}"},
+                )
+                if resp.status_code == 200:
+                    deepseek_health["models"] = [
+                        m.get("id", "") for m in resp.json().get("data", [])
+                        if m.get("id", "").startswith("deepseek-")
+                    ]
+                else:
+                    deepseek_health["status"] = "error"
+                    deepseek_health["error"] = f"DeepSeek API returned {resp.status_code}"
+        except Exception as e:
+            deepseek_health["status"] = "error"
+            deepseek_health["error"] = str(e)
+    status_map["deepseek"] = deepseek_health
+
     return {"providers": status_map}
 
 
@@ -1517,6 +1624,29 @@ async def get_llm_providers():
         "models": openai_models,
     })
 
+    # DeepSeek — OpenAI-compatible API
+    deepseek_key = _deepseek_key()
+    deepseek_models: list[str] = []
+    if deepseek_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.deepseek.com/models",
+                    headers={"Authorization": f"Bearer {deepseek_key}"},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        mid = m.get("id", "")
+                        if mid and mid.startswith("deepseek-"):
+                            deepseek_models.append(mid)
+        except Exception as e:
+            logger.warning(f"Failed to fetch DeepSeek models for providers: {e}")
+    providers.append({
+        "name": "deepseek", "type": "deepseek",
+        "available": bool(deepseek_key),
+        "models": deepseek_models,
+    })
+
     default = "ollama"
     for p in providers:
         if p["available"]:
@@ -1603,6 +1733,25 @@ async def list_all_models():
         except Exception as e:
             logger.warning(f"Failed to fetch OpenAI models: {e}")
 
+    # DeepSeek — fetch from API
+    deepseek_key = _deepseek_key()
+    if deepseek_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.deepseek.com/models",
+                    headers={"Authorization": f"Bearer {deepseek_key}"},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        model_id = m.get("id", "")
+                        if model_id and model_id.startswith("deepseek-"):
+                            all_models.append({"id": model_id, "provider": "deepseek"})
+                else:
+                    logger.warning(f"DeepSeek models API returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch DeepSeek models: {e}")
+
     return {"models": all_models}
 
 
@@ -1646,6 +1795,7 @@ class ProviderConfigUpdate(BaseModel):
     gemini_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
+    deepseek_api_key: Optional[str] = None
 
 
 @router.get("/config")
@@ -1657,9 +1807,11 @@ async def get_config():
         "gemini_api_key": _mask_key(_config["GEMINI_API_KEY"]),
         "anthropic_api_key": _mask_key(_config["ANTHROPIC_API_KEY"]),
         "openai_api_key": _mask_key(_config["OPENAI_API_KEY"]),
+        "deepseek_api_key": _mask_key(_config["DEEPSEEK_API_KEY"]),
         "gemini_configured": bool(_config["GEMINI_API_KEY"]),
         "anthropic_configured": bool(_config["ANTHROPIC_API_KEY"]),
         "openai_configured": bool(_config["OPENAI_API_KEY"]),
+        "deepseek_configured": bool(_config["DEEPSEEK_API_KEY"]),
     }
 
 
@@ -1687,6 +1839,11 @@ async def update_config(update: ProviderConfigUpdate):
         _config["OPENAI_API_KEY"] = update.openai_api_key.strip()
         await _save_config_to_db("OPENAI_API_KEY", _config["OPENAI_API_KEY"])
         changes.append(f"OPENAI_API_KEY → {'set' if _config['OPENAI_API_KEY'] else 'cleared'}")
+
+    if update.deepseek_api_key is not None:
+        _config["DEEPSEEK_API_KEY"] = update.deepseek_api_key.strip()
+        await _save_config_to_db("DEEPSEEK_API_KEY", _config["DEEPSEEK_API_KEY"])
+        changes.append(f"DEEPSEEK_API_KEY → {'set' if _config['DEEPSEEK_API_KEY'] else 'cleared'}")
 
     if not changes:
         return {"status": "no_changes", "message": "No fields provided"}

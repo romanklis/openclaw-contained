@@ -48,11 +48,51 @@ from copy import deepcopy
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# In-memory default model config (persists until container restart)
+# Default model config — persisted to DB (llm_provider_config) so it survives restarts
+_DAG_MODEL_KEYS = ["planning_model", "agent_model", "deep_review_model"]
 _dag_model_defaults: dict[str, str] = {
     "planning_model": "gemini-flash-lite-latest",
     "agent_model": "gemini-flash-lite-latest",
+    "deep_review_model": "gemini-flash-lite-latest",
 }
+
+
+async def _load_dag_model_defaults_from_db():
+    """Load persisted DAG model defaults from the DB (overrides in-memory defaults)."""
+    try:
+        from sqlalchemy import text
+        from database import async_session
+        session = async_session()
+        async with session:
+            result = await session.execute(
+                text("SELECT key, value FROM llm_provider_config WHERE key IN (:k1, :k2, :k3)"),
+                {"k1": "planning_model", "k2": "agent_model", "k3": "deep_review_model"},
+            )
+            for key, value in result.fetchall():
+                if key in _DAG_MODEL_KEYS and value:
+                    _dag_model_defaults[key] = value
+    except Exception as e:
+        logger.warning(f"Could not load DAG model defaults from DB: {e}")
+
+
+async def _save_dag_model_default_to_db(key: str, value: str):
+    """Persist a single DAG model default to the DB."""
+    try:
+        from sqlalchemy import text
+        from database import async_session
+        session = async_session()
+        async with session:
+            await session.execute(
+                text(
+                    "INSERT INTO llm_provider_config (key, value, updated_at) "
+                    "VALUES (:key, :value, NOW()) "
+                    "ON CONFLICT (key) DO UPDATE SET value = :value, updated_at = NOW()"
+                ),
+                {"key": key, "value": value},
+            )
+            await session.commit()
+    except Exception as e:
+        logger.error(f"Failed to persist DAG model default {key}: {e}")
 
 
 def _gen_dag_id() -> str:
@@ -261,6 +301,7 @@ async def list_dag_models():
 @router.get("/model-defaults")
 async def get_model_defaults():
     """Return the current default planning + agent model."""
+    await _load_dag_model_defaults_from_db()
     return dict(_dag_model_defaults)
 
 
@@ -274,6 +315,13 @@ async def set_model_defaults(body: dict):
     if "agent_model" in body and body["agent_model"]:
         _dag_model_defaults["agent_model"] = body["agent_model"]
         changed.append(f"agent_model={body['agent_model']}")
+    if "deep_review_model" in body and body["deep_review_model"]:
+        _dag_model_defaults["deep_review_model"] = body["deep_review_model"]
+        changed.append(f"deep_review_model={body['deep_review_model']}")
+    # Persist changed keys to DB so they survive restarts
+    for key in ("planning_model", "agent_model", "deep_review_model"):
+        if key in _dag_model_defaults and (key in body and body[key]):
+            await _save_dag_model_default_to_db(key, _dag_model_defaults[key])
     logger.info(f"DAG model defaults updated: {', '.join(changed)}")
     return dict(_dag_model_defaults)
 

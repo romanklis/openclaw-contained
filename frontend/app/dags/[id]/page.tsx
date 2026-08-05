@@ -164,6 +164,12 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   // Skill extraction state
   const [miningSkill, setMiningSkill] = useState(false)
   const [mineResult, setMineResult] = useState<string | null>(null)
+  const [analysisResult, setAnalysisResult] = useState<any>(null)
+  const [deepReviewResult, setDeepReviewResult] = useState<any>(null)
+  const [deepReviewLoading, setDeepReviewLoading] = useState(false)
+  const [includeSkillInReview, setIncludeSkillInReview] = useState(true)
+  const [correctSkillLoading, setCorrectSkillLoading] = useState(false)
+  const [correctSkillResult, setCorrectSkillResult] = useState<any>(null)
 
   // Per-node task data cache
   const [nodeTaskData, setNodeTaskData] = useState<Record<string, {
@@ -597,9 +603,66 @@ setNodeState(prev => {
   const examineAndLearnSkill = async (taskId: string, nodeId: string) => {
     setMiningSkill(true)
     setMineResult(null)
+    setAnalysisResult(null)
     try {
-      // Call existing mine endpoint with node/DAG context
-      const res = await fetch(`${API}/api/skill-learning/mine`, {
+      // Call the new analyze endpoint (returns assessment + draft skill for review)
+      const res = await fetch(`${API}/api/skill-learning/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_id: taskId,
+          node_id: nodeId,
+          dag_id: dag?.id,
+          created_by: 'dag-review',
+          include_skill: includeSkillInReview,
+        }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      setAnalysisResult(data)
+      setMineResult(data.learning_potential
+        ? '✅ Skill-learning potential detected — review the draft below'
+        : 'ℹ️ No reusable skill extracted. See assessment.')
+    } catch (e: any) {
+      setMineResult(`❌ Error: ${e.message}`)
+    } finally {
+      setMiningSkill(false)
+    }
+  }
+
+  const deepReviewTask = async (taskId: string, nodeId: string) => {
+    setDeepReviewLoading(true)
+    setDeepReviewResult(null)
+    setMineResult(null)
+    try {
+      const res = await fetch(`${API}/api/skill-learning/deep-review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_id: taskId,
+          node_id: nodeId,
+          dag_id: dag?.id,
+          created_by: 'dag-review',
+          include_skill: includeSkillInReview,
+        }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      setDeepReviewResult(data)
+      setMineResult(null)
+    } catch (e: any) {
+      setMineResult(`❌ Deep review error: ${e.message}`)
+    } finally {
+      setDeepReviewLoading(false)
+    }
+  }
+
+  const correctSkillFromReview = async (taskId: string, nodeId: string) => {
+    setCorrectSkillLoading(true)
+    setCorrectSkillResult(null)
+    setMineResult(null)
+    try {
+      const res = await fetch(`${API}/api/skill-learning/correct`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -610,12 +673,12 @@ setNodeState(prev => {
         }),
       })
       if (!res.ok) throw new Error(await res.text())
-      const demo = await res.json()
-      setMineResult(`✅ Demo ${demo.id} created — extracted procedure available`)
+      const data = await res.json()
+      setCorrectSkillResult(data)
     } catch (e: any) {
-      setMineResult(`❌ Error: ${e.message}`)
+      setMineResult(`❌ Skill correction error: ${e.message}`)
     } finally {
-      setMiningSkill(false)
+      setCorrectSkillLoading(false)
     }
   }
 
@@ -899,7 +962,24 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🧠 Examine Logs → Learn Skill
                       </button>
-                    </div>
+                      <button
+                        onClick={() => deepReviewTask(selectedNode.task_id!, selectedNode.node_id)}
+                        disabled={nodeActionLoading || deepReviewLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-amber-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🔍 Deep Review (hallucination / synthetic data)
+                      </button>
+                      <div className="border-t border-gray-700 my-1 px-3 py-2">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={includeSkillInReview}
+                            onChange={(e) => setIncludeSkillInReview(e.target.checked)}
+                            className="accent-amber-500"
+                          />
+                          <span className="text-xs text-gray-400">Include skill context in review</span>
+                        </label>
+                      </div>                    </div>
                   )}
                 </div>
               )}
@@ -937,7 +1017,24 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🧠 Examine Logs → Learn Skill
                       </button>
-                      <div className="border-t border-gray-700 my-1" />
+                      <button
+                        onClick={() => deepReviewTask(selectedNode.task_id!, selectedNode.node_id)}
+                        disabled={nodeActionLoading || deepReviewLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-amber-200 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🔍 Deep Review (hallucination / synthetic data)
+                      </button>
+                      <div className="border-t border-gray-700 my-1 px-3 py-2">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={includeSkillInReview}
+                            onChange={(e) => setIncludeSkillInReview(e.target.checked)}
+                            className="accent-amber-500"
+                          />
+                          <span className="text-xs text-gray-400">Include skill context in review</span>
+                        </label>
+                      </div>                      <div className="border-t border-gray-700 my-1" />
                       <button
                         onClick={() => {
                           setShowNodeActions(false)
@@ -1005,6 +1102,166 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 : 'bg-red-900/30 border-red-500/30 text-red-300'
             }">
               {mineResult}
+            </div>
+          )}
+
+          {analysisResult && (
+            <div className="mb-3 rounded border border-indigo-700/40 bg-indigo-950/20 p-3 text-xs">
+              <div className="text-xs uppercase tracking-wide text-indigo-300 mb-2 flex items-center justify-between">
+                <span>Skill Learning Analysis — {analysisResult.image_id} {analysisResult.image_tag && <span className="text-gray-500">({analysisResult.image_tag})</span>}</span>
+                {analysisResult.skill_used_name && (
+                  <span className="text-gray-400">used: {analysisResult.skill_used_name}</span>
+                )}
+              </div>
+
+              <div className="mb-2 text-gray-300 whitespace-pre-wrap">{analysisResult.assessment}</div>
+
+              {analysisResult.warnings?.length > 0 && (
+                <div className="mb-2">
+                  <div className="text-amber-300 font-semibold mb-1">⚠️ Warnings (potential hallucination / synthetic data)</div>
+                  <ul className="list-disc list-inside text-amber-200 space-y-1">
+                    {analysisResult.warnings.map((w: string, i: number) => <li key={i}>{w}</li>)}
+                  </ul>
+                </div>
+              )}
+
+              {analysisResult.suggested_improvements?.length > 0 && (
+                <div className="mb-2">
+                  <div className="text-blue-300 font-semibold mb-1">💡 Suggested improvements</div>
+                  <ul className="list-disc list-inside text-blue-200 space-y-1">
+                    {analysisResult.suggested_improvements.map((s: string, i: number) => <li key={i}>{s}</li>)}
+                  </ul>
+                </div>
+              )}
+
+              {analysisResult.extracted_skills?.length > 0 && (
+                <div className="mt-3">
+                  <div className="text-emerald-300 font-semibold mb-2">📚 Draft skill(s) for review</div>
+                  {analysisResult.extracted_skills.map((sk: any, i: number) => (
+                    <div key={i} className="mb-3 rounded border border-gray-700 bg-gray-900/60 p-3">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="font-semibold text-gray-200">{sk.name}</span>
+                        <span className="text-emerald-300">{sk.status}</span>
+                      </div>
+                      {sk.description && <div className="text-gray-400 mb-2">{sk.description}</div>}
+                      <pre className="whitespace-pre-wrap text-gray-300 mb-2 bg-gray-950/60 p-2 rounded">{sk.instructions}</pre>
+                      {sk.tags?.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {sk.tags.map((t: string, j: number) => (
+                            <span key={j} className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-400">{t}</span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="mt-2 flex items-center gap-3">
+                        <Link
+                          href="/skill-studio"
+                          className="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white"
+                        >
+                          Review in Skill Studio
+                        </Link>
+                        <span className="text-gray-500">ID: {sk.id}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {deepReviewResult && (
+            <div className="mb-3 rounded border border-amber-700/40 bg-amber-950/20 p-3 text-xs">
+              <div className="text-xs uppercase tracking-wide text-amber-300 mb-2 flex items-center justify-between">
+                <span>Deep Review — {deepReviewResult.image_id}{deepReviewResult.image_tag && <span className="text-gray-500"> ({deepReviewResult.image_tag})</span>}</span>
+                {deepReviewResult.skill_used_name && <span className="text-gray-400">skill: {deepReviewResult.skill_used_name}</span>}
+              </div>
+
+              <div className="mb-2 flex items-center gap-3">
+                <span className={'px-2 py-0.5 rounded font-semibold ' + (deepReviewResult.verdict === 'clean' ? 'bg-emerald-800/50 text-emerald-200' : deepReviewResult.verdict === 'issues_found' ? 'bg-red-800/50 text-red-200' : 'bg-amber-800/50 text-amber-200')}>
+                  verdict: {deepReviewResult.verdict}
+                </span>
+                <span className="text-gray-300">quality score: <span className="font-semibold text-amber-200">{deepReviewResult.score}/100</span></span>
+              </div>
+
+              <div className="mb-3 text-gray-300 whitespace-pre-wrap">{deepReviewResult.summary}</div>
+
+              {deepReviewResult.issues?.length > 0 ? (
+                <div className="mb-3">
+                  <div className="text-red-300 font-semibold mb-2">⚠️ Issues found ({deepReviewResult.issues.length})</div>
+                  <div className="space-y-2">
+                    {deepReviewResult.issues.map((iss: any, i: number) => (
+                      <div key={i} className="rounded border border-gray-700 bg-gray-900/60 p-2">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className={'px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ' + (iss.severity === 'high' ? 'bg-red-800/60 text-red-100' : iss.severity === 'medium' ? 'bg-amber-800/60 text-amber-100' : 'bg-gray-700 text-gray-300')}>{iss.severity}</span>
+                          <span className={'px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase bg-indigo-900/60 text-indigo-200'}>{iss.category}</span>
+                        </div>
+                        <div className="text-gray-200 font-medium">{iss.finding}</div>
+                        {iss.evidence && <div className="mt-1 text-gray-400 italic whitespace-pre-wrap">Evidence: {iss.evidence}</div>}
+                        {iss.recommendation && <div className="mt-1 text-amber-200">→ {iss.recommendation}</div>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="mb-3 text-emerald-300">No integrity issues detected.</div>
+              )}
+
+              {deepReviewResult.positives?.length > 0 && (
+                <div className="mb-2">
+                  <div className="text-emerald-300 font-semibold mb-1">✅ Done correctly</div>
+                  <ul className="list-disc list-inside text-emerald-200 space-y-1">
+                    {deepReviewResult.positives.map((p: string, i: number) => <li key={i}>{p}</li>)}
+                  </ul>
+                </div>
+              )}
+
+              {deepReviewResult.issues?.length > 0 && (
+                <button
+                  onClick={() => correctSkillFromReview(selectedNode.task_id!, selectedNode.node_id)}
+                  disabled={correctSkillLoading}
+                  className="mt-2 w-full px-3 py-2 rounded bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold disabled:opacity-50"
+                >
+                  {correctSkillLoading ? '🛠️ Generating corrected skill…' : '🛠️ Correct Skill to Prevent Issues'}
+                </button>
+              )}
+
+              {correctSkillResult && (
+                <div className="mt-3 rounded border border-emerald-700/40 bg-emerald-950/20 p-3">
+                  {correctSkillResult.unchanged ? (
+                    <div className="text-emerald-300 text-xs">No issues found — no skill correction needed.</div>
+                  ) : (
+                    <>
+                      <div className="text-xs uppercase tracking-wide text-emerald-300 mb-2">
+                        ✅ Corrected skill created (child of "{correctSkillResult.skill_name}")
+                      </div>
+                      {correctSkillResult.corrected?.map((sk: any, i: number) => (
+                        <div key={i} className="mb-3 rounded border border-gray-700 bg-gray-900/60 p-3">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="font-semibold text-gray-200">{sk.name}</span>
+                            <span className="text-emerald-300 text-xs">{sk.status}</span>
+                          </div>
+                          {sk.description && <div className="text-gray-400 text-xs mb-2">{sk.description}</div>}
+                          <pre className="whitespace-pre-wrap text-gray-300 text-xs mb-2 bg-gray-950/60 p-2 rounded">{sk.instructions}</pre>
+                          {sk.addressed_issues?.length > 0 && (
+                            <div className="mb-2">
+                              <div className="text-amber-300 font-semibold text-xs mb-1">Addresses:</div>
+                              <ul className="list-disc list-inside text-amber-200 text-xs space-y-1">
+                                {sk.addressed_issues.map((a: string, j: number) => <li key={j}>{a}</li>)}
+                              </ul>
+                            </div>
+                          )}
+                          <a
+                            href="/skill-studio"
+                            className="inline-block mt-2 px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs"
+                          >
+                            Review in Skill Studio
+                          </a>
+                          <span className="ml-3 text-gray-500 text-xs">ID: {sk.skill_id}</span>
+                        </div>
+                      ))}
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           )}
 

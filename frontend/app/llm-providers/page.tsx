@@ -55,8 +55,9 @@ export default function LLMProvidersPage() {
   const [configGeminiKey, setConfigGeminiKey] = useState('')
   const [configAnthropicKey, setConfigAnthropicKey] = useState('')
   const [configOpenaiKey, setConfigOpenaiKey] = useState('')
-  const [configStatus, setConfigStatus] = useState<{ gemini: boolean; anthropic: boolean; openai: boolean }>({
-    gemini: false, anthropic: false, openai: false,
+  const [configDeepseekKey, setConfigDeepseekKey] = useState('')
+  const [configStatus, setConfigStatus] = useState<{ gemini: boolean; anthropic: boolean; openai: boolean; deepseek: boolean }>({
+    gemini: false, anthropic: false, openai: false, deepseek: false,
   })
   const [savingConfig, setSavingConfig] = useState(false)
   const [configMsg, setConfigMsg] = useState<string | null>(null)
@@ -64,6 +65,7 @@ export default function LLMProvidersPage() {
   // DAG model defaults
   const [dagPlanningModel, setDagPlanningModel] = useState('')
   const [dagAgentModel, setDagAgentModel] = useState('')
+  const [dagDeepReviewModel, setDagDeepReviewModel] = useState('')
   const [savingDagDefaults, setSavingDagDefaults] = useState(false)
   const [dagDefaultsMsg, setDagDefaultsMsg] = useState<string | null>(null)
 
@@ -80,10 +82,12 @@ export default function LLMProvidersPage() {
       setConfigGeminiKey(data.gemini_api_key ?? '')
       setConfigAnthropicKey(data.anthropic_api_key ?? '')
       setConfigOpenaiKey(data.openai_api_key ?? '')
+      setConfigDeepseekKey(data.deepseek_api_key ?? '')
       setConfigStatus({
         gemini: data.gemini_configured ?? false,
         anthropic: data.anthropic_configured ?? false,
         openai: data.openai_configured ?? false,
+        deepseek: data.deepseek_configured ?? false,
       })
     } catch { /* ignore */ }
   }, [])
@@ -95,6 +99,7 @@ export default function LLMProvidersPage() {
       const data = await res.json()
       setDagPlanningModel(data.planning_model ?? '')
       setDagAgentModel(data.agent_model ?? '')
+      setDagDeepReviewModel(data.deep_review_model ?? '')
     } catch { /* ignore */ }
   }, [])
 
@@ -108,13 +113,15 @@ export default function LLMProvidersPage() {
         body: JSON.stringify({
           planning_model: dagPlanningModel,
           agent_model: dagAgentModel,
+          deep_review_model: dagDeepReviewModel,
         }),
       })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
       setDagPlanningModel(data.planning_model)
       setDagAgentModel(data.agent_model)
-      setDagDefaultsMsg(`✓ Defaults saved — planning: ${data.planning_model}, agents: ${data.agent_model}`)
+      setDagDeepReviewModel(data.deep_review_model)
+      setDagDefaultsMsg(`✓ Defaults saved — planning: ${data.planning_model}, agents: ${data.agent_model}, deep-review: ${data.deep_review_model}`)
     } catch (err) {
       setDagDefaultsMsg(`✗ ${err instanceof Error ? err.message : 'Failed'}`)
     } finally {
@@ -231,6 +238,7 @@ export default function LLMProvidersPage() {
     if (m.startsWith('gemini')) return 'gemini'
     if (m.startsWith('claude')) return 'anthropic'
     if (m.startsWith('gpt-') || m.startsWith('o1-') || m.startsWith('o3-')) return 'openai'
+    if (m.startsWith('deepseek')) return 'deepseek'
     return 'ollama'
   }
 
@@ -246,6 +254,7 @@ export default function LLMProvidersPage() {
       case 'gemini': return '✨'
       case 'anthropic': return '🧠'
       case 'openai': return '🤖'
+      case 'deepseek': return '🔵'
       default: return '🔌'
     }
   }
@@ -256,6 +265,7 @@ export default function LLMProvidersPage() {
       case 'gemini': return 'border-blue-500/30 bg-blue-500/5'
       case 'anthropic': return 'border-amber-500/30 bg-amber-500/5'
       case 'openai': return 'border-green-500/30 bg-green-500/5'
+      case 'deepseek': return 'border-blue-500/30 bg-blue-500/5'
       default: return 'border-gray-500/30 bg-gray-500/5'
     }
   }
@@ -344,7 +354,7 @@ export default function LLMProvidersPage() {
 
         {!showConfig && (
           <div className="flex gap-2 text-sm">
-            {(['gemini', 'anthropic', 'openai'] as const).map((p) => (
+            {(['gemini', 'anthropic', 'openai', 'deepseek'] as const).map((p) => (
               <span
                 key={p}
                 className={`px-2.5 py-1 rounded-full border text-xs font-medium capitalize ${
@@ -433,6 +443,21 @@ export default function LLMProvidersPage() {
               </div>
             </div>
 
+            {/* DeepSeek */}
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">
+                🔵 DeepSeek API Key
+                <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener" className="ml-2 text-indigo-400 hover:text-indigo-300">Get key →</a>
+              </label>
+              <div className="flex gap-2">
+                <input type="password" value={configDeepseekKey} onChange={(e) => setConfigDeepseekKey(e.target.value)} placeholder={configStatus.deepseek ? '••••••••  (configured)' : 'Paste API key'} className="input-field flex-1 font-mono text-sm" />
+                <button onClick={() => saveConfig('deepseek_api_key', configDeepseekKey)} disabled={savingConfig} className="btn-primary text-xs">Save</button>
+                {configStatus.deepseek && (
+                  <button onClick={() => { setConfigDeepseekKey(''); saveConfig('deepseek_api_key', '') }} disabled={savingConfig} className="btn-danger text-xs">✗</button>
+                )}
+              </div>
+            </div>
+
             <p className="text-xs text-gray-600 mt-2">
               Keys are stored in-memory on the control-plane and take effect immediately. They do not persist across container restarts.
             </p>
@@ -489,13 +514,29 @@ export default function LLMProvidersPage() {
               </select>
               <p className="text-xs text-gray-600 mt-1">Runs inside each agent container for task execution</p>
             </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">🔍 Deep Review / Skill-Learning Model</label>
+              <select
+                value={dagDeepReviewModel}
+                onChange={(e) => setDagDeepReviewModel(e.target.value)}
+                className="input-field w-full text-sm"
+              >
+                {allModels.map((m) => (
+                  <option key={`review-${m.provider}-${m.id}`} value={m.id}>{m.id}</option>
+                ))}
+                {dagDeepReviewModel && !allModels.find(m => m.id === dagDeepReviewModel) && (
+                  <option value={dagDeepReviewModel}>{dagDeepReviewModel}</option>
+                )}
+              </select>
+              <p className="text-xs text-gray-600 mt-1">Used for examining logs, hallucination/synthetic-data audits, and skill extraction</p>
+            </div>
           </div>
           <div className="flex items-center gap-3">
             <button onClick={saveDagModelDefaults} disabled={savingDagDefaults} className="btn-primary text-sm">
               {savingDagDefaults ? 'Saving…' : 'Save Defaults'}
             </button>
             <span className="text-xs text-gray-600">
-              Current: <span className="font-mono text-gray-400">{dagPlanningModel}</span> / <span className="font-mono text-gray-400">{dagAgentModel}</span>
+              Current: <span className="font-mono text-gray-400">{dagPlanningModel}</span> / <span className="font-mono text-gray-400">{dagAgentModel}</span> / review: <span className="font-mono text-gray-400">{dagDeepReviewModel}</span>
             </span>
           </div>
         </div>
