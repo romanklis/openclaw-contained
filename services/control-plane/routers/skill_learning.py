@@ -891,7 +891,7 @@ def _normalize_review_payload(parsed: dict) -> dict:
             break
     # Standardize key aliases
     alias = {
-        "verdict": ("verdict", "status", "outcome", "result_status"),
+        "verdict": ("verdict", "outcome", "result_status", "verdict_status"),
         "score": ("score", "quality_score", "integrity_score", "rating"),
         "summary": ("summary", "assessment", "overall", "analysis_summary"),
         "issues": ("issues", "findings", "problems", "concerns"),
@@ -913,6 +913,61 @@ def _normalize_review_payload(parsed: dict) -> dict:
     if "assessment" in out and "summary" not in out:
         out["summary"] = out["assessment"]
     return out
+
+
+
+
+VALID_VERDICTS = {"clean", "issues_found", "needs_attention", "completed_with_issues"}
+# Map alternate verdict wordings the LLM may use -> canonical values.
+_VERDICT_ALIASES = {
+    "pass": "clean",
+    "ok": "clean",
+    "succeeded": "clean",
+    "success": "clean",
+    "no_issues": "clean",
+    "good": "clean",
+    "fail": "issues_found",
+    "failed": "issues_found",
+    "failed_with_issues": "issues_found",
+    "issues": "issues_found",
+    "issues_detected": "issues_found",
+    "problems": "issues_found",
+    "needs_revision": "needs_attention",
+    "needs_improvement": "needs_attention",
+    "review_needed": "needs_attention",
+    "attention_needed": "needs_attention",
+    "inconclusive": "needs_attention",
+    "unknown": "needs_attention",
+    "completed_with_issues": "issues_found",
+}
+
+
+def _normalize_verdict(value) -> str:
+    """Validate/normalize a verdict to one of the known values; empty otherwise."""
+    if not isinstance(value, str):
+        return ""
+    v = value.strip().lower().replace(" ", "_").replace("-", "_")
+    if v in VALID_VERDICTS:
+        return v
+    if v in _VERDICT_ALIASES:
+        return _VERDICT_ALIASES[v]
+    # fuzzy: contains a known verdict keyword
+    if "clean" in v:
+        return "clean"
+    if "issue" in v or "fail" in v:
+        return "issues_found"
+    if "attention" in v or "revision" in v or "review" in v:
+        return "needs_attention"
+    return ""
+
+
+def _normalize_score(value) -> int:
+    """Coerce a model score to an int 0-100 (round floats, clamp)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(100, int(round(f))))
 
 
 def _extract_json_object(text: str):
@@ -1184,12 +1239,60 @@ def _deep_review_model() -> str:
         return "gemini-flash-lite-latest"
 
 
+
+
+def _trim_execution_summary_for_llm(summary: dict, max_deliverable_chars: int = 4000,
+                                    max_turn_output_chars: int = 400,
+                                    max_iter_output_chars: int = 800) -> dict:
+    """Return a context-safe copy of the execution summary for LLM review.
+
+    Large deliverable file contents and long turn outputs are truncated to keep
+    the prompt within the model's context window. The structure is preserved so
+    parsing/analysis still works. Full deliverables remain available for the
+    rule-based integrity scan (which runs separately).
+    """
+    def _trim_deliverables(deliverables):
+        if not isinstance(deliverables, dict):
+            return deliverables
+        out = {}
+        for k, v in deliverables.items():
+            if isinstance(v, str) and len(v) > max_deliverable_chars:
+                out[k] = v[:max_deliverable_chars] + "\n...[truncated]..."
+            else:
+                out[k] = v
+        return out
+
+    def _trim_iter(it):
+        trimmed = dict(it)
+        if "deliverables" in it:
+            trimmed["deliverables"] = _trim_deliverables(it["deliverables"])
+        if "output" in it and isinstance(it["output"], str) and len(it["output"]) > max_iter_output_chars:
+            trimmed["output"] = it["output"][:max_iter_output_chars] + "\n...[truncated]..."
+        if "turns" in it and isinstance(it["turns"], list):
+            new_turns = []
+            for t in it["turns"]:
+                if isinstance(t, dict) and isinstance(t.get("output"), str) and len(t["output"]) > max_turn_output_chars:
+                    nt = dict(t)
+                    nt["output"] = t["output"][:max_turn_output_chars] + "\n...[truncated]..."
+                    new_turns.append(nt)
+                else:
+                    new_turns.append(t)
+            trimmed["turns"] = new_turns
+        return trimmed
+
+    out = dict(summary)
+    if "iterations" in summary and isinstance(summary["iterations"], list):
+        out["iterations"] = [_trim_iter(it) for it in summary["iterations"]]
+    return out
+
+
 async def _call_deep_review_llm(summary: dict, skill_used: Optional[dict], task: Task, include_skill: bool = True) -> dict:
     """Call the LLM for a rigorous audit of hallucinations / synthetic data / shortcuts."""
     import httpx
-    # Send the summary as the top-level user content (matches the format that yields
-    # accurate manual audits). Optionally include the skill used for context.
-    user_content = dict(summary)
+    # Send a context-safe copy of the summary (truncated to fit the model's
+    # context window). Structure preserved for parsing. Full deliverables are
+    # still scanned by the rule-based integrity detector separately.
+    user_content = _trim_execution_summary_for_llm(summary)
     if include_skill and skill_used:
         user_content["skill_used"] = skill_used
     payload = {
@@ -1254,8 +1357,13 @@ async def _call_deep_review_llm(summary: dict, skill_used: Optional[dict], task:
             content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
             parsed = _extract_json_object(content)
             if parsed is not None:
-                return _normalize_review_payload(parsed)
-            # Retry with a stricter instruction to force raw JSON only
+                normalized = _normalize_review_payload(parsed)
+                # If the parsed payload has no usable verdict/score, it's a
+                # wrong-shaped response (e.g. the model echoed the task instead
+                # of returning an audit). Treat as unparseable and retry.
+                if _normalize_verdict(normalized.get("verdict")):
+                    return normalized
+            # Retry with a stricter instruction to force the correct audit JSON
             logger.warning("Deep review: could not parse output on attempt %s; retrying", attempt + 1)
             original_user = payload['messages'][1]['content']
             payload = {
@@ -1332,10 +1440,15 @@ async def deep_review_task(data: DeepReviewRequest, db: AsyncSession = Depends(g
 
     if hard_signals:
         verdict = "issues_found"
-        score = min(int(review.get("score", 0) or 0), 55) if review.get("score") else 50
+        score = min(_normalize_score(review.get("score")), 55) if review.get("score") else 50
     else:
-        verdict = review.get("verdict", "needs_attention")
-        score = int(review.get("score", 0) or 0)
+        verdict = _normalize_verdict(review.get("verdict"))
+        if not verdict:
+            # Model returned a malformed/wrong-shaped payload (e.g. echoed task
+            # status instead of a verdict). Fall back gracefully instead of
+            # surfacing the raw value (e.g. "completed").
+            verdict = "needs_attention" if (review.get("issues") or []) else "clean"
+        score = _normalize_score(review.get("score"))
 
     return DeepReviewResponse(
         task_id=data.task_id,
@@ -1386,9 +1499,56 @@ class SkillCorrectResponse(BaseModel):
     unchanged: bool
 
 
+def _build_correction_context(summary: dict, skill: dict, issues: List[dict]) -> dict:
+    """Build a compact context for skill correction.
+
+    The correction task only needs the skill, the concrete issues, and a brief
+    execution summary — NOT the full deliverable file contents (which can overflow
+    the model context window). Deliverable filenames + sizes are kept for reference.
+    """
+    def _trim_iter(it: dict) -> dict:
+        deliverables = it.get("deliverables") or {}
+        return {
+            "iteration": it.get("iteration"),
+            "status": it.get("status"),
+            "error": it.get("error"),
+            "deliverables_produced": it.get("deliverables_produced") or list(deliverables.keys()),
+            "deliverable_sizes": {
+                k: len(v) if isinstance(v, str) else None
+                for k, v in (deliverables or {}).items()
+            },
+            "turn_count": it.get("turn_count"),
+            "turns": [
+                {
+                    "turn": t.get("turn"),
+                    "command_issued": t.get("command_issued"),
+                    "output": (t.get("output") or "")[:600],
+                }
+                for t in (it.get("turns") or [])
+            ],
+            "output": (it.get("output") or "")[:1000],
+        }
+
+    return {
+        "task": {
+            "task_id": summary.get("task_metadata", {}).get("task_id"),
+            "name": summary.get("task_metadata", {}).get("task_name"),
+            "description": summary.get("task_metadata", {}).get("description"),
+            "base_image": summary.get("task_metadata", {}).get("base_image"),
+        },
+        "skill_used": {"id": skill.get("id"), "name": skill.get("name"), "instructions": (skill.get("instructions") or "")[:2000]},
+        "issues": issues,
+        "execution_summary": {
+            "task_metadata": summary.get("task_metadata"),
+            "iterations": [_trim_iter(it) for it in (summary.get("iterations") or [])],
+        },
+    }
+
+
 async def _correct_skill_llm(summary: dict, skill: dict, issues: List[dict], task: Task) -> dict:
     """Ask the LLM to produce a corrected version of the skill that prevents the issues."""
     import httpx
+    user_context = _build_correction_context(summary, skill, issues)
     payload = {
         "model": _deep_review_model(),
         "max_tokens": 4000,
@@ -1419,33 +1579,32 @@ async def _correct_skill_llm(summary: dict, skill: dict, issues: List[dict], tas
             },
             {
                 "role": "user",
-                "content": json.dumps(
-                    {
-                        "task": {
-                            "task_id": summary.get("task_metadata", {}).get("task_id"),
-                            "name": summary.get("task_metadata", {}).get("task_name"),
-                            "description": summary.get("task_metadata", {}).get("description"),
-                        },
-                        "skill_used": {"id": skill.get("id"), "name": skill.get("name"), "instructions": skill.get("instructions")},
-                        "issues": issues,
-                        "execution_summary": summary,
-                    },
-                    default=str,
-                ),
+                "content": json.dumps(user_context, default=str),
             },
         ],
     }
     async with httpx.AsyncClient(timeout=240) as client:
-        resp = await client.post("http://localhost:8000/api/llm/v1/chat/completions", json=payload)
-        if resp.status_code != 200:
-            logger.warning("Skill correction LLM returned %s: %s", resp.status_code, resp.text[:500])
-            return None
-        content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-    parsed = _extract_json_object(content)
-    if parsed is None:
-        logger.warning("Could not parse skill correction JSON")
-        return None
-    return _normalize_review_payload(parsed) or parsed
+        for attempt in range(2):
+            resp = await client.post("http://localhost:8000/api/llm/v1/chat/completions", json=payload)
+            if resp.status_code != 200:
+                logger.warning("Skill correction LLM returned %s: %s", resp.status_code, resp.text[:500])
+                return None
+            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            parsed = _extract_json_object(content)
+            if parsed is not None:
+                norm = _normalize_review_payload(parsed) or parsed
+                if norm.get("instructions"):
+                    return norm
+            logger.warning("Skill correction: could not parse/validate output on attempt %s; retrying", attempt + 1)
+            payload = {
+                **payload,
+                "messages": [
+                    {"role": "system", "content": "Output ONLY a single valid JSON object with the corrected skill. No markdown, no commentary, no trailing text."},
+                    {"role": "user", "content": f"Return the corrected skill as valid JSON only.\n\n{json.dumps(user_context, default=str)}"},
+                ],
+            }
+    logger.warning("Skill correction failed after retries")
+    return None
 
 
 @router.post("/correct", response_model=SkillCorrectResponse)

@@ -182,6 +182,44 @@ def request_capability(capability_type: str, packages: List[str], justification:
 # OpenClaw configuration
 # ---------------------------------------------------------------------------
 
+
+def _resolve_writable_openclaw_dir():
+    """Return a writable directory for OpenClaw config/state.
+
+    Prefers $HOME/.openclaw when $HOME is writable (normal case, e.g. browser
+    images that set ENV HOME=/home/agent). If $HOME is read-only (e.g. /root on
+    the base 'openclaw' image), falls back to a writable temp directory so the
+    agent can still start. Derived images keep using their normal writable HOME.
+    """
+    candidates = []
+    home_dir = os.path.expanduser("~")
+    if home_dir:
+        candidates.append(os.path.join(home_dir, ".openclaw"))
+    # Writable temp locations, in priority order
+    candidates += [
+        os.path.join(os.environ.get("TMPDIR", "/tmp"), "openclaw"),
+        "/tmp/agent/.openclaw",
+        "/tmp/.openclaw",
+    ]
+
+    for candidate in candidates:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            # Probe writability
+            probe = os.path.join(candidate, ".write_test")
+            with open(probe, "w") as fh:
+                fh.write("ok")
+            os.remove(probe)
+            return candidate
+        except Exception:
+            continue
+
+    # Last resort: a per-uid dir under /tmp
+    fallback = "/tmp/openclaw-{}".format(os.getuid() if hasattr(os, "getuid") else "agent")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
 def setup_openclaw_config():
     """
     Configure OpenClaw to use the control-plane LLM router.
@@ -193,7 +231,11 @@ def setup_openclaw_config():
     talking to the actual model, but the router dispatches to
     Ollama / Gemini / Anthropic / OpenAI based on model name.
     """
-    openclaw_dir = os.path.expanduser("~/.openclaw")
+    # Resolve a writable OpenClaw home directory.
+    # Prefer $HOME/.openclaw when writable; fall back to a writable temp dir for
+    # base images where $HOME is read-only. Derived images (browser_v4, etc.)
+    # keep their normal writable $HOME.
+    openclaw_dir = _resolve_writable_openclaw_dir()
     agent_dir = os.path.join(openclaw_dir, "agents", "main", "agent")
     os.makedirs(openclaw_dir, exist_ok=True)
     os.makedirs(agent_dir, exist_ok=True)

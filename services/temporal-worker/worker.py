@@ -3120,6 +3120,78 @@ def _build_compact_step_summary(output: Dict[str, Any]) -> str:
     return " | ".join(parts)[:1200]
 
 
+def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
+    """Build a bounded 'stage handoff' block describing each predecessor node:
+    what was done (tool/action trace), what was produced (deliverables + paths),
+    and the outcome. This gives downstream nodes real context instead of only a
+    bare output-text preview, so they know what upstream already accomplished and
+    what new work remains.
+    """
+    if not input_data:
+        return ""
+
+    blocks: List[str] = ["--- Handoff from previous stages (what was done + produced) ---"]
+    for src_node, data in input_data.items():
+        if not isinstance(data, dict):
+            blocks.append(f"[{src_node}] literal input: {str(data)[:500]}")
+            continue
+
+        # Status / outcome
+        status = data.get("status") or "unknown"
+        completed = data.get("completed")
+        error = str(data.get("error") or "").strip()
+        gate_failure = str(data.get("gate_failure") or "").strip()
+        outcome = []
+        if completed is not None:
+            outcome.append(f"completed={completed}")
+        if error:
+            outcome.append(f"error={error[:200]}")
+        if gate_failure:
+            outcome.append(f"gate_failure={gate_failure[:200]}")
+        outcome_str = "; ".join(outcome) if outcome else "ok"
+
+        # What was done — structured tool/action trace
+        acq = (data.get("acquisition_log") or [])
+        if isinstance(acq, list) and acq:
+            action_lines = []
+            for entry in acq[:20]:
+                if isinstance(entry, dict):
+                    tool = entry.get("tool") or entry.get("kind") or "?"
+                    inv = str(entry.get("invocation") or "")[:200]
+                    res = str(entry.get("result_preview") or "")[:160]
+                    if tool:
+                        action_lines.append(f"    - {tool}: {inv}" + (f" -> {res}" if res else ""))
+            what_done = "\n".join(action_lines) if action_lines else "(no tool trace recorded)"
+        else:
+            logs = str(data.get("agent_logs") or "")
+            what_done = ("    " + "\n    ".join(logs.splitlines()[:15])) if logs else "(no logs)"
+
+        # What was produced — deliverables + explicit paths
+        dl = data.get("deliverables")
+        produced = []
+        if isinstance(dl, dict) and dl:
+            for name, content in dl.items():
+                ctype = "script" if name.lower().endswith((".py", ".js", ".sh")) else "data"
+                size = len(str(content)) if content is not None else 0
+                produced.append(f"    - {name}  [{ctype}, {size} bytes]  at /workspace/{name}")
+        produced_str = "\n".join(produced) if produced else "    (no deliverables)"
+
+        # Primary output text
+        output_text = _extract_task_output_text(data)
+        output_preview = output_text[:1500] + ("..." if len(output_text) > 1500 else "") if output_text else ""
+
+        block = (
+            f"[{src_node}] status={status}; {outcome_str}\n"
+            f"  WHAT WAS DONE:\n{what_done}\n"
+            f"  PRODUCED:\n{produced_str}"
+        )
+        if output_preview:
+            block += f"\n  OUTPUT: {output_preview}"
+        blocks.append(block)
+
+    return "\n\n".join(blocks)
+
+
 async def _assess_objective_alignment_external(
     task_id: str,
     output: Dict[str, Any],
@@ -3606,21 +3678,14 @@ class DAGNodeWorkflow:
             for criterion in success_criteria[:8]:
                 follow_up_parts.append(f"- {str(criterion)[:240]}")
         if input_data:
-            follow_up_parts.append("\n--- Input from previous nodes ---")
-            for src_node, data in input_data.items():
-                if isinstance(data, dict):
-                    output_text = _extract_task_output_text(data)
-                    if output_text:
-                        preview = output_text[:2000] + ("..." if len(output_text) > 2000 else "")
-                        follow_up_parts.append(f"[{src_node}.output]: {preview}")
-                    else:
-                        logs = data.get("agent_logs", "")
-                        if logs:
-                            preview = logs[:2000] + ("..." if len(logs) > 2000 else "")
-                            follow_up_parts.append(f"[{src_node}]: {preview}")
-                else:
-                    # Literal value (int, str, etc.) from input_mapping
-                    follow_up_parts.append(f"[{src_node}]: {data}")
+            handoff = _build_stage_handoff(input_data)
+            if handoff:
+                follow_up_parts.append("\n" + handoff)
+                follow_up_parts.append(
+                    "\nThe files listed above are INPUTS from previous stages — treat them as read-only. "
+                    "Do NOT regenerate or re-run upstream scripts. Your job is to produce NEW deliverables "
+                    "specific to this step's objective below, using the upstream outputs as inputs where relevant."
+                )
         if upstream_state_review:
             follow_up_parts.append("\n--- Required review of previous step state ---")
             follow_up_parts.append(_build_prior_state_review_prompt(upstream_state_review))

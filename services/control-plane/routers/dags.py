@@ -22,6 +22,7 @@ from schemas import (
     DAGResponse,
     DAGDetail,
     DAGNodeResponse,
+    DAGNodeCreate,
     DAGRevise,
     DAGRefine,
     DAGNodeEnhanceRequest,
@@ -346,13 +347,28 @@ async def get_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.post("/{dag_id}/start", response_model=DAGDetail)
 async def start_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
-    """Start executing a DAG via Temporal workflow."""
+    """Start executing a DAG via Temporal workflow.
+
+    Allowed from ready/failed (fresh or retry) and completed (re-run all steps).
+    For a completed DAG, resets every node back to PENDING before starting.
+    """
     dag = await _get_dag_or_404(dag_id, db)
-    if dag.status not in (DAGStatus.READY, DAGStatus.FAILED):
+    if dag.status not in (DAGStatus.READY, DAGStatus.FAILED, DAGStatus.COMPLETED):
         raise HTTPException(
             status_code=400,
-            detail=f"DAG is in '{dag.status.value}' state, must be 'ready' or 'failed' to start"
+            detail=f"DAG is in '{dag.status.value}' state, must be 'ready', 'failed', or 'completed' to start"
         )
+    if dag.status == DAGStatus.COMPLETED:
+        nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+        for node in nodes_result.scalars().all():
+            node.status = NodeStatus.PENDING
+            node.output_data = None
+            node.task_id = None
+            node.container_id = None
+            node.started_at = None
+            node.completed_at = None
+        await db.commit()
+        await db.refresh(dag)
     return await _start_dag(dag, db)
 
 
@@ -862,6 +878,108 @@ async def delete_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_
     return _build_dag_detail(dag, remaining_nodes)
 
 
+@router.post("/{dag_id}/nodes", response_model=DAGDetail)
+async def add_node(dag_id: str, payload: DAGNodeCreate, db: AsyncSession = Depends(get_db)):
+    """Add a new step (node) to the DAG graph.
+
+    Allows adding steps after the DAG has been planned or even completed.
+    - If `after` is provided in config, the new node is inserted after that
+      predecessor (it depends on that node; its successors are not auto-rewired,
+      so callers can place the step at the tail or wire explicitly).
+    - If no `after`, the node is appended at the tail with no dependencies.
+    """
+    dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_editable(dag)
+
+    node_id = (payload.node_id or "").strip()
+    if not node_id:
+        raise HTTPException(status_code=422, detail="node_id is required")
+
+    # Ensure unique node_id
+    existing = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(existing.scalars().all())
+    existing_ids = {n.node_id for n in all_nodes}
+    if node_id in existing_ids:
+        raise HTTPException(status_code=422, detail=f"Node '{node_id}' already exists")
+
+    config = dict(payload.config or {})
+    depends_on = _dedupe_node_ids(payload.depends_on or [])
+    after = config.pop("after", None)
+    if after and not depends_on:
+        depends_on = [after]
+
+    new_node = DAGNode(
+        dag_id=dag_id,
+        node_id=node_id,
+        skill_id=payload.skill_id,
+        skill_step_index=payload.skill_step_index,
+        description=payload.description or "",
+        status=NodeStatus.PENDING,
+        depends_on=depends_on,
+        config=config,
+        input_mapping=payload.input_mapping or {},
+    )
+    db.add(new_node)
+
+    # Mirror into dag_json so the planner/executor sees it
+    dag_json = deepcopy(dag.dag_json or {})
+    dag_nodes = dag_json.get("nodes", [])
+    dag_nodes.append({
+        "node_id": node_id,
+        "skill_id": payload.skill_id,
+        "skill_step_index": payload.skill_step_index,
+        "description": payload.description or "",
+        "depends_on": depends_on,
+        "config": config,
+        "input_mapping": payload.input_mapping or {},
+    })
+    dag_json["nodes"] = dag_nodes
+    is_valid, errors = validate_dag(dag_json)
+    if not is_valid:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail={"errors": errors})
+    dag.dag_json = dag_json
+
+    await db.commit()
+    await db.refresh(dag)
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    return _build_dag_detail(dag, list(nodes_result.scalars().all()))
+
+
+@router.post("/{dag_id}/nodes/{node_id}/image", response_model=DAGDetail)
+async def patch_node_image(dag_id: str, node_id: str, payload: dict, db: AsyncSession = Depends(get_db)):
+    """Change the base image a node executes on (manual override)."""
+    dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_editable(dag)
+
+    base_image = (payload.get("base_image") or "").strip()
+    if not base_image:
+        raise HTTPException(status_code=422, detail="base_image is required")
+
+    result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id))
+    node = result.scalar_one_or_none()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    node_config = dict(node.config or {})
+    node_config["base_image"] = base_image
+    node.config = node_config
+
+    dag_json = deepcopy(dag.dag_json or {})
+    for dag_node in dag_json.get("nodes", []):
+        if dag_node.get("node_id") == node_id:
+            dn_config = dict(dag_node.get("config") or {})
+            dn_config["base_image"] = base_image
+            dag_node["config"] = dn_config
+            break
+    dag.dag_json = dag_json
+
+    await db.commit()
+    await db.refresh(dag)
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    return _build_dag_detail(dag, list(nodes_result.scalars().all()))
+
+
 @router.post("/{dag_id}/nodes/{node_id}/enhance", response_model=DAGDetail)
 async def enhance_node(
     dag_id: str,
@@ -1052,8 +1170,8 @@ async def enhance_node(
 async def retry_dag_from_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_db)):
     """Resume execution from one failed node onward."""
     dag = await _get_dag_or_404(dag_id, db)
-    if dag.status != DAGStatus.FAILED:
-        raise HTTPException(status_code=400, detail="Retry-from-node is only available for failed DAGs")
+    if dag.status not in (DAGStatus.FAILED, DAGStatus.COMPLETED):
+        raise HTTPException(status_code=400, detail="Run-from-node is only available for failed or completed DAGs")
 
     nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
     all_nodes = list(nodes_result.scalars().all())
@@ -1288,11 +1406,11 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
 # ── Helpers ─────────────────────────────────────────────
 
 def _ensure_dag_editable(dag: MasterDAG) -> None:
-    editable_statuses = {DAGStatus.READY, DAGStatus.FAILED}
+    editable_statuses = {DAGStatus.READY, DAGStatus.FAILED, DAGStatus.COMPLETED}
     if dag.status not in editable_statuses:
         raise HTTPException(
             status_code=400,
-            detail=f"DAG is in '{dag.status.value}' state, must be 'ready' or 'failed' for this operation",
+            detail=f"DAG is in '{dag.status.value}' state, must be 'ready', 'failed', or 'completed' for this operation",
         )
 
 

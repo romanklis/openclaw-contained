@@ -160,6 +160,13 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [enhanceMode, setEnhanceMode] = useState<'rewrite' | 'split'>('rewrite')
   const [enhanceGuidance, setEnhanceGuidance] = useState('')
   const [enhanceSplitCount, setEnhanceSplitCount] = useState(2)
+  const [showAddNodeDialog, setShowAddNodeDialog] = useState(false)
+  const [addNodeDesc, setAddNodeDesc] = useState('')
+  const [addNodeImage, setAddNodeImage] = useState('openclaw')
+  const [addNodeMode, setAddNodeMode] = useState<'after' | 'parallel' | 'custom'>('after')
+  const [addNodeDeps, setAddNodeDeps] = useState<string[]>([])
+  const [showImageDialog, setShowImageDialog] = useState(false)
+  const [nodeImage, setNodeImage] = useState('')
 
   // Skill extraction state
   const [miningSkill, setMiningSkill] = useState(false)
@@ -507,6 +514,69 @@ setNodeState(prev => {
     }
   }
 
+  const addNodeAfterSelected = async () => {
+    if (!dag || !selectedNode) return
+    setNodeActionLoading(true)
+    try {
+      const newId = 'step-' + Math.random().toString(36).slice(2, 8)
+      // "after" -> depends on selected node; "parallel" -> same deps as selected;
+      // "custom" -> explicitly chosen predecessors.
+      let deps: string[]
+      if (addNodeMode === 'parallel') {
+        deps = selectedNode.depends_on?.length ? selectedNode.depends_on : []
+      } else if (addNodeMode === 'custom') {
+        deps = addNodeDeps
+      } else {
+        deps = [selectedNode.node_id]
+      }
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          node_id: newId,
+          description: addNodeDesc.trim() || 'New step',
+          depends_on: deps,
+          config: {
+            base_image: addNodeImage.trim() || 'openclaw',
+            llm_model: dag.llm_model || undefined,
+          },
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail || `HTTP ${res.status}`)
+      setShowAddNodeDialog(false)
+      setAddNodeDesc('')
+      setAddNodeDeps([])
+      setShowNodeActions(false)
+      await applyDagMutationResult(data as DAGDetail, true)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
+  const changeSelectedNodeImage = async () => {
+    if (!dag || !selectedNode) return
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes/${selectedNode.node_id}/image`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_image: nodeImage.trim() }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail || `HTTP ${res.status}`)
+      setShowImageDialog(false)
+      setShowNodeActions(false)
+      await applyDagMutationResult(data as DAGDetail, true)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
   const enhanceSelectedNode = async () => {
     if (!dag || !selectedNode) return
     if (!(dag.status === 'failed' || dag.status === 'ready')) return
@@ -734,8 +804,8 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
           <p className="text-gray-400 text-sm mt-1 max-w-3xl">{dag.objective}</p>
         </div>
         <div className="flex gap-2">
-          {dag.status === 'ready' && (
-            <button onClick={startDag} className="btn-success text-sm">&#9654; Start</button>
+          {(dag.status === 'ready' || dag.status === 'completed') && (
+            <button onClick={startDag} className="btn-success text-sm">{dag.status === 'completed' ? '▶ Run (all)' : '▶ Start'}</button>
           )}
           {dag.status === 'running' && (
             <button onClick={cancelDag} className="btn-danger text-sm">&#9209; Cancel</button>
@@ -915,13 +985,27 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🗑 Delete Step
                       </button>
-                      {dag.status === 'failed' && (
+                      <button
+                        onClick={() => { setShowNodeActions(false); setShowAddNodeDialog(true) }}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ➕ Add Step After
+                      </button>
+                      <button
+                        onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🖼️ Change Image
+                      </button>
+                      {(dag.status === 'failed' || dag.status === 'completed') && (
                         <button
                           onClick={retryFromSelectedNode}
                           disabled={nodeActionLoading}
                           className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 border-t border-gray-700 disabled:opacity-50"
                         >
-                          ▶ Retry From This Step
+                          ▶ Run From This Step
                         </button>
                       )}
                     </div>
@@ -979,7 +1063,23 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                           />
                           <span className="text-xs text-gray-400">Include skill context in review</span>
                         </label>
-                      </div>                    </div>
+                      </div>
+                      <div className="border-t border-gray-700 my-1" />
+                      <button
+                        onClick={() => { setShowNodeActions(false); setShowAddNodeDialog(true) }}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ➕ Add Step After
+                      </button>
+                      <button
+                        onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🖼️ Change Image
+                      </button>
+                    </div>
                   )}
                 </div>
               )}
@@ -1052,13 +1152,27 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🗑 Delete Step
                       </button>
-                      {dag.status === 'failed' && (
+                      <button
+                        onClick={() => { setShowNodeActions(false); setShowAddNodeDialog(true) }}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ➕ Add Step After
+                      </button>
+                      <button
+                        onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🖼️ Change Image
+                      </button>
+                      {(dag.status === 'failed' || dag.status === 'completed') && (
                         <button
                           onClick={retryFromSelectedNode}
                           disabled={nodeActionLoading}
                           className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 border-t border-gray-700 disabled:opacity-50"
                         >
-                          ▶ Retry From This Step
+                          ▶ Run From This Step
                         </button>
                       )}
                     </div>
@@ -1313,6 +1427,106 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
                 >
                   {nodeActionLoading ? 'Applying...' : 'Apply Enhancement'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showAddNodeDialog && selectedNode && (
+            <div className="mb-3 rounded border border-indigo-700/40 bg-indigo-950/20 p-3">
+              <div className="text-xs uppercase tracking-wide text-indigo-300 mb-2">
+                {addNodeMode === 'parallel' ? 'Add Parallel Step (next to ' : addNodeMode === 'custom' ? 'Add Connected Step (depends on ' : 'Add Step After '}{selectedNode.node_id}
+                {addNodeMode === 'parallel' ? ')' : addNodeMode === 'custom' ? ')' : ''}
+              </div>
+              <div className="flex gap-2 mb-2">
+                <button
+                  onClick={() => setAddNodeMode('after')}
+                  className={`text-xs px-2 py-1 rounded border ${addNodeMode === 'after' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+                >
+                  After this step
+                </button>
+                <button
+                  onClick={() => setAddNodeMode('parallel')}
+                  className={`text-xs px-2 py-1 rounded border ${addNodeMode === 'parallel' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+                >
+                  Parallel (same deps)
+                </button>
+                <button
+                  onClick={() => { setAddNodeMode('custom'); setAddNodeDeps(selectedNode.depends_on || []) }}
+                  className={`text-xs px-2 py-1 rounded border ${addNodeMode === 'custom' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+                >
+                  Connect to step(s)
+                </button>
+              </div>
+              {addNodeMode === 'parallel' && (
+                <p className="text-[11px] text-gray-500 mb-2">Runs in parallel with "{selectedNode.node_id}" — depends on the same predecessors.</p>
+              )}
+              {addNodeMode === 'custom' && (
+                <div className="mb-2">
+                  <p className="text-[11px] text-gray-500 mb-1">Choose which existing step(s) this new step depends on:</p>
+                  <div className="max-h-32 overflow-y-auto border border-gray-700 rounded p-1.5 space-y-1">
+                    {(dag?.nodes || []).filter(n => n.node_id !== selectedNode.node_id).map(n => {
+                      const checked = addNodeDeps.includes(n.node_id)
+                      return (
+                        <label key={n.node_id} className="flex items-center gap-2 cursor-pointer text-xs text-gray-300">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              setAddNodeDeps(prev => e.target.checked ? [...prev, n.node_id] : prev.filter(d => d !== n.node_id))
+                            }}
+                            className="accent-indigo-500"
+                          />
+                          {n.node_id}
+                        </label>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+              <textarea
+                value={addNodeDesc}
+                onChange={(e) => setAddNodeDesc(e.target.value)}
+                rows={2}
+                className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2"
+                placeholder="Describe the new step..."
+              />
+              <label className="block text-xs text-gray-400 mb-1">Image</label>
+              <select
+                value={addNodeImage}
+                onChange={(e) => setAddNodeImage(e.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2"
+              >
+                {['openclaw', 'browser', 'browser_v2', 'browser_v3', 'browser_v4', 'nanobot', 'picoclaw', 'octaveclaw', 'zeroclaw'].map(img => (
+                  <option key={img} value={img}>{img}</option>
+                ))}
+              </select>
+              <div className="flex justify-end gap-2">
+                <button onClick={() => setShowAddNodeDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
+                <button onClick={addNodeAfterSelected} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
+                  {nodeActionLoading ? 'Adding...' : 'Add Step'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showImageDialog && selectedNode && (
+            <div className="mb-3 rounded border border-indigo-700/40 bg-indigo-950/20 p-3">
+              <div className="text-xs uppercase tracking-wide text-indigo-300 mb-2">Change Image for "{selectedNode.node_id}"</div>
+              <label className="block text-xs text-gray-400 mb-1">Current: {selectedNode.config?.base_image || 'openclaw'}</label>
+              <select
+                value={nodeImage}
+                onChange={(e) => setNodeImage(e.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2"
+              >
+                {['openclaw', 'browser', 'browser_v2', 'browser_v3', 'browser_v4', 'nanobot', 'picoclaw', 'octaveclaw', 'zeroclaw'].map(img => (
+                  <option key={img} value={img}>{img}</option>
+                ))}
+              </select>
+              <div className="flex justify-end gap-2">
+                <button onClick={() => setShowImageDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
+                <button onClick={changeSelectedNodeImage} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
+                  {nodeActionLoading ? 'Saving...' : 'Change Image'}
                 </button>
               </div>
             </div>
