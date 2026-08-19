@@ -21,6 +21,48 @@ logger = logging.getLogger(__name__)
 LLM_ROUTER_URL = "http://localhost:8000/api/llm/v1/chat/completions"
 
 
+def _extract_json_object(text: str):
+    """Robustly extract the first valid JSON object from an LLM response.
+
+    Handles markdown code fences, leading/trailing prose, and nested braces
+    inside string values. Returns the parsed object or None.
+    """
+    if not text:
+        return None
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1)
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception:
+                        break
+        start = text.find("{", start + 1)
+    return None
+
+
 def is_gemini_lite_model(model: str) -> bool:
     """Return True if model belongs to the gemini-lite family."""
     normalized = (model or "").strip().lower()
@@ -373,6 +415,12 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
                         ],
                         "temperature": 0.3,
                         "stream": False,
+                        # DeepSeek V4 is a reasoning model — the chain-of-thought
+                        # counts toward max_tokens. Disable thinking for this
+                        # structured-JSON call (faster, no truncation) and keep a
+                        # generous max_tokens as a safety net.
+                        "max_tokens": 30000,
+                        "thinking": {"type": "disabled"},
                     },
                 )
                 resp.raise_for_status()
@@ -399,13 +447,18 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
                     lines = lines[:-1]
                 content = "\n".join(lines)
 
-            # Parse JSON
+            # Parse JSON — prefer a direct parse, fall back to extracting the
+            # first complete JSON object (in case the model wraps the answer in
+            # prose or trailing reasoning).
             try:
                 dag_json = json.loads(content)
-            except json.JSONDecodeError as e:
-                last_error = f"Invalid JSON: {e}"
-                logger.warning(f"Planner attempt {attempt}/{max_attempts}: {last_error}")
-                continue
+            except json.JSONDecodeError:
+                extracted = _extract_json_object(content)
+                if extracted is None:
+                    last_error = "Invalid JSON: no parseable object returned"
+                    logger.warning(f"Planner attempt {attempt}/{max_attempts}: {last_error}")
+                    continue
+                dag_json = extracted
 
             # Validate DAG structure
             is_valid, errors = validate_dag(dag_json, {s.id: True for s in skills})

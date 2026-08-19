@@ -1,7 +1,7 @@
 'use client'
 
-import { useMemo } from 'react'
-import ReactFlow, { Node, Edge, Position, MarkerType } from 'reactflow'
+import { useMemo, useState, useEffect, useCallback } from 'react'
+import ReactFlow, { Node, Edge, Position, MarkerType, applyEdgeChanges } from 'reactflow'
 import 'reactflow/dist/style.css'
 
 interface DAGNodeData {
@@ -18,6 +18,9 @@ interface DAGNodeData {
 interface DAGGraphProps {
   nodes: DAGNodeData[]
   onNodeClick: (nodeId: string) => void
+  editable?: boolean
+  onConnect?: (source: string, target: string) => void
+  onDisconnect?: (source: string, target: string) => void
 }
 
 const STATUS_COLORS: Record<string, { bg: string; border: string; text: string }> = {
@@ -33,7 +36,10 @@ function getColors(status: string) {
   return STATUS_COLORS[status] || STATUS_COLORS.pending
 }
 
-export default function DAGGraph({ nodes, onNodeClick }: DAGGraphProps) {
+const EDGE_MARKER = { type: MarkerType.ArrowClosed, color: '#6b7280' }
+const EDGE_STYLE = { stroke: '#6b7280', strokeWidth: 2 }
+
+export default function DAGGraph({ nodes, onNodeClick, editable = false, onConnect, onDisconnect }: DAGGraphProps) {
   const { flowNodes, flowEdges } = useMemo(() => {
     // Build adjacency for layout: group into waves (topological layers)
     const nodeMap = new Map(nodes.map(n => [n.node_id, n]))
@@ -89,6 +95,16 @@ export default function DAGGraph({ nodes, onNodeClick }: DAGGraphProps) {
             minWidth: '140px',
             cursor: 'pointer',
           },
+          ...(editable
+            ? {
+                handleStyle: {
+                  width: 10,
+                  height: 10,
+                  background: '#38bdf8',
+                  border: '1px solid #0c4a6e',
+                },
+              }
+            : {}),
         })
       }
     }
@@ -100,30 +116,73 @@ export default function DAGGraph({ nodes, onNodeClick }: DAGGraphProps) {
           id: `${dep}->${n.node_id}`,
           source: dep,
           target: n.node_id,
-          markerEnd: { type: MarkerType.ArrowClosed, color: '#6b7280' },
-          style: { stroke: '#6b7280', strokeWidth: 2 },
+          markerEnd: EDGE_MARKER,
+          style: EDGE_STYLE,
         })
       }
     }
 
     return { flowNodes, flowEdges }
-  }, [nodes])
+  }, [nodes, editable])
+
+  const [edges, setEdges] = useState<Edge[]>(flowEdges)
+
+  // Resync local edge state whenever the derived graph changes (e.g. after a
+  // successful mutation/refetch from the parent).
+  useEffect(() => {
+    setEdges(flowEdges)
+  }, [flowEdges])
+
+  const handleConnect = useCallback(
+    (conn: { source: string; target: string }) => {
+      if (!onConnect || conn.source === conn.target) return
+      onConnect(conn.source, conn.target)
+      // Show the new connection immediately; the parent refetch reconciles it.
+      setEdges(eds =>
+        eds.some(e => e.source === conn.source && e.target === conn.target)
+          ? eds
+          : [...eds, { id: `${conn.source}->${conn.target}`, source: conn.source, target: conn.target, markerEnd: EDGE_MARKER, style: EDGE_STYLE }]
+      )
+    },
+    [onConnect]
+  )
+
+  const handleEdgesChange = useCallback(
+    (changes: any[]) => {
+      for (const ch of changes) {
+        if (ch.type === 'remove' && onDisconnect) {
+          const e = edges.find(x => x.id === ch.id)
+          if (e) onDisconnect(e.source, e.target)
+        }
+      }
+      setEdges(eds => applyEdgeChanges(changes, eds))
+    },
+    [edges, onDisconnect]
+  )
 
   return (
-    <div className="card" style={{ height: Math.max(500, nodes.length * 80 + 150) }}>
+    <div className="card" style={{ height: Math.max(500, nodes.length * 80 + 150), position: 'relative' }}>
       <ReactFlow
         nodes={flowNodes}
-        edges={flowEdges}
+        edges={edges}
         onNodeClick={(_, node) => onNodeClick(node.id)}
+        onConnect={editable ? handleConnect : undefined}
+        onEdgesChange={editable ? handleEdgesChange : undefined}
         fitView
         fitViewOptions={{ padding: 0.2 }}
         proOptions={{ hideAttribution: true }}
         nodesDraggable={false}
-        nodesConnectable={false}
+        nodesConnectable={editable}
         elementsSelectable={true}
+        deleteKeyCode={editable ? ['Backspace', 'Delete'] : null}
         minZoom={0.3}
         maxZoom={1.5}
       />
+      {editable && (
+        <div className="absolute top-2 left-2 z-10 rounded bg-gray-900/80 border border-indigo-700/40 px-2 py-1 text-[10px] text-indigo-200">
+          Drag from a step's right edge to another step's left edge to connect · select an edge and press Delete to remove
+        </div>
+      )}
     </div>
   )
 }

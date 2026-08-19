@@ -9,7 +9,7 @@ from database import get_db
 from models import (
     SkillV2, SkillV2Status, SkillV2Source,
     SkillDemo, SkillReview, SkillSelectionEvent,
-    AgentImage, TaskOutput, Task, DAGNode, Skill,
+    AgentImage, TaskOutput, Task, DAGNode, Skill, DeepReview,
 )
 from typing import Optional, List
 from datetime import datetime
@@ -881,13 +881,19 @@ def _normalize_review_payload(parsed: dict) -> dict:
     """
     if not isinstance(parsed, dict):
         return {}
-    # Unwrap nested wrapper objects
-    for wrapper in ("analysis", "result", "data", "review", "response"):
-        if wrapper in parsed and isinstance(parsed[wrapper], dict):
-            inner = parsed[wrapper]
-            # merge inner into outer, keeping outer keys that exist
-            merged = {**inner, **{k: v for k, v in parsed.items() if k != wrapper}}
-            parsed = merged
+    # Recursively unwrap nested wrapper objects (models sometimes return
+    # {"status":..., "analysis": {"overall_assessment":...}} envelopes).
+    wrappers = ("analysis", "result", "data", "review", "response", "assessment", "output", "content", "payload")
+    for _ in range(6):
+        unwrapped = False
+        for wrapper in wrappers:
+            if wrapper in parsed and isinstance(parsed[wrapper], dict):
+                inner = parsed[wrapper]
+                # merge inner into outer, keeping outer keys that exist
+                parsed = {**inner, **{k: v for k, v in parsed.items() if k != wrapper}}
+                unwrapped = True
+                break
+        if not unwrapped:
             break
     # Standardize key aliases
     alias = {
@@ -970,6 +976,26 @@ def _normalize_score(value) -> int:
     return max(0, min(100, int(round(f))))
 
 
+def _derive_verdict_from_payload(payload: dict) -> str:
+    """Synthesize a verdict from issues/score when the model omits a verdict.
+
+    Returns a canonical verdict string, or "" if the payload has no usable
+    signals (so callers know it's a wrong-shaped response, not a review).
+    """
+    if payload.get("issues"):
+        return "issues_found"
+    score = _normalize_score(payload.get("score"))
+    if score:
+        if score >= 85:
+            return "clean"
+        if score >= 50:
+            return "needs_attention"
+        return "issues_found"
+    if payload.get("positives"):
+        return "needs_attention"
+    return ""
+
+
 def _extract_json_object(text: str):
     """Robustly extract the first JSON object from an LLM response.
 
@@ -1018,73 +1044,89 @@ def _extract_json_object(text: str):
     return None
 
 
+def _build_skill_analysis_system_prompt() -> str:
+    return (
+        "You are a senior skill-extraction and code-review analyst for an autonomous agent platform. "
+        "You examine an agent's execution log for a task and decide whether it reveals a reusable/improveable "
+        "procedural skill. You must also critically assess whether the agent completed the task CORRECTLY, "
+        "flagging any hallucinations, fabrication of data, or generation of synthetic/mock content in code or "
+        "output files (this is a serious quality problem we must prevent).\n\n"
+        "Respond with ONLY valid JSON, no surrounding text, in this exact shape:\n"
+        "{\n"
+        '  "learning_potential": <bool>,\n'
+        '  "assessment": "<string: overall quality + whether a skill can be learned>",\n'
+        '  "warnings": ["<string: hallucination/synthetic-data/quality concerns>", ...],\n'
+        '  "suggested_improvements": ["<string: how to improve the skill to avoid these issues>", ...],\n'
+        '  "skills": [\n'
+        "    {\n"
+        '      "name": "<skill name>",\n'
+        '      "description": "<one-line description>",\n'
+        '      "instructions": "<detailed procedural instructions, newline separated>",\n'
+        '      "tags": ["<tag>", ...]\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "If no reusable skill is evident, set learning_potential=false and skills=[]. "
+        "If the agent generated synthetic/fabricated data or mocked outputs, surface it clearly in warnings."
+    )
+
+
 async def _call_skill_analysis_llm(summary: dict, skill_used: Optional[dict], task: Task) -> dict:
-    """Call the LLM to analyze the execution and propose skill(s)."""
+    """Call the LLM to analyze the execution and propose skill(s).
+
+    Uses a single, explicitly configured model (no silent cross-model fallback).
+    """
     import httpx
-    payload = {
-        "model": _deep_review_model(),
-        "max_tokens": 4000,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a senior skill-extraction and code-review analyst for an autonomous agent platform. "
-                    "You examine an agent's execution log for a task and decide whether it reveals a reusable/improveable "
-                    "procedural skill. You must also critically assess whether the agent completed the task CORRECTLY, "
-                    "flagging any hallucinations, fabrication of data, or generation of synthetic/mock content in code or "
-                    "output files (this is a serious quality problem we must prevent).\n\n"
-                    "Respond with ONLY valid JSON, no surrounding text, in this exact shape:\n"
-                    "{\n"
-                    '  "learning_potential": <bool>,\n'
-                    '  "assessment": "<string: overall quality + whether a skill can be learned>",\n'
-                    '  "warnings": ["<string: hallucination/synthetic-data/quality concerns>", ...],\n'
-                    '  "suggested_improvements": ["<string: how to improve the skill to avoid these issues>", ...],\n'
-                    '  "skills": [\n'
-                    '    {\n'
-                    '      "name": "<skill name>",\n'
-                    '      "description": "<one-line description>",\n'
-                    '      "instructions": "<detailed procedural instructions, newline separated>",\n'
-                    '      "tags": ["<tag>", ...]\n'
-                    "    }\n"
-                    "  ]\n"
-                    "}\n"
-                    "If no reusable skill is evident, set learning_potential=false and skills=[]. "
-                    "If the agent generated synthetic/fabricated data or mocked outputs, surface it clearly in warnings."
-                ),
+    model = _deep_review_model()
+    user_content = json.dumps(
+        {
+            "task": {
+                "task_id": summary.get("task_metadata", {}).get("task_id"),
+                "name": summary.get("task_metadata", {}).get("task_name"),
+                "description": summary.get("task_metadata", {}).get("description"),
+                "model": summary.get("task_metadata", {}).get("model"),
+                "base_image": summary.get("task_metadata", {}).get("base_image"),
+                "dag_id": summary.get("task_metadata", {}).get("dag_id"),
+                "node_id": summary.get("task_metadata", {}).get("node_id"),
             },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "task": {
-                            "task_id": summary.get("task_metadata", {}).get("task_id"),
-                            "name": summary.get("task_metadata", {}).get("task_name"),
-                            "description": summary.get("task_metadata", {}).get("description"),
-                            "model": summary.get("task_metadata", {}).get("model"),
-                            "base_image": summary.get("task_metadata", {}).get("base_image"),
-                            "dag_id": summary.get("task_metadata", {}).get("dag_id"),
-                            "node_id": summary.get("task_metadata", {}).get("node_id"),
-                        },
-                        "skill_used": skill_used,
-                        "execution_summary": summary,
-                    },
-                    default=str,
-                ),
-            },
-        ],
-    }
+            "skill_used": skill_used,
+            "execution_summary": summary,
+        },
+        default=str,
+    )
     async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.post("http://localhost:8000/api/llm/v1/chat/completions", json=payload)
-        if resp.status_code != 200:
-            logger.warning("Skill analysis LLM returned %s: %s", resp.status_code, resp.text[:500])
-            return {"learning_potential": False, "assessment": "LLM analysis failed", "warnings": [], "suggested_improvements": [], "skills": []}
-        content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-    # Parse JSON from response
-    parsed = _extract_json_object(content)
-    if parsed is not None:
-        return _normalize_review_payload(parsed)
-    logger.warning("Could not parse skill analysis JSON")
-    return {"learning_potential": False, "assessment": "Could not parse LLM output", "warnings": [], "suggested_improvements": [], "skills": []}
+        for strict in (False, True):
+            if strict:
+                system = "Output ONLY a single valid JSON object. No markdown, no code fences, no commentary, no trailing text. Begin with { and end with }."
+                user = f"Return your analysis as valid JSON only.\n\n{user_content}"
+            else:
+                system = _build_skill_analysis_system_prompt()
+                user = user_content
+            payload = {
+                "model": model,
+                "max_tokens": 30000,
+                "thinking": {"type": "disabled"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+            try:
+                resp = await client.post("http://localhost:8000/api/llm/v1/chat/completions", json=payload)
+            except httpx.HTTPError as exc:
+                logger.warning("Skill analysis LLM request failed (%s): %s", model, exc)
+                continue
+            if resp.status_code != 200:
+                logger.warning("Skill analysis LLM returned %s for %s: %s", resp.status_code, model, resp.text[:500])
+                break
+            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            parsed = _extract_json_object(content)
+            if parsed is not None:
+                normalized = _normalize_review_payload(parsed)
+                normalized["model"] = model
+                return normalized
+            logger.warning("Could not parse skill analysis JSON for %s (strict=%s)", model, strict)
+    return {"learning_potential": False, "assessment": "Could not parse LLM output", "warnings": [], "suggested_improvements": [], "skills": [], "model": model}
 
 
 @router.post("/analyze", response_model=SkillAnalysisResponse)
@@ -1216,7 +1258,7 @@ class DeepReviewIssue(BaseModel):
 
 class DeepReviewResponse(BaseModel):
     task_id: str
-    node_id: Optional[str]
+    node_id: Optional[str] = None
     image_id: str
     image_tag: str
     skill_used_id: Optional[str]
@@ -1226,6 +1268,9 @@ class DeepReviewResponse(BaseModel):
     summary: str
     issues: List[DeepReviewIssue]
     positives: List[str]
+    id: Optional[int] = None
+    model: Optional[str] = None       # which model generated this review
+    created_at: Optional[datetime] = None
 
 
 
@@ -1286,94 +1331,110 @@ def _trim_execution_summary_for_llm(summary: dict, max_deliverable_chars: int = 
     return out
 
 
+def _build_deep_review_system_prompt() -> str:
+    return (
+        "You are a rigorous AI-execution auditor for an autonomous agent platform. "
+        "You are given the full execution log summary of an agent task and must audit it "
+        "for integrity issues. Be skeptical and thorough. Look specifically for:\n"
+        "1. HALLUCINATIONS: claims, URLs, file contents, or data that were never actually "
+        "   fetched/verified — the agent describing things as done without evidence.\n"
+        "2. SYNTHETIC DATA / MOCKING: the agent generating fabricated/synthetic/mock data "
+        "   (e.g. sample rows, placeholder values, invented API responses) instead of real "
+        "   fetched data, especially inside code files or deliverables.\n"
+        "3. SHORTCUTS: skipping steps, hardcoding expected answers, not actually calling tools, "
+        "   circumventing validation, silently degrading to fallback without justification.\n"
+        "4. MISMATCH: claims in the final output that don't match the tool results, or "
+        "   deliverables that don't match the task requirements.\n"
+        "5. QUALITY: dead code, ignored errors, brittle behavior, missing error handling.\n"
+        "6. DATA QUALITY: check if the data used in the processing is complete and without errors.\n"
+        "MANDATORY CHECKS — you MUST actively hunt for these common failure signals and report them as issues:\n"
+        '   - Placeholder/synthetic values in deliverables, e.g. "N/A", "TBD", "example", "sample", dummy data, or empty fields.\n'
+        '   - The agent reporting success/"completed" while tool outputs show empty results, 0 items, or failed fetches.\n'
+        "   - Claims in the final output/summary that are not supported by the actual tool results or deliverable contents.\n"
+        "   - Scripts that rely on brittle selectors and silently produce empty output yet are reported as working.\n"
+        "   - Repeated script rewrites with no evidence of verification against real responses.\n"
+        "Do NOT give a clean verdict if any of the above is present. Verify the deliverable CONTENTS against the claimed result before judging clean.\n\n"
+        "Respond with ONLY valid JSON, no surrounding text, in this exact shape:\n"
+        "{\n"
+        '  "verdict": "<clean | issues_found | needs_attention>",\n'
+        '  "score": <int 0-100>,\n'
+        '  "summary": "<2-3 sentence overall assessment>",\n'
+        '  "issues": [\n'
+        "    {\n"
+        '      "severity": "<high | medium | low>",\n'
+        '      "category": "<hallucination | synthetic_data | shortcut | mismatch | quality>",\n'
+        '      "finding": "<what was found>",\n'
+        '      "evidence": "<excerpt or location from the log>",\n'
+        '      "recommendation": "<how to fix / prevent>"\n'
+        "    }\n"
+        "  ],\n"
+        '  "positives": ["<what was done correctly>", ...]\n'
+        "}\n"
+        "If the execution is clean, set verdict=clean, score>=85, and issues=[]. "
+        "Be honest and specific — do not invent issues, but do not be lenient either."
+    )
+
+
+def _build_deep_review_payload(model: str, user_content: dict, strict: bool) -> dict:
+    if strict:
+        system = "Output ONLY a single valid JSON object. No markdown, no code fences, no commentary, no trailing text. Begin with { and end with }."
+        user = f"Return your analysis as valid JSON only.\n\n{json.dumps(user_content, default=str)}"
+    else:
+        system = _build_deep_review_system_prompt()
+        user = json.dumps(user_content, default=str)
+    return {
+        "model": model,
+        "max_tokens": 30000,  # generous: reasoning models burn tokens on CoT before the final JSON
+        "thinking": {"type": "disabled"},  # structured JSON: skip chain-of-thought entirely
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+
+
 async def _call_deep_review_llm(summary: dict, skill_used: Optional[dict], task: Task, include_skill: bool = True) -> dict:
-    """Call the LLM for a rigorous audit of hallucinations / synthetic data / shortcuts."""
+    """Call the LLM for a rigorous audit of hallucinations / synthetic data / shortcuts.
+
+    Uses a single, explicitly configured review model (no silent cross-model
+    fallback) so the result is traceable to the model that generated it.
+    """
     import httpx
+    model = _deep_review_model()
     # Send a context-safe copy of the summary (truncated to fit the model's
     # context window). Structure preserved for parsing. Full deliverables are
     # still scanned by the rule-based integrity detector separately.
     user_content = _trim_execution_summary_for_llm(summary)
     if include_skill and skill_used:
         user_content["skill_used"] = skill_used
-    payload = {
-        "model": _deep_review_model(),
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a rigorous AI-execution auditor for an autonomous agent platform. "
-                    "You are given the full execution log summary of an agent task and must audit it "
-                    "for integrity issues. Be skeptical and thorough. Look specifically for:\n"
-                    "1. HALLUCINATIONS: claims, URLs, file contents, or data that were never actually "
-                    "   fetched/verified — the agent describing things as done without evidence.\n"
-                    "2. SYNTHETIC DATA / MOCKING: the agent generating fabricated/synthetic/mock data "
-                    "   (e.g. sample rows, placeholder values, invented API responses) instead of real "
-                    "   fetched data, especially inside code files or deliverables.\n"
-                    "3. SHORTCUTS: skipping steps, hardcoding expected answers, not actually calling tools, "
-                    "   circumventing validation, silently degrading to fallback without justification.\n"
-                    "4. MISMATCH: claims in the final output that don't match the tool results, or "
-                    "   deliverables that don't match the task requirements.\n"
-                    "5. QUALITY: dead code, ignored errors, brittle behavior, missing error handling.\n"
-                    "6. DATA QUALITY: check if the data used in the processing is complete and without errors.\n"
-                    "MANDATORY CHECKS — you MUST actively hunt for these common failure signals and report them as issues:\n"
-                    "   - Placeholder/synthetic values in deliverables, e.g. \"N/A\", \"TBD\", \"example\", \"sample\", dummy data, or empty fields.\n"
-                    "   - The agent reporting success/\"completed\" while tool outputs show empty results, 0 items, or failed fetches.\n"
-                    "   - Claims in the final output/summary that are not supported by the actual tool results or deliverable contents.\n"
-                    "   - Scripts that rely on brittle selectors and silently produce empty output yet are reported as working.\n"
-                    "   - Repeated script rewrites with no evidence of verification against real responses.\n"
-                    "Do NOT give a clean verdict if any of the above is present. Verify the deliverable CONTENTS against the claimed result before judging clean.\n\n"
-                    "Respond with ONLY valid JSON, no surrounding text, in this exact shape:\n"
-                    "{\n"
-                    '  "verdict": "<clean | issues_found | needs_attention>",\n'
-                    '  "score": <int 0-100>,\n'
-                    '  "summary": "<2-3 sentence overall assessment>",\n'
-                    '  "issues": [\n'
-                    '    {\n'
-                    '      "severity": "<high | medium | low>",\n'
-                    '      "category": "<hallucination | synthetic_data | shortcut | mismatch | quality>",\n'
-                    '      "finding": "<what was found>",\n'
-                    '      "evidence": "<excerpt or location from the log>",\n'
-                    '      "recommendation": "<how to fix / prevent>"\n'
-                    "    }\n"
-                    "  ],\n"
-                    '  "positives": ["<what was done correctly>", ...]\n'
-                    "}\n"
-                    "If the execution is clean, set verdict=clean, score>=85, and issues=[]. "
-                    "Be honest and specific — do not invent issues, but do not be lenient either."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(user_content, default=str),
-            },
-        ],
-    }
+
     async with httpx.AsyncClient(timeout=240) as client:
-        for attempt in range(2):
-            resp = await client.post("http://localhost:8000/api/llm/v1/chat/completions", json=payload)
+        for strict in (False, True):
+            payload = _build_deep_review_payload(model, user_content, strict=strict)
+            try:
+                resp = await client.post("http://localhost:8000/api/llm/v1/chat/completions", json=payload)
+            except httpx.HTTPError as exc:
+                logger.warning("Deep review LLM request failed (%s): %s", model, exc)
+                continue
             if resp.status_code != 200:
-                logger.warning("Deep review LLM returned %s: %s", resp.status_code, resp.text[:500])
-                return {"verdict": "needs_attention", "score": 0, "summary": "Deep review failed", "issues": [], "positives": []}
+                logger.warning("Deep review LLM returned %s for %s: %s", resp.status_code, model, resp.text[:500])
+                break
             content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
             parsed = _extract_json_object(content)
             if parsed is not None:
                 normalized = _normalize_review_payload(parsed)
-                # If the parsed payload has no usable verdict/score, it's a
-                # wrong-shaped response (e.g. the model echoed the task instead
-                # of returning an audit). Treat as unparseable and retry.
-                if _normalize_verdict(normalized.get("verdict")):
+                # Prefer an explicit verdict; otherwise derive one from
+                # issues/score so wrapped-but-valid audits work.
+                verdict = _normalize_verdict(normalized.get("verdict"))
+                if not verdict:
+                    verdict = _derive_verdict_from_payload(normalized)
+                    if verdict:
+                        normalized["verdict"] = verdict
+                if verdict:
+                    normalized["model"] = model
                     return normalized
-            # Retry with a stricter instruction to force the correct audit JSON
-            logger.warning("Deep review: could not parse output on attempt %s; retrying", attempt + 1)
-            original_user = payload['messages'][1]['content']
-            payload = {
-                **payload,
-                "messages": [
-                    {"role": "system", "content": "Output ONLY a single valid JSON object. No markdown, no code fences, no commentary, no trailing text. Begin with { and end with }."},
-                    {"role": "user", "content": f"Return your analysis as valid JSON only.\n\n{original_user}"},
-                ],
-            }
-    return {"verdict": "needs_attention", "score": 0, "summary": "Could not parse LLM output", "issues": [], "positives": []}
+            logger.warning("Deep review: could not parse output for %s (strict=%s); retrying", model, strict)
+    return {"verdict": "needs_attention", "score": 0, "summary": "Could not parse LLM output", "issues": [], "positives": [], "model": model}
 
 
 @router.post("/deep-review", response_model=DeepReviewResponse)
@@ -1450,7 +1511,9 @@ async def deep_review_task(data: DeepReviewRequest, db: AsyncSession = Depends(g
             verdict = "needs_attention" if (review.get("issues") or []) else "clean"
         score = _normalize_score(review.get("score"))
 
-    return DeepReviewResponse(
+    review_model = review.get("model") or _deep_review_model()
+
+    response = DeepReviewResponse(
         task_id=data.task_id,
         node_id=data.node_id,
         image_id=image_id,
@@ -1462,7 +1525,71 @@ async def deep_review_task(data: DeepReviewRequest, db: AsyncSession = Depends(g
         summary=review.get("summary", ""),
         issues=merged_issues,
         positives=[str(p) for p in (review.get("positives") or [])],
+        model=review_model,
     )
+
+    # Persist so each step's review is retained and switchable in the UI.
+    record = DeepReview(
+        dag_id=data.dag_id or task.dag_id,
+        node_id=data.node_id or task.node_id or "",
+        task_id=data.task_id,
+        image_id=image_id,
+        image_tag=image_tag,
+        skill_used_id=response.skill_used_id,
+        skill_used_name=response.skill_used_name,
+        model=review_model,
+        include_skill=data.include_skill,
+        verdict=verdict,
+        score=score,
+        summary=response.summary,
+        issues=[i.model_dump() for i in merged_issues],
+        positives=response.positives,
+    )
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+
+    response.id = record.id
+    response.created_at = record.created_at
+    return response
+
+
+@router.get("/deep-review", response_model=List[DeepReviewResponse])
+async def list_deep_reviews(
+    dag_id: Optional[str] = Query(None),
+    node_id: Optional[str] = Query(None),
+    task_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return persisted deep-review results so the UI can show each step's review."""
+    stmt = select(DeepReview).order_by(DeepReview.created_at.desc())
+    if dag_id:
+        stmt = stmt.where(DeepReview.dag_id == dag_id)
+    if node_id:
+        stmt = stmt.where(DeepReview.node_id == node_id)
+    if task_id:
+        stmt = stmt.where(DeepReview.task_id == task_id)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    return [
+        DeepReviewResponse(
+            task_id=r.task_id,
+            node_id=r.node_id,
+            image_id=r.image_id or "openclaw",
+            image_tag=r.image_tag or "",
+            skill_used_id=r.skill_used_id,
+            skill_used_name=r.skill_used_name,
+            verdict=r.verdict,
+            score=r.score,
+            summary=r.summary or "",
+            issues=[DeepReviewIssue(**i) for i in (r.issues or []) if isinstance(i, dict)],
+            positives=list(r.positives or []),
+            id=r.id,
+            model=r.model,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

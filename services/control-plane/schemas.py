@@ -456,6 +456,16 @@ class DAGNodePatch(BaseModel):
     input_mapping: Optional[Dict[str, Any]] = None
 
 
+class DAGGraphPatch(BaseModel):
+    """Atomic bulk rewire of node dependencies across a DAG.
+
+    Maps node_id -> new depends_on list. Only the listed nodes are touched;
+    nodes omitted keep their current dependencies. Applied and validated in a
+    single transaction.
+    """
+    node_dependencies: Dict[str, List[str]] = {}
+
+
 class DAGNodeResponse(BaseModel):
     id: int
     dag_id: str

@@ -167,13 +167,16 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [addNodeDeps, setAddNodeDeps] = useState<string[]>([])
   const [showImageDialog, setShowImageDialog] = useState(false)
   const [nodeImage, setNodeImage] = useState('')
+  const [showEditConnectionsDialog, setShowEditConnectionsDialog] = useState(false)
+  const [editConnInputs, setEditConnInputs] = useState<string[]>([])
+  const [editConnOutputs, setEditConnOutputs] = useState<string[]>([])
 
   // Skill extraction state
   const [miningSkill, setMiningSkill] = useState(false)
   const [mineResult, setMineResult] = useState<string | null>(null)
   const [analysisResult, setAnalysisResult] = useState<any>(null)
-  const [deepReviewResult, setDeepReviewResult] = useState<any>(null)
   const [deepReviewLoading, setDeepReviewLoading] = useState(false)
+  const [deepReviews, setDeepReviews] = useState<Record<string, any>>({})
   const [includeSkillInReview, setIncludeSkillInReview] = useState(true)
   const [correctSkillLoading, setCorrectSkillLoading] = useState(false)
   const [correctSkillResult, setCorrectSkillResult] = useState<any>(null)
@@ -201,7 +204,23 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
     }
   }, [dagId])
 
+  const loadDeepReviews = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/skill-learning/deep-review?dag_id=${encodeURIComponent(dagId)}`)
+      if (!res.ok) return
+      const list = await res.json()
+      const map: Record<string, any> = {}
+      for (const r of list || []) {
+        if (r.node_id) map[r.node_id] = r
+      }
+      setDeepReviews(map)
+    } catch {
+      // non-fatal: reviews simply won't be prefilled
+    }
+  }, [dagId])
+
   useEffect(() => { fetchDag() }, [fetchDag])
+  useEffect(() => { loadDeepReviews() }, [loadDeepReviews])
 
   // Auto-refresh while running, and fetch once more when status changes from running
   useEffect(() => {
@@ -556,6 +575,85 @@ setNodeState(prev => {
     }
   }
 
+  const openEditConnectionsDialog = () => {
+    if (!selectedNode || !dag) return
+    setEditConnInputs(selectedNode.depends_on || [])
+    setEditConnOutputs((dag.nodes || []).filter(n => (n.depends_on || []).includes(selectedNode.node_id)).map(n => n.node_id))
+    setShowEditConnectionsDialog(true)
+    setShowNodeActions(false)
+  }
+
+  const applyGraphPatch = async (nodeDependencies: Record<string, string[]>): Promise<DAGDetail> => {
+    const res = await fetch(`${API}/api/dags/${dagId}/graph`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ node_dependencies: nodeDependencies }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error((data as any).detail ? (typeof (data as any).detail === 'string' ? (data as any).detail : JSON.stringify((data as any).detail)) : `HTTP ${res.status}`)
+    return data as DAGDetail
+  }
+
+  const saveEditConnections = async () => {
+    if (!dag || !selectedNode) return
+    setNodeActionLoading(true)
+    try {
+      const nodeDependencies: Record<string, string[]> = {}
+      nodeDependencies[selectedNode.node_id] = editConnInputs
+      for (const n of dag.nodes) {
+        if (n.node_id === selectedNode.node_id) continue
+        const hasEdge = (n.depends_on || []).includes(selectedNode.node_id)
+        const wantEdge = editConnOutputs.includes(n.node_id)
+        if (hasEdge !== wantEdge) {
+          const deps = (n.depends_on || []).filter(d => d !== selectedNode.node_id)
+          if (wantEdge) deps.push(selectedNode.node_id)
+          nodeDependencies[n.node_id] = deps
+        }
+      }
+      const updated = await applyGraphPatch(nodeDependencies)
+      setShowEditConnectionsDialog(false)
+      setShowNodeActions(false)
+      await applyDagMutationResult(updated, false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
+  const handleGraphConnect = async (source: string, target: string) => {
+    if (!dag) return
+    if (source === target) return
+    const targetNode = dag.nodes.find(n => n.node_id === target)
+    if (!targetNode || (targetNode.depends_on || []).includes(source)) return
+    setNodeActionLoading(true)
+    try {
+      const updated = await applyGraphPatch({ [target]: [...(targetNode.depends_on || []), source] })
+      await applyDagMutationResult(updated, false)
+    } catch (err: any) {
+      setError(err.message)
+      await applyDagMutationResult(null, false)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
+  const handleGraphDisconnect = async (source: string, target: string) => {
+    if (!dag) return
+    const targetNode = dag.nodes.find(n => n.node_id === target)
+    if (!targetNode || !(targetNode.depends_on || []).includes(source)) return
+    setNodeActionLoading(true)
+    try {
+      const updated = await applyGraphPatch({ [target]: (targetNode.depends_on || []).filter(d => d !== source) })
+      await applyDagMutationResult(updated, false)
+    } catch (err: any) {
+      setError(err.message)
+      await applyDagMutationResult(null, false)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
   const changeSelectedNodeImage = async () => {
     if (!dag || !selectedNode) return
     setNodeActionLoading(true)
@@ -702,7 +800,6 @@ setNodeState(prev => {
 
   const deepReviewTask = async (taskId: string, nodeId: string) => {
     setDeepReviewLoading(true)
-    setDeepReviewResult(null)
     setMineResult(null)
     try {
       const res = await fetch(`${API}/api/skill-learning/deep-review`, {
@@ -718,7 +815,7 @@ setNodeState(prev => {
       })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
-      setDeepReviewResult(data)
+      setDeepReviews(prev => ({ ...prev, [nodeId]: data }))
       setMineResult(null)
     } catch (e: any) {
       setMineResult(`❌ Deep review error: ${e.message}`)
@@ -763,6 +860,10 @@ setNodeState(prev => {
 const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
    const selectedNodeAcceptance = selectedNode ? nodeAcceptance[selectedNode.node_id] : null
    const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
+  // Graph-level editing (drag-to-connect / edge deletion) allowed when the DAG
+  // itself is in a pre-run editable state, independent of node selection.
+  const dagEditable = !!(dag?.status === 'failed' || dag?.status === 'ready')
+  const selectedReview = deepReviews[selectedNode?.node_id || ''] || null
   // Read actions (download logs, examine logs) allowed on completed/failed/ready DAGs
   const nodeReadActionsAllowed = !!(
     selectedNode &&
@@ -917,6 +1018,9 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             setSelectedNodeId(nodeId === selectedNodeId ? null : nodeId)
             setActiveTab('overview')
           }}
+          editable={dagEditable}
+          onConnect={dagEditable ? handleGraphConnect : undefined}
+          onDisconnect={dagEditable ? handleGraphDisconnect : undefined}
         />
       </div>
 
@@ -991,6 +1095,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         ➕ Add Step After
+                      </button>
+                      <button
+                        onClick={openEditConnectionsDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🔗 Edit Connections
                       </button>
                       <button
                         onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
@@ -1071,6 +1182,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         ➕ Add Step After
+                      </button>
+                      <button
+                        onClick={openEditConnectionsDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🔗 Edit Connections
                       </button>
                       <button
                         onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
@@ -1158,6 +1276,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         ➕ Add Step After
+                      </button>
+                      <button
+                        onClick={openEditConnectionsDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🔗 Edit Connections
                       </button>
                       <button
                         onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
@@ -1282,27 +1407,35 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             </div>
           )}
 
-          {deepReviewResult && (
+          {selectedReview && (
             <div className="mb-3 rounded border border-amber-700/40 bg-amber-950/20 p-3 text-xs">
               <div className="text-xs uppercase tracking-wide text-amber-300 mb-2 flex items-center justify-between">
-                <span>Deep Review — {deepReviewResult.image_id}{deepReviewResult.image_tag && <span className="text-gray-500"> ({deepReviewResult.image_tag})</span>}</span>
-                {deepReviewResult.skill_used_name && <span className="text-gray-400">skill: {deepReviewResult.skill_used_name}</span>}
+                <span>Deep Review — {selectedReview.image_id}{selectedReview.image_tag && <span className="text-gray-500"> ({selectedReview.image_tag})</span>}</span>
+                {selectedReview.skill_used_name && <span className="text-gray-400">skill: {selectedReview.skill_used_name}</span>}
               </div>
+              {selectedReview.model && (
+                <div className="mb-2 text-[10px] text-gray-400 font-mono">
+                  model: <span className="text-cyan-300">{selectedReview.model}</span>
+                  {selectedReview.created_at && (
+                    <span className="ml-2 text-gray-500">· reviewed {new Date(selectedReview.created_at).toLocaleString()}</span>
+                  )}
+                </div>
+              )}
 
               <div className="mb-2 flex items-center gap-3">
-                <span className={'px-2 py-0.5 rounded font-semibold ' + (deepReviewResult.verdict === 'clean' ? 'bg-emerald-800/50 text-emerald-200' : deepReviewResult.verdict === 'issues_found' ? 'bg-red-800/50 text-red-200' : 'bg-amber-800/50 text-amber-200')}>
-                  verdict: {deepReviewResult.verdict}
+                <span className={'px-2 py-0.5 rounded font-semibold ' + (selectedReview.verdict === 'clean' ? 'bg-emerald-800/50 text-emerald-200' : selectedReview.verdict === 'issues_found' ? 'bg-red-800/50 text-red-200' : 'bg-amber-800/50 text-amber-200')}>
+                  verdict: {selectedReview.verdict}
                 </span>
-                <span className="text-gray-300">quality score: <span className="font-semibold text-amber-200">{deepReviewResult.score}/100</span></span>
+                <span className="text-gray-300">quality score: <span className="font-semibold text-amber-200">{selectedReview.score}/100</span></span>
               </div>
 
-              <div className="mb-3 text-gray-300 whitespace-pre-wrap">{deepReviewResult.summary}</div>
+              <div className="mb-3 text-gray-300 whitespace-pre-wrap">{selectedReview.summary}</div>
 
-              {deepReviewResult.issues?.length > 0 ? (
+              {selectedReview.issues?.length > 0 ? (
                 <div className="mb-3">
-                  <div className="text-red-300 font-semibold mb-2">⚠️ Issues found ({deepReviewResult.issues.length})</div>
+                  <div className="text-red-300 font-semibold mb-2">⚠️ Issues found ({selectedReview.issues.length})</div>
                   <div className="space-y-2">
-                    {deepReviewResult.issues.map((iss: any, i: number) => (
+                    {selectedReview.issues.map((iss: any, i: number) => (
                       <div key={i} className="rounded border border-gray-700 bg-gray-900/60 p-2">
                         <div className="flex items-center gap-2 mb-1">
                           <span className={'px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ' + (iss.severity === 'high' ? 'bg-red-800/60 text-red-100' : iss.severity === 'medium' ? 'bg-amber-800/60 text-amber-100' : 'bg-gray-700 text-gray-300')}>{iss.severity}</span>
@@ -1319,16 +1452,16 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 <div className="mb-3 text-emerald-300">No integrity issues detected.</div>
               )}
 
-              {deepReviewResult.positives?.length > 0 && (
+              {selectedReview.positives?.length > 0 && (
                 <div className="mb-2">
                   <div className="text-emerald-300 font-semibold mb-1">✅ Done correctly</div>
                   <ul className="list-disc list-inside text-emerald-200 space-y-1">
-                    {deepReviewResult.positives.map((p: string, i: number) => <li key={i}>{p}</li>)}
+                    {selectedReview.positives.map((p: string, i: number) => <li key={i}>{p}</li>)}
                   </ul>
                 </div>
               )}
 
-              {deepReviewResult.issues?.length > 0 && (
+              {selectedReview.issues?.length > 0 && (
                 <button
                   onClick={() => correctSkillFromReview(selectedNode.task_id!, selectedNode.node_id)}
                   disabled={correctSkillLoading}
@@ -1505,6 +1638,64 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 <button onClick={() => setShowAddNodeDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
                 <button onClick={addNodeAfterSelected} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
                   {nodeActionLoading ? 'Adding...' : 'Add Step'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showEditConnectionsDialog && selectedNode && (
+            <div className="mb-3 rounded border border-indigo-700/40 bg-indigo-950/20 p-3">
+              <div className="text-xs uppercase tracking-wide text-indigo-300 mb-2">
+                Edit Connections for "{selectedNode.node_id}"
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <p className="text-[11px] text-gray-500 mb-1">Inputs — steps this step depends on:</p>
+                  <div className="max-h-40 overflow-y-auto border border-gray-700 rounded p-1.5 space-y-1">
+                    {(dag?.nodes || []).filter(n => n.node_id !== selectedNode.node_id).map(n => {
+                      const checked = editConnInputs.includes(n.node_id)
+                      return (
+                        <label key={n.node_id} className="flex items-center gap-2 cursor-pointer text-xs text-gray-300">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              setEditConnInputs(prev => e.target.checked ? [...prev, n.node_id] : prev.filter(d => d !== n.node_id))
+                            }}
+                            className="accent-indigo-500"
+                          />
+                          {n.node_id}
+                        </label>
+                      )
+                    })}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-[11px] text-gray-500 mb-1">Outputs — steps that depend on this step:</p>
+                  <div className="max-h-40 overflow-y-auto border border-gray-700 rounded p-1.5 space-y-1">
+                    {(dag?.nodes || []).filter(n => n.node_id !== selectedNode.node_id).map(n => {
+                      const checked = editConnOutputs.includes(n.node_id)
+                      return (
+                        <label key={n.node_id} className="flex items-center gap-2 cursor-pointer text-xs text-gray-300">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              setEditConnOutputs(prev => e.target.checked ? [...prev, n.node_id] : prev.filter(d => d !== n.node_id))
+                            }}
+                            className="accent-indigo-500"
+                          />
+                          {n.node_id}
+                        </label>
+                      )
+                    })}
+                  </div>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2 mt-2">
+                <button onClick={() => setShowEditConnectionsDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
+                <button onClick={saveEditConnections} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
+                  {nodeActionLoading ? 'Saving...' : 'Save Connections'}
                 </button>
               </div>
             </div>

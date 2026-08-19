@@ -34,6 +34,7 @@ from schemas import (
     DAGNodeOutputResponse,
     NodeAcceptanceResponse,
     WorkspaceManifestResponse,
+    DAGGraphPatch,
 )
 from dag_validator import validate_dag
 from planner import plan_dag
@@ -803,6 +804,59 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
 
     await db.commit()
     return {"ok": True}
+
+
+@router.patch("/{dag_id}/graph", response_model=DAGDetail)
+async def patch_dag_graph(dag_id: str, payload: DAGGraphPatch, db: AsyncSession = Depends(get_db)):
+    """Atomically rewire node dependencies across a DAG.
+
+    Maps node_id -> new depends_on list. Only the listed nodes are touched;
+    nodes omitted keep their current dependencies. Applied and validated in a
+    single transaction so a cycle or unknown reference rolls back everything.
+    """
+    dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_editable(dag)
+
+    node_deps = payload.node_dependencies or {}
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(nodes_result.scalars().all())
+    node_map = {n.node_id: n for n in all_nodes}
+    valid_ids = set(node_map.keys())
+
+    for node_id in node_deps:
+        if node_id not in valid_ids:
+            raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    if not node_deps:
+        return _build_dag_detail(dag, all_nodes)
+
+    # Apply new depends_on to DAGNode rows.
+    for node_id, deps in node_deps.items():
+        node_map[node_id].depends_on = _dedupe_node_ids(deps)
+
+    # Mirror into dag_json so the planner/executor sees the new topology.
+    dag_json = deepcopy(dag.dag_json or {})
+    dag_json_nodes = {n.get("node_id"): n for n in dag_json.get("nodes", [])}
+    for node_id, deps in node_deps.items():
+        dag_node = dag_json_nodes.get(node_id)
+        if dag_node is None:
+            await db.rollback()
+            raise HTTPException(status_code=500, detail=f"Node '{node_id}' missing from dag_json")
+        dag_node["depends_on"] = _dedupe_node_ids(deps)
+
+    is_valid, errors = validate_dag(dag_json)
+    if not is_valid:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    dag.dag_json = dag_json
+    await db.commit()
+    await db.refresh(dag)
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    remaining_nodes = list(nodes_result.scalars().all())
+    return _build_dag_detail(dag, remaining_nodes)
 
 
 @router.delete("/{dag_id}/nodes/{node_id}", response_model=DAGDetail)

@@ -1100,11 +1100,19 @@ async def call_deepseek(req: ChatCompletionRequest) -> ChatCompletionResponse:
                 msg_dict[k] = v
         messages.append(msg_dict)
 
+    # DeepSeek V4 models are reasoning models: they emit a long chain-of-thought
+    # in `reasoning_content` that counts toward max_tokens. With a low max_tokens
+    # the final answer in `content` is truncated away (finish_reason="length"),
+    # leaving an empty/partial response. Floor max_tokens so the real answer fits.
+    max_tokens = req.max_tokens or 8192
+    if max_tokens < 8192:
+        max_tokens = 8192
+
     payload: Dict[str, Any] = {
         "model": req.model,
         "messages": messages,
         "temperature": req.temperature,
-        "max_tokens": req.max_tokens,
+        "max_tokens": max_tokens,
         "stream": False,
     }
     extras = req.model_extra or {}
@@ -1112,6 +1120,14 @@ async def call_deepseek(req: ChatCompletionRequest) -> ChatCompletionResponse:
         payload["tools"] = extras["tools"]
     if "tool_choice" in extras:
         payload["tool_choice"] = extras["tool_choice"]
+    # DeepSeek V4 thinking-mode controls. `thinking` is a top-level body param
+    # ({"type": "enabled"/"disabled"}); `reasoning_effort` controls CoT depth.
+    # Callers (e.g. structured-JSON planning/review) may disable thinking to
+    # avoid burning max_tokens on chain-of-thought.
+    if "thinking" in extras:
+        payload["thinking"] = extras["thinking"]
+    if "reasoning_effort" in extras:
+        payload["reasoning_effort"] = extras["reasoning_effort"]
 
     headers = {
         "Authorization": f"Bearer {api_key}",

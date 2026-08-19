@@ -464,6 +464,39 @@ class DAGNodeAuditEvent(Base):
     created_at = Column(DateTime, server_default=func.now(), index=True)
 
 
+class DeepReview(Base):
+    """Persisted deep-review audit result, scoped to a DAG node/task.
+
+    Keeping a history per node lets the UI show each step's review when
+    switching between steps, and records the model + timestamp used to
+    generate it for traceability.
+    """
+    __tablename__ = "deep_reviews"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=True, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+
+    image_id = Column(String, nullable=True)
+    image_tag = Column(String, nullable=True)
+    skill_used_id = Column(String, nullable=True)
+    skill_used_name = Column(String, nullable=True)
+
+    # Traceability metadata
+    model = Column(String, nullable=False)        # which model generated the review
+    include_skill = Column(Boolean, nullable=False, default=True)
+
+    verdict = Column(String, nullable=False)
+    score = Column(Integer, nullable=False, default=0)
+    summary = Column(Text, nullable=False, default="")
+    issues = Column(JSON, default=list)
+    positives = Column(JSON, default=list)
+
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+
 class DAGNodeOutput(Base):
     """Structured output envelope for DAG node execution.
 

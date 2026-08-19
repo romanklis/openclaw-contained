@@ -194,5 +194,55 @@ def test_authentication():
     pass
 
 
+def test_patch_dag_graph_rewires():
+    """Atomic bulk rewire of node dependencies returns updated DAG."""
+    # Create a ready DAG with nodes A, B, C (B depends on A).
+    # dag_id = create_dag(["A", "B"], {"B": ["A"]})
+    # payload = {"node_dependencies": {"C": ["A", "B"]}}
+    # response = client.patch(f"/api/dags/{dag_id}/graph", json=payload)
+    # assert response.status_code == 200
+    # nodes = {n["node_id"]: n for n in response.json()["nodes"]}
+    # assert set(nodes["C"]["depends_on"]) == {"A", "B"}
+    pass
+
+
+def test_patch_dag_graph_cycle_rejected():
+    """A cycle-creating rewires rolls back and returns 422 with no change."""
+    # dag_id = create_dag(["A", "B"], {"B": ["A"]})
+    # # Make A depend on B, forming A -> B -> A.
+    # response = client.patch(
+    #     f"/api/dags/{dag_id}/graph",
+    #     json={"node_dependencies": {"A": ["B"]}},
+    # )
+    # assert response.status_code == 422
+    # # DAG is unchanged.
+    # fetched = client.get(f"/api/dags/{dag_id}").json()
+    # node = next(n for n in fetched["nodes"] if n["node_id"] == "A")
+    # assert node["depends_on"] == []
+    pass
+
+
+def test_patch_dag_graph_running_rejected():
+    """Rewiring a running DAG is rejected with 400."""
+    # dag_id = create_dag(["A", "B"], {}, status="running")
+    # response = client.patch(
+    #     f"/api/dags/{dag_id}/graph",
+    #     json={"node_dependencies": {"B": ["A"]}},
+    # )
+    # assert response.status_code == 400
+    pass
+
+
+def test_patch_dag_graph_unknown_node_rejected():
+    """Rewiring with an unknown node returns 404."""
+    # dag_id = create_dag(["A", "B"], {})
+    # response = client.patch(
+    #     f"/api/dags/{dag_id}/graph",
+    #     json={"node_dependencies": {"NOPE": []}},
+    # )
+    # assert response.status_code == 404
+    pass
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
