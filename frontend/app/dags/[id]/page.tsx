@@ -170,6 +170,10 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [showEditConnectionsDialog, setShowEditConnectionsDialog] = useState(false)
   const [editConnInputs, setEditConnInputs] = useState<string[]>([])
   const [editConnOutputs, setEditConnOutputs] = useState<string[]>([])
+  const [showSkillDialog, setShowSkillDialog] = useState(false)
+  const [availableSkills, setAvailableSkills] = useState<any[]>([])
+  const [selectedSkillId, setSelectedSkillId] = useState<string>('')
+  const [skillDialogLoading, setSkillDialogLoading] = useState(false)
 
   // Skill extraction state
   const [miningSkill, setMiningSkill] = useState(false)
@@ -583,8 +587,48 @@ setNodeState(prev => {
     setShowNodeActions(false)
   }
 
-  const applyGraphPatch = async (nodeDependencies: Record<string, string[]>): Promise<DAGDetail> => {
-    const res = await fetch(`${API}/api/dags/${dagId}/graph`, {
+  const openChangeSkillDialog = async () => {
+    if (!selectedNode || !dag) return
+    setShowNodeActions(false)
+    setSelectedSkillId(selectedNode.selected_skill_v2_id || '')
+    setSkillDialogLoading(true)
+    setShowSkillDialog(true)
+    try {
+      const img = selectedNode.config?.base_image || 'openclaw'
+      const res = await fetch(`${API}/api/skill-learning/skills?image_id=${encodeURIComponent(img)}&limit=200`)
+      if (res.ok) setAvailableSkills(await res.json())
+    } catch {
+      setAvailableSkills([])
+    } finally {
+      setSkillDialogLoading(false)
+    }
+  }
+
+  const saveSkillAssignment = async () => {
+    if (!dag || !selectedNode) return
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes/${selectedNode.node_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          selected_skill_v2_id: selectedSkillId || null,
+          skill_selection_reason: selectedSkillId ? 'Manually assigned in DAG editor' : '',
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail || `HTTP ${res.status}`)
+      setShowSkillDialog(false)
+      setShowNodeActions(false)
+      await applyDagMutationResult(data as DAGDetail, false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
+  const applyGraphPatch = async (nodeDependencies: Record<string, string[]>): Promise<DAGDetail> => {    const res = await fetch(`${API}/api/dags/${dagId}/graph`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ node_dependencies: nodeDependencies }),
@@ -905,8 +949,10 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
           <p className="text-gray-400 text-sm mt-1 max-w-3xl">{dag.objective}</p>
         </div>
         <div className="flex gap-2">
-          {(dag.status === 'ready' || dag.status === 'completed') && (
-            <button onClick={startDag} className="btn-success text-sm">{dag.status === 'completed' ? '▶ Run (all)' : '▶ Start'}</button>
+          {(dag.status === 'ready' || dag.status === 'failed' || dag.status === 'cancelled' || dag.status === 'completed') && (
+            <button onClick={startDag} className="btn-success text-sm">
+              {dag.status === 'completed' ? '▶ Run (all)' : (dag.status === 'failed' ? '▶ Retry (all)' : '▶ Start')}
+            </button>
           )}
           {dag.status === 'running' && (
             <button onClick={cancelDag} className="btn-danger text-sm">&#9209; Cancel</button>
@@ -1060,7 +1106,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               )}
             </div>
             <div className="flex items-center gap-3 text-xs">
-              {nodeActionsAllowed && (
+              {nodeActionsAllowed && !selectedNode.task_id && (
                 <div className="relative">
                   <button
                     onClick={() => setShowNodeActions(v => !v)}
@@ -1102,6 +1148,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         🔗 Edit Connections
+                      </button>
+                      <button
+                        onClick={openChangeSkillDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🎯 Change Skill
                       </button>
                       <button
                         onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
@@ -1189,6 +1242,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         🔗 Edit Connections
+                      </button>
+                      <button
+                        onClick={openChangeSkillDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🎯 Change Skill
                       </button>
                       <button
                         onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
@@ -1283,6 +1343,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         🔗 Edit Connections
+                      </button>
+                      <button
+                        onClick={openChangeSkillDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        🎯 Change Skill
                       </button>
                       <button
                         onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
@@ -1696,6 +1763,38 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 <button onClick={() => setShowEditConnectionsDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
                 <button onClick={saveEditConnections} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
                   {nodeActionLoading ? 'Saving...' : 'Save Connections'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showSkillDialog && selectedNode && (
+            <div className="mb-3 rounded border border-purple-700/40 bg-purple-950/20 p-3">
+              <div className="text-xs uppercase tracking-wide text-purple-300 mb-2">
+                Change Skill for "{selectedNode.node_id}"
+              </div>
+              <select
+                value={selectedSkillId}
+                onChange={(e) => setSelectedSkillId(e.target.value)}
+                disabled={skillDialogLoading}
+                className="input-field w-full text-sm"
+              >
+                <option value="">— None (no skill) —</option>
+                {availableSkills.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}{s.image_id ? ` (${s.image_id})` : ''}
+                  </option>
+                ))}
+              </select>
+              {skillDialogLoading && <p className="text-[11px] text-gray-500 mt-1">Loading skills…</p>}
+              {selectedSkillId && (() => {
+                const sk = availableSkills.find((s) => s.id === selectedSkillId)
+                return sk?.description ? <p className="text-[11px] text-gray-400 mt-1">{sk.description}</p> : null
+              })()}
+              <div className="flex justify-end gap-2 mt-2">
+                <button onClick={() => setShowSkillDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
+                <button onClick={saveSkillAssignment} disabled={nodeActionLoading || skillDialogLoading} className="px-3 py-1 text-xs rounded bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50">
+                  {nodeActionLoading ? 'Saving…' : 'Save Skill'}
                 </button>
               </div>
             </div>

@@ -350,16 +350,17 @@ async def get_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
 async def start_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     """Start executing a DAG via Temporal workflow.
 
-    Allowed from ready/failed (fresh or retry) and completed (re-run all steps).
-    For a completed DAG, resets every node back to PENDING before starting.
+    Allowed from ready/failed (fresh or retry), cancelled (resume/restart all),
+    and completed (re-run all steps). For a completed or cancelled DAG, resets
+    every node back to PENDING before starting so all steps run again.
     """
     dag = await _get_dag_or_404(dag_id, db)
-    if dag.status not in (DAGStatus.READY, DAGStatus.FAILED, DAGStatus.COMPLETED):
+    if dag.status not in (DAGStatus.READY, DAGStatus.FAILED, DAGStatus.COMPLETED, DAGStatus.CANCELLED):
         raise HTTPException(
             status_code=400,
-            detail=f"DAG is in '{dag.status.value}' state, must be 'ready', 'failed', or 'completed' to start"
+            detail=f"DAG is in '{dag.status.value}' state, must be 'ready', 'failed', 'cancelled', or 'completed' to start"
         )
-    if dag.status == DAGStatus.COMPLETED:
+    if dag.status in (DAGStatus.COMPLETED, DAGStatus.CANCELLED):
         nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
         for node in nodes_result.scalars().all():
             node.status = NodeStatus.PENDING
