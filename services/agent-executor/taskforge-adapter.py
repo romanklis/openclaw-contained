@@ -31,6 +31,7 @@ ITERATION = os.getenv("ITERATION", "0")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:4b")
 LLM_ROUTER_URL = os.getenv("LLM_ROUTER_URL", f"{CONTROL_PLANE_URL}/api/llm")
 IMAGE_TYPE = os.getenv("OPENCLAW_IMAGE_TYPE", "nanobot")
+NODE_ID = os.getenv("NODE_ID", "")  # For step-scoped deliverables in DAG nodes
 
 # Runtime description can be overridden via OPENCLAW_RUNTIME_DESCRIPTION env var
 # (set in each image's Dockerfile). Falls back to get_runtime_description().
@@ -428,6 +429,7 @@ The system will build a deployment image and the user can start/stop it.
 - Image: {agent_image}
 - Runtime: {IMAGE_TYPE}
 - Workspace: `/workspace` (files here are collected as deliverables)
+- Deliverables: write final outputs to your node's deliverables directory (e.g. `/workspace/<node_id>/`, given in the task prompt); intermediates/raw fetched HTML to `/tmp` or `/workspace/.cache/`
 """
 
     with open(os.path.join(workspace, "AGENTS.md"), "w") as f:
@@ -611,6 +613,8 @@ def build_system_prompt() -> str:
     parts = [
         "You are a task execution agent running inside a managed container.",
         "Your workspace is /workspace. All files you create there are collected as deliverables.",
+        "Write final deliverables to your node's deliverables directory (e.g. /workspace/<node_id>/, given in the task prompt).",
+        "Intermediate/raw files (fetched HTML pages, caches, scratch) go to /tmp or /workspace/.cache/ and are NOT collected.",
         "",
         "You have these tools: write, read, exec, edit.",
         "- write: Create/overwrite a file",
@@ -989,29 +993,17 @@ def _is_binary_file(fpath: str) -> bool:
         return True
 
 
-def collect_workspace_files() -> Dict[str, str]:
-    """Scan /workspace for deliverable files."""
+def _scan_workspace_tree(scan_root: str, workspace: str, SKIP_DIRS, SKIP_FILES,
+                         MAX_FILE_SIZE: int, MAX_TOTAL: int, collected: Dict[str, str], total_size: int):
+    """Walk scan_root collecting files into `collected`. Returns updated total_size."""
     import base64
-    workspace = "/workspace"
-    SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm"}
-    SKIP_FILES = {"result.json", "AGENTS.md", "SOUL.md", "TOOLS.md",
-                  "IDENTITY.md", "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md",
-                  "package-lock.json", "input_prompt.md", "attached_context.md"}
-    MAX_FILE_SIZE = 500_000
-    MAX_TOTAL = 2_000_000
-    collected: Dict[str, str] = {}
-    total_size = 0
-
-    if not os.path.isdir(workspace):
-        return collected
-
-    for root, dirs, files in os.walk(workspace):
+    for root, dirs, files in os.walk(scan_root):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         for fname in sorted(files):
             if fname in SKIP_FILES:
                 continue
             fpath = os.path.join(root, fname)
-            relpath = os.path.relpath(fpath, workspace)
+            relpath = os.path.relpath(fpath, scan_root)
             try:
                 size = os.path.getsize(fpath)
                 if size == 0 or size > MAX_FILE_SIZE:
@@ -1031,6 +1023,63 @@ def collect_workspace_files() -> Dict[str, str]:
                 collected[relpath] = content
             except Exception as e:
                 print(f"  ⚠️  Could not read {relpath}: {e}")
+    return total_size
+
+
+def collect_workspace_files(node_id: str | None = None) -> Dict[str, str]:
+    """Scan the workspace for deliverable files.
+
+    For DAG nodes (node_id set) /workspace/{node_id}/ is scanned so files written
+    by PARALLEL steps sharing the workspace are NOT mixed in. If the node dir is
+    empty (agent wrote outputs to the workspace root, common for older skills),
+    fall back to collecting root-level files directly in /workspace so the step
+    still delivers. For legacy non-DAG tasks the whole /workspace is scanned.
+    """
+    workspace = "/workspace"
+    SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm"}
+    SKIP_FILES = {"result.json", "AGENTS.md", "SOUL.md", "TOOLS.md",
+                  "IDENTITY.md", "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md",
+                  "package-lock.json", "input_prompt.md", "attached_context.md"}
+    MAX_FILE_SIZE = 500_000
+    MAX_TOTAL = 2_000_000
+    collected: Dict[str, str] = {}
+    total_size = 0
+
+    scan_root = os.path.join(workspace, node_id) if node_id else workspace
+    if os.path.isdir(scan_root):
+        total_size = _scan_workspace_tree(scan_root, workspace, SKIP_DIRS, SKIP_FILES,
+                                          MAX_FILE_SIZE, MAX_TOTAL, collected, total_size)
+
+    # Fallback: node dir empty but the agent wrote to the workspace root.
+    # Only root-level files are collected (no descent into .cache/, steps/, or
+    # sibling node dirs) so parallel steps' subdirs are not pulled in.
+    if node_id and not collected and os.path.isdir(workspace):
+        try:
+            for fname in sorted(os.listdir(workspace)):
+                if fname.startswith(".") or fname in SKIP_FILES:
+                    continue
+                fpath = os.path.join(workspace, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                relpath = fname
+                size = os.path.getsize(fpath)
+                if size == 0 or size > MAX_FILE_SIZE:
+                    continue
+                estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
+                if total_size + estimated_size > MAX_TOTAL:
+                    continue
+                if _is_binary_file(fpath):
+                    with open(fpath, "rb") as f:
+                        raw = f.read()
+                    content = "base64:" + base64.b64encode(raw).decode("ascii")
+                    total_size += len(content)
+                else:
+                    with open(fpath, "r", errors="replace") as f:
+                        content = f.read()
+                    total_size += size
+                collected[relpath] = content
+        except Exception as e:
+            print(f"  ⚠️  Fallback scan failed: {e}")
     return collected
 
 
@@ -1164,7 +1213,7 @@ def main():
         result["completed"] = True
         result["deployment_requested"] = True
         result["deployment"] = deploy
-        deliverables = collect_workspace_files()
+        deliverables = collect_workspace_files(NODE_ID or None)
         if deliverables:
             result["deliverables"] = deliverables
             result["deployment"]["files"] = deliverables
@@ -1188,7 +1237,7 @@ def main():
                 result["completed"] = True
                 result["deployment_requested"] = True
                 result["deployment"] = auto_deploy
-                deliverables = collect_workspace_files()
+                deliverables = collect_workspace_files(NODE_ID or None)
                 if deliverables:
                     result["deliverables"] = deliverables
                     result["deployment"]["files"] = deliverables
@@ -1326,7 +1375,7 @@ def main():
         print(f"\n❌ Task failed")
 
     # Collect deliverables
-    deliverables = collect_workspace_files()
+    deliverables = collect_workspace_files(NODE_ID or None)
     if deliverables:
         result["deliverables"] = deliverables
         print(f"\n📦 Collected {len(deliverables)} deliverable file(s):")

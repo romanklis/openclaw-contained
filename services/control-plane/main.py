@@ -47,6 +47,14 @@ async def lifespan(app: FastAPI):
 
     logger.info("Database initialized")
 
+    # Load persisted DAG model defaults (planning/agent/deep-review models) from
+    # the DB at startup so a saved deep-review model selection is honored even
+    # before the LLM Router page is visited (previously only reloaded on GET).
+    try:
+        await dags._load_dag_model_defaults_from_db()
+    except Exception as e:
+        logger.warning(f"Could not load DAG model defaults at startup: {e}")
+
     # Auto-seed supply-chain from YAML if DB is empty
     try:
         from sqlalchemy import select

@@ -303,6 +303,8 @@ async def _extract_procedure_from_demo(demo: SkillDemo, db: AsyncSession):
                     "as a JSON object with keys: name (string), steps (list of strings), "
                     "tools_used (list of strings), preconditions (list of strings), "
                     "postconditions (list of strings). "
+                    "Write each item in 'steps' as a single pseudo-code statement (imperative, with explicit "
+                    "tool calls, conditions IF/ELSE, loops, and verification checks) — not prose paragraphs. "
                     "Respond with ONLY the JSON object, no surrounding text."
                 ),
             },
@@ -797,8 +799,10 @@ def _detect_integrity_signals(summary: dict) -> List[str]:
         error = it.get("error")
 
         # 1. Placeholder markers in deliverable contents (only flag DATA files,
-        #    not source code where N/A is legitimately handled in logic)
-        data_exts = (".json", ".csv", ".tsv", ".txt", ".md", ".xml", ".yaml", ".yml", ".html")
+        #    not source code where N/A is legitimately handled in logic).
+        #    .html is excluded: markup naturally contains N/A/null and is not
+        #    tabular data — it is validated by the agent's claims + presence.
+        data_exts = (".json", ".csv", ".tsv", ".txt", ".md", ".xml", ".yaml", ".yml")
         for fname, content in deliverables.items():
             if not isinstance(content, str):
                 continue
@@ -1061,11 +1065,31 @@ def _build_skill_analysis_system_prompt() -> str:
         "    {\n"
         '      "name": "<skill name>",\n'
         '      "description": "<one-line description>",\n'
-        '      "instructions": "<detailed procedural instructions, newline separated>",\n'
+        '      "instructions": "<pseudo-code: an explicit, step-by-step algorithm an agent can follow verbatim>",\n'
         '      "tags": ["<tag>", ...]\n'
         "    }\n"
         "  ]\n"
         "}\n"
+        "WRITE INSTRUCTIONS AS PSEUDO-CODE, not prose. This is critical: the skill is executed by another "
+        "AI agent, so instructions must be an unambiguous, structured algorithm.\n"
+        "Format requirements for \"instructions\":\n"
+        "- One statement per line (plain text, no JSON nesting).\n"
+        "- Use indentation to denote nesting/block scope.\n"
+        "- Name every exact source, URL/API endpoint, and tool call (e.g. web_search(query=..., source='google trends')).\n"
+        "- Make control flow explicit: IF/ELSE, FOR EACH, WHILE, RETRY / ON FAILURE.\n"
+        "- Include an explicit verification step for any data fetched: what to check and what counts as fabricated "
+        "or placeholder (e.g. 'N/A', 'TBD', empty results), and how to react (retry, fail, or mark an issue).\n"
+        "- End with an explicit RETURN of the final deliverable/result.\n"
+        "Example pseudo-code style:\n"
+        "  INPUT: product_category\n"
+        "  trends = fetch_google_trends(product_category, region='CH', timeframe='last_90_days')\n"
+        "  IF trends is empty OR trends has placeholder values THEN\n"
+        "    retry(fetch_google_trends) UP_TO 3 TIMES\n"
+        "  END IF\n"
+        "  FOR EACH trend IN trends DO\n"
+        "    validate(trend.interest > 0 AND trend.source == 'google')\n"
+        "  END FOR\n"
+        "  RETURN report(items=trends)\n"
         "If no reusable skill is evident, set learning_potential=false and skills=[]. "
         "If the agent generated synthetic/fabricated data or mocked outputs, surface it clearly in warnings."
     )
@@ -1301,7 +1325,14 @@ def _trim_execution_summary_for_llm(summary: dict, max_deliverable_chars: int = 
             return deliverables
         out = {}
         for k, v in deliverables.items():
-            if isinstance(v, str) and len(v) > max_deliverable_chars:
+            if not isinstance(v, str):
+                out[k] = v
+                continue
+            # HTML deliverables: keep the filename in context but exclude the raw
+            # markup (it is huge and full of N/A/null false positives).
+            if k.lower().endswith(".html"):
+                out[k] = f"[HTML deliverable, {len(v)} bytes — markup excluded from review]"
+            elif len(v) > max_deliverable_chars:
                 out[k] = v[:max_deliverable_chars] + "\n...[truncated]..."
             else:
                 out[k] = v
@@ -1678,7 +1709,8 @@ async def _correct_skill_llm(summary: dict, skill: dict, issues: List[dict], tas
     user_context = _build_correction_context(summary, skill, issues)
     payload = {
         "model": _deep_review_model(),
-        "max_tokens": 4000,
+        "max_tokens": 30000,
+        "thinking": {"type": "disabled"},
         "messages": [
             {
                 "role": "system",
@@ -1687,18 +1719,24 @@ async def _correct_skill_llm(summary: dict, skill: dict, issues: List[dict], tas
                     "report listing concrete issues found when the agent executed that skill (hallucinations, "
                     "synthetic/mock data generation, shortcuts, quality problems). You must produce an IMPROVED "
                     "version of the skill whose instructions PREVENT these issues from recurring.\n"
-                    "The corrected instructions must be concrete, step-by-step, and explicitly include:\n"
-                    "- Mandatory verification steps (e.g. validate fetched data is real, check for placeholders/N-A, "
-                    "  verify row counts, confirm non-empty results before declaring success).\n"
-                    "- Explicit 'do NOT' rules against the specific failure modes found (no mock/synthetic data, "
-                    "  no fabricating URLs/descriptions, no declaring success on empty results).\n"
-                    "- Error-handling and fallback guidance so shortcuts are not taken silently.\n"
+                    "Write the corrected instructions as PSEUDO-CODE, not prose — the skill is executed by "
+                    "another AI agent, so instructions must be an explicit, structured algorithm it can follow "
+                    "verbatim. Requirements:\n"
+                    "- One statement per line (plain text, no JSON nesting); use indentation for block scope.\n"
+                    "- Name every exact source, URL/API endpoint, and tool call explicitly.\n"
+                    "- Make control flow explicit: IF/ELSE, FOR EACH, WHILE, RETRY / ON FAILURE.\n"
+                    "- Include mandatory verification steps: validate fetched data is real, check for "
+                    "placeholders/N-A, verify row counts, confirm non-empty results before declaring success; "
+                    "spell out how to react (retry, fail, or mark an issue) when a check fails.\n"
+                    "- Add explicit 'do NOT' rules against the specific failure modes found (no mock/synthetic "
+                    "data, no fabricating URLs/descriptions, no declaring success on empty results).\n"
+                    "- End with an explicit RETURN of the final deliverable/result.\n"
                     "Keep the working, correct parts of the original skill. Respond with ONLY valid JSON, no "
                     "surrounding text, in this exact shape:\n"
                     "{\n"
                     '  "name": "<corrected skill name>",\n'
                     '  "description": "<one-line description>",\n'
-                    '  "instructions": "<full corrected instructions, newline separated>",\n'
+                    '  "instructions": "<full corrected instructions as pseudo-code>",\n'
                     '  "tags": ["<tag>", ...],\n'
                     '  "addressed_issues": ["<issue this correction addresses>", ...]\n'
                     "}\n"

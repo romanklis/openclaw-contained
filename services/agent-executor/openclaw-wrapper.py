@@ -331,11 +331,17 @@ def setup_workspace_context():
 
 You are running inside a managed container. Your workspace is `/workspace`.
 
+## DELIVERABLES (important)
+
+- **Final deliverables** (reports, parsed data files, code artifacts you intend as outputs) must be written to your **node's deliverables directory** — the task prompt tells you the exact path (e.g. `/workspace/<node_id>/`). Only files there are collected as deliverables.
+- **Intermediate products** (raw fetched HTML pages, caches, scratch/temporary files) must NOT go into the deliverables directory. Put them in `/tmp` or `/workspace/.cache/` — they are NOT collected.
+- When the task requires fetching data from the web, save the RAW fetched HTML to `/tmp` or `/workspace/.cache/` and extract/parse it into a structured data file (JSON/CSV) in the deliverables directory. Never treat a raw fetched page itself as a deliverable unless the task explicitly asks for an HTML file.
+
 ## YOUR WORKFLOW (follow this order)
 
-1. **Write** the code/files the task requires into `/workspace`.
+1. **Write** the code/files the task requires into your node's deliverables directory (see DELIVERABLES).
 2. **Execute** the code using the `exec` tool to verify it works.
-   - Example: `exec python3 /workspace/stats.py`
+   - Example: `exec python3 /workspace/<node_id>/stats.py`
 3. **If execution fails** with `ModuleNotFoundError`, ONLY THEN request the package (see below).
 4. **If execution succeeds**, you are DONE. Do not output anything else.
 
@@ -409,6 +415,7 @@ with the server starting). Just write the code and request deployment.
 - Model: {LLM_MODEL}
 - Image: {agent_image}
 - Workspace: `/workspace` (files here are collected as deliverables)
+- Deliverables: write final outputs to your node's deliverables directory (see DELIVERABLES above); intermediates to `/tmp` or `/workspace/.cache/`
 """
 
     agents_path = os.path.join(workspace, "AGENTS.md")
@@ -427,7 +434,8 @@ efficiently and correctly.
 - If you need a package that's not installed, request it (see AGENTS.md).
   Do NOT try workarounds — they will fail.
 - Test your code if possible before finishing.
-- Write all files to `/workspace`.
+- Write final deliverables to your node's deliverables directory (see AGENTS.md).
+  Intermediate/raw files (fetched HTML, caches, scratch) go to `/tmp` or `/workspace/.cache/`.
 """
     with open(os.path.join(workspace, "SOUL.md"), "w") as f:
         f.write(soul_md)
@@ -847,14 +855,26 @@ def collect_workspace_files(node_id: str | None = None, segregate_steps: bool = 
             }
         return collected
 
-    for root, dirs, files in os.walk(workspace):
+    # DAG nodes: scope collection to the node's own output directory so parallel
+    # steps sharing /workspace never mix their deliverables.
+    scan_root = os.path.join(workspace, node_id) if node_id else workspace
+    if not os.path.isdir(scan_root):
+        if segregate_steps:
+            return {
+                "deliverables": {},
+                "step_path": f"steps/{node_id}/deliverables/" if node_id else None,
+                "deliverables_keys": [],
+            }
+        return collected
+
+    for root, dirs, files in os.walk(scan_root):
         # Prune skip dirs AND segregated step directories (they're housekeeping)
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         for fname in sorted(files):  # sorted for deterministic order
             if fname in SKIP_FILES:
                 continue
             fpath = os.path.join(root, fname)
-            relpath = os.path.relpath(fpath, workspace)
+            relpath = os.path.relpath(fpath, scan_root)
             try:
                 size = os.path.getsize(fpath)
                 if size == 0 or size > MAX_FILE_SIZE:
@@ -877,6 +897,37 @@ def collect_workspace_files(node_id: str | None = None, segregate_steps: bool = 
                 collected[relpath] = content
             except Exception as e:
                 print(f"  ⚠️  Could not read {relpath}: {e}")
+
+    # Fallback: node dir empty but the agent wrote to the workspace root.
+    # Only root-level files are collected (no descent into .cache/, steps/, or
+    # sibling node dirs) so parallel steps' subdirs are not pulled in.
+    if node_id and not collected and os.path.isdir(workspace):
+        try:
+            for fname in sorted(os.listdir(workspace)):
+                if fname.startswith(".") or fname in SKIP_FILES:
+                    continue
+                fpath = os.path.join(workspace, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                relpath = fname
+                size = os.path.getsize(fpath)
+                if size == 0 or size > MAX_FILE_SIZE:
+                    continue
+                estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
+                if total_size + estimated_size > MAX_TOTAL:
+                    continue
+                if _is_binary_file(fpath):
+                    with open(fpath, "rb") as f:
+                        raw = f.read()
+                    content = "base64:" + base64.b64encode(raw).decode("ascii")
+                    total_size += len(content)
+                else:
+                    with open(fpath, "r", errors="replace") as f:
+                        content = f.read()
+                    total_size += size
+                collected[relpath] = content
+        except Exception as e:
+            print(f"  ⚠️  Fallback scan failed: {e}")
 
     if segregate_steps and node_id:
         step_path = f"steps/{node_id}/deliverables/"

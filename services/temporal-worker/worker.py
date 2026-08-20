@@ -1078,10 +1078,18 @@ async def start_agent_container(
         }
 
 
+        # Only the workspace is a bind mount. Adapters are baked into the agent
+        # images (see Dockerfile.openclaw) — do NOT bind-mount them at their
+        # image paths: `docker commit` records bind mounts as VOLUME entries, and
+        # a VOLUME over a baked FILE (e.g. /opt/openclaw/taskforge-adapter.py)
+        # makes any later `docker build FROM` the committed DAG image fail with
+        # "cannot mount volume over existing file", breaking capability rebuilds.
+        _agent_volumes = {workspace_dir: {"bind": "/workspace", "mode": "rw"}}
+
         container_kwargs = dict(
             image=agent_image,
             environment=agent_env,
-            volumes={workspace_dir: {"bind": "/workspace", "mode": "rw"}},
+            volumes=_agent_volumes,
             tmpfs={"/tmp": "size=100m,mode=1777"},
             read_only=True,
             detach=True,
@@ -3173,7 +3181,8 @@ def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
             for name, content in dl.items():
                 ctype = "script" if name.lower().endswith((".py", ".js", ".sh")) else "data"
                 size = len(str(content)) if content is not None else 0
-                produced.append(f"    - {name}  [{ctype}, {size} bytes]  at /workspace/{name}")
+                # Per-node output dirs: upstream files live under the source node's dir.
+                produced.append(f"    - {name}  [{ctype}, {size} bytes]  at /workspace/{src_node}/{name}")
         produced_str = "\n".join(produced) if produced else "    (no deliverables)"
 
         # Primary output text
@@ -3282,6 +3291,43 @@ async def _assess_objective_alignment_external(
         }
 
 
+def _bounded_payload(obj: Any, max_str: int = 40000, max_total: int = 700000) -> Any:
+    """Recursively trim a payload to stay under Temporal's 2 MB payload limit.
+
+    Temporal rejects activity inputs/results larger than ~2 MB
+    ("ScheduleActivityTaskCommandAttributes.Input exceeds size limit"). Node
+    outputs can contain large agent logs and deliverable file contents; keep
+    structure (keys, summaries) but cap string sizes and the overall budget.
+    """
+    remaining = [max_total]
+
+    def _trim(v):
+        if isinstance(v, str):
+            if len(v) > max_str:
+                v = v[:max_str] + f"\n...[truncated {len(v)} chars]"
+            if len(v) > remaining[0]:
+                v = v[:max(1, remaining[0])]
+            remaining[0] -= len(v)
+            return v
+        if isinstance(v, dict):
+            out: Dict[str, Any] = {}
+            for k, val in v.items():
+                if remaining[0] <= 0:
+                    break
+                out[k] = _trim(val)
+            return out
+        if isinstance(v, list):
+            out = []
+            for val in v:
+                if remaining[0] <= 0:
+                    break
+                out.append(_trim(val))
+            return out
+        return v
+
+    return _trim(obj)
+
+
 @activity.defn
 async def collect_node_output(task_id: str) -> Dict[str, Any]:
     """Collect output from a completed node task."""
@@ -3346,7 +3392,7 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
             result["acquisition_log"] = _extract_acquisition_log(result["agent_logs"])
             result["compact_summary"] = _build_compact_step_summary(result)
 
-        return result
+        return _bounded_payload(result)
 
 
 def _summarize_upstream_state(input_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -3670,6 +3716,16 @@ class DAGNodeWorkflow:
 
         # Build the follow-up prompt from objective + input_data
         follow_up_parts = []
+        # Deliverables-dir instruction FIRST so it is never truncated away by the
+        # FOLLOW_UP env limit — agents must know exactly where to write outputs.
+        follow_up_parts.append(
+            f"--- Deliverables directory ---\n"
+            f"This step's deliverables directory is `/workspace/{node_id}/` — create it if needed. "
+            f"Write your FINAL deliverables (reports, parsed data files, code artifacts) there; only files in "
+            f"that directory are collected. Put intermediate/raw products (fetched HTML pages, caches, scratch) "
+            f"in `/tmp` or `/workspace/.cache/` — they are NOT collected. If the task fetches web data, save the "
+            f"raw pages outside the deliverables directory and place only the parsed/structured data inside it."
+        )
         if node_objective:
             follow_up_parts.append("--- Step Objective ---")
             follow_up_parts.append(node_objective)
@@ -4327,6 +4383,10 @@ class DAGWorkflow:
                             resolution_report["dependency_inputs"].append(dep)
                         else:
                             resolution_report["missing_dependency_outputs"].append(dep)
+
+                # Bound the aggregated upstream input so activity/child-workflow
+                # payloads stay under Temporal's size limit, even with many deps.
+                input_data = _bounded_payload(input_data, max_str=20000, max_total=600000)
 
                 if resolution_report["missing_dependency_outputs"]:
                     for dep in resolution_report["missing_dependency_outputs"]:
