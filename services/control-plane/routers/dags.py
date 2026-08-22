@@ -1,6 +1,7 @@
 """
 DAGs Router — CRUD and lifecycle for Master DAGs.
 """
+from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -15,6 +16,9 @@ from models import (
     DAGNodeStateSnapshot,
     DAGNodeAuditEvent,
     DAGNodeOutput,
+    SkillV2,
+    TemplateSkill,
+    TemplateSkillStatus,
 )
 from schemas import (
     DAGCreate,
@@ -35,6 +39,9 @@ from schemas import (
     NodeAcceptanceResponse,
     WorkspaceManifestResponse,
     DAGGraphPatch,
+    TemplateParam,
+    DAGLockRequest,
+    DAGInstantiateRequest,
 )
 from dag_validator import validate_dag
 from planner import plan_dag
@@ -355,6 +362,7 @@ async def start_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     every node back to PENDING before starting so all steps run again.
     """
     dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_mutable(dag)
     if dag.status not in (DAGStatus.READY, DAGStatus.FAILED, DAGStatus.COMPLETED, DAGStatus.CANCELLED):
         raise HTTPException(
             status_code=400,
@@ -378,6 +386,7 @@ async def start_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
 async def cancel_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     """Cancel a running DAG."""
     dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_mutable(dag)
     if dag.status != DAGStatus.RUNNING:
         raise HTTPException(status_code=400, detail=f"DAG is not running (status: {dag.status.value})")
 
@@ -394,6 +403,446 @@ async def cancel_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(dag)
     return dag
+
+
+@router.post("/{dag_id}/lock", response_model=DAGDetail)
+async def lock_dag(dag_id: str, body: DAGLockRequest, db: AsyncSession = Depends(get_db)):
+    """Lock a DAG as a frozen, parameterized template."""
+    dag = await _get_dag_or_404(dag_id, db)
+    params = [p.model_dump() for p in body.parameters]
+    dag.locked = True
+    dag.template_params = params
+
+    # Parameterize the DAG text: replace each param's concrete default with its
+    # {key} placeholder so a future instantiation substitutes new inputs.
+    dag.objective = _parameterize_text(dag.objective, params)
+    dag_json = deepcopy(dag.dag_json or {})
+    for nd in dag_json.get("nodes", []):
+        if nd.get("description"):
+            nd["description"] = _parameterize_text(nd["description"], params)
+        cfg = dict(nd.get("config") or {})
+        for field in ("node_objective",):
+            if isinstance(cfg.get(field), str):
+                cfg[field] = _parameterize_text(cfg[field], params)
+        nd["config"] = cfg
+
+    # Generalize each step's skill into a parameterized TemplateSkill (new skill
+    # category tied to the template) and store the generalized instructions in
+    # the node config so instantiation can resolve {param} to new values.
+    param_keys = {p.get("key") for p in params if p.get("key")}
+    for nd in dag_json.get("nodes", []):
+        node_cfg = dict(nd.get("config") or {})
+        skill_id = (
+            nd.get("selected_skill_v2_id")
+            or nd.get("skill_id")
+            or node_cfg.get("selected_skill_v2_id")
+            or node_cfg.get("skill_id")
+        )
+        generalized_instructions = ""
+        tskill_name = f"Generalized {nd.get('node_id')}"
+        tskill_desc = ""
+        tskill_params = sorted(param_keys)
+        if skill_id:
+            src_skill = await db.get(SkillV2, skill_id)
+            src_instructions = (src_skill.instructions if src_skill else "") or ""
+            if src_instructions:
+                generalized = await _generalize_skill_instructions(
+                    src_instructions, nd.get("description") or "", params
+                )
+                if generalized.get("instructions"):
+                    generalized_instructions = generalized["instructions"]
+                    tskill_name = generalized.get("name") or tskill_name
+                    tskill_desc = generalized.get("description") or ""
+                    tskill_params = generalized.get("params_used") or sorted(param_keys)
+            if not generalized_instructions:
+                # Fallback: mechanical string parameterization.
+                generalized_instructions = _parameterize_text(src_instructions, params)
+
+        if generalized_instructions:
+            node_cfg["template_skill_instructions"] = generalized_instructions
+            nd["config"] = node_cfg
+
+            # Upsert TemplateSkill row for (dag_id, node_id).
+            existing = await db.execute(
+                select(TemplateSkill).where(
+                    TemplateSkill.dag_id == dag_id,
+                    TemplateSkill.node_id == nd.get("node_id"),
+                )
+            )
+            ts = existing.scalar_one_or_none()
+            if ts is None:
+                ts = TemplateSkill(
+                    id="tsk-" + uuid.uuid4().hex[:8],
+                    dag_id=dag_id,
+                    node_id=nd.get("node_id"),
+                    source_skill_id=skill_id,
+                    created_by=dag.created_by,
+                )
+                db.add(ts)
+            ts.name = tskill_name
+            ts.description = tskill_desc
+            ts.instructions = generalized_instructions
+            ts.params = tskill_params
+    dag.dag_json = dag_json
+
+    # Keep DAGNode rows in sync (frontend + detail reads them).
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    dag_nodes = list(nodes_result.scalars().all())
+    json_nodes = {n.get("node_id"): n for n in dag_json.get("nodes", [])}
+    for n in dag_nodes:
+        jn = json_nodes.get(n.node_id)
+        if jn is not None:
+            n.description = jn.get("description")
+            node_cfg = dict(n.config or {})
+            jcfg = dict(jn.get("config") or {})
+            if "node_objective" in jcfg:
+                node_cfg["node_objective"] = jcfg["node_objective"]
+            if "template_skill_instructions" in jcfg:
+                node_cfg["template_skill_instructions"] = jcfg["template_skill_instructions"]
+            n.config = node_cfg
+
+    await db.commit()
+    await db.refresh(dag)
+    return _build_dag_detail(dag, dag_nodes)
+
+
+@router.post("/{dag_id}/unlock", response_model=DAGDetail)
+async def unlock_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Unlock a DAG template so it can be modified again."""
+    dag = await _get_dag_or_404(dag_id, db)
+    dag.locked = False
+    await db.commit()
+    await db.refresh(dag)
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    return _build_dag_detail(dag, list(nodes_result.scalars().all()))
+
+
+def _substitute_params(text: Any, params: dict) -> Any:
+    """Replace {key} placeholders in a string (or recursively in str fields)."""
+    if isinstance(text, str):
+        out = text
+        for k, v in (params or {}).items():
+            out = out.replace("{" + str(k) + "}", str(v))
+        return out
+    if isinstance(text, list):
+        return [_substitute_params(x, params) for x in text]
+    if isinstance(text, dict):
+        return {k: _substitute_params(v, params) for k, v in text.items()}
+    return text
+
+
+def _parameterize_text(text: str, params: list) -> str:
+    """Replace each param's concrete `default` value with its `{key}` placeholder.
+
+    Turns the template's current values into placeholders so a future
+    instantiation can substitute new inputs. Longer defaults first to avoid
+    partial overlaps.
+    """
+    if not text:
+        return text
+    out = text
+    ordered = sorted(
+        (p for p in params if p.get("default") and p.get("key")),
+        key=lambda p: len(str(p.get("default"))),
+        reverse=True,
+    )
+    for p in ordered:
+        out = out.replace(str(p["default"]), "{" + p["key"] + "}")
+    return out
+
+
+async def _generalize_skill_instructions(skill_instructions: str, node_desc: str, params: list) -> dict:
+    """Ask the LLM to rewrite a step's skill into a generalized, parameterized form.
+
+    Returns {"name","description","instructions","params_used"} or {} on failure.
+    """
+    if not skill_instructions:
+        return {}
+    param_schema = ", ".join(
+        f"{p.get('key')} (default: {p.get('default') or 'n/a'})" for p in params if p.get("key")
+    ) or "none"
+
+    system = (
+        "You generalize learned agent skills so they become reusable, parameterized routines "
+        "that can be executed for different inputs. You are given a step objective, a list of "
+        "template input parameters, and the skill's current pseudo-code instructions (which "
+        "likely hardcode concrete values from the run it was learned on).\n"
+        "Rewrite the skill into a GENERALIZED pseudo-code form that:\n"
+        "- Declares its inputs at the top as: INPUT: <param_key1>, <param_key2> (only params it actually uses).\n"
+        "- Replaces hardcoded concrete values (target models, markets, currencies, hosts, filenames) "
+        "with {param_key} placeholders from the provided parameter list.\n"
+        "- Keeps the procedural logic (fetching, parsing, verification, error handling) intact.\n"
+        "- Generalizes hardcoded variant/rejection lists to be derived from the parameter where possible "
+        "(e.g. accepted variants built from the {camera_model} value), while keeping genuinely fixed rules.\n"
+        "- Ends with an explicit RETURN.\n"
+        "Return ONLY a valid JSON object (no markdown, no commentary):\n"
+        '{"name": "<skill name>", "description": "<one line>", "instructions": "<generalized pseudo-code>", "params_used": ["key", ...]}'
+    )
+    user = (
+        f"Step objective: {node_desc or 'n/a'}\n"
+        f"Template input parameters: {param_schema}\n\n"
+        f"Current skill instructions:\n{skill_instructions[:6000]}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(
+                "http://localhost:8000/api/llm/v1/chat/completions",
+                json={
+                    "model": _dag_model_defaults.get("planning_model", "gemini-flash-lite-latest"),
+                    "max_tokens": 16384,
+                    "thinking": {"type": "disabled"},
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception as e:
+        logger.warning(f"Skill generalization LLM call failed: {e}")
+        return {}
+
+    parsed = _extract_json_from_text(content)
+    if not isinstance(parsed, dict):
+        return {}
+    instructions = str(parsed.get("instructions") or "").strip()
+    if not instructions:
+        return {}
+    return {
+        "name": str(parsed.get("name") or "generalized-skill")[:200],
+        "description": str(parsed.get("description") or "")[:500],
+        "instructions": instructions,
+        "params_used": [str(x) for x in (parsed.get("params_used") or []) if str(x)][:20],
+    }
+
+
+_RUNTIME_CONFIG_KEYS = {"dag_image", "task_id", "container_id", "template_guidance"}
+
+
+@router.post("/{dag_id}/instantiate", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
+async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSession = Depends(get_db)):
+    """Instantiate a template into a new DAG run (follow-the-guidance).
+
+    Clones the frozen structure + skills, substitutes {param} placeholders into
+    node objectives/descriptions, and injects each node's own bounded prior-run
+    summary as `template_guidance` so the agent repeats the proven approach.
+    """
+    source = await _get_dag_or_404(dag_id, db)
+
+    # Per-node prior-run guidance (bounded, one step at a time).
+    outputs_result = await db.execute(
+        select(DAGNodeOutput).where(DAGNodeOutput.dag_id == dag_id)
+    )
+    guidance_by_node: dict[str, str] = {}
+    for o in outputs_result.scalars().all():
+        outcome = (o.output_text or o.error_text or "").strip()
+        lines = []
+        if o.objective:
+            lines.append(f"Objective: {o.objective[:300]}")
+        if outcome:
+            lines.append(f"Outcome: {outcome[:500]}")
+        if o.deliverables_keys:
+            lines.append(f"Deliverables: {', '.join(o.deliverables_keys[:20])}")
+        if o.acceptance_verdict:
+            lines.append(f"Verdict: {o.acceptance_verdict}")
+        guidance_by_node[o.node_id] = "\n".join(lines)[:1500]
+
+    params = body.parameters or {}
+    objective = _substitute_params(body.objective or source.objective, params)
+
+    src_dag_json = deepcopy(source.dag_json or {})
+    nodes_defs = src_dag_json.get("nodes", [])
+    new_nodes = []
+    for nd in nodes_defs:
+        node_id = nd.get("node_id")
+        desc = _substitute_params(nd.get("description"), params)
+        cfg = dict(nd.get("config") or {})
+        cfg = _substitute_params(cfg, params)
+        for k in _RUNTIME_CONFIG_KEYS:
+            cfg.pop(k, None)
+        guidance = guidance_by_node.get(node_id)
+        if guidance:
+            cfg["template_guidance"] = guidance
+        new_nodes.append({
+            **nd,
+            "description": desc,
+            "config": cfg,
+        })
+    new_dag_json = {
+        **{k: v for k, v in src_dag_json.items() if k != "nodes"},
+        "nodes": new_nodes,
+    }
+
+    is_valid, errors = validate_dag(new_dag_json)
+    if not is_valid:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    new_dag_id = _gen_dag_id()
+    new_dag = MasterDAG(
+        id=new_dag_id,
+        objective=objective,
+        status=DAGStatus.READY,
+        dag_json=new_dag_json,
+        workspace_id=_gen_workspace_id(new_dag_id),
+        llm_model=new_dag_json.get("default_llm") or source.llm_model,
+        template_params=list(source.template_params or []),
+        template_source_dag_id=source.id,
+    )
+    db.add(new_dag)
+
+    created_nodes = []
+    for nd in new_nodes:
+        node_cfg = dict(nd.get("config") or {})
+        skill_id = nd.get("skill_id")
+        selected_skill_v2_id = node_cfg.pop("selected_skill_v2_id", None) or None
+        skill_selection_reason = node_cfg.pop("skill_selection_reason", None) or None
+        node = DAGNode(
+            dag_id=new_dag_id,
+            node_id=nd.get("node_id"),
+            skill_id=skill_id,
+            skill_step_index=nd.get("skill_step_index"),
+            description=nd.get("description"),
+            status=NodeStatus.PENDING,
+            depends_on=nd.get("depends_on") or [],
+            config=node_cfg,
+            input_mapping=nd.get("input_mapping"),
+            selected_skill_v2_id=selected_skill_v2_id,
+            skill_selection_reason=skill_selection_reason,
+        )
+        db.add(node)
+        created_nodes.append(node)
+
+    await db.commit()
+    await db.refresh(new_dag)
+
+    if body.auto_start:
+        return await _start_dag(new_dag, db)
+    return _build_dag_detail(new_dag, created_nodes)
+
+
+def _extract_json_from_text(text: str):
+    """Robustly extract the first JSON array or object from an LLM response."""
+    if not text:
+        return None
+    import re
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1)
+    for start_ch in ("[", "{"):
+        start = text.find(start_ch)
+        while start != -1:
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch in "[{":
+                    depth += 1
+                elif ch in "]}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except Exception:
+                            break
+            start = text.find(start_ch, start + 1)
+    return None
+
+
+@router.post("/{dag_id}/propose-parameters", response_model=list[TemplateParam])
+async def propose_dag_parameters(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Ask the LLM to propose input parameters for this DAG (template signature).
+
+    Detects the parameters an operator would change between runs from the DAG's
+    objective and node objectives/descriptions (e.g. a product, marketplace,
+    region, date range, item count).
+    """
+    dag = await _get_dag_or_404(dag_id, db)
+
+    context_parts = [f"DAG objective: {dag.objective}"]
+    context_parts.append("Steps:")
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    for n in nodes_result.scalars().all():
+        desc = (n.description or "").strip()
+        obj = ((n.config or {}).get("node_objective") or "").strip()
+        line = f"- {n.node_id}"
+        if desc:
+            line += f": {desc[:400]}"
+        if obj and obj != desc:
+            line += f" | objective: {obj[:400]}"
+        context_parts.append(line)
+    context = "\n".join(context_parts)[:6000]
+
+    system = (
+        "You are analyzing a reusable agent routine (a DAG of steps) so it can be locked "
+        "as a template and re-executed with different inputs — like a function call.\n"
+        "Identify the INPUT PARAMETERS an operator would change between runs (e.g. a product "
+        "or category to research, a marketplace/host, a region/market, a currency, a date range, "
+        "an item count). Do NOT propose internal/derived things (file paths, deliverable names, "
+        "temporary values). Only propose operator-level inputs that appear as concrete values in "
+        "the objective/step descriptions.\n"
+        "Return ONLY a valid JSON array (no markdown, no commentary):\n"
+        '[{"key": "<short snake_case id usable as a {key} placeholder>", "label": "<human label>", '
+        '"type": "string|number|boolean", "default": "<sensible default from the content, else empty>", '
+        '"description": "<what this input is>"}]\n'
+        "Propose 1-5 parameters. If none are evident, return []."
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                "http://localhost:8000/api/llm/v1/chat/completions",
+                json={
+                    "model": _dag_model_defaults.get("planning_model", "gemini-flash-lite-latest"),
+                    "max_tokens": 8192,
+                    "thinking": {"type": "disabled"},
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": context},
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception as e:
+        logger.warning(f"Propose-parameters LLM call failed: {e}")
+        return []
+
+    parsed = _extract_json_from_text(content)
+    if not isinstance(parsed, list):
+        parsed = []
+    params: list[TemplateParam] = []
+    seen_keys: set[str] = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        params.append(TemplateParam(
+            key=key,
+            label=str(item.get("label") or key),
+            type=str(item.get("type") or "string"),
+            default=str(item.get("default") or "") or None,
+            description=str(item.get("description") or "") or None,
+        ))
+        if len(params) >= 8:
+            break
+    return params
 
 
 @router.get("/{dag_id}/nodes", response_model=list[DAGNodeResponse])
@@ -1460,7 +1909,17 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
 
 # ── Helpers ─────────────────────────────────────────────
 
+def _ensure_dag_mutable(dag: MasterDAG) -> None:
+    """Reject mutations on a locked DAG (a frozen, parameterized routine)."""
+    if getattr(dag, "locked", False):
+        raise HTTPException(
+            status_code=400,
+            detail="DAG is locked (a frozen template). Unlock it to modify.",
+        )
+
+
 def _ensure_dag_editable(dag: MasterDAG) -> None:
+    _ensure_dag_mutable(dag)
     editable_statuses = {DAGStatus.READY, DAGStatus.FAILED, DAGStatus.COMPLETED}
     if dag.status not in editable_statuses:
         raise HTTPException(
@@ -1626,6 +2085,9 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
         "updated_at": dag.updated_at,
         "started_at": dag.started_at,
         "completed_at": dag.completed_at,
+        "locked": bool(getattr(dag, "locked", False)),
+        "template_params": list(getattr(dag, "template_params", []) or []),
+        "template_source_dag_id": getattr(dag, "template_source_dag_id", None),
         "dag_json": dag.dag_json,
         "nodes": [
             {

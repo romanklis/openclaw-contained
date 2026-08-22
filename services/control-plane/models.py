@@ -365,6 +365,12 @@ class MasterDAG(Base):
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
 
+    # Templating / routines: a locked DAG is a frozen, parameterized procedure
+    # that can be re-instantiated with new inputs (like calling a function).
+    locked = Column(Boolean, default=False, nullable=False)
+    template_params = Column(JSON, default=list)  # [{key,label,type,default,description}]
+    template_source_dag_id = Column(String, nullable=True)  # set on instances
+
     # Relationships
     nodes = relationship("DAGNode", back_populates="dag", cascade="all, delete-orphan")
     tasks = relationship("Task", backref="dag", foreign_keys="Task.dag_id")
@@ -661,6 +667,46 @@ class SkillV2Status(str, enum.Enum):
     DRAFT = "draft"         # extracted but not yet reviewed
     ACTIVE = "active"       # approved and eligible for planner use
     ARCHIVED = "archived"   # retired; preserved for lineage
+
+
+class TemplateSkillStatus(str, enum.Enum):
+    """Lifecycle state of a generalized (template) skill."""
+    DRAFT = "draft"         # produced at lock time, awaiting review
+    ACTIVE = "active"       # approved; used by template execution
+    ARCHIVED = "archived"   # retired; preserved for lineage
+
+
+class TemplateSkill(Base):
+    """A generalized, parameterized skill tied to a template (locked DAG).
+
+    Produced by the LLM when a DAG is locked as a template: each step's v2
+    skill is rewritten into a reusable pseudo-code routine that declares its
+    inputs as {param} placeholders, so executing the template with new values
+    follows the same learned procedure for new inputs.
+    """
+    __tablename__ = "template_skills"
+
+    id = Column(String, primary_key=True)                    # tsk-<uuid8>
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False)
+    source_skill_id = Column(String, nullable=True)          # v2 skill it generalizes (lineage)
+
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    instructions = Column(Text, default="")                  # generalized pseudo-code using {param}
+    params = Column(JSON, default=list)                      # keys this skill expects
+
+    status = Column(SQLEnum(TemplateSkillStatus), default=TemplateSkillStatus.DRAFT, nullable=False)
+    reviewer_score = Column(Integer, nullable=True)          # 1-5
+    review_notes = Column(Text, default="")
+    tags = Column(JSON, default=list)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    created_by = Column(String)
+
+    # Relationships
+    dag = relationship("MasterDAG", backref="template_skills")
 
 
 class SkillV2Source(str, enum.Enum):

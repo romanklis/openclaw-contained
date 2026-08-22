@@ -939,8 +939,15 @@ async def start_agent_container(
 
                             _selected_v2 = _n.get("selected_skill_v2_id")
                             _legacy_skill = _n.get("skill_id")
+                            _skill_override = (_n.get("config") or {}).get("template_skill_instructions")
 
-                            if _selected_v2:
+                            if _skill_override:
+                                skill_instructions = str(_skill_override)
+                                logger.info(
+                                    f"📚 Parameterized (template) skill instructions used for {node_id} "
+                                    f"({len(skill_instructions)} chars)"
+                                )
+                            elif _selected_v2:
                                 _skill_resp = await _hc_skill.get(
                                     f"{_cp_skill}/api/skill-learning/skills/{_selected_v2}"
                                 )
@@ -3733,6 +3740,15 @@ class DAGNodeWorkflow:
             follow_up_parts.append("--- Success Criteria ---")
             for criterion in success_criteria[:8]:
                 follow_up_parts.append(f"- {str(criterion)[:240]}")
+        template_guidance = config.get("template_guidance")
+        if template_guidance:
+            follow_up_parts.append(
+                "\n--- FOLLOW THE GUIDANCE (re-running a proven routine) ---\n"
+                "In a previous successful run, THIS step did:\n"
+                f"{str(template_guidance)[:1500]}\n"
+                "Follow the same approach now with the current objective and inputs. "
+                "When you act, briefly note what you are repeating from the previous run vs. adapting."
+            )
         if input_data:
             handoff = _build_stage_handoff(input_data)
             if handoff:

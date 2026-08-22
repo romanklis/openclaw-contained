@@ -15,6 +15,7 @@ interface DAG {
   created_at: string
   started_at: string | null
   completed_at: string | null
+  locked: boolean
 }
 
 interface Skill {
@@ -112,9 +113,12 @@ export default function DAGsPage() {
     <div>
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold">DAGs</h1>
-        <button onClick={() => setShowForm(!showForm)} className="btn-primary text-sm">
-          {showForm ? 'Cancel' : '+ New DAG'}
-        </button>
+        <div className="flex gap-2 items-center">
+          <Link href="/template-skills" className="btn-primary text-sm !bg-purple-700 hover:!bg-purple-600">🧩 Template Skills</Link>
+          <button onClick={() => setShowForm(!showForm)} className="btn-primary text-sm">
+            {showForm ? 'Cancel' : '+ New DAG'}
+          </button>
+        </div>
       </div>
 
       {error && <div className="bg-red-900/20 border border-red-500/30 rounded p-3 mb-4 text-red-300 text-sm">{error}</div>}
@@ -199,6 +203,7 @@ export default function DAGsPage() {
                 <div className="flex items-center gap-3 mb-1">
                   <span className="font-mono text-sm text-gray-400">{dag.id}</span>
                   <StatusBadge status={dag.status} />
+                  {dag.locked && <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">🔒 template</span>}
                 </div>
                 <p className="text-sm text-gray-300 line-clamp-2">{dag.objective}</p>
               </div>

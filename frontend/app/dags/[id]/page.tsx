@@ -40,6 +40,9 @@ interface DAGDetail {
   created_at: string
   started_at: string | null
   completed_at: string | null
+  locked: boolean
+  template_params: { key: string; label: string; type: string; default: string | null; description: string | null }[]
+  template_source_dag_id: string | null
 }
 
 interface TaskOutput {
@@ -174,6 +177,15 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [availableSkills, setAvailableSkills] = useState<any[]>([])
   const [selectedSkillId, setSelectedSkillId] = useState<string>('')
   const [skillDialogLoading, setSkillDialogLoading] = useState(false)
+  const [showLockDialog, setShowLockDialog] = useState(false)
+  const [lockParams, setLockParams] = useState<{ key: string; label: string; type: string; default: string; description: string }[]>([])
+  const [lockSaving, setLockSaving] = useState(false)
+  const [lockDialogLoading, setLockDialogLoading] = useState(false)
+  const [showExecuteDialog, setShowExecuteDialog] = useState(false)
+  const [executeValues, setExecuteValues] = useState<Record<string, string>>({})
+  const [executeObjective, setExecuteObjective] = useState('')
+  const [executeAutoStart, setExecuteAutoStart] = useState(false)
+  const [executeSaving, setExecuteSaving] = useState(false)
 
   // Skill extraction state
   const [miningSkill, setMiningSkill] = useState(false)
@@ -628,6 +640,109 @@ setNodeState(prev => {
     }
   }
 
+  const openLockDialog = async () => {
+    const existing = dag?.template_params || []
+    setLockParams(existing.length > 0
+      ? existing.map(p => ({ key: p.key, label: p.label, type: p.type || 'string', default: p.default || '', description: p.description || '' }))
+      : [])
+    setShowLockDialog(true)
+    if (existing.length === 0) {
+      setLockDialogLoading(true)
+      try {
+        const res = await fetch(`${API}/api/dags/${dagId}/propose-parameters`, { method: 'POST' })
+        if (res.ok) {
+          const proposed = await res.json()
+          if (Array.isArray(proposed) && proposed.length > 0) {
+            setLockParams(proposed.map((p: any) => ({ key: p.key, label: p.label || p.key, type: p.type || 'string', default: p.default || '', description: p.description || '' })))
+          }
+        }
+      } catch {
+        // leave empty rows; user can add manually
+      } finally {
+        setLockDialogLoading(false)
+      }
+    }
+  }
+
+  const addLockParam = () => {
+    setLockParams(prev => [...prev, { key: '', label: '', type: 'string', default: '', description: '' }])
+  }
+
+  const updateLockParam = (idx: number, field: string, value: string) => {
+    setLockParams(prev => prev.map((p, i) => i === idx ? { ...p, [field]: value } : p))
+  }
+
+  const removeLockParam = (idx: number) => {
+    setLockParams(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  const saveLock = async () => {
+    if (!dag) return
+    setLockSaving(true)
+    try {
+      const params = lockParams.filter(p => p.key.trim()).map(p => ({ key: p.key.trim(), label: p.label.trim() || p.key.trim(), type: p.type || 'string', default: p.default || null, description: p.description || null }))
+      const res = await fetch(`${API}/api/dags/${dagId}/lock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parameters: params }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail || `HTTP ${res.status}`)
+      setShowLockDialog(false)
+      await applyDagMutationResult(data as DAGDetail, false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLockSaving(false)
+    }
+  }
+
+  const unlockDag = async () => {
+    if (!dag) return
+    setLockSaving(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/unlock`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail || `HTTP ${res.status}`)
+      await applyDagMutationResult(data as DAGDetail, false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLockSaving(false)
+    }
+  }
+
+  const openExecuteDialog = () => {
+    const vals: Record<string, string> = {}
+    for (const p of dag?.template_params || []) {
+      vals[p.key] = p.default ?? ''
+    }
+    setExecuteValues(vals)
+    setExecuteObjective(dag?.objective || '')
+    setExecuteAutoStart(false)
+    setShowExecuteDialog(true)
+  }
+
+  const runExecute = async () => {
+    if (!dag) return
+    setExecuteSaving(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/instantiate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ objective: executeObjective, parameters: executeValues, auto_start: executeAutoStart }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail || `HTTP ${res.status}`)
+      setShowExecuteDialog(false)
+      router.push(`/dags/${(data as any).id}`)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setExecuteSaving(false)
+    }
+  }
+
   const applyGraphPatch = async (nodeDependencies: Record<string, string[]>): Promise<DAGDetail> => {    const res = await fetch(`${API}/api/dags/${dagId}/graph`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -945,19 +1060,21 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             <span className="text-gray-600">/</span>
             <h1 className="text-xl font-bold font-mono">{dag.id}</h1>
             <StatusBadge status={dag.status} />
+            {dag.locked && <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">🔒 template</span>}
+            {dag.template_source_dag_id && <span className="text-xs bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded">follow-the-guidance</span>}
           </div>
           <p className="text-gray-400 text-sm mt-1 max-w-3xl">{dag.objective}</p>
         </div>
         <div className="flex gap-2">
-          {(dag.status === 'ready' || dag.status === 'failed' || dag.status === 'cancelled' || dag.status === 'completed') && (
+          {(dag.status === 'ready' || dag.status === 'failed' || dag.status === 'cancelled' || dag.status === 'completed') && !dag.locked && (
             <button onClick={startDag} className="btn-success text-sm">
               {dag.status === 'completed' ? '▶ Run (all)' : (dag.status === 'failed' ? '▶ Retry (all)' : '▶ Start')}
             </button>
           )}
-          {dag.status === 'running' && (
+          {dag.status === 'running' && !dag.locked && (
             <button onClick={cancelDag} className="btn-danger text-sm">&#9209; Cancel</button>
           )}
-          {(dag.status === 'completed' || dag.status === 'failed' || dag.status === 'cancelled') && (
+          {(dag.status === 'completed' || dag.status === 'failed' || dag.status === 'cancelled') && !dag.locked && (
             <button
               onClick={() => setShowRevise(!showRevise)}
               className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-md transition-colors"
@@ -965,8 +1082,88 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               {showRevise ? 'Cancel' : '♻️ Revise'}
             </button>
           )}
+          {dag.locked && (
+            <>
+              <button onClick={openExecuteDialog} className="btn-success text-sm">▶ Execute routine</button>
+              <button onClick={unlockDag} disabled={lockSaving} className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-sm rounded-md transition-colors disabled:opacity-50">🔓 Unlock</button>
+            </>
+          )}
+          {!dag.locked && (dag.status === 'completed' || dag.status === 'failed' || dag.status === 'ready') && (
+            <button onClick={openLockDialog} className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-md transition-colors">🔒 Lock as template</button>
+          )}
         </div>
       </div>
+
+      {/* Lock as template dialog */}
+      {showLockDialog && (
+        <div className="card p-4 mb-4 border border-purple-500/30">
+          <label className="block text-sm font-medium text-gray-300 mb-1">Lock as template</label>
+          <p className="text-xs text-gray-500 mb-2">Freeze this DAG into a reusable, parameterized routine. Define input parameters below; node objectives can reference them as {'{key}'}. Locking also LLM-generalizes each step's skill into a reviewable template skill (see Template Skills).</p>
+          {lockDialogLoading && <p className="text-xs text-purple-300 mb-2">Proposing parameters with the LLM…</p>}
+          {!lockDialogLoading && lockParams.length === 0 && (
+            <p className="text-xs text-gray-500 mb-2">No parameters proposed — add them manually below.</p>
+          )}
+          <div className="space-y-2 mb-3">
+            {lockParams.map((p, i) => (
+              <div key={i} className="flex gap-2 items-center">
+                <input value={p.key} onChange={(e) => updateLockParam(i, 'key', e.target.value)} placeholder="key (e.g. category)" className="w-40 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs" />
+                <input value={p.label} onChange={(e) => updateLockParam(i, 'label', e.target.value)} placeholder="label" className="w-36 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs" />
+                <select value={p.type} onChange={(e) => updateLockParam(i, 'type', e.target.value)} className="w-28 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs">
+                  <option value="string">string</option>
+                  <option value="number">number</option>
+                  <option value="boolean">boolean</option>
+                </select>
+                <input value={p.default} onChange={(e) => updateLockParam(i, 'default', e.target.value)} placeholder="default" className="w-32 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs" />
+                <input value={p.description} onChange={(e) => updateLockParam(i, 'description', e.target.value)} placeholder="description" className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs" />
+                <button onClick={() => removeLockParam(i)} className="text-red-400 text-xs">✕</button>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={addLockParam} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">+ Add parameter</button>
+            <div className="flex-1" />
+            <button onClick={() => setShowLockDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
+            <button onClick={saveLock} disabled={lockSaving || lockDialogLoading} className="px-3 py-1 text-xs rounded bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50">
+              {lockSaving ? 'Locking…' : '🔒 Lock template'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Execute routine dialog */}
+      {showExecuteDialog && (
+        <div className="card p-4 mb-4 border border-cyan-500/30">
+          <label className="block text-sm font-medium text-gray-300 mb-1">Execute routine (follow the guidance)</label>
+          <p className="text-xs text-gray-500 mb-3">Run the locked procedure against new inputs. Each step will re-execute its learned skill, guided by what it did last time.</p>
+          <label className="block text-xs text-gray-400 mb-1">Objective</label>
+          <textarea value={executeObjective} onChange={(e) => setExecuteObjective(e.target.value)} rows={2} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm mb-3" />
+          {(dag?.template_params || []).length > 0 && (
+            <div className="space-y-2 mb-3">
+              {(dag?.template_params || []).map((p) => (
+                <div key={p.key}>
+                  <label className="block text-xs text-gray-400">{p.label || p.key}{p.description ? <span className="text-gray-600"> — {p.description}</span> : null}</label>
+                  <input
+                    value={executeValues[p.key] ?? ''}
+                    onChange={(e) => setExecuteValues(prev => ({ ...prev, [p.key]: e.target.value }))}
+                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm"
+                    placeholder={p.default ?? ''}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+          <label className="flex items-center gap-2 text-xs text-gray-400 mb-3">
+            <input type="checkbox" checked={executeAutoStart} onChange={(e) => setExecuteAutoStart(e.target.checked)} />
+            Auto-start after creation
+          </label>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setShowExecuteDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
+            <button onClick={runExecute} disabled={executeSaving} className="px-3 py-1 text-xs rounded bg-cyan-600 hover:bg-cyan-500 text-white disabled:opacity-50">
+              {executeSaving ? 'Creating…' : '▶ Create & run'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Revise panel */}
       {showRevise && (
@@ -1399,6 +1596,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               <span className="font-semibold text-blue-400">Skill rationale: </span>
               {selectedNode.skill_selection_reason}
             </div>
+          )}
+
+          {selectedNode.config?.template_guidance && (
+            <details className="mb-3 p-2 bg-cyan-950/40 border border-cyan-800/50 rounded text-xs text-cyan-200">
+              <summary className="cursor-pointer font-semibold text-cyan-300">📋 Previous run (follow-the-guidance reference)</summary>
+              <pre className="whitespace-pre-wrap mt-1 text-cyan-200/80">{selectedNode.config.template_guidance}</pre>
+            </details>
           )}
 
           {mineResult && (

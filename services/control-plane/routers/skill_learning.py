@@ -10,6 +10,7 @@ from models import (
     SkillV2, SkillV2Status, SkillV2Source,
     SkillDemo, SkillReview, SkillSelectionEvent,
     AgentImage, TaskOutput, Task, DAGNode, Skill, DeepReview,
+    TemplateSkill, TemplateSkillStatus,
 )
 from typing import Optional, List
 from datetime import datetime
@@ -525,6 +526,93 @@ async def get_review_queue(
         q = q.where(SkillV2.image_id == image_id)
     result = await db.execute(q)
     return list(result.scalars().all())
+
+
+# ---------------------------------------------------------------------------
+# Template skills — generalized skills tied to templates (locked DAGs)
+# ---------------------------------------------------------------------------
+
+def _template_skill_payload(ts: TemplateSkill) -> dict:
+    return {
+        "id": ts.id,
+        "dag_id": ts.dag_id,
+        "node_id": ts.node_id,
+        "source_skill_id": ts.source_skill_id,
+        "name": ts.name,
+        "description": ts.description or "",
+        "instructions": ts.instructions or "",
+        "params": list(ts.params or []),
+        "status": ts.status.value,
+        "reviewer_score": ts.reviewer_score,
+        "review_notes": ts.review_notes or "",
+        "tags": list(ts.tags or []),
+        "created_at": ts.created_at,
+        "updated_at": ts.updated_at,
+    }
+
+
+@router.get("/template-skills", response_model=List[dict])
+async def list_template_skills(
+    dag_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """List generalized (template) skills, optionally filtered by template DAG or status."""
+    q = select(TemplateSkill).order_by(TemplateSkill.created_at.desc())
+    if dag_id:
+        q = q.where(TemplateSkill.dag_id == dag_id)
+    if status:
+        try:
+            q = q.where(TemplateSkill.status == TemplateSkillStatus(status))
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Invalid status '{status}'")
+    result = await db.execute(q)
+    return [_template_skill_payload(ts) for ts in result.scalars().all()]
+
+
+@router.get("/template-skills/{tskill_id}", response_model=dict)
+async def get_template_skill(tskill_id: str, db: AsyncSession = Depends(get_db)):
+    """Get a generalized (template) skill by id."""
+    ts = await db.get(TemplateSkill, tskill_id)
+    if not ts:
+        raise HTTPException(status_code=404, detail="Template skill not found")
+    return _template_skill_payload(ts)
+
+
+@router.patch("/template-skills/{tskill_id}", response_model=dict)
+async def update_template_skill(tskill_id: str, body: dict, db: AsyncSession = Depends(get_db)):
+    """Review a generalized (template) skill: approve/archive, rate, edit."""
+    ts = await db.get(TemplateSkill, tskill_id)
+    if not ts:
+        raise HTTPException(status_code=404, detail="Template skill not found")
+    if body.get("status"):
+        try:
+            ts.status = TemplateSkillStatus(body["status"])
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Invalid status '{body['status']}'")
+    if "reviewer_score" in body and body["reviewer_score"] is not None:
+        ts.reviewer_score = max(1, min(5, int(body["reviewer_score"])))
+    if "review_notes" in body and body["review_notes"] is not None:
+        ts.review_notes = str(body["review_notes"])
+    if "edited_instructions" in body and body["edited_instructions"] is not None:
+        ts.instructions = str(body["edited_instructions"])
+        # Keep template node config in sync so execution uses the edited skill.
+        from routers.dags import _get_dag_or_404
+        dag = await _get_dag_or_404(ts.dag_id, db)
+        dag_json = dag.dag_json or {}
+        for nd in dag_json.get("nodes", []):
+            if nd.get("node_id") == ts.node_id:
+                cfg = dict(nd.get("config") or {})
+                cfg["template_skill_instructions"] = str(body["edited_instructions"])
+                nd["config"] = cfg
+        dag.dag_json = dag_json
+    if body.get("name"):
+        ts.name = str(body["name"])
+    if "description" in body and body["description"] is not None:
+        ts.description = str(body["description"])
+    await db.commit()
+    await db.refresh(ts)
+    return _template_skill_payload(ts)
 
 
 # ---------------------------------------------------------------------------

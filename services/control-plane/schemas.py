@@ -538,6 +538,56 @@ class DAGManualCreate(BaseModel):
     default_llm: str = "gemma3:4b"
 
 
+class TemplateParam(BaseModel):
+    """An input parameter of a locked DAG template (the function signature)."""
+    key: str
+    label: str
+    type: str = "string"  # string | number | boolean | list
+    default: Optional[str] = None
+    description: Optional[str] = None
+
+
+class DAGLockRequest(BaseModel):
+    """Lock a DAG as a template with an optional input parameter schema."""
+    parameters: List[TemplateParam] = []
+
+
+class DAGInstantiateRequest(BaseModel):
+    """Instantiate a template into a new DAG run (follow-the-guidance)."""
+    objective: Optional[str] = None
+    parameters: Dict[str, Any] = {}
+    auto_start: bool = False
+
+
+class TemplateSkillResponse(BaseModel):
+    id: str
+    dag_id: str
+    node_id: str
+    source_skill_id: Optional[str]
+    name: str
+    description: str = ""
+    instructions: str = ""
+    params: List[str] = []
+    status: str = "draft"
+    reviewer_score: Optional[int] = None
+    review_notes: str = ""
+    tags: List[str] = []
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TemplateSkillUpdate(BaseModel):
+    status: Optional[Literal["draft", "active", "archived"]] = None
+    reviewer_score: Optional[int] = None
+    review_notes: Optional[str] = None
+    edited_instructions: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
 class DAGResponse(BaseModel):
     id: str
     objective: str
@@ -550,6 +600,9 @@ class DAGResponse(BaseModel):
     updated_at: Optional[datetime]
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+    locked: bool = False
+    template_params: Optional[List[Dict[str, Any]]] = None
+    template_source_dag_id: Optional[str] = None
 
     class Config:
         from_attributes = True

@@ -44,6 +44,10 @@ async def lifespan(app: FastAPI):
         # v2 skill learning system columns
         await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS selected_skill_v2_id VARCHAR"))
         await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS skill_selection_reason TEXT"))
+        # DAG templating / routines columns
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS template_params JSON"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS template_source_dag_id VARCHAR"))
 
     logger.info("Database initialized")
 
