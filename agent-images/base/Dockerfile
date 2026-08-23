@@ -24,6 +24,9 @@ RUN apt-get update && apt-get install -y \
     make \
     # Network tools
     netcat-openbsd \
+    # File inspection tools
+    xxd \
+    file \
     # Process management
     supervisor \
     && rm -rf /var/lib/apt/lists/*

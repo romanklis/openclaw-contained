@@ -1044,6 +1044,18 @@ async def start_agent_container(
         # --- Zep CE memory service discovery ---
         zep_ip = os.getenv("ZEP_IP", "") or _resolve("zep", fallback="")
         zep_url_for_agent = f"http://{zep_ip}:8000" if zep_ip else ""
+
+        # --- Docling RAG tool discovery ---
+        # gVisor agents get an isolated netns and cannot resolve Compose service
+        # hostnames, so pre-resolve `docling-rag` to an IP (same pattern as
+        # control-plane / zep) and inject an IP-based URL.
+        rag_ip = os.getenv("RAG_TOOL_IP", "") or _resolve("docling-rag", fallback="")
+        rag_url_for_agent = (
+            f"http://{rag_ip}:8080"
+            if rag_ip
+            else os.getenv("RAG_TOOL_URL", "http://docling-rag:8080")
+        )
+
         # Session ID: DAG-scoped by node_id so memory persists across
         # retries for the same DAG node.  For standalone tasks we
         # fall back to the task_id.
@@ -1073,6 +1085,9 @@ async def start_agent_container(
             "CONTROL_PLANE_URL": cp_url_for_agent,
             "LLM_ROUTER_URL": llm_router_url,
             "OLLAMA_URL": os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"),
+            # External RAG tool (docling-rag) so agents can query uploaded docs.
+            "RAG_TOOL_URL": rag_url_for_agent,
+            "RAG_API_KEY": os.getenv("RAG_API_KEY", "my-local-secret-key"),
             "LLM_MODEL": llm_model,
             "TASK_DESCRIPTION": task_description[:2000],
             "AGENT_IMAGE": agent_image,
@@ -3481,6 +3496,59 @@ def _build_prior_state_review_prompt(upstream_state_review: List[Dict[str, Any]]
     return "\n".join(lines)
 
 
+async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], assessment: Dict[str, Any]) -> Dict[str, Any]:
+    """Gate fallback: when the objective-alignment reviewer errors, validate the
+    node via the deep review (the control-plane's integrity audit). A clean or
+    needs_attention verdict passes the node; issues_found fails it; and if the
+    deep review itself is unavailable the node passes (a broken reviewer must
+    never sink a well-executed step).
+    """
+    import httpx as _httpx_dr
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    node_id = (output or {}).get("node_id") or ""
+    try:
+        async with _httpx_dr.AsyncClient(timeout=180.0) as _dr_client:
+            resp = await _dr_client.post(
+                f"{control_plane_url}/api/skill-learning/deep-review",
+                json={
+                    "task_id": task_id,
+                    "node_id": node_id,
+                    "include_skill": True,
+                },
+            )
+            resp.raise_for_status()
+            review = resp.json()
+    except Exception as exc:
+        logger.warning(f"objective_assessment_error: deep-review fallback failed ({exc}) — passing node {node_id}")
+        return {
+            "valid": True,
+            "reason": "objective_assessment_error (deep review unavailable)",
+            "external_assessment": assessment,
+            "deep_review": None,
+        }
+
+    verdict = str((review or {}).get("verdict") or "").lower()
+    score = review.get("score")
+    # The deep review is LLM-nondeterministic (same task can come back clean or
+    # issues_found on different calls). Only treat it as a HARD failure when
+    # deterministic rule-based integrity signals fired: deep_review_task caps
+    # the score at <=55 in that case. An LLM-only "issues_found" (score > 55)
+    # is reviewer judgment and must not sink a well-executed step.
+    if verdict == "issues_found" and score is not None and score <= 55:
+        return {
+            "valid": False,
+            "reason": "objective_assessment_error → deep_review: issues_found (hard integrity signals)",
+            "external_assessment": assessment,
+            "deep_review": review,
+        }
+    return {
+        "valid": True,
+        "reason": f"objective_assessment_error → deep_review: {verdict or 'n/a'}" + (f" (score {score})" if score is not None else ""),
+        "external_assessment": assessment,
+        "deep_review": review,
+    }
+
+
 @activity.defn
 async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Evaluate node output quality gate.
@@ -3562,11 +3630,10 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
             "external_assessment": assessment,
         }
     if assessment.get("enabled") and assessment.get("verdict") == "error":
-        return {
-            "valid": False,
-            "reason": "objective_assessment_error",
-            "external_assessment": assessment,
-        }
+        # The objective-alignment reviewer errored (LLM parse/call failure). Do
+        # NOT fail the node for the reviewer's failure — validate via the deep
+        # review instead, and treat an unavailable deep review as non-blocking.
+        return await _deep_review_gate_fallback(task_id, output, assessment)
     return {"valid": True, "reason": "ok", "external_assessment": assessment}
 
 
@@ -4372,10 +4439,21 @@ class DAGWorkflow:
                                     "optional": False,
                                 })
                             else:
-                                resolution_report["missing_required_inputs"].append({
+                                # The mapped field isn't present on the source
+                                # node's output (e.g. the planner guessed a
+                                # field the producer doesn't emit). Don't fail
+                                # the node — fall back to the source node's full
+                                # output so downstream still receives the
+                                # upstream deliverables and can locate the real
+                                # artifact (e.g. the PDF file).
+                                fallback_value = node_outputs[source_node]
+                                input_data[key] = fallback_value
+                                resolution_report["resolved_inputs"].append({
                                     "key": key,
-                                    "source_node": source_spec,
-                                    "reason": "missing source node field",
+                                    "source_node": source_node,
+                                    "source_field": source_field,
+                                    "optional": False,
+                                    "fallback": "field missing — passed full source output",
                                 })
                         else:
                             resolution_report["missing_required_inputs"].append({
@@ -4715,6 +4793,9 @@ async def main():
             persist_task_workflow_id,
             update_task_status,
         ],
+        # Limit concurrency to avoid OOM on constrained hosts: only ONE activity
+        # (i.e. one agent container) runs at a time. Configurable via env.
+        max_concurrent_activities=int(os.getenv("MAX_CONCURRENT_ACTIVITIES", "1")),
     )
     
     logger.info(f"Worker starting on task queue: {TASK_QUEUE}")

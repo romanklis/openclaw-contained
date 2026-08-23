@@ -1,0 +1,14 @@
+# Keep the project-root build context (used only by Dockerfile.docling-rag,
+# which clones from GitHub and needs no local files) small and permission-safe.
+.git
+workspaces
+agent-images
+node_modules
+services
+frontend
+.kilo
+.openclaw
+docs
+scripts
+*.log
+.DS_Store

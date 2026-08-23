@@ -41,6 +41,8 @@ RUN apt-get update && apt-get install -y \
     libdbus-1-3 \
     fonts-liberation \
     fonts-noto-color-emoji \
+    xxd \
+    file \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Camoufox and curl_cffi (with CLI support)
@@ -65,7 +67,9 @@ RUN python3 -m pip install --no-cache-dir \
     feedparser \
     lxml-html-clean \
     html-sanitizer \
-    fake-useragent
+    fake-useragent \
+    pypdf \
+    pymupdf
 
 # Copy adapter
 COPY taskforge-adapter.py /opt/openclaw/taskforge-adapter.py
