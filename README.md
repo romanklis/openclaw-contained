@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/images/0.7.0/main image.png" alt="TaskForge Platform" width="720" />
-</p>
-
 # TaskForge
 
 **Auditable Agent Orchestration for [OpenClaw](https://github.com/openclaw/openclaw)**
