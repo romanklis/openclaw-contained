@@ -103,6 +103,7 @@ dist/
 
 # Test coverage
 .coverage
+.kilo
 htmlcov/
 .pytest_cache/
 
