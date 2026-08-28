@@ -1,18 +1,15 @@
 # Use OpenClaw official image as base
-FROM ghcr.io/openclaw/openclaw:latest
+# Pin to specific version for reproducibility
+FROM ghcr.io/openclaw/openclaw:0.5.43
 
 # Install Python for the wrapper script
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
-    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Create virtual environment for Python dependencies
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Install Python dependencies for the wrapper
+# Install Python dependencies system-wide (no venv)
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN pip install --no-cache-dir httpx
 
 # Copy the wrapper script

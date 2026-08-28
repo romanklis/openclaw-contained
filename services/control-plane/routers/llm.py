@@ -44,10 +44,11 @@ _config: Dict[str, str] = {
     "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
     "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
     "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
+    "DEEPSEEK_API_KEY": os.getenv("DEEPSEEK_API_KEY", ""),
 }
 _config_loaded = False  # Whether we've loaded from DB yet
 
-_CONFIG_KEYS = ["OLLAMA_URL", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+_CONFIG_KEYS = ["OLLAMA_URL", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"]
 
 # ---------------------------------------------------------------------------
 # Gemini thought_signature cache
@@ -229,6 +230,7 @@ def _ollama_url() -> str: return _config["OLLAMA_URL"]
 def _gemini_key() -> str: return _config["GEMINI_API_KEY"]
 def _anthropic_key() -> str: return _config["ANTHROPIC_API_KEY"]
 def _openai_key() -> str: return _config["OPENAI_API_KEY"]
+def _deepseek_key() -> str: return _config["DEEPSEEK_API_KEY"]
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +315,14 @@ def detect_provider(model: str) -> str:
     """Detect which provider to use based on model name."""
     model_lower = model.lower()
 
-    if model_lower.startswith("gemini"):
+    if model_lower.startswith("gemini") or model_lower.startswith("gemma"):
         return "gemini"
     if model_lower.startswith("claude"):
         return "anthropic"
     if any(model_lower.startswith(p) for p in ("gpt-", "o1-", "o3-", "o4-")):
         return "openai"
+    if model_lower.startswith("deepseek"):
+        return "deepseek"
 
     # Everything else → Ollama (local)
     return "ollama"
@@ -1073,6 +1077,101 @@ async def call_openai(req: ChatCompletionRequest) -> ChatCompletionResponse:
     )
 
 
+
+
+async def call_deepseek(req: ChatCompletionRequest) -> ChatCompletionResponse:
+    """Forward to DeepSeek Chat Completions API (OpenAI-compatible), preserving tool_calls."""
+    api_key = _deepseek_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY not configured — add it via /llm-providers in the UI")
+
+    url = "https://api.deepseek.com/chat/completions"
+
+    messages = []
+    for m in req.messages:
+        msg_dict: Dict[str, Any] = {"role": m.role, "content": m.content}
+        if m.tool_calls:
+            msg_dict["tool_calls"] = m.tool_calls
+        if m.function_call:
+            msg_dict["function_call"] = m.function_call
+        extras = m.model_extra or {}
+        for k, v in extras.items():
+            if k not in msg_dict:
+                msg_dict[k] = v
+        messages.append(msg_dict)
+
+    # DeepSeek V4 models are reasoning models: they emit a long chain-of-thought
+    # in `reasoning_content` that counts toward max_tokens. With a low max_tokens
+    # the final answer in `content` is truncated away (finish_reason="length"),
+    # leaving an empty/partial response. Floor max_tokens so the real answer fits.
+    max_tokens = req.max_tokens or 8192
+    if max_tokens < 8192:
+        max_tokens = 8192
+
+    payload: Dict[str, Any] = {
+        "model": req.model,
+        "messages": messages,
+        "temperature": req.temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    extras = req.model_extra or {}
+    if "tools" in extras:
+        payload["tools"] = extras["tools"]
+    if "tool_choice" in extras:
+        payload["tool_choice"] = extras["tool_choice"]
+    # DeepSeek V4 thinking-mode controls. `thinking` is a top-level body param
+    # ({"type": "enabled"/"disabled"}); `reasoning_effort` controls CoT depth.
+    # Callers (e.g. structured-JSON planning/review) may disable thinking to
+    # avoid burning max_tokens on chain-of-thought.
+    if "thinking" in extras:
+        payload["thinking"] = extras["thinking"]
+    if "reasoning_effort" in extras:
+        payload["reasoning_effort"] = extras["reasoning_effort"]
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+    choices = []
+    for c in data.get("choices", []):
+        msg = c.get("message", {})
+        content = msg.get("content")
+        # DeepSeek reasoning models return chain-of-thought in `reasoning_content`
+        # and may leave `content` empty/null. Use reasoning_content as a fallback.
+        if content is None or (isinstance(content, str) and not content.strip()):
+            content = msg.get("reasoning_content")
+        choices.append(ChatCompletionChoice(
+            index=c.get("index", 0),
+            message=ChatMessage(
+                role=msg.get("role", "assistant"),
+                content=content,
+                tool_calls=msg.get("tool_calls"),
+                function_call=msg.get("function_call"),
+            ),
+            finish_reason=c.get("finish_reason", "stop"),
+        ))
+
+    usage = data.get("usage", {})
+    return ChatCompletionResponse(
+        id=data.get("id", "chatcmpl-deepseek"),
+        created=data.get("created", int(time.time())),
+        model=req.model,
+        choices=choices,
+        usage=UsageInfo(
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Provider dispatch map
 # ---------------------------------------------------------------------------
@@ -1082,6 +1181,7 @@ PROVIDER_HANDLERS = {
     "gemini": call_gemini,
     "anthropic": call_anthropic,
     "openai": call_openai,
+    "deepseek": call_deepseek,
 }
 
 
@@ -1337,6 +1437,7 @@ async def clear_task_interactions(task_id: str):
 @router.get("/health")
 async def llm_health():
     """Check backend provider connectivity."""
+    await _load_config_from_db()
     status_map = {}
     ollama_url = _ollama_url()
 
@@ -1350,18 +1451,97 @@ async def llm_health():
     except Exception as e:
         status_map["ollama"] = {"status": "unhealthy", "error": str(e)}
 
-    status_map["gemini"] = {
-        "status": "configured" if _gemini_key() else "not_configured",
-        "models": ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"],
-    }
-    status_map["anthropic"] = {
-        "status": "configured" if _anthropic_key() else "not_configured",
-        "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-haiku-20241022"],
-    }
-    status_map["openai"] = {
-        "status": "configured" if _openai_key() else "not_configured",
-        "models": ["gpt-4o", "gpt-4o-mini", "o1-preview"],
-    }
+    # Gemini — fetch dynamically
+    gemini_key = _gemini_key()
+    gemini_health: dict = {"status": "configured" if gemini_key else "not_configured", "models": []}
+    if gemini_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": gemini_key, "pageSize": 100},
+                )
+                if resp.status_code == 200:
+                    gemini_health["models"] = [
+                        m.get("name", "").removeprefix("models/")
+                        for m in resp.json().get("models", [])
+                        if m.get("name", "").removeprefix("models/").startswith(("gemini-", "gemma-"))
+                    ]
+                else:
+                    gemini_health["status"] = "error"
+                    gemini_health["error"] = f"Google API returned {resp.status_code}"
+        except Exception as e:
+            gemini_health["status"] = "error"
+            gemini_health["error"] = str(e)
+    status_map["gemini"] = gemini_health
+
+    # Anthropic — fetch dynamically
+    anthropic_key = _anthropic_key()
+    anthropic_health: dict = {"status": "configured" if anthropic_key else "not_configured", "models": []}
+    if anthropic_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01"},
+                )
+                if resp.status_code == 200:
+                    anthropic_health["models"] = [
+                        m.get("id", "") for m in resp.json().get("data", []) if m.get("id")
+                    ]
+                else:
+                    anthropic_health["status"] = "error"
+                    anthropic_health["error"] = f"Anthropic API returned {resp.status_code}"
+        except Exception as e:
+            anthropic_health["status"] = "error"
+            anthropic_health["error"] = str(e)
+    status_map["anthropic"] = anthropic_health
+
+    # OpenAI — fetch dynamically
+    openai_key = _openai_key()
+    openai_health: dict = {"status": "configured" if openai_key else "not_configured", "models": []}
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                )
+                if resp.status_code == 200:
+                    openai_health["models"] = [
+                        m.get("id", "") for m in resp.json().get("data", [])
+                        if m.get("id", "").startswith(("gpt-", "o1-", "o3-", "o4-"))
+                    ]
+                else:
+                    openai_health["status"] = "error"
+                    openai_health["error"] = f"OpenAI API returned {resp.status_code}"
+        except Exception as e:
+            openai_health["status"] = "error"
+            openai_health["error"] = str(e)
+    status_map["openai"] = openai_health
+
+    # DeepSeek — OpenAI-compatible API
+    deepseek_key = _deepseek_key()
+    deepseek_health: dict = {"status": "configured" if deepseek_key else "not_configured", "models": []}
+    if deepseek_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.deepseek.com/models",
+                    headers={"Authorization": f"Bearer {deepseek_key}"},
+                )
+                if resp.status_code == 200:
+                    deepseek_health["models"] = [
+                        m.get("id", "") for m in resp.json().get("data", [])
+                        if m.get("id", "").startswith("deepseek-")
+                    ]
+                else:
+                    deepseek_health["status"] = "error"
+                    deepseek_health["error"] = f"DeepSeek API returned {resp.status_code}"
+        except Exception as e:
+            deepseek_health["status"] = "error"
+            deepseek_health["error"] = str(e)
+    status_map["deepseek"] = deepseek_health
 
     return {"providers": status_map}
 
@@ -1369,6 +1549,7 @@ async def llm_health():
 @router.get("/providers")
 async def get_llm_providers():
     """Return available providers for the frontend / agent."""
+    await _load_config_from_db()
     providers = []
 
     # Ollama — always present if reachable
@@ -1386,20 +1567,100 @@ async def get_llm_providers():
         "name": "ollama", "type": "ollama", "url": ollama_url,
         "available": len(ollama_models) > 0, "models": ollama_models,
     })
+
+    # Google (Gemini + Gemma) — fetch dynamically
+    gemini_key = _gemini_key()
+    google_models: list[str] = []
+    if gemini_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": gemini_key, "pageSize": 100},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("models", []):
+                        model_id = m.get("name", "").removeprefix("models/")
+                        if model_id and any(model_id.startswith(p) for p in ("gemini-", "gemma-")):
+                            google_models.append(model_id)
+        except Exception as e:
+            logger.warning(f"Failed to fetch Google models for providers: {e}")
     providers.append({
         "name": "gemini", "type": "gemini",
-        "available": bool(_gemini_key()),
-        "models": ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"],
+        "available": bool(gemini_key),
+        "models": google_models,
     })
+
+    # Anthropic — fetch dynamically
+    anthropic_key = _anthropic_key()
+    anthropic_models: list[str] = []
+    if anthropic_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={
+                        "x-api-key": anthropic_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        mid = m.get("id", "")
+                        if mid:
+                            anthropic_models.append(mid)
+        except Exception as e:
+            logger.warning(f"Failed to fetch Anthropic models for providers: {e}")
     providers.append({
         "name": "anthropic", "type": "anthropic",
-        "available": bool(_anthropic_key()),
-        "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-haiku-20241022"],
+        "available": bool(anthropic_key),
+        "models": anthropic_models,
     })
+
+    # OpenAI — fetch dynamically
+    openai_key = _openai_key()
+    openai_models: list[str] = []
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        mid = m.get("id", "")
+                        if mid and any(mid.startswith(p) for p in ("gpt-", "o1-", "o3-", "o4-")):
+                            openai_models.append(mid)
+        except Exception as e:
+            logger.warning(f"Failed to fetch OpenAI models for providers: {e}")
     providers.append({
         "name": "openai", "type": "openai",
-        "available": bool(_openai_key()),
-        "models": ["gpt-4o", "gpt-4o-mini", "o1-preview"],
+        "available": bool(openai_key),
+        "models": openai_models,
+    })
+
+    # DeepSeek — OpenAI-compatible API
+    deepseek_key = _deepseek_key()
+    deepseek_models: list[str] = []
+    if deepseek_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.deepseek.com/models",
+                    headers={"Authorization": f"Bearer {deepseek_key}"},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        mid = m.get("id", "")
+                        if mid and mid.startswith("deepseek-"):
+                            deepseek_models.append(mid)
+        except Exception as e:
+            logger.warning(f"Failed to fetch DeepSeek models for providers: {e}")
+    providers.append({
+        "name": "deepseek", "type": "deepseek",
+        "available": bool(deepseek_key),
+        "models": deepseek_models,
     })
 
     default = "ollama"
@@ -1414,6 +1675,7 @@ async def get_llm_providers():
 @router.get("/models")
 async def list_all_models():
     """List models across all configured providers."""
+    await _load_config_from_db()
     all_models = []
 
     ollama_url = _ollama_url()
@@ -1426,15 +1688,85 @@ async def list_all_models():
     except Exception:
         pass
 
-    if _gemini_key():
-        for m in ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"]:
-            all_models.append({"id": m, "provider": "gemini"})
-    if _anthropic_key():
-        for m in ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-haiku-20241022"]:
-            all_models.append({"id": m, "provider": "anthropic"})
-    if _openai_key():
-        for m in ["gpt-4o", "gpt-4o-mini", "o1-preview"]:
-            all_models.append({"id": m, "provider": "openai"})
+    # Google (Gemini + Gemma) — fetch dynamically from the API
+    gemini_key = _gemini_key()
+    if gemini_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": gemini_key, "pageSize": 100},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("models", []):
+                        # name is like "models/gemini-2.0-flash"
+                        model_id = m.get("name", "").removeprefix("models/")
+                        if model_id and any(model_id.startswith(p) for p in ("gemini-", "gemma-")):
+                            all_models.append({"id": model_id, "provider": "gemini"})
+                else:
+                    logger.warning(f"Google models API returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch Google models: {e}")
+
+    # Anthropic — fetch from API
+    anthropic_key = _anthropic_key()
+    if anthropic_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={
+                        "x-api-key": anthropic_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        model_id = m.get("id", "")
+                        if model_id:
+                            all_models.append({"id": model_id, "provider": "anthropic"})
+                else:
+                    logger.warning(f"Anthropic models API returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch Anthropic models: {e}")
+
+    # OpenAI — fetch from API
+    openai_key = _openai_key()
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        model_id = m.get("id", "")
+                        if model_id and any(model_id.startswith(p) for p in ("gpt-", "o1-", "o3-", "o4-")):
+                            all_models.append({"id": model_id, "provider": "openai"})
+                else:
+                    logger.warning(f"OpenAI models API returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch OpenAI models: {e}")
+
+    # DeepSeek — fetch from API
+    deepseek_key = _deepseek_key()
+    if deepseek_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.deepseek.com/models",
+                    headers={"Authorization": f"Bearer {deepseek_key}"},
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        model_id = m.get("id", "")
+                        if model_id and model_id.startswith("deepseek-"):
+                            all_models.append({"id": model_id, "provider": "deepseek"})
+                else:
+                    logger.warning(f"DeepSeek models API returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch DeepSeek models: {e}")
 
     return {"models": all_models}
 
@@ -1479,6 +1811,7 @@ class ProviderConfigUpdate(BaseModel):
     gemini_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
+    deepseek_api_key: Optional[str] = None
 
 
 @router.get("/config")
@@ -1490,9 +1823,11 @@ async def get_config():
         "gemini_api_key": _mask_key(_config["GEMINI_API_KEY"]),
         "anthropic_api_key": _mask_key(_config["ANTHROPIC_API_KEY"]),
         "openai_api_key": _mask_key(_config["OPENAI_API_KEY"]),
+        "deepseek_api_key": _mask_key(_config["DEEPSEEK_API_KEY"]),
         "gemini_configured": bool(_config["GEMINI_API_KEY"]),
         "anthropic_configured": bool(_config["ANTHROPIC_API_KEY"]),
         "openai_configured": bool(_config["OPENAI_API_KEY"]),
+        "deepseek_configured": bool(_config["DEEPSEEK_API_KEY"]),
     }
 
 
@@ -1520,6 +1855,11 @@ async def update_config(update: ProviderConfigUpdate):
         _config["OPENAI_API_KEY"] = update.openai_api_key.strip()
         await _save_config_to_db("OPENAI_API_KEY", _config["OPENAI_API_KEY"])
         changes.append(f"OPENAI_API_KEY → {'set' if _config['OPENAI_API_KEY'] else 'cleared'}")
+
+    if update.deepseek_api_key is not None:
+        _config["DEEPSEEK_API_KEY"] = update.deepseek_api_key.strip()
+        await _save_config_to_db("DEEPSEEK_API_KEY", _config["DEEPSEEK_API_KEY"])
+        changes.append(f"DEEPSEEK_API_KEY → {'set' if _config['DEEPSEEK_API_KEY'] else 'cleared'}")
 
     if not changes:
         return {"status": "no_changes", "message": "No fields provided"}

@@ -1,0 +1,6 @@
+curl -s -X POST http://localhost:8000/api/dags \
+  -H "Content-Type: application/json" \
+  -d '{
+    "objective": "Write a Python script that uses pandas to read a CSV file, compute basic statistics (mean, median, std dev for numeric columns), and save a summary report as summary.txt",
+    "base_image": "zeroclaw"
+  }' | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'DAG: {d["id"]}')" 2>&1

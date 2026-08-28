@@ -19,17 +19,67 @@ interface AgentProfileInfo {
   icon?: string
   tags?: string[]
   strengths?: string[]
+  is_task_force?: boolean
+  member_count?: number
+  member_roles?: string[]
 }
 
 const IMAGE_COLORS: Record<string, { bg: string; text: string; border: string }> = {
   openclaw: { bg: 'bg-indigo-500/10', text: 'text-indigo-400', border: 'border-indigo-500/20' },
+  octaveclaw: { bg: 'bg-sky-500/10', text: 'text-sky-400', border: 'border-sky-500/20' },
   nanobot: { bg: 'bg-emerald-500/10', text: 'text-emerald-400', border: 'border-emerald-500/20' },
   picoclaw: { bg: 'bg-amber-500/10', text: 'text-amber-400', border: 'border-amber-500/20' },
   zeroclaw: { bg: 'bg-red-500/10', text: 'text-red-400', border: 'border-red-500/20' },
+  taskforce: { bg: 'bg-cyan-500/10', text: 'text-cyan-400', border: 'border-cyan-500/20' },
 }
 
 export function AgentProfileBadge({ profile }: { profile: AgentProfileInfo | null }) {
-  if (!profile || !profile.base_image) return null
+  if (!profile) return null
+
+  // Task Force profile
+  if (profile.is_task_force || profile.id?.startsWith('taskforce-')) {
+    const colors = IMAGE_COLORS.taskforce
+    return (
+      <div className={`rounded-lg border ${colors.border} ${colors.bg} p-3 space-y-2`}>
+        <div className="flex items-center gap-2">
+          <span className="text-lg">⚓</span>
+          <span className={`text-sm font-semibold ${colors.text}`}>
+            {profile.profile_name || profile.id}
+          </span>
+          <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">
+            Task Force
+          </span>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <span className={`inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded ${colors.bg} ${colors.text} border ${colors.border}`}>
+            🤖 {profile.member_count || '?'} Agents
+          </span>
+          <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20">
+            Multi-Agent Orchestration
+          </span>
+        </div>
+
+        {profile.profile_description && (
+          <p className="text-[11px] text-gray-500 leading-relaxed">
+            {profile.profile_description}
+          </p>
+        )}
+
+        {profile.member_roles && profile.member_roles.length > 0 && (
+          <div className="flex flex-wrap gap-1 pt-1">
+            {profile.member_roles.map((role: string) => (
+              <span key={role} className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                {role}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  if (!profile.base_image) return null
 
   const colors = IMAGE_COLORS[profile.base_image] ?? IMAGE_COLORS.openclaw
 

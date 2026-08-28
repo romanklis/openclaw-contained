@@ -4,7 +4,7 @@
 # This is the foundational image for all OpenClaw agents.
 # Capabilities are layered on top of this image.
 
-FROM python:3.11-slim
+FROM python:3.11.15-slim-bookworm
 
 # Image metadata
 LABEL org.openclaw.image.type="base-agent"
@@ -24,9 +24,17 @@ RUN apt-get update && apt-get install -y \
     make \
     # Network tools
     netcat-openbsd \
+    # File inspection tools
+    xxd \
+    file \
     # Process management
     supervisor \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js (for npm package support in capability requests)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for agent execution
 RUN useradd -m -u 1001 -s /bin/bash agent && \
@@ -42,6 +50,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt && \
 COPY agent_runtime.py /opt/openclaw/
 COPY policy_client.py /opt/openclaw/
 COPY config.py /opt/openclaw/
+COPY taskforge-adapter.py /opt/openclaw/
 
 # Set up workspace
 WORKDIR /workspace
@@ -49,14 +58,17 @@ USER agent
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     OPENCLAW_WORKSPACE=/workspace \
     OPENCLAW_OUTPUT=/workspace/output \
     OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001 \
-    OPENCLAW_IMAGE_TYPE=openclaw
+    OPENCLAW_IMAGE_TYPE=openclaw \
+    OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (standard library)\n- \`httpx\` (HTTP client)\n- \`curl\`, \`git\`\n- Node.js for npm package support\n- Build tools: gcc, g++, make"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD python -c "import sys; sys.exit(0)"
 
-# Default command
-CMD ["python", "/opt/openclaw/agent_runtime.py"]
+# Default command — use taskforge-adapter for proper LLM agent loop
+ENTRYPOINT ["python", "/opt/openclaw/taskforge-adapter.py"]
+CMD []

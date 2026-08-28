@@ -5,9 +5,13 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
+from sqlalchemy import text
 
-from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom
-from database import engine, Base
+from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom, supply_chain, skills, environments, dags
+from routers import openai_dag
+from routers import agent_images as agent_images_router
+from routers import skill_learning as skill_learning_router
+from database import engine, Base, async_session
 from config import settings
 
 # Configure logging
@@ -27,9 +31,92 @@ async def lifespan(app: FastAPI):
     # Create database tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
+        # Transitional compatibility migration: ensure DAG columns exist on tasks.
+        # Some existing DB volumes were created before the DAG schema landed.
+        await conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS dag_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS node_id VARCHAR"))
+        # Transitional compatibility migration: ensure AgentImage suitability
+        # columns exist so planning can select images by capabilities/use-cases.
+        await conn.execute(text("ALTER TABLE agent_images ADD COLUMN IF NOT EXISTS runtime VARCHAR"))
+        await conn.execute(text("ALTER TABLE agent_images ADD COLUMN IF NOT EXISTS capabilities JSON"))
+        await conn.execute(text("ALTER TABLE agent_images ADD COLUMN IF NOT EXISTS best_for JSON"))
+        await conn.execute(text("ALTER TABLE agent_images ADD COLUMN IF NOT EXISTS avoid_for JSON"))
+        # v2 skill learning system columns
+        await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS selected_skill_v2_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS skill_selection_reason TEXT"))
+        # DAG templating / routines columns
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS template_params JSON"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS template_source_dag_id VARCHAR"))
+        # DAG archiving (soft delete / declutter)
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
+        # Task status enum values (kept in sync with models.TaskStatus)
+        await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'WAITING_APPROVAL'"))
+        await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'BUILDING_IMAGE'"))
+
     logger.info("Database initialized")
-    
+
+    # Load persisted DAG model defaults (planning/agent/deep-review models) from
+    # the DB at startup so a saved deep-review model selection is honored even
+    # before the LLM Router page is visited (previously only reloaded on GET).
+    try:
+        await dags._load_dag_model_defaults_from_db()
+    except Exception as e:
+        logger.warning(f"Could not load DAG model defaults at startup: {e}")
+
+    # Auto-seed supply-chain from YAML if DB is empty
+    try:
+        from sqlalchemy import select
+        from models import SupplyChainPackage
+        async with async_session() as session:
+            result = await session.execute(select(SupplyChainPackage).limit(1))
+            if not result.scalar_one_or_none():
+                logger.info("Supply-chain DB empty — seeding from YAML…")
+                from routers.supply_chain import seed_from_yaml
+                await seed_from_yaml(session)
+                await session.commit()
+                logger.info("Supply-chain seeded successfully")
+    except Exception as exc:
+        logger.warning(f"Supply-chain auto-seed skipped: {exc}")
+
+    # Auto-seed agent images from agent_profiles.yaml if DB is empty
+    try:
+        from sqlalchemy import select
+        from models import AgentImage
+        from pathlib import Path
+        import yaml as _yaml
+        async with async_session() as session:
+            result = await session.execute(select(AgentImage).limit(1))
+            if not result.scalar_one_or_none():
+                candidates = [
+                    Path("/agent-images/agent_profiles.yaml"),
+                    Path(__file__).resolve().parent.parent.parent / "agent-images" / "agent_profiles.yaml",
+                ]
+                for p in candidates:
+                    if p.is_file():
+                        data = _yaml.safe_load(p.read_text()) or {}
+                        base_images = data.get("base_images", {})
+                        for img_id, info in base_images.items():
+                            if not isinstance(info, dict):
+                                continue
+                            enabled = info.get("enabled", True)
+                            session.add(AgentImage(
+                                id=img_id,
+                                name=info.get("name", img_id.capitalize()),
+                                description=info.get("description", ""),
+                                tag=info.get("tag", f"openclaw-agent:{img_id}"),
+                                enabled=bool(enabled),
+                                runtime=info.get("runtime", ""),
+                                capabilities=info.get("capabilities", []),
+                                best_for=info.get("best_for", []),
+                                avoid_for=info.get("avoid_for", []),
+                            ))
+                        await session.commit()
+                        logger.info("Agent images seeded from %s", p)
+                        break
+    except Exception as exc:
+        logger.warning(f"Agent images auto-seed skipped: {exc}")
+
     yield
     
     # Shutdown
@@ -63,6 +150,13 @@ app.include_router(llm.router)
 app.include_router(tasks_extended.router)
 app.include_router(deployments.router, prefix="/api/deployments", tags=["deployments"])
 app.include_router(sbom.router)
+app.include_router(supply_chain.router)
+app.include_router(skills.router, prefix="/api/skills", tags=["skills"])
+app.include_router(environments.router, prefix="/api/environments", tags=["environments"])
+app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
+app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
+app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
+app.include_router(skill_learning_router.router, prefix="/api/skill-learning", tags=["skill-learning"])
 
 
 @app.get("/health")

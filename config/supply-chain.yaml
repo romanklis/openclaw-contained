@@ -195,31 +195,56 @@ openclaw:
     - jq
     - zip
     - unzip
+    # Chrome/browser shared libraries
+    - libglib2.0-0
+    - libnss3
+    - libnspr4
+    - libatk1.0-0
+    - libatk-bridge2.0-0
+    - libcups2
+    - libdrm2
+    - libxkbcommon0
+    - libatspi2.0-0
+    - libxcomposite1
+    - libxdamage1
+    - libxfixes3
+    - libxrandr2
+    - libgbm1
+    - libpango-1.0-0
+    - libcairo2
+    - libasound2
+    - libxshmfence1
+    - fonts-noto-color-emoji
 
-  npm:
-    - express
-    - typescript
-    - ts-node
-    - prettier
-    - eslint
-    - webpack
-    - vite
-    - tailwindcss
-    - postcss
-    - autoprefixer
-    # Frontend frameworks
-    - react
-    - react-dom
-    # Mapping / geospatial
-    - leaflet
-    - react-leaflet
-    - georaster
-    - georaster-layer-for-leaflet
-    # Charts
-    - recharts
+  npm: []
 
 # ---------------------------------------------------------------------------
-# nanobot — Lightweight Alpine + Python
+# octaveclaw — OpenClaw + GNU Octave for simulation workloads
+# ---------------------------------------------------------------------------
+octaveclaw:
+  notes: >
+    Debian-based OpenClaw variant with GNU Octave pre-installed for numerical
+    simulations. Allows core Python/Node workflows plus simulation tooling.
+  pip:
+    - flask
+    - requests
+    - pytest
+    - numpy
+    - scipy
+    - pandas
+    - matplotlib
+  apt:
+    - octave
+    - gnuplot
+    - libblas-dev
+    - liblapack-dev
+    - curl
+    - wget
+    - git
+    - jq
+    - build-essential
+  npm: []
+
 # ---------------------------------------------------------------------------
 nanobot:
   notes: >
@@ -428,6 +453,26 @@ zeroclaw:
     - jq
     - zip
     - unzip
+    # Chrome/browser shared libraries
+    - libglib2.0-0
+    - libnss3
+    - libnspr4
+    - libatk1.0-0
+    - libatk-bridge2.0-0
+    - libcups2
+    - libdrm2
+    - libxkbcommon0
+    - libatspi2.0-0
+    - libxcomposite1
+    - libxdamage1
+    - libxfixes3
+    - libxrandr2
+    - libgbm1
+    - libpango-1.0-0
+    - libcairo2
+    - libasound2
+    - libxshmfence1
+    - fonts-noto-color-emoji
 
   npm:
     - express
@@ -450,4 +495,158 @@ zeroclaw:
     - georaster-layer-for-leaflet
     # Charts
     - recharts
+    # Browser automation
+    - agent-browser
+    - puppeteer
+    - playwright
+
+# ---------------------------------------------------------------------------
+# browser — OpenClaw + pre-installed Chromium and agent-browser
+# ---------------------------------------------------------------------------
+browser:
+  notes: >
+    Extends the openclaw base image with Chromium, all browser shared libraries,
+    and agent-browser pre-installed.  Agents using this image can run headless
+    browser automation without any capability requests.  The same pip/apt/npm
+    allowlists as openclaw apply; chromium and its shared libs are already
+    present in the image.
+  pip:
+    - flask
+    - fastapi
+    - uvicorn
+    - django
+    - requests
+    - httpx
+    - aiohttp
+    - urllib3
+    - pandas
+    - numpy
+    - scipy
+    - matplotlib
+    - seaborn
+    - plotly
+    - pillow
+    - sqlalchemy
+    - psycopg2-binary
+    - pymongo
+    - redis
+    - sqlite-utils
+    - aiosqlite
+    - pyyaml
+    - toml
+    - python-dotenv
+    - click
+    - rich
+    - jinja2
+    - pydantic
+    - marshmallow
+    - reportlab
+    - fpdf2
+    - weasyprint
+    - pdfkit
+    - python-docx
+    - openpyxl
+    - cryptography
+    - pyjwt
+    - bcrypt
+    - passlib
+    - pytest
+    - coverage
+    - beautifulsoup4
+    - lxml
+    - html5lib
+    - scrapy
+    - playwright
+    - pyppeteer
+    - scikit-learn
+    - joblib
+    - rasterio
+    - rio-cogeo
+    - flask-cors
+    - celery
+    - boto3
+    - google-cloud-storage
+    - paramiko
+    - websockets
+
+  apt:
+    - redis-server
+    - redis-tools
+    - postgresql-client
+    - sqlite3
+    - libsqlite3-dev
+    - nginx
+    - ffmpeg
+    - imagemagick
+    - graphviz
+    - tesseract-ocr
+    - poppler-utils
+    - wkhtmltopdf
+    # chromium + shared libs are pre-installed in the image; listed here
+    # so the image-builder can layer additional apt packages if needed.
+    - chromium
+    - gcc
+    - g++
+    - make
+    - cmake
+    - libffi-dev
+    - libssl-dev
+    - libxml2-dev
+    - libxslt1-dev
+    - libjpeg-dev
+    - libpng-dev
+    - zlib1g-dev
+    - libpq-dev
+    - libgdal-dev
+    - gdal-bin
+    - default-libmysqlclient-dev
+    - curl
+    - wget
+    - git
+    - jq
+    - zip
+    - unzip
+    - libglib2.0-0
+    - libnss3
+    - libnspr4
+    - libatk1.0-0
+    - libatk-bridge2.0-0
+    - libcups2
+    - libdrm2
+    - libxkbcommon0
+    - libatspi2.0-0
+    - libxcomposite1
+    - libxdamage1
+    - libxfixes3
+    - libxrandr2
+    - libgbm1
+    - libpango-1.0-0
+    - libcairo2
+    - libasound2
+    - libxshmfence1
+    - fonts-noto-color-emoji
+
+  npm:
+    - express
+    - typescript
+    - ts-node
+    - prettier
+    - eslint
+    - webpack
+    - vite
+    - tailwindcss
+    - postcss
+    - autoprefixer
+    - react
+    - react-dom
+    - leaflet
+    - react-leaflet
+    - georaster
+    - georaster-layer-for-leaflet
+    - recharts
+    # agent-browser + puppeteer are pre-installed; listed here so agents
+    # can request additional browser-related npm packages if needed.
+    - agent-browser
+    - puppeteer
+    - playwright
 

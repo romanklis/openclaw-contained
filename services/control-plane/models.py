@@ -1,7 +1,7 @@
 """
 Database models
 """
-from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text
+from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -16,9 +16,36 @@ class TaskStatus(str, enum.Enum):
     CREATED = "created"
     RUNNING = "running"
     PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
+    BUILDING_IMAGE = "building_image"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class DAGStatus(str, enum.Enum):
+    """Master DAG lifecycle status"""
+    PLANNING = "planning"
+    READY = "ready"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class NodeStatus(str, enum.Enum):
+    """DAG node execution status"""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class ExecutionEnvironment(str, enum.Enum):
+    """Execution environment types"""
+    DIND = "dind"
+    DEDICATED_VM = "dedicated_vm"
 
 
 class CapabilityType(str, enum.Enum):
@@ -67,7 +94,11 @@ class Task(Base):
     # Temporal workflow
     workflow_id = Column(String, unique=True)
     workflow_run_id = Column(String)
-    
+
+    # DAG membership (null for standalone tasks)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=True)
+    node_id = Column(String)  # node_id within the DAG
+
     # Metadata
     created_by = Column(String)
     created_at = Column(DateTime, server_default=func.now())
@@ -195,6 +226,7 @@ class Deployment(Base):
 
     # Image
     image_tag = Column(String)  # registry tag of the deployment image
+    agent_image = Column(String)  # agent's committed image (used as deploy base)
     entrypoint = Column(String)  # e.g. "python app.py"
     port = Column(Integer)  # primary exposed port
 
@@ -264,3 +296,557 @@ class SBOM(Base):
     generated_at = Column(DateTime, server_default=func.now())
 
     task = relationship("Task", backref="sboms")
+
+
+# =========================================================================
+# DAG Orchestration Models — Task-Centric Skill-Based Execution
+# =========================================================================
+
+class Skill(Base):
+    """A reusable skill template defining a sequence of functional steps.
+
+    Skills are the building blocks of DAGs. Each skill describes what
+    inputs it needs, what artifacts it produces, and the ordered steps
+    to achieve its goal. Steps are executed as individual DAG nodes.
+    """
+    __tablename__ = "skills"
+
+    id = Column(String, primary_key=True)  # skill-<uuid8>
+    name = Column(String, unique=True, nullable=False)
+    description = Column(Text)
+    version = Column(Integer, default=1)
+
+    # Full SKILL.md content — install instructions, usage, setup steps
+    instructions = Column(Text, default="")
+
+    # Schema definitions
+    input_schema = Column(JSON, default=dict)   # required inputs {key: type_description}
+    output_artifacts = Column(JSON, default=list)  # expected output file paths/patterns
+    steps = Column(JSON, default=list)  # ordered list of sub-steps
+
+    # ClawHub source metadata
+    source_url = Column(String, default="")  # e.g. clawhub.ai slug
+
+    # Searchability
+    tags = Column(JSON, default=list)  # list of string tags
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class MasterDAG(Base):
+    """A Master DAG representing a decomposed user objective.
+
+    Created by the Planner from a user's objective and a set of skills.
+    Contains the full DAG structure (nodes + edges) as JSON, and is
+    executed by a Temporal DAGWorkflow.
+    """
+    __tablename__ = "master_dags"
+
+    id = Column(String, primary_key=True)  # dag-<uuid8>
+    objective = Column(Text, nullable=False)  # original user prompt
+    status = Column(SQLEnum(DAGStatus), default=DAGStatus.PLANNING)
+
+    # The full DAG structure
+    dag_json = Column(JSON, nullable=False, default=dict)
+
+    # Execution config
+    workspace_id = Column(String, nullable=False)
+    llm_model = Column(String, default="gemma3:4b")
+
+    # Temporal workflow reference
+    workflow_id = Column(String, unique=True)
+    workflow_run_id = Column(String)
+
+    # Metadata
+    created_by = Column(String)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+
+    # Templating / routines: a locked DAG is a frozen, parameterized procedure
+    # that can be re-instantiated with new inputs (like calling a function).
+    locked = Column(Boolean, default=False, nullable=False)
+    template_params = Column(JSON, default=list)  # [{key,label,type,default,description}]
+    template_source_dag_id = Column(String, nullable=True)  # set on instances
+
+    # Archiving: hides the DAG from the default list (soft delete), keeps data.
+    archived = Column(Boolean, default=False, nullable=False)
+
+    # Relationships
+    nodes = relationship("DAGNode", back_populates="dag", cascade="all, delete-orphan")
+    tasks = relationship("Task", backref="dag", foreign_keys="Task.dag_id")
+
+
+class DAGNode(Base):
+    """A single node in a Master DAG.
+
+    Each node represents one unit of work — typically one step from a
+    skill, or an inline custom task. Nodes track their dependencies,
+    execution status, and output data.
+    """
+    __tablename__ = "dag_nodes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False)  # unique within DAG (e.g. "search-1")
+
+    # Skill reference (nullable for inline/custom nodes)
+    skill_id = Column(String, ForeignKey("skills.id"), nullable=True)
+    skill_step_index = Column(Integer)  # which step within the skill
+
+    # Execution
+    description = Column(Text)
+    status = Column(SQLEnum(NodeStatus), default=NodeStatus.PENDING)
+    depends_on = Column(JSON, default=list)  # list of node_ids
+    config = Column(JSON, default=dict)  # overrides: base_image, llm_model, env_id, timeout, deploy_authorized
+    input_mapping = Column(JSON, default=dict)  # maps inputs to dependency outputs
+    output_data = Column(JSON)  # captured results after execution
+
+    # v2 Skill selection (planner picks an image-scoped skill for this node)
+    selected_skill_v2_id = Column(String, ForeignKey("skills_v2.id"), nullable=True)
+    skill_selection_reason = Column(Text, nullable=True)
+
+    # Runtime
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+    container_id = Column(String)
+
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+
+    # Relationships
+    dag = relationship("MasterDAG", back_populates="nodes")
+    skill = relationship("Skill")
+    selected_skill_v2 = relationship("SkillV2", foreign_keys=[selected_skill_v2_id])
+    task = relationship("Task", foreign_keys=[task_id])
+
+
+class DAGNodeStateSnapshot(Base):
+    """Immutable snapshot of a DAG node execution state.
+
+    Captures what inputs were brought into the step, what was produced,
+    how it was obtained, and acceptance outcomes for auditability.
+    """
+    __tablename__ = "dag_node_state_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+    phase = Column(String, nullable=False, default="runtime")  # input_resolved|running|completed|failed
+    status = Column(String, nullable=False, default="pending")
+    wave = Column(Integer, nullable=True)
+    attempt = Column(Integer, nullable=False, default=1)
+
+    input_context = Column(JSON, default=dict)
+    output_context = Column(JSON, default=dict)
+    completion_state = Column(JSON, default=dict)
+    acquisition_log = Column(JSON, default=list)
+    acceptance_result = Column(JSON, default=dict)
+    pending_items = Column(JSON, default=list)
+
+    # Structured acceptance state for deterministic testing
+    acceptance_state = Column(JSON, default=dict)
+    # Structure: {
+    #   "verdict": "pass|fail|partial",
+    #   "score": 0-100,
+    #   "criteria_results": [{"criterion": "...", "met": true, "evidence": "..."}],
+    #   "checked_at": "ISO timestamp"
+    # }
+
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+class DAGNodeAuditEvent(Base):
+    """Structured audit events for DAG node execution and provenance checks."""
+    __tablename__ = "dag_node_audit_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    severity = Column(String, nullable=False, default="info")  # info|warning|critical
+    message = Column(Text, nullable=False)
+    event_data = Column(JSON, default=dict)
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+class DeepReview(Base):
+    """Persisted deep-review audit result, scoped to a DAG node/task.
+
+    Keeping a history per node lets the UI show each step's review when
+    switching between steps, and records the model + timestamp used to
+    generate it for traceability.
+    """
+    __tablename__ = "deep_reviews"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=True, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+
+    image_id = Column(String, nullable=True)
+    image_tag = Column(String, nullable=True)
+    skill_used_id = Column(String, nullable=True)
+    skill_used_name = Column(String, nullable=True)
+
+    # Traceability metadata
+    model = Column(String, nullable=False)        # which model generated the review
+    include_skill = Column(Boolean, nullable=False, default=True)
+
+    verdict = Column(String, nullable=False)
+    score = Column(Integer, nullable=False, default=0)
+    summary = Column(Text, nullable=False, default="")
+    issues = Column(JSON, default=list)
+    positives = Column(JSON, default=list)
+
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+
+class DAGNodeOutput(Base):
+    """Structured output envelope for DAG node execution.
+
+    Provides a fixed schema for node outputs, enabling deterministic
+    acceptance testing and skill compliance verification.
+    """
+    __tablename__ = "dag_node_outputs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True, index=True)
+
+    # Fixed structure fields
+    status = Column(String, nullable=False)  # "completed" | "failed" | "skipped"
+    completed_at = Column(DateTime)
+
+    # Acceptance verification
+    objective = Column(Text)  # What this step was supposed to achieve
+    success_criteria = Column(JSON, default=list)  # The criteria that should be met
+    criteria_met = Column(JSON, default=dict)  # {criterion_text: bool, ...}
+    acceptance_verdict = Column(String)  # "pass" | "fail" | "partial"
+    acceptance_score = Column(Integer, default=0)  # 0-100
+
+    # Evidence of skill usage (if applicable)
+    skill_id = Column(String)  # v2 skill that was selected for this node
+    skill_followed = Column(Boolean, nullable=True)  # Did agent follow skill?
+    skill_instruction_sections_used = Column(JSON, default=list)  # Which instructions were referenced
+
+    # Deterministic deliverables
+    deliverables_count = Column(Integer, default=0)
+    deliverables_keys = Column(JSON, default=list)  # sorted list of deliverable filenames
+
+    # Links to provenance
+    acquisition_log = Column(JSON, default=list)  # tool calls made during execution
+    llm_interaction_count = Column(Integer, default=0)
+
+    # Primary content
+    output_text = Column(Text)  # extracted main output
+    error_text = Column(Text)  # extracted error if any
+
+    # Workspace provenance
+    workspace_step_path = Column(String)  # relative path to this node's deliverables in workspace
+
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+    # Relationships
+    dag = relationship("MasterDAG", backref="node_outputs")
+    task = relationship("Task", foreign_keys=[task_id])
+
+
+class NodeEnvironment(Base):
+    """A reusable execution environment with approved capabilities.
+
+    Environments decouple the execution context from individual tasks.
+    They accumulate approved packages over time and can be referenced
+    by any DAG node. They can also be forked to create variants.
+    """
+    __tablename__ = "node_environments"
+
+    id = Column(String, primary_key=True)  # env-<uuid8>
+    name = Column(String, nullable=False)
+    description = Column(Text)
+
+    # Capability tracking
+    capability_fingerprint = Column(String, index=True)  # sorted SHA256 of capabilities
+    capabilities = Column(JSON, default=list)  # list of approved packages/tools
+    base_image = Column(String, default="openclaw")  # openclaw/nanobot/picoclaw/zeroclaw
+    current_image_tag = Column(String)  # registry tag (e.g. localhost:5000/openclaw-agent:env-abc123-v3)
+    version = Column(Integer, default=0)  # increments on each capability addition
+
+    # Forking
+    parent_env_id = Column(String, ForeignKey("node_environments.id"), nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    parent = relationship("NodeEnvironment", remote_side="NodeEnvironment.id")
+
+
+class SupplyChainPackage(Base):
+    """A single approved package in the supply-chain allowlist.
+
+    Each row represents one package that an agent is allowed to install
+    for a given image type and package manager.
+    """
+    __tablename__ = "supply_chain_packages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    image_type = Column(String, nullable=False, index=True)  # e.g. openclaw, nanobot
+    manager = Column(String, nullable=False)  # pip, apt, apk, npm
+    package_name = Column(String, nullable=False)
+    notes = Column(Text)
+    is_exception = Column(String, default="false")  # "true" for one-off exceptions
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class SupplyChainAlias(Base):
+    """Cross-distro package name mapping (apt ↔ apk)."""
+    __tablename__ = "supply_chain_aliases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    direction = Column(String, nullable=False)  # "apt_to_apk" or "apk_to_apt"
+    from_name = Column(String, nullable=False)
+    to_name = Column(String, nullable=False)
+
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SupplyChainImageType(Base):
+    """Metadata for each image type in the supply chain."""
+    __tablename__ = "supply_chain_image_types"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    image_type = Column(String, unique=True, nullable=False)
+    notes = Column(Text)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class AgentImage(Base):
+    """A named base image that the planner can assign to DAG nodes.
+
+    Rows are seeded from agent_profiles.yaml at startup (if table is empty)
+    and can be added/updated via the /api/agent-images CRUD API.
+    Users nominate post-build images here so the planner can discover them.
+    """
+    __tablename__ = "agent_images"
+
+    # Logical name — used as base_image value in DAG node configs (e.g. "browser")
+    id = Column(String, primary_key=True)
+    # Human-readable label (e.g. "Web Agent")
+    name = Column(String, nullable=False)
+    # Full description shown to the planner LLM for image selection
+    description = Column(Text, default="")
+    # Registry tag (e.g. "openclaw-agent:browser") — informational
+    tag = Column(String, default="")
+    # Whether this image is currently selectable by the planner
+    enabled = Column(Boolean, default=True, nullable=False)
+    # Runtime summary (e.g. "Python 3.11 (Debian) + Chromium")
+    runtime = Column(String, default="")
+    # High-level capabilities/tools available in this image
+    capabilities = Column(JSON, default=list)
+    # Task categories this image is best suited for
+    best_for = Column(JSON, default=list)
+    # Optional guidance for what this image should avoid
+    avoid_for = Column(JSON, default=list)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+# =========================================================================
+# Skill Learning System v2 — Image-Scoped, Evidence-Based Skill Trees
+# =========================================================================
+
+class SkillV2Status(str, enum.Enum):
+    """Lifecycle state of a v2 skill node."""
+    DRAFT = "draft"         # extracted but not yet reviewed
+    ACTIVE = "active"       # approved and eligible for planner use
+    ARCHIVED = "archived"   # retired; preserved for lineage
+
+
+class TemplateSkillStatus(str, enum.Enum):
+    """Lifecycle state of a generalized (template) skill."""
+    DRAFT = "draft"         # produced at lock time, awaiting review
+    ACTIVE = "active"       # approved; used by template execution
+    ARCHIVED = "archived"   # retired; preserved for lineage
+
+
+class TemplateSkill(Base):
+    """A generalized, parameterized skill tied to a template (locked DAG).
+
+    Produced by the LLM when a DAG is locked as a template: each step's v2
+    skill is rewritten into a reusable pseudo-code routine that declares its
+    inputs as {param} placeholders, so executing the template with new values
+    follows the same learned procedure for new inputs.
+    """
+    __tablename__ = "template_skills"
+
+    id = Column(String, primary_key=True)                    # tsk-<uuid8>
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False)
+    source_skill_id = Column(String, nullable=True)          # v2 skill it generalizes (lineage)
+
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    instructions = Column(Text, default="")                  # generalized pseudo-code using {param}
+    params = Column(JSON, default=list)                      # keys this skill expects
+
+    status = Column(SQLEnum(TemplateSkillStatus), default=TemplateSkillStatus.DRAFT, nullable=False)
+    reviewer_score = Column(Integer, nullable=True)          # 1-5
+    review_notes = Column(Text, default="")
+    tags = Column(JSON, default=list)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    created_by = Column(String)
+
+    # Relationships
+    dag = relationship("MasterDAG", backref="template_skills")
+
+
+class SkillV2Source(str, enum.Enum):
+    """How this skill node was originally created."""
+    DEMO = "demo"           # user demonstrated the task interactively
+    AUDIT_MINE = "audit_mine"  # extracted from prior task audit logs
+    MANUAL = "manual"       # written directly by a human operator
+
+
+class SkillV2(Base):
+    """An image-scoped, versioned skill node in the learning tree.
+
+    Skill nodes belong to one agent image and describe a repeatable
+    procedural competency (e.g. "download PDF with httpx on browser_v3").
+    They are extracted from demos or audit logs, reviewed by a human,
+    and then made available to the planner for selection.
+    """
+    __tablename__ = "skills_v2"
+
+    id = Column(String, primary_key=True)           # skv2-<uuid8>
+    image_id = Column(String, ForeignKey("agent_images.id"), nullable=False, index=True)
+
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    instructions = Column(Text, default="")         # injected verbatim at agent start
+
+    status = Column(SQLEnum(SkillV2Status), default=SkillV2Status.DRAFT, nullable=False)
+    source_type = Column(SQLEnum(SkillV2Source), default=SkillV2Source.MANUAL, nullable=False)
+
+    # Hierarchical skill tree: null parent = root competency
+    parent_id = Column(String, ForeignKey("skills_v2.id"), nullable=True)
+
+    # Quality / confidence signals
+    confidence_score = Column(Integer, default=0)   # 0-100; updated by review + outcomes
+    usage_count = Column(Integer, default=0)         # times planner selected this skill
+    success_count = Column(Integer, default=0)       # times execution succeeded with it
+    reviewer_score = Column(Integer, nullable=True)  # explicit human rating 1-5
+
+    # Searchability
+    tags = Column(JSON, default=list)
+
+    # Evidence links (task IDs that contributed to this skill)
+    evidence_task_ids = Column(JSON, default=list)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    created_by = Column(String)
+
+    # Relationships
+    image = relationship("AgentImage", backref="skills_v2")
+    parent = relationship("SkillV2", remote_side="SkillV2.id", backref="children")
+    demos = relationship("SkillDemo", back_populates="skill", cascade="all, delete-orphan")
+    reviews = relationship("SkillReview", back_populates="skill", cascade="all, delete-orphan")
+    selection_events = relationship("SkillSelectionEvent", back_populates="skill")
+
+
+class SkillDemo(Base):
+    """A user-provided demonstration that seeded or refined a SkillV2 node.
+
+    Stores the raw prompt + optional artifact files + extracted procedure
+    from the LLM extraction pass. A SkillV2 node may have multiple demos
+    (accumulated evidence).
+    """
+    __tablename__ = "skill_demos"
+
+    id = Column(String, primary_key=True)           # demo-<uuid8>
+    skill_id = Column(String, ForeignKey("skills_v2.id"), nullable=True)  # set after review
+    image_id = Column(String, ForeignKey("agent_images.id"), nullable=False)
+
+    # User-provided description of what was demonstrated
+    prompt = Column(Text, nullable=False)
+
+    # LLM-extracted structured procedure (JSON steps / free-form text)
+    extracted_procedure = Column(JSON, nullable=True)
+
+    # Optional source task (if demo was captured from a live run)
+    source_task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+
+    # Attached files (filename -> base64 content or S3 ref)
+    artifacts = Column(JSON, default=dict)
+
+    status = Column(String, default="pending")      # pending / extracted / linked / rejected
+
+    created_at = Column(DateTime, server_default=func.now())
+    created_by = Column(String)
+
+    skill = relationship("SkillV2", back_populates="demos")
+    source_task = relationship("Task", foreign_keys=[source_task_id])
+
+
+class SkillReview(Base):
+    """Human review decision for a SkillV2 node or a demo candidate.
+
+    Reviewers can approve (optionally with edits to instructions),
+    reject (with a reason), or request changes.
+    """
+    __tablename__ = "skill_reviews"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(String, ForeignKey("skills_v2.id"), nullable=False)
+
+    decision = Column(String, nullable=False)       # approve / reject / request_changes
+    rating = Column(Integer, nullable=True)         # 1-5 quality rating
+    notes = Column(Text)
+    edited_instructions = Column(Text, nullable=True)  # reviewer-corrected instructions
+
+    reviewed_by = Column(String)
+    reviewed_at = Column(DateTime, server_default=func.now())
+
+    skill = relationship("SkillV2", back_populates="reviews")
+
+
+class SkillSelectionEvent(Base):
+    """Records that the planner selected a skill for a DAG node.
+
+    Used to update usage statistics, track whether the agent followed
+    the skill, and feed back into confidence scoring.
+    """
+    __tablename__ = "skill_selection_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(String, ForeignKey("skills_v2.id"), nullable=False)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=True)
+    node_id = Column(String, nullable=True)         # node_id within the DAG
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+
+    selection_reason = Column(Text)                 # planner's rationale
+    alternatives_considered = Column(JSON, default=list)  # other skill IDs ranked
+
+    # Post-execution outcome (filled in by worker after task completes)
+    followed = Column(Boolean, nullable=True)       # did agent follow the skill?
+    outcome = Column(String, nullable=True)         # success / failure / partial
+    feedback_notes = Column(Text, nullable=True)
+
+    selected_at = Column(DateTime, server_default=func.now())
+    resolved_at = Column(DateTime, nullable=True)
+
+    skill = relationship("SkillV2", back_populates="selection_events")
+    dag = relationship("MasterDAG", foreign_keys=[dag_id])
+    task = relationship("Task", foreign_keys=[task_id])

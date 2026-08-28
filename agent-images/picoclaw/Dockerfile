@@ -5,7 +5,7 @@
 # No Python runtime — only POSIX shell, coreutils, and essential CLI tools.
 # Ideal for file manipulation, system commands, and lightweight automation.
 
-FROM alpine:3.19
+FROM alpine:3.19.7
 
 # Image metadata
 LABEL org.openclaw.image.type="picoclaw"
@@ -48,7 +48,8 @@ USER agent
 ENV OPENCLAW_WORKSPACE=/workspace \
     OPENCLAW_OUTPUT=/workspace/output \
     OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001 \
-    OPENCLAW_IMAGE_TYPE=picoclaw
+    OPENCLAW_IMAGE_TYPE=picoclaw \
+    OPENCLAW_RUNTIME_DESCRIPTION="- No Python runtime — POSIX shell only\n- \`bash\`, coreutils (cat, ls, cp, mv, rm, etc.)\n- \`curl\`, \`wget\` (HTTP clients)\n- \`git\` (version control)\n- \`jq\`, \`yq\` (JSON/YAML processing)\n- \`grep\`, \`sed\`, \`gawk\`, \`findutils\` (text processing)\n- \`openssh-client\` (SSH)"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=3s \

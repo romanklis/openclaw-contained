@@ -15,3 +15,9 @@ export const API =
  */
 export const API_GATEWAY =
   process.env.NEXT_PUBLIC_API_GATEWAY_URL || "http://localhost:8080";
+
+/**
+ * Temporal UI base URL for workflow deep links.
+ */
+export const TEMPORAL_UI =
+  process.env.NEXT_PUBLIC_TEMPORAL_UI_URL || "http://localhost:8088";

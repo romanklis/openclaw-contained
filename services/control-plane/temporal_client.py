@@ -4,6 +4,7 @@ Temporal client for workflow management
 from temporalio.client import Client
 from config import settings
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,24 @@ async def start_task_workflow(task_id: str, llm_model: str = "gemma3:4b", base_i
     
     logger.info(f"Started workflow {workflow_id} for task {task_id} with model {llm_model}, image {base_image}")
     
+    return workflow_id
+
+
+async def start_dag_workflow(dag_id: str) -> str:
+    """Start a DAG orchestration workflow."""
+    client = await get_temporal_client()
+
+    # Use a unique workflow id so failed DAG restarts don't collide with prior runs.
+    workflow_id = f"dag-workflow-{dag_id}-run-{uuid.uuid4().hex[:8]}"
+
+    handle = await client.start_workflow(
+        "DAGWorkflow",
+        args=[dag_id],
+        id=workflow_id,
+        task_queue=settings.TEMPORAL_TASK_QUEUE,
+    )
+
+    logger.info(f"Started DAGWorkflow {workflow_id} for {dag_id}")
     return workflow_id
 
 

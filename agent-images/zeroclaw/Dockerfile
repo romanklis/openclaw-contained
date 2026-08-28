@@ -9,7 +9,7 @@
 # control plane protocol, but core execution happens in Rust.
 
 # ── Stage 1: Build the Rust agent binary ──────────────────────────
-FROM rust:1.77-slim AS builder
+FROM rust:1.77.2-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -28,7 +28,7 @@ RUN cargo build --release 2>/dev/null || \
     chmod +x /build/target/release/zeroclaw-agent
 
 # ── Stage 2: Minimal runtime ─────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:bookworm-20250317-slim
 
 # Image metadata
 LABEL org.openclaw.image.type="zeroclaw"
@@ -80,7 +80,8 @@ ENV OPENCLAW_WORKSPACE=/workspace \
     OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001 \
     OPENCLAW_IMAGE_TYPE=zeroclaw \
     RUST_LOG=info \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`pydantic\` (data validation)\n- \`requests\`, \`structlog\`, \`pytest\`\n- \`curl\`, \`git\`\n- Rust toolchain available at /opt/openclaw/zeroclaw-agent\n- Node.js for npm package support"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \

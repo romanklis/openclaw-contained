@@ -39,13 +39,31 @@ async def get_temporal_client():
 @router.get("/requests", response_model=List[CapabilityRequestResponse])
 async def list_capability_requests(
     task_id: str = None,
+    dag_id: str = None,
     status_filter: RequestStatus = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """List capability requests"""
+    """List capability requests.
+
+    - task_id: filter to a single task
+    - dag_id: include requests from ALL tasks belonging to this DAG
+    - status_filter: filter by request status
+    """
     query = select(CapabilityRequest)
-    
-    if task_id:
+
+    if dag_id:
+        # Find all task IDs in this DAG
+        dag_tasks = await db.execute(
+            select(Task.id).where(
+                Task.dag_id == dag_id,
+            )
+        )
+        dag_task_ids = [row[0] for row in dag_tasks.all()]
+        if dag_task_ids:
+            query = query.where(CapabilityRequest.task_id.in_(dag_task_ids))
+        else:
+            return []
+    elif task_id:
         query = query.where(CapabilityRequest.task_id == task_id)
     
     if status_filter:
@@ -139,32 +157,86 @@ async def review_capability_request(
     await db.commit()
     await db.refresh(capability_request)
     
-    # Signal Temporal workflow
+    # Signal Temporal workflow(s)
+    approved = decision.decision == "approved"
+
+    # Resolve the task + DAG context to determine candidate workflows.
+    # Capability signals must reach the task's live AgentTaskWorkflow; during a
+    # DAG corrective retry that runs under "agent-task-{dag}-{node}-assessment-retry",
+    # which is not the persisted task.workflow_id. Signal ALL candidates so the
+    # live workflow always receives the decision.
+    result = await db.execute(
+        select(Task).where(Task.id == capability_request.task_id)
+    )
+    task = result.scalar_one_or_none()
+
+    candidates: List[str] = []
+    if task:
+        if task.workflow_id:
+            candidates.append(task.workflow_id)
+        if task.dag_id and task.node_id:
+            candidates.append(f"agent-task-{task.dag_id}-{task.node_id}")
+            candidates.append(f"agent-task-{task.dag_id}-{task.node_id}-assessment-retry")
+
+    temporal_client = None
     try:
-        # Get task to find workflow ID
-        result = await db.execute(
-            select(Task).where(Task.id == capability_request.task_id)
+        temporal_client = await get_temporal_client()
+    except Exception as exc:
+        logger.error(f"Could not connect to Temporal to send signal: {exc}")
+
+    if temporal_client and candidates:
+        for wf_id in dict.fromkeys(candidates):  # de-dupe, preserve order
+            try:
+                handle = temporal_client.get_workflow_handle(wf_id)
+                await handle.signal("approve_capability", approved)
+                logger.info(f"Sent capability signal to workflow {wf_id}: approved={approved}")
+            except Exception as sig_err:
+                logger.warning(f"Could not signal workflow {wf_id}: {sig_err}")
+    elif not task:
+        logger.warning(f"No task found for capability request {capability_request.id}")
+    else:
+        logger.warning(f"No workflow candidates for task {capability_request.task_id}")
+
+    # If this task belongs to a DAG, also signal ALL sibling node workflows so
+    # they ALL rebuild their images with the newly approved capability.
+    if approved and task and task.dag_id and temporal_client:
+        siblings_result = await db.execute(
+            select(Task).where(
+                Task.dag_id == task.dag_id,
+                Task.id != task.id,
+            )
         )
-        task = result.scalar_one_or_none()
-        
-        if task and task.workflow_id:
-            temporal_client = await get_temporal_client()
-            if temporal_client:
-                # Get workflow handle
-                workflow_handle = temporal_client.get_workflow_handle(task.workflow_id)
-                
-                # Send approval signal
-                approved = decision.decision == "approved"
-                await workflow_handle.signal("approve_capability", approved)
-                
-                logger.info(f"Sent signal to workflow {task.workflow_id}: approved={approved}")
-            else:
-                logger.error("Could not connect to Temporal to send signal")
-        else:
-            logger.warning(f"No workflow found for task {capability_request.task_id}")
-    except Exception as e:
-        logger.error(f"Error signaling Temporal workflow: {e}", exc_info=True)
-    
+        siblings = siblings_result.scalars().all()
+        for sibling in siblings:
+            try:
+                # Create a matching capability request for each sibling
+                # so their AgentTaskWorkflow can find it
+                sib_cap = CapabilityRequest(
+                    task_id=sibling.id,
+                    capability_type=capability_request.capability_type,
+                    resource_name=capability_request.resource_name,
+                    justification=f"Propagated from sibling {task.id}: {capability_request.justification}",
+                    details=capability_request.details,
+                    status=RequestStatus.APPROVED,
+                    reviewed_at=datetime.utcnow(),
+                    reviewed_by="system (task-force-propagation)",
+                    decision_notes=f"Auto-approved: same Task Force as {task.id}",
+                )
+                db.add(sib_cap)
+
+                if sibling.workflow_id:
+                    sib_handle = temporal_client.get_workflow_handle(sibling.workflow_id)
+                    await sib_handle.signal("approve_capability", True)
+                    logger.info(
+                        f"Propagated cap approval to sibling {sibling.id} "
+                        f"(workflow {sibling.workflow_id})"
+                    )
+            except Exception as sib_err:
+                logger.warning(
+                    f"Could not propagate to sibling {sibling.id}: {sib_err}"
+                )
+        await db.commit()
+
     return capability_request
 
 
@@ -208,6 +280,36 @@ async def approve_capability(
         pass
     
     return capability_request
+
+
+@router.post("/requests/dismiss-pending")
+async def dismiss_pending_capabilities(
+    task_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Bulk-dismiss all pending capability requests for a task.
+
+    Called by the temporal worker after a capability has been processed
+    to prevent stale pending requests from interfering with subsequent
+    container runs.
+    """
+    result = await db.execute(
+        select(CapabilityRequest).where(
+            CapabilityRequest.task_id == task_id,
+            CapabilityRequest.status == RequestStatus.PENDING,
+        )
+    )
+    pending = result.scalars().all()
+    count = 0
+    for cap in pending:
+        cap.status = RequestStatus.APPROVED
+        cap.decision_notes = "auto-dismissed after processing"
+        cap.reviewed_at = datetime.utcnow()
+        cap.reviewed_by = "system"
+        count += 1
+    await db.commit()
+    logger.info(f"Dismissed {count} pending capability request(s) for {task_id}")
+    return {"dismissed": count}
 
 
 @router.get("/requests/{request_id}", response_model=CapabilityRequestResponse)

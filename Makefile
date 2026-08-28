@@ -2,7 +2,8 @@
 # Auditable Agent Orchestration for OpenClaw
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
-        backup restore scale-workers build-base build-nanobot build-picoclaw build-zeroclaw build-all-images
+		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images \
+		docker-clean-dag docker-clean-dag-dry-run
 
 # ─────────────────────────────────────────────────────────
 # Help
@@ -83,6 +84,15 @@ build-base: ## Force rebuild the base agent image (openclaw-agent:openclaw)
 	@echo "  Base image rebuild triggered. Watch logs:"
 	@echo "    make logs-service SERVICE=image-builder"
 
+build-octaveclaw: ## Build the OctaveClaw agent image (OpenClaw + GNU Octave) and push to registry
+	@echo "Building OctaveClaw agent image inside DinD..."
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:octaveclaw \
+		-f /agent-images/octaveclaw/Dockerfile \
+		/agent-images/octaveclaw/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:octaveclaw
+	@echo "  ✅  openclaw-agent:octaveclaw built & pushed"
+
 check-base: ## Check if base agent image exists in internal registry
 	@docker exec openclaw-docker-dind docker images registry:5000/openclaw-agent:openclaw --format "{{.Repository}}:{{.Tag}}  {{.Size}}  {{.CreatedAt}}" 2>/dev/null \
 		|| echo "  ❌ Base image not found. It will be auto-built on next startup."
@@ -116,13 +126,72 @@ build-zeroclaw: ## Build the ZeroClaw agent image and push to registry
 	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:zeroclaw
 	@echo "  ✅  openclaw-agent:zeroclaw built & pushed"
 
-build-all-images: build-base build-nanobot build-picoclaw build-zeroclaw ## Build all 4 agent base images
+build-browser: ## Build the Browser agent image (Chromium + agent-browser) and push to registry
+	@echo "Building Browser agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/browser/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:browser \
+		-f /agent-images/browser/Dockerfile \
+		/agent-images/browser/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser
+	@rm -f agent-images/browser/taskforge-adapter.py
+	@echo "  ✅  openclaw-agent:browser built & pushed"
+
+build-browser-v2: ## Build Browser v2 image (Chromium + agent-browser + obscura) and push to registry
+	@echo "Building Browser v2 agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/browser_v2/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:browser_v2 \
+		-f /agent-images/browser_v2/Dockerfile \
+		/agent-images/browser_v2/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser_v2
+	@rm -f agent-images/browser_v2/taskforge-adapter.py
+	@echo "  ✅  openclaw-agent:browser_v2 built & pushed"
+
+build-browser-v3: ## Build Browser v3 image (Chromium + agent-browser + Lightpanda) and push to registry
+	@echo "Building Browser v3 agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/browser_v3/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:browser_v3 \
+		-f /agent-images/browser_v3/Dockerfile \
+		/agent-images/browser_v3/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser_v3
+	@rm -f agent-images/browser_v3/taskforge-adapter.py
+	@echo "  ✅  openclaw-agent:browser_v3 built & pushed"
+
+build-browser-v4: ## Build Browser v4 image (Chromium + agent-browser + Lightpanda) and push to registry
+	@echo "Building Browser v4 agent image inside DinD..."
+	@cp agent-images/base/taskforge-adapter.py agent-images/browser_v4/taskforge-adapter.py
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:browser_v4 \
+		-f /agent-images/browser_v4/Dockerfile \
+		/agent-images/browser_v4/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser_v4
+	@rm -f agent-images/browser_v4/taskforge-adapter.py
+	@echo "  ✅  openclaw-agent:browser_v4 built & pushed"
+
+
+build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 ## Build all 8 agent base images
 	@echo ""
 	@echo "  ✅  All agent base images built & pushed to registry:"
 	@echo "      openclaw-agent:openclaw  (Full Python)"
+	@echo "      openclaw-agent:octaveclaw (OpenClaw + GNU Octave)"
 	@echo "      openclaw-agent:nanobot   (Alpine Python)"
 	@echo "      openclaw-agent:picoclaw  (Shell)"
 	@echo "      openclaw-agent:zeroclaw  (Rust)"
+	@echo "      openclaw-agent:browser   (Chromium + agent-browser)"
+	@echo "      openclaw-agent:browser_v2 (Chromium + agent-browser + obscura)"
+	@echo "      openclaw-agent:browser_v3 (Chromium + agent-browser + lightpanda)"
+
+# ─────────────────────────────────────────────────────────
+# Logs & Status
+# ─────────────────────────────────────────────────────────
+
+docker-clean-dag: ## Remove old DAG agent images from DinD (default retention 5 days; override with DAG_RETENTION_DAYS)
+	@scripts/cleanup-dag-images.sh $(DAG_RETENTION_DAYS)
+
+docker-clean-dag-dry-run: ## Dry-run: list old DAG images that would be removed (deletes nothing)
+	@scripts/cleanup-dag-images.sh $(DAG_RETENTION_DAYS) --dry-run
 
 # ─────────────────────────────────────────────────────────
 # Logs & Status

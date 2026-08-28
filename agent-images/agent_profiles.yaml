@@ -71,7 +71,7 @@ profiles:
   name: Shell Operator
   description: Minimal shell agent for file manipulation and CLI automation.
   base_image: picoclaw
-  llm_model: gemini-flash-latest
+  llm_model: granite4:latest
   tags:
   - shell
   - devops
@@ -82,12 +82,16 @@ profiles:
     strengths:
     - Tiny image (~15 MB)
     - POSIX-compliant shell
-    - jq, yq, awk, sed, grep
+    - jq
+    - yq
+    - awk
+    - sed
+    - grep
 - id: devops-runner
   name: DevOps Runner
   description: Shell-based agent for CI/CD scripts, deploys, and infrastructure tasks.
   base_image: picoclaw
-  llm_model: claude-sonnet-4-20250514
+  llm_model: granite4:latest
   tags:
   - devops
   - ci-cd
@@ -117,22 +121,16 @@ profiles:
     - Tamper-resistant runtime
     - Deep code analysis
 - id: crypto-agent
-  name: Crypto Agent
+  name: Local Ollama Agent
   description: Rust-based agent for cryptographic operations and security-sensitive
     workloads.
   base_image: zeroclaw
-  llm_model: gpt-4o
-  tags:
-  - security
-  - crypto
-  - performance
+  llm_model: granite4:latest
+  tags: []
   icon: 🔐
   metadata:
     runtime: Rust (Debian)
-    strengths:
-    - High-performance crypto
-    - Sandboxed execution
-    - Zero-copy data handling
+    strengths: []
 - id: performance-agent
   name: Performance Agent
   description: Rust runtime optimised for compute-heavy and latency-sensitive tasks.
@@ -153,24 +151,168 @@ base_images:
   openclaw:
     dockerfile: agent-images/base/Dockerfile
     tag: openclaw-agent:openclaw
+    enabled: true
     runtime: Python 3.11 (Debian)
     description: Full Python environment with build tools and networking.
     size_estimate: ~450 MB
+    capabilities:
+    - python
+    - package-install
+    - build-tools
+    - git
+    - network-clients
+    best_for:
+    - general coding
+    - backend services
+    - data processing
+    - sdk integration
+    avoid_for:
+    - browser automation at scale
+  octaveclaw:
+    dockerfile: agent-images/octaveclaw/Dockerfile
+    tag: openclaw-agent:octaveclaw
+    enabled: true
+    runtime: Python 3.11 (Debian) + GNU Octave
+    description: OpenClaw image with GNU Octave and preinstalled Python API stack for simulation services.
+    size_estimate: ~1.1 GB
+    capabilities:
+    - python
+    - package-install
+    - build-tools
+    - octave
+    - numerical-simulation
+    - flask
+    - rest-api
+    - python-web-backend
+    best_for:
+    - scientific simulations
+    - matrix-heavy workloads
+    - prototyping control systems
+    - simulation-api integration
+    avoid_for:
+    - minimal image footprint
   nanobot:
     dockerfile: agent-images/nanobot/Dockerfile
     tag: openclaw-agent:nanobot
+    enabled: true
     runtime: Python 3.11 (Alpine)
     description: Lightweight Alpine Python for fast scripts.
     size_estimate: ~80 MB
+    capabilities:
+    - python
+    - lightweight-runtime
+    - fast-startup
+    best_for:
+    - quick scripts
+    - data transforms
+    - short-lived tasks
+    avoid_for:
+    - heavy native builds
+    - browser automation
   picoclaw:
     dockerfile: agent-images/picoclaw/Dockerfile
     tag: openclaw-agent:picoclaw
+    enabled: true
     runtime: Shell (Alpine)
     description: Minimal shell environment for simple tasks.
     size_estimate: ~15 MB
+    capabilities:
+    - shell
+    - cli-tools
+    - text-processing
+    best_for:
+    - shell automation
+    - file operations
+    - ops glue scripts
+    avoid_for:
+    - python package workflows
+    - browser automation
   zeroclaw:
     dockerfile: agent-images/zeroclaw/Dockerfile
     tag: openclaw-agent:zeroclaw
+    enabled: true
     runtime: Rust (Debian)
     description: Rust-based runtime for high-security/performance.
     size_estimate: ~120 MB
+    capabilities:
+    - rust
+    - secure-runtime
+    - high-performance
+    best_for:
+    - security-sensitive jobs
+    - performance-critical tasks
+    - systems programming
+    avoid_for:
+    - rich python ecosystem tasks
+  browser:
+    dockerfile: agent-images/browser/Dockerfile
+    tag: openclaw-agent:browser
+    enabled: false
+    runtime: Python 3.11 (Debian) + Chromium
+    description: Full OpenClaw environment with pre-installed Chromium, browser shared libs, and agent-browser.
+    size_estimate: ~600 MB
+    capabilities:
+    - browser-automation
+    - chromium
+    - screenshots
+    - dynamic-web-scraping
+    best_for:
+    - web navigation
+    - interactive scraping
+    - js-rendered pages
+    avoid_for:
+    - minimal-latency scripting
+  browser_v2:
+    dockerfile: agent-images/browser_v2/Dockerfile
+    tag: openclaw-agent:browser_v2
+    enabled: true
+    runtime: Python 3.11 (Debian) + Chromium + Obscura
+    description: Browser automation image with Chromium, agent-browser, and Obscura for stealthier scraping.
+    size_estimate: ~620 MB
+    capabilities:
+    - browser-automation
+    - chromium
+    - obscura
+    - anti-bot-resilience
+    best_for:
+    - protected-site scraping
+    - dynamic websites
+    - browser-driven extraction
+    avoid_for:
+    - tasks requiring smallest image footprint
+  browser_v3:
+    dockerfile: agent-images/browser_v3/Dockerfile
+    tag: openclaw-agent:browser_v3
+    enabled: true
+    runtime: Python 3.11 (Debian) + Chromium + Lightpanda
+    description: Browser automation image with Chromium, agent-browser, and Lightpanda.
+    size_estimate: ~620 MB
+    capabilities:
+    - browser-automation
+    - chromium
+    - lightpanda
+    - dynamic-content handling
+    best_for:
+    - modern web app interaction
+    - javascript-heavy pages
+    - browser testing/scraping
+  browser_v4:
+    dockerfile: agent-images/browser_v4/Dockerfile
+    tag: openclaw-agent:browser_v4
+    enabled: true
+    runtime: Python 3.11 (Debian) + Camoufox
+    description: Browser automation image with Camoufox (custom headless Firefox) for agentic browsing.
+    size_estimate: ~650 MB
+    capabilities:
+    - browser-automation
+    - camoufox
+    - firefox
+    - dynamic-content handling
+    - web-scraping
+    best_for:
+    - web navigation
+    - interactive scraping
+    - javascript-heavy pages
+    - browser testing
+    avoid_for:
+    - tasks requiring smallest image footprint

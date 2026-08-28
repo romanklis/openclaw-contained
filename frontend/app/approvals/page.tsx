@@ -241,6 +241,10 @@ function ApprovalsContent() {
               const isLoading = actionLoading === req.id
               const task = taskCache[req.task_id]
               const packages = req.details?.packages || req.resource_name.split(',').map(s => s.trim())
+              // Normalise: packages may be string[] (legacy) or {name,type}[] (new typed format)
+              const normalisedPackages = packages.map((p: any) =>
+                typeof p === 'string' ? { name: p, type: req.details?.original_type || req.capability_type } : p
+              )
               const versions = req.details?.versions || {}
               const iteration = req.details?.iteration || null
               const detailedReason = req.details?.reason || null
@@ -285,11 +289,12 @@ function ApprovalsContent() {
                           <div className="bg-[#12121a] border border-[#1a1a2a] rounded-lg p-3 mb-3">
                             <div className="text-xs text-gray-500 font-medium mb-2">📦 Requested Packages</div>
                             <div className="space-y-1.5">
-                              {packages.map((pkg: string) => {
-                                const version = versions[pkg]
-                                const pkgType = req.details?.original_type || req.capability_type
+                              {normalisedPackages.map((pkg: any) => {
+                                const pkgName = pkg.name || pkg
+                                const version = versions[pkgName]
+                                const pkgType = pkg.type || req.details?.original_type || req.capability_type
                                 return (
-                                  <div key={pkg} className="flex items-center gap-2">
+                                  <div key={pkgName} className="flex items-center gap-2">
                                     <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${
                                       pkgType.includes('python') || pkgType.includes('pip') ? 'bg-blue-900/40 text-blue-300' :
                                       pkgType.includes('npm') ? 'bg-green-900/40 text-green-300' :
@@ -300,7 +305,7 @@ function ApprovalsContent() {
                                        pkgType.includes('npm') ? 'npm' :
                                        pkgType.includes('apt') || pkgType.includes('system') ? 'apt' : 'pkg'}
                                     </span>
-                                    <span className="font-mono text-sm text-white font-medium">{pkg}</span>
+                                    <span className="font-mono text-sm text-white font-medium">{pkgName}</span>
                                     {version ? (
                                       <span className="font-mono text-xs text-emerald-400">
                                         =={version}

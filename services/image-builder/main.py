@@ -31,7 +31,7 @@ AGENT_IMAGES_DIR = Path(os.getenv("AGENT_IMAGES_DIR", "/app/agent-images"))
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
 # =============================================================================
-# Supply-Chain Configuration — loaded once at import / startup
+# Supply-Chain Configuration — loaded from control-plane DB (with YAML fallback)
 # =============================================================================
 
 SUPPLY_CHAIN_PATH = Path(os.getenv("SUPPLY_CHAIN_PATH", "/config/supply-chain.yaml"))
@@ -39,11 +39,45 @@ _supply_chain: Dict[str, Any] = {}  # populated by _load_supply_chain()
 _supply_chain_aliases: Dict[str, Dict[str, str]] = {}  # apt_to_apk / apk_to_apt
 
 
-def _load_supply_chain() -> None:
-    """Load (or reload) the supply-chain config from disk.
+def _load_supply_chain_from_api() -> bool:
+    """Try to load supply-chain config from the control-plane DB API.
 
-    Called once at startup and can be called again via the reload endpoint.
+    Returns True on success, False if the API is unavailable.
     """
+    global _supply_chain, _supply_chain_aliases
+    import httpx
+
+    try:
+        resp = httpx.get(f"{CONTROL_PLANE_URL}/api/supply-chain/config", timeout=5.0)
+        if resp.status_code != 200:
+            logger.warning(f"Supply-chain API returned {resp.status_code} — falling back to YAML")
+            return False
+
+        data = resp.json()
+        _supply_chain = data.get("raw", {})
+        _supply_chain_aliases = data.get("aliases", {})
+
+        if not _supply_chain:
+            logger.warning("Supply-chain API returned empty config — falling back to YAML")
+            return False
+
+        image_types = list(_supply_chain.keys())
+        total_entries = sum(
+            len(v.get("pip", []) + v.get("apt", []) + v.get("apk", []) + v.get("npm", []))
+            for v in _supply_chain.values()
+        )
+        logger.info(f"✅ Supply-chain loaded from DB API | Image types: {image_types} | "
+                     f"Total allowlist entries: {total_entries} | "
+                     f"Aliases: apt_to_apk={len(_supply_chain_aliases.get('apt_to_apk', {}))}, "
+                     f"apk_to_apt={len(_supply_chain_aliases.get('apk_to_apt', {}))}")
+        return True
+    except Exception as exc:
+        logger.warning(f"Supply-chain API unavailable ({exc}) — falling back to YAML")
+        return False
+
+
+def _load_supply_chain_from_yaml() -> None:
+    """Fallback: load supply-chain config from the static YAML file."""
     global _supply_chain, _supply_chain_aliases
 
     if not SUPPLY_CHAIN_PATH.exists():
@@ -56,21 +90,30 @@ def _load_supply_chain() -> None:
     try:
         raw = yaml.safe_load(SUPPLY_CHAIN_PATH.read_text())
         _supply_chain_aliases = raw.pop("aliases", {})
-        # Top-level keys are image types (openclaw, nanobot, picoclaw, zeroclaw)
         _supply_chain = {k: v for k, v in raw.items() if isinstance(v, dict)}
         image_types = list(_supply_chain.keys())
         total_entries = sum(
             len(v.get("pip", []) + v.get("apt", []) + v.get("apk", []) + v.get("npm", []))
             for v in _supply_chain.values()
         )
-        logger.info(f"✅ Supply-chain loaded | Image types: {image_types} | "
+        logger.info(f"✅ Supply-chain loaded from YAML | Image types: {image_types} | "
                      f"Total allowlist entries: {total_entries} | "
                      f"Aliases: apt_to_apk={len(_supply_chain_aliases.get('apt_to_apk', {}))}, "
                      f"apk_to_apt={len(_supply_chain_aliases.get('apk_to_apt', {}))}")
     except Exception as exc:
-        logger.error(f"Failed to parse supply-chain config: {exc}")
+        logger.error(f"Failed to parse supply-chain YAML: {exc}")
         _supply_chain = {}
         _supply_chain_aliases = {}
+
+
+def _load_supply_chain() -> None:
+    """Load (or reload) the supply-chain config.
+
+    Tries the control-plane DB API first, falls back to the static YAML file.
+    Called once at startup and can be called again via the reload endpoint.
+    """
+    if not _load_supply_chain_from_api():
+        _load_supply_chain_from_yaml()
 
 
 # Load at import time so it's available before any request
@@ -280,6 +323,299 @@ class DeploymentBuildRequest(BaseModel):
     entrypoint: str = "python app.py"
     port: int = 5000
     pip_packages: Optional[List[str]] = None  # extra pip packages
+    agent_image: Optional[str] = None  # use agent's committed image as base (has all deps)
+
+
+# =============================================================================
+# Package Verification — validate packages against native registries
+# =============================================================================
+
+import httpx as _httpx
+from functools import lru_cache
+
+_PYPI_URL = "https://pypi.org/pypi/{}/json"
+_NPM_URL = "https://registry.npmjs.org/{}"
+
+
+class PackageVerification:
+    """Result of verifying a package name against its native registry."""
+
+    def __init__(self, exists: bool, canonical_name: str, claimed_type: str,
+                 suggested_type: Optional[str] = None,
+                 suggested_name: Optional[str] = None):
+        self.exists = exists
+        self.canonical_name = canonical_name
+        self.claimed_type = claimed_type
+        self.suggested_type = suggested_type
+        self.suggested_name = suggested_name
+
+    def __repr__(self):
+        return (f"PackageVerification(exists={self.exists}, "
+                f"canonical={self.canonical_name!r}, claimed={self.claimed_type}, "
+                f"suggested_type={self.suggested_type})")
+
+
+def _check_pypi(name: str) -> bool:
+    """Check if a package exists on PyPI."""
+    try:
+        resp = _httpx.get(_PYPI_URL.format(name), timeout=10.0, follow_redirects=True)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _check_npm(name: str) -> bool:
+    """Check if a package exists on the npm registry."""
+    try:
+        resp = _httpx.get(_NPM_URL.format(name), timeout=10.0, follow_redirects=True)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _check_apt(name: str) -> bool:
+    """Check if a package exists in the local apt cache (Debian/Ubuntu)."""
+    try:
+        r = subprocess.run(["apt-cache", "show", name],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _check_apk(name: str) -> bool:
+    """Check if a package exists in the Alpine apk index."""
+    try:
+        r = subprocess.run(["apk", "info", "-d", name],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=512)
+def _verify_package_exists(name: str, claimed_type: str, image_type: str = "openclaw") -> PackageVerification:
+    """Verify a package exists in its claimed registry, with cross-type fallback.
+
+    Returns a PackageVerification with suggested_type set when the package
+    was found in a different registry than claimed.
+    """
+    is_alpine = image_type in ("nanobot", "picoclaw")
+
+    # ----- Check in claimed type first -----
+    if claimed_type == "pip_package":
+        if _check_pypi(name):
+            return PackageVerification(True, name, claimed_type)
+        # Cross-check: maybe it's npm?
+        if _check_npm(name):
+            logger.info(f"🔄 Package '{name}' not found on PyPI but exists on npm")
+            return PackageVerification(False, name, claimed_type,
+                                       suggested_type="npm_package", suggested_name=name)
+        # Cross-check: maybe it's a system package?
+        if is_alpine:
+            if _check_apk(name):
+                logger.info(f"🔄 Package '{name}' not found on PyPI but exists in apk")
+                return PackageVerification(False, name, claimed_type,
+                                           suggested_type="apt_package", suggested_name=name)
+        else:
+            if _check_apt(name):
+                logger.info(f"🔄 Package '{name}' not found on PyPI but exists in apt")
+                return PackageVerification(False, name, claimed_type,
+                                           suggested_type="apt_package", suggested_name=name)
+
+    elif claimed_type == "npm_package":
+        if _check_npm(name):
+            return PackageVerification(True, name, claimed_type)
+        # Cross-check: maybe it's pip?
+        if _check_pypi(name):
+            logger.info(f"🔄 Package '{name}' not found on npm but exists on PyPI")
+            return PackageVerification(False, name, claimed_type,
+                                       suggested_type="pip_package", suggested_name=name)
+
+    elif claimed_type in ("apt_package", "apk_package"):
+        if is_alpine:
+            if _check_apk(name):
+                return PackageVerification(True, name, claimed_type)
+            # Try alias
+            aliased = _resolve_alias(name, "apt", "apk")
+            if aliased != name and _check_apk(aliased):
+                return PackageVerification(True, aliased, claimed_type)
+        else:
+            if _check_apt(name):
+                return PackageVerification(True, name, claimed_type)
+            # Try alias
+            aliased = _resolve_alias(name, "apk", "apt")
+            if aliased != name and _check_apt(aliased):
+                return PackageVerification(True, aliased, claimed_type)
+        # Cross-check: maybe it's pip?
+        if _check_pypi(name):
+            logger.info(f"🔄 Package '{name}' not found in system pkgs but exists on PyPI")
+            return PackageVerification(False, name, claimed_type,
+                                       suggested_type="pip_package", suggested_name=name)
+
+    # Nothing found anywhere
+    return PackageVerification(False, name, claimed_type)
+
+
+def verify_and_reclassify(
+    capabilities: List["BuildCapability"],
+    image_type: str,
+) -> List["BuildCapability"]:
+    """Verify each capability's package exists in its claimed registry.
+
+    If a package is misclassified, reclassify it to the suggested type.
+    Returns a new list of BuildCapability with corrected types.
+    """
+    result = []
+    for cap in capabilities:
+        if cap.type not in ("pip_package", "npm_package", "apt_package", "apk_package"):
+            result.append(cap)
+            continue
+
+        v = _verify_package_exists(cap.name, cap.type, image_type)
+        if v.exists:
+            # Possibly use canonical name (e.g. alias-resolved)
+            result.append(BuildCapability(type=cap.type, name=v.canonical_name, version=cap.version))
+        elif v.suggested_type:
+            logger.warning(f"🔄 Reclassifying '{cap.name}' from {cap.type} → {v.suggested_type}")
+            result.append(BuildCapability(
+                type=v.suggested_type,
+                name=v.suggested_name or cap.name,
+                version=cap.version,
+            ))
+        else:
+            # Package not found anywhere — try LLM resolver as last resort
+            resolved = _llm_resolve_package(cap.name, cap.type, image_type)
+            if resolved:
+                logger.info(f"🤖 LLM resolved '{cap.name}' → {resolved['name']} ({resolved['type']})")
+                result.append(BuildCapability(
+                    type=resolved["type"],
+                    name=resolved["name"],
+                    version=cap.version,
+                ))
+            else:
+                # Keep as-is, supply-chain will handle it
+                result.append(cap)
+    return result
+
+
+# =============================================================================
+# LLM-based Package Name Resolver
+# =============================================================================
+
+_LLM_RESOLVE_CACHE: Dict[tuple, Optional[Dict[str, str]]] = {}
+_LLM_CACHE_TTL_POS = 86400  # 24h for positive results
+_LLM_CACHE_TTL_NEG = 3600   # 1h for negative results
+
+_API_GATEWAY_URL = os.getenv("API_GATEWAY_URL", "http://api-gateway:8080")
+_LLM_RESOLVER_MODEL = os.getenv("LLM_RESOLVER_MODEL", "gemini-flash-lite-latest")
+
+_RESOLVE_PROMPT = """You are a package name resolver. Given a package name and the package manager type 
+it was claimed to belong to, determine the correct package name and package manager.
+
+Package name: {name}
+Claimed type: {claimed_type}
+Target OS: {os_type}
+
+The package was NOT found in the {claimed_type} registry. 
+
+Rules:
+- If the name is a Python import name that differs from the pip package name (e.g. "cv2" → "opencv-python", 
+  "PIL" → "Pillow", "sklearn" → "scikit-learn", "bs4" → "beautifulsoup4", "yaml" → "pyyaml"), 
+  return the correct pip package name.
+- If the package belongs to a different manager (e.g. claimed as pip but it's actually npm), correct the type.
+- For system library errors (lib*.so), suggest the apt/apk package that provides it.
+- Only return a result if you are confident. If unsure, return null.
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{"name": "correct-package-name", "type": "pip_package|npm_package|apt_package", "confidence": 0.0-1.0}}
+
+Or if you cannot determine the correct package:
+null"""
+
+
+def _llm_resolve_package(
+    name: str, claimed_type: str, image_type: str = "openclaw"
+) -> Optional[Dict[str, str]]:
+    """Use an LLM to resolve an ambiguous or misnamed package.
+
+    Returns {"name": "correct-name", "type": "pip_package"} or None.
+    Results are cached in-memory.
+    """
+    cache_key = (name, claimed_type, image_type)
+
+    # Check cache (with TTL)
+    if cache_key in _LLM_RESOLVE_CACHE:
+        entry = _LLM_RESOLVE_CACHE[cache_key]
+        cached_result, cached_at = entry  # type: ignore[misc]
+        ttl = _LLM_CACHE_TTL_POS if cached_result else _LLM_CACHE_TTL_NEG
+        if time.time() - cached_at < ttl:
+            return cached_result
+
+    os_type = "Alpine Linux" if image_type in ("nanobot", "picoclaw") else "Debian/Ubuntu"
+    prompt = _RESOLVE_PROMPT.format(
+        name=name, claimed_type=claimed_type, os_type=os_type,
+    )
+
+    try:
+        resp = _httpx.post(
+            f"{_API_GATEWAY_URL}/v1/chat/completions",
+            json={
+                "model": _LLM_RESOLVER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 150,
+            },
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"🤖 LLM resolver: API returned {resp.status_code}")
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+        # Parse JSON response
+        if content.lower() == "null" or not content:
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        # Strip markdown fences if present
+        if content.startswith("```"):
+            content = re.sub(r"^```\w*\n?", "", content)
+            content = re.sub(r"\n?```$", "", content)
+            content = content.strip()
+
+        resolved = json.loads(content)
+        if not isinstance(resolved, dict) or "name" not in resolved or "type" not in resolved:
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        confidence = float(resolved.get("confidence", 0))
+        if confidence < 0.7:
+            logger.info(f"🤖 LLM resolver: low confidence ({confidence}) for '{name}' → {resolved}")
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        valid_types = {"pip_package", "npm_package", "apt_package", "apk_package"}
+        if resolved["type"] not in valid_types:
+            _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+            return None
+
+        result = {"name": resolved["name"], "type": resolved["type"]}
+        logger.info(f"🤖 LLM resolver: '{name}' ({claimed_type}) → {result} (confidence={confidence})")
+        _LLM_RESOLVE_CACHE[cache_key] = (result, time.time())
+        return result
+
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.warning(f"🤖 LLM resolver: failed to parse response for '{name}': {e}")
+        _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+        return None
+    except Exception as e:
+        logger.warning(f"🤖 LLM resolver: request failed for '{name}': {e}")
+        _LLM_RESOLVE_CACHE[cache_key] = (None, time.time())
+        return None
 
 
 # =============================================================================
@@ -288,10 +624,10 @@ class DeploymentBuildRequest(BaseModel):
 
 # Per-image-type install strategies
 # ─────────────────────────────────
-#  openclaw  : Debian + /opt/venv/bin/pip + npm + apt-get
-#  nanobot   : Alpine + /usr/local/bin/pip + apk (no npm)
+#  openclaw  : Debian + system pip --break-system-packages + npm + apt-get
+#  nanobot   : Alpine + pip + apk (no npm)
 #  picoclaw  : Alpine + apk only (no Python, no npm)
-#  zeroclaw  : Debian + /usr/bin/pip3 --break-system-packages + apt-get (no npm)
+#  zeroclaw  : Debian + pip3 --break-system-packages + apt-get (no npm)
 
 DOCKERFILE_TEMPLATE = """
 FROM {{ base_image }}
@@ -324,10 +660,11 @@ RUN apt-get update && apt-get install -y \\
 # ⚠ PicoClaw has no Python — cannot install pip packages
 # Requested: {{ pip_packages | join(', ') }}
 RUN echo "ERROR: pip packages requested but PicoClaw has no Python runtime" >&2 && exit 1
-{% elif image_type == 'openclaw' %}
-# Install Python packages into venv (OpenClaw)
+{% elif image_type in ('openclaw', 'browser', 'octaveclaw') %}
+# Install Python packages (OpenClaw — system pip, no venv)
 USER root
-RUN /opt/venv/bin/pip install --no-cache-dir {{ pip_packages | join(' ') }}
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN pip install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
 {% elif image_type == 'nanobot' %}
 # Install Python packages (NanoBot — Alpine Python)
 USER root
@@ -335,25 +672,26 @@ RUN pip install --no-cache-dir {{ pip_packages | join(' ') }}
 {% elif image_type == 'zeroclaw' %}
 # Install Python packages (ZeroClaw — Debian system Python)
 USER root
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN pip3 install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
 {% else %}
-# Install Python packages (generic — auto-detect pip)
+# Install Python packages (generic — system-wide)
 USER root
-RUN set -e; \\
-    PIP=""; \\
-    for p in /opt/venv/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip /usr/bin/pip3; do \\
-        if [ -x "$p" ]; then PIP="$p"; break; fi; \\
-    done; \\
-    if [ -z "$PIP" ]; then echo "ERROR: no pip found" >&2; exit 1; fi; \\
-    echo "Using pip: $PIP"; \\
-    $PIP install --no-cache-dir {{ pip_packages | join(' ') }} || \\
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN set -e; \
+    PIP=""; \
+    for p in /usr/local/bin/pip3 /usr/local/bin/pip /usr/bin/pip3 /usr/bin/pip; do \
+        if [ -x "$p" ]; then PIP="$p"; break; fi; \
+    done; \
+    if [ -z "$PIP" ]; then echo "ERROR: no pip found" >&2; exit 1; fi; \
+    echo "Using pip: $PIP"; \
     $PIP install --no-cache-dir --break-system-packages {{ pip_packages | join(' ') }}
 {% endif %}
 {% endif %}
 
 {% if npm_packages %}
-{% if image_type == 'openclaw' %}
-# Install NPM packages globally (OpenClaw only)
+{% if image_type in ('openclaw', 'zeroclaw', 'browser', 'octaveclaw') %}
+# Install NPM packages globally
 USER root
 RUN npm install -g \\
 {% for pkg in npm_packages %}
@@ -586,10 +924,11 @@ def _scan_imports_for_pip_packages(app_dir: Path) -> List[str]:
 # Per-image-type deployment base images
 # picoclaw/nanobot are Alpine-based; zeroclaw/openclaw are Debian-based
 _DEPLOYMENT_BASE_IMAGES = {
-    "picoclaw": "alpine:3.19",
-    "nanobot":  "python:3.11-alpine",
-    "zeroclaw": "python:3.11-slim",
-    "openclaw": "python:3.11-slim",
+    "picoclaw": "alpine:3.19.7",
+    "nanobot":  "python:3.11.15-alpine3.21",
+    "zeroclaw": "python:3.11.15-slim-bookworm",
+    "openclaw": "python:3.11.15-slim-bookworm",
+    "octaveclaw": "python:3.11.15-slim-bookworm",
 }
 
 # System packages to always include for shell-based deployments (picoclaw)
@@ -601,6 +940,12 @@ FROM {{ base_image }}
 
 LABEL deployment_id="{{ deployment_id }}"
 LABEL task_id="{{ task_id }}"
+
+{% if agent_image %}
+# Reset agent entrypoint — this is a standalone deployment now
+ENTRYPOINT []
+USER root
+{% endif %}
 
 WORKDIR /app
 
@@ -635,6 +980,7 @@ RUN find /app -type f \\( -name '*.py' -o -name '*.sh' -o -name '*.yaml' -o -nam
 # Make shell scripts executable
 RUN find /app -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
 
+ENV PORT={{ port }}
 EXPOSE {{ port }}
 
 CMD {{ entrypoint_cmd }}
@@ -649,26 +995,41 @@ def generate_deployment_dockerfile(
     image_type: str = "openclaw",
     pip_packages: Optional[List[str]] = None,
     apt_packages: Optional[List[str]] = None,
+    agent_image: Optional[str] = None,
 ) -> str:
     """Generate a minimal Dockerfile for a deployment (no OpenClaw).
 
-    The base image and system package manager are chosen based on *image_type*
-    so that shell-only agents (picoclaw) get an Alpine base with the right
-    tools, while Python-based agents get python:3.11-slim.
-    """
-    base_image = _DEPLOYMENT_BASE_IMAGES.get(image_type, "python:3.11-slim")
-    is_alpine = "alpine" in base_image
+    When *agent_image* is provided, it is used as the base image directly.
+    This guarantees all approved dependencies (pip, apt, npm, etc.) are
+    already present regardless of language — no dependency guessing needed.
 
-    # For picoclaw deployments, ensure essential shell tools are present
-    apk_packages: List[str] = []
-    if is_alpine:
-        apk_packages = list(_PICOCLAW_DEPLOY_PACKAGES) if image_type == "picoclaw" else []
-        # Move any apt_packages to apk equivalents
-        if apt_packages:
-            for pkg in apt_packages:
-                if pkg not in apk_packages:
-                    apk_packages.append(pkg)
-            apt_packages = []  # clear — we use apk on Alpine
+    Otherwise, falls back to a generic base image chosen by *image_type*
+    and installs detected packages explicitly.
+    """
+    if agent_image:
+        # Use the agent's own image — all deps already installed
+        # Normalize registry prefix: DinD resolves "registry:5000" not "localhost:5000"
+        base_image = agent_image.replace("localhost:5000/", "registry:5000/")
+        # No need for pip/apt/apk — everything is in the image
+        pip_packages = []
+        apt_packages = []
+        is_alpine = False
+        apk_packages: List[str] = []
+        logger.info(f"Using agent image as deployment base: {agent_image}")
+    else:
+        base_image = _DEPLOYMENT_BASE_IMAGES.get(image_type, "python:3.11.15-slim-bookworm")
+        is_alpine = "alpine" in base_image
+
+        # For picoclaw deployments, ensure essential shell tools are present
+        apk_packages = []
+        if is_alpine:
+            apk_packages = list(_PICOCLAW_DEPLOY_PACKAGES) if image_type == "picoclaw" else []
+            # Move any apt_packages to apk equivalents
+            if apt_packages:
+                for pkg in apt_packages:
+                    if pkg not in apk_packages:
+                        apk_packages.append(pkg)
+                apt_packages = []  # clear — we use apk on Alpine
 
     # Rewrite /workspace/ paths to /app/ since deployment copies files to /app/
     entrypoint = entrypoint.replace("/workspace/", "/app/")
@@ -702,6 +1063,7 @@ def generate_deployment_dockerfile(
         pip_packages=pip_packages or [],
         apt_packages=apt_packages or [],
         apk_packages=apk_packages,
+        agent_image=agent_image,
     )
 
 
@@ -921,7 +1283,7 @@ async def build_image_task(
             dockerfile=f"Dockerfile.{version}",
             tag=image_tag,
             rm=True,
-            pull=False
+            pull=True
         )
         
         # Collect logs
@@ -1009,7 +1371,7 @@ async def build_deployment_image_task(
                         import shutil
                         # Copy all files from workspace to app dir
                         for item in ws_path.iterdir():
-                            if item.name in ("AGENTS.md", "SOUL.md", "result.json", ".openclaw"):
+                            if item.name in ("AGENTS.md", "SOUL.md", "result.json", ".openclaw", "input_prompt.md", "attached_context.md"):
                                 continue
                             dest = app_dir / item.name
                             if item.is_dir():
@@ -1128,8 +1490,11 @@ async def build_image(
     
     logger.info(f"Expanded {len(request.capabilities)} capability entries → {len(expanded_capabilities)} individual packages")
     
-    # ── Supply-chain validation ──────────────────────────────────────────
+    # ── Native package verification & reclassification ───────────────────
     image_type = _detect_image_type(request.base_image)
+    expanded_capabilities = verify_and_reclassify(expanded_capabilities, image_type)
+
+    # ── Supply-chain validation ──────────────────────────────────────────
     verdict = validate_supply_chain(image_type, expanded_capabilities)
 
     supply_chain_denied = verdict.denied if verdict.denied else None
@@ -1231,100 +1596,115 @@ async def build_deployment_image(
     request: DeploymentBuildRequest,
     background_tasks: BackgroundTasks,
 ):
-    """Build a minimal deployment image from workspace files."""
+    """Build a deployment image from workspace files.
+
+    When *agent_image* is provided, it is used as the base image directly —
+    all approved dependencies (pip, apt, npm, etc.) are already present
+    regardless of language.  No dependency guessing or import scanning is
+    needed.  This is the preferred path.
+
+    When *agent_image* is not provided (legacy), falls back to detecting
+    packages from Dockerfiles, import scanning, etc.
+    """
     build_id = str(uuid.uuid4())[:8]
     image_tag = f"openclaw-deploy:{request.deployment_id}"
 
     logger.info(f"Creating deployment build {build_id} for {request.deployment_id}")
 
-    # Determine pip packages from task capabilities (approved ones)
-    pip_packages = list(request.pip_packages or [])
-    apt_packages = []
-    
-    # Also check if the task's agent image Dockerfile has pip/apt installs
-    task_dir = AGENT_IMAGES_DIR / request.task_id
-    # Check ALL versioned Dockerfiles (Dockerfile.1, Dockerfile.2, etc.)
-    import re
-    for df_path in sorted(task_dir.glob("Dockerfile*")):
-        content = df_path.read_text()
-        
-        # ---- Parse LABEL capabilities (covers both pip and apt) ----
-        # Format: LABEL capabilities="pip_package:flask,pip_package:redis,apt_package:redis-server"
-        for m in re.finditer(r'capabilities="([^"]+)"', content):
-            for cap in m.group(1).split(","):
-                cap = cap.strip()
-                if cap.startswith("pip_package:"):
-                    pkg = cap[len("pip_package:"):]
-                    if pkg and pkg not in pip_packages:
+    pip_packages: List[str] = []
+    apt_packages: List[str] = []
+    image_type = "openclaw"
+
+    if request.agent_image:
+        # ---- Fast path: agent image has all deps ----
+        logger.info(f"Using agent image as deployment base: {request.agent_image}")
+        # Detect image_type for entrypoint formatting only
+        _tag = request.agent_image.rsplit(":", 1)[-1] if ":" in request.agent_image else ""
+        KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw", "browser"}
+        for kt in KNOWN_TYPES:
+            if kt in _tag:
+                image_type = kt
+                break
+    else:
+        # ---- Legacy path: guess dependencies from Dockerfiles + imports ----
+        pip_packages = list(request.pip_packages or [])
+
+        # Also check if the task's agent image Dockerfile has pip/apt installs
+        task_dir = AGENT_IMAGES_DIR / request.task_id
+        # Check ALL versioned Dockerfiles (Dockerfile.1, Dockerfile.2, etc.)
+        import re
+        for df_path in sorted(task_dir.glob("Dockerfile*")):
+            content = df_path.read_text()
+
+            # ---- Parse LABEL capabilities (covers both pip and apt) ----
+            for m in re.finditer(r'capabilities="([^"]+)"', content):
+                for cap in m.group(1).split(","):
+                    cap = cap.strip()
+                    if cap.startswith("pip_package:"):
+                        pkg = cap[len("pip_package:"):]
+                        if pkg and pkg not in pip_packages:
+                            pip_packages.append(pkg)
+                    elif cap.startswith("apt_package:"):
+                        pkg = cap[len("apt_package:"):]
+                        if pkg and pkg not in apt_packages:
+                            apt_packages.append(pkg)
+
+            # ---- APT packages from RUN commands ----
+            for m in re.finditer(r"apt-get install\s+-y\s+(.*?)(?:&&|$)", content, re.DOTALL):
+                block = m.group(1)
+                for token in block.split():
+                    token = token.strip().rstrip("\\")
+                    if token and not token.startswith("-") and token not in apt_packages:
+                        apt_packages.append(token)
+
+            # ---- PIP packages from RUN commands ----
+            for m in re.finditer(r"--no-cache-dir\s+(.+?)(?:\s*[;|]|$)", content):
+                for pkg in m.group(1).split():
+                    if not pkg.startswith("-") and pkg not in pip_packages:
                         pip_packages.append(pkg)
-                elif cap.startswith("apt_package:"):
-                    pkg = cap[len("apt_package:"):]
-                    if pkg and pkg not in apt_packages:
-                        apt_packages.append(pkg)
-        
-        # ---- APT packages from RUN commands ----
-        # Handle multi-line: apt-get install -y \<newline>  pkg1 \<newline>  && rm ...
-        for m in re.finditer(r"apt-get install\s+-y\s+(.*?)(?:&&|$)", content, re.DOTALL):
-            block = m.group(1)
-            for token in block.split():
-                token = token.strip().rstrip("\\")
-                if token and not token.startswith("-") and token not in apt_packages:
-                    apt_packages.append(token)
-        
-        # ---- PIP packages from RUN commands ----
-        # Look for packages after --no-cache-dir
-        for m in re.finditer(r"--no-cache-dir\s+(.+?)(?:\s*[;|]|$)", content):
-            for pkg in m.group(1).split():
-                if not pkg.startswith("-") and pkg not in pip_packages:
-                    pip_packages.append(pkg)
-    
-    logger.info(f"Deployment packages from capabilities — pip: {pip_packages}, apt: {apt_packages}")
 
-    # ---- Detect image type from the task's current_image / agent_profile ----
-    image_type = "openclaw"  # default
-    workspace_path = Path("/workspaces")
-    _ws_path = None
-    try:
-        control_plane_url_env = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-        import httpx as _httpx_sync
-        with _httpx_sync.Client(timeout=10.0) as _client:
-            _resp = _client.get(f"{control_plane_url_env}/api/tasks/{request.task_id}")
-            if _resp.status_code == 200:
-                _task_data = _resp.json()
-                _ws_id = _task_data.get("workspace_id", "")
-                _ws_path = workspace_path / _ws_id if _ws_id else None
+        logger.info(f"Deployment packages from capabilities — pip: {pip_packages}, apt: {apt_packages}")
 
-                # Detect image type from current_image tag or agent_profile
-                _cur_img = _task_data.get("current_image", "")
-                _tag = _cur_img.rsplit(":", 1)[-1] if ":" in _cur_img else ""
-                KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
-                if _tag in KNOWN_TYPES:
-                    image_type = _tag
-                else:
-                    # Try from Dockerfile labels in task image dir
-                    _detected = _detect_image_type(_cur_img) if _cur_img else "openclaw"
-                    if _detected in KNOWN_TYPES:
-                        image_type = _detected
-    except Exception as _det_err:
-        logger.warning(f"Image type detection failed (non-fatal): {_det_err}")
-
-    logger.info(f"Detected image type for deployment: {image_type}")
-
-    # ---- Also scan app source files for third-party imports ----
-    # This catches packages that were pre-installed in the agent base image
-    # (e.g. `requests` in ZeroClaw) but never explicitly requested as a capability.
-    if image_type != "picoclaw":  # picoclaw has no Python
+        # ---- Detect image type from the task's current_image / agent_profile ----
+        workspace_path = Path("/workspaces")
+        _ws_path = None
         try:
-            if _ws_path and _ws_path.exists():
-                scanned = _scan_imports_for_pip_packages(_ws_path)
-                for pkg in scanned:
-                    if pkg.lower() not in {p.lower() for p in pip_packages}:
-                        pip_packages.append(pkg)
-                logger.info(f"Import scan found additional packages: {scanned}")
-        except Exception as _scan_err:
-            logger.warning(f"Import scanning failed (non-fatal): {_scan_err}")
+            control_plane_url_env = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+            import httpx as _httpx_sync
+            with _httpx_sync.Client(timeout=10.0) as _client:
+                _resp = _client.get(f"{control_plane_url_env}/api/tasks/{request.task_id}")
+                if _resp.status_code == 200:
+                    _task_data = _resp.json()
+                    _ws_id = _task_data.get("workspace_id", "")
+                    _ws_path = workspace_path / _ws_id if _ws_id else None
 
-    logger.info(f"Final deployment packages — pip: {pip_packages}, apt: {apt_packages}")
+                    _cur_img = _task_data.get("current_image", "")
+                    _tag = _cur_img.rsplit(":", 1)[-1] if ":" in _cur_img else ""
+                    KNOWN_TYPES = {"nanobot", "openclaw", "picoclaw", "zeroclaw"}
+                    if _tag in KNOWN_TYPES:
+                        image_type = _tag
+                    else:
+                        _detected = _detect_image_type(_cur_img) if _cur_img else "openclaw"
+                        if _detected in KNOWN_TYPES:
+                            image_type = _detected
+        except Exception as _det_err:
+            logger.warning(f"Image type detection failed (non-fatal): {_det_err}")
+
+        logger.info(f"Detected image type for deployment: {image_type}")
+
+        # ---- Also scan app source files for third-party imports ----
+        if image_type != "picoclaw":
+            try:
+                if _ws_path and _ws_path.exists():
+                    scanned = _scan_imports_for_pip_packages(_ws_path)
+                    for pkg in scanned:
+                        if pkg.lower() not in {p.lower() for p in pip_packages}:
+                            pip_packages.append(pkg)
+                    logger.info(f"Import scan found additional packages: {scanned}")
+            except Exception as _scan_err:
+                logger.warning(f"Import scanning failed (non-fatal): {_scan_err}")
+
+        logger.info(f"Final deployment packages — pip: {pip_packages}, apt: {apt_packages}")
 
     dockerfile = generate_deployment_dockerfile(
         deployment_id=request.deployment_id,
@@ -1334,6 +1714,7 @@ async def build_deployment_image(
         image_type=image_type,
         pip_packages=pip_packages if pip_packages else None,
         apt_packages=apt_packages if apt_packages else None,
+        agent_image=request.agent_image,
     )
 
     builds[build_id] = BuildStatus(
@@ -1663,10 +2044,13 @@ async def check_supply_chain(request: SupplyChainCheckRequest):
 
 @app.get("/supply-chain/config")
 async def get_supply_chain_config():
-    """Return the current supply-chain configuration (for audit UI)."""
+    """Return the current supply-chain configuration (for audit UI).
+    
+    Now backed by the control-plane DB; the in-memory cache is returned.
+    """
     return {
         "loaded": bool(_supply_chain),
-        "path": str(SUPPLY_CHAIN_PATH),
+        "source": "database" if _supply_chain else "none",
         "image_types": {
             itype: {
                 "pip": len(cfg.get("pip", [])),
@@ -1684,7 +2068,7 @@ async def get_supply_chain_config():
 
 @app.post("/supply-chain/reload")
 async def reload_supply_chain():
-    """Hot-reload the supply-chain config from disk without restarting."""
+    """Hot-reload the supply-chain config from the control-plane DB API."""
     _load_supply_chain()
     return {
         "status": "reloaded",

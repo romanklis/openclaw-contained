@@ -1,0 +1,58 @@
+# --- Stage 1: Build docling-rag (RAG server) from source ---
+# No official Docker Hub image exists; the prebuilt `docling-rs` CLI binary is
+# built without the HTTP server. Build the `docling-rag` crate (chunking +
+# embeddings + vector search + REST API) with its default `sqlite` + `ollama`
+# features. Ubuntu 24.04 (glibc 2.39) is required: the transitive `ort`
+# (onnxruntime) build references glibc 2.38+ symbols that fail to link on
+# Debian bookworm (glibc 2.36).
+FROM ubuntu:24.04 AS builder
+
+# Native build dependencies (cmake/clang for native bindings, libssl for reqwest/sqlx TLS)
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    cmake \
+    clang \
+    libssl-dev \
+    pkg-config \
+    libsqlite3-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain (no official rust:trixie/ubuntu image)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /src
+RUN git clone --depth 1 --branch v1.14.2 https://github.com/docling-project/docling.rs.git . \
+    && cargo build --release --bin docling-rag -p docling-rag
+
+# --- Stage 2: Minimal runtime image ---
+# Must be >= glibc 2.39 (the binary links against Ubuntu 24.04's libc) →
+# Debian trixie (glibc 2.41).
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    libsqlite3-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /src/target/release/docling-rag /usr/local/bin/docling-rag
+
+# PDF/image conversion needs pdfium + the ONNX layout/OCR/tableformer models.
+# Fetch them into /app/.pdfium and /app/.models (found relative to CWD by
+# default). Skip the optional ASR/Whisper models (audio only) to keep it lean.
+COPY --from=builder /src/scripts/install/download_dependencies.sh /tmp/download_dependencies.sh
+RUN sh /tmp/download_dependencies.sh --no-asr && rm /tmp/download_dependencies.sh
+
+ENV PDFIUM_DYNAMIC_LIB_PATH=/app/.pdfium/lib
+
+# Data directory for SQLite & uploads
+RUN mkdir -p /app/data
+
+EXPOSE 8080
+
+ENTRYPOINT ["docling-rag", "serve"]

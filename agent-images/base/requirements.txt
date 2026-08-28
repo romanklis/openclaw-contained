@@ -8,6 +8,10 @@ requests==2.31.0
 # Data processing (minimal baseline)
 pydantic==2.6.0
 
+# PDF processing
+pypdf
+pymupdf
+
 # Logging and monitoring
 structlog==24.1.0
 

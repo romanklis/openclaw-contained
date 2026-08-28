@@ -11,8 +11,10 @@ export function StatusDot({ status }: { status: string }) {
     approved: 'bg-indigo-400',
     building: 'bg-blue-400',
     built: 'bg-cyan-400',
+    waiting_approval: 'bg-yellow-400',
+    building_image: 'bg-indigo-400',
   }
-  const isAnimated = status === 'running' || status === 'building'
+  const isAnimated = status === 'running' || status === 'building' || status === 'building_image'
   return (
     <span className="relative flex h-2.5 w-2.5">
       {isAnimated && (
@@ -34,6 +36,8 @@ export function StatusBadge({ status }: { status: string }) {
     approved: 'bg-indigo-500/15 text-indigo-400 border-indigo-500/20',
     building: 'bg-blue-500/15 text-blue-400 border-blue-500/20',
     built: 'bg-cyan-500/15 text-cyan-400 border-cyan-500/20',
+    waiting_approval: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/20',
+    building_image: 'bg-indigo-500/15 text-indigo-400 border-indigo-500/20',
   }
   return (
     <span className={`badge border ${styles[status] || 'bg-gray-500/15 text-gray-400 border-gray-500/20'}`}>

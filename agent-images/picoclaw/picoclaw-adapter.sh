@@ -32,11 +32,19 @@ FOLLOW_UP="${FOLLOW_UP:-}"
 AGENT_IMAGE="${AGENT_IMAGE:-picoclaw}"
 AGENT_DOCKERFILE="${AGENT_DOCKERFILE:-}"
 
+# Zep CE memory service
+ZEP_URL="${ZEP_URL:-}"
+ZEP_SESSION_ID="${ZEP_SESSION_ID:-}"
+
 RESULT_START="===OPENCLAW_RESULT_JSON_START==="
 RESULT_END="===OPENCLAW_RESULT_JSON_END==="
 
 WORKSPACE="/workspace"
 ALL_OUTPUT=""
+
+# Intra-iteration loop guard
+RECENT_HASHES=""
+LOOP_GUARD_THRESHOLD=3
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -64,6 +72,110 @@ truncate_str() {
     else
         echo "$str"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Zep CE memory helpers — inter-iteration & intra-iteration memory
+# ---------------------------------------------------------------------------
+
+zep_ok() {
+    [ -n "$ZEP_URL" ] && [ -n "$ZEP_SESSION_ID" ]
+}
+
+zep_ensure_session() {
+    zep_ok || return 1
+    local payload
+    payload=$(jq -n \
+        --arg sid "$ZEP_SESSION_ID" \
+        --arg tid "$TASK_ID" \
+        --arg iter "$ITERATION" \
+        '{session_id: $sid, metadata: {task_id: $tid, iteration: $iter}}')
+    local resp
+    resp=$(curl -sf --max-time 10 \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "${ZEP_URL}/api/v1/sessions" 2>/dev/null) && {
+        log "🧠 Zep session ensured: ${ZEP_SESSION_ID}"
+        return 0
+    }
+    log "⚠️ Zep session create failed"
+    return 1
+}
+
+zep_fetch_memory() {
+    # Prints memory context string to stdout. Returns 1 if no memory.
+    zep_ok || return 1
+    local resp
+    resp=$(curl -sf --max-time 15 \
+        "${ZEP_URL}/api/v1/sessions/${ZEP_SESSION_ID}/memory" 2>/dev/null) || return 1
+
+    local msg_count summary_content
+    msg_count=$(echo "$resp" | jq '.messages | length' 2>/dev/null)
+    summary_content=$(echo "$resp" | jq -r '.summary.content // empty' 2>/dev/null)
+
+    if [ "${msg_count:-0}" -eq 0 ] && [ -z "$summary_content" ]; then
+        return 1
+    fi
+
+    local parts=""
+    if [ -n "$summary_content" ]; then
+        parts="[Memory summary from previous iterations]
+${summary_content}
+"
+    fi
+
+    # Extract last 20 messages
+    local i=0 max_msgs="${msg_count:-0}"
+    [ "$max_msgs" -gt 20 ] && i=$((max_msgs - 20))
+    while [ "$i" -lt "$max_msgs" ]; do
+        local role content
+        role=$(echo "$resp" | jq -r ".messages[$i].role // \"?\"")
+        content=$(echo "$resp" | jq -r ".messages[$i].content // \"\"" | head -c 500)
+        parts="${parts}[${role}] ${content}
+"
+        i=$((i + 1))
+    done
+
+    log "🧠 Zep: fetched ${msg_count} memory message(s)"
+    echo "$parts"
+}
+
+zep_save_messages() {
+    # Usage: zep_save_messages "role" "content"
+    zep_ok || return 1
+    local role="$1" content="$2"
+    local payload
+    payload=$(jq -n --arg role "$role" --arg content "$content" \
+        '{messages: [{role: $role, content: $content}]}')
+    curl -sf --max-time 10 \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "${ZEP_URL}/api/v1/sessions/${ZEP_SESSION_ID}/memory" >/dev/null 2>&1
+}
+
+action_hash() {
+    # Usage: action_hash "tool_name" "tool_args_json"
+    printf '%s|%s' "$1" "$2" | md5sum | cut -d' ' -f1
+}
+
+check_loop_guard() {
+    # Usage: check_loop_guard "hash"
+    # Returns 0 (true = loop detected) if last LOOP_GUARD_THRESHOLD hashes are identical
+    local new_hash="$1"
+    RECENT_HASHES="${RECENT_HASHES} ${new_hash}"
+    # Keep only last N hashes
+    local count
+    count=$(echo "$RECENT_HASHES" | wc -w)
+    if [ "$count" -ge "$LOOP_GUARD_THRESHOLD" ]; then
+        local tail_hashes
+        tail_hashes=$(echo "$RECENT_HASHES" | tr ' ' '\n' | tail -n "$LOOP_GUARD_THRESHOLD" | sort -u | wc -l)
+        if [ "$tail_hashes" -eq 1 ]; then
+            return 0  # loop detected
+        fi
+    fi
+    return 1  # no loop
 }
 
 # ---------------------------------------------------------------------------
@@ -187,8 +299,14 @@ ${dockerfile_section}
 **ONLY** if a command is not found:
 
 \`\`\`
-CAPABILITY_REQUEST:tool_install:<tool_name>:<detailed reason why this tool is needed>
+CAPABILITY_REQUEST:tool_install:<type>/<tool_name>:<detailed reason why this tool is needed>
 \`\`\`
+
+Where \`<type>\` is one of:
+- \`apt\` — System packages and CLI tools (e.g. apt/ffmpeg, apt/jq)
+- \`pip\` — Python packages (if Python is available)
+- \`npm\` — Node.js packages (if Node.js is available)
+- \`auto\` — Use when unsure (the system will auto-detect)
 
 After this line, STOP. The system will rebuild your container with the tool
 and re-run your task automatically.
@@ -246,10 +364,13 @@ execute_tool() {
         read)
             local path
             path=$(echo "$args_json" | jq -r '.path')
-            if [ ! -f "$path" ]; then
-                result="ERROR: File not found: ${path}"
-            else
+            if [ -d "$path" ]; then
+                # Directory: list contents with sizes
+                result=$(ls -la "$path" 2>/dev/null | head -100)
+            elif [ -f "$path" ]; then
                 result=$(cat "$path" 2>/dev/null | head -c 50000)
+            else
+                result="ERROR: File not found: ${path}"
             fi
             ;;
         exec)
@@ -367,7 +488,7 @@ You have these tools: write, read, exec, edit.
 IMPORTANT RULES:
 1. Always write code to /workspace
 2. Always exec your code to verify it works
-3. If a tool is missing, emit: CAPABILITY_REQUEST:tool_install:<tool>:<reason>
+3. If a tool is missing, emit: CAPABILITY_REQUEST:tool_install:<type>/<tool>:<reason> (type is pip, npm, apt, or auto)
 4. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>
 5. Do NOT try apk add or pip install — they will fail
 6. This is a shell-only environment (no Python) — write shell scripts or use available tools"
@@ -553,7 +674,9 @@ write_result() {
 parse_capability_request() {
     local output="$1"
 
-    # Check for CAPABILITY_REQUEST markers
+    # Check for CAPABILITY_REQUEST markers — handle both new typed format
+    # (CAPABILITY_REQUEST:tool_install:pip/pandas:reason) and legacy format
+    # (CAPABILITY_REQUEST:tool_install:pandas:reason)
     local match
     match=$(echo "$output" | grep -oP 'CAPABILITY_REQUEST:\w+:[^:\n]+:[^\n]+' | head -1)
 
@@ -562,6 +685,14 @@ parse_capability_request() {
         cap_type=$(echo "$match" | cut -d: -f2)
         packages=$(echo "$match" | cut -d: -f3)
         reason=$(echo "$match" | cut -d: -f4-)
+
+        # Strip type prefix if present (e.g. "pip/pandas" → "pandas",
+        # "apt/ffmpeg" → "ffmpeg").  The prefix is informational — the
+        # build system reads per-package types from details.packages.
+        if echo "$packages" | grep -qE '^(pip|npm|apt|apk|auto)/'; then
+            packages=$(echo "$packages" | sed 's|^[^/]*/||')
+        fi
+
         echo "${cap_type}|${packages}|${reason}"
         return 0
     fi
@@ -587,9 +718,9 @@ parse_deployment_request() {
 
     if [ -n "$match" ]; then
         local name port entrypoint
-        name=$(echo "$match" | cut -d: -f2)
+        name=$(echo "$match" | cut -d: -f2 | sed 's/^\*\+//;s/\*\+$//')
         port=$(echo "$match" | cut -d: -f3)
-        entrypoint=$(echo "$match" | cut -d: -f4-)
+        entrypoint=$(echo "$match" | cut -d: -f4- | sed 's/^\*\+//;s/\*\+$//')
         echo "${name}|${port}|${entrypoint}"
         return 0
     fi

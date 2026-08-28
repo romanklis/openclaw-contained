@@ -2,7 +2,7 @@
 Pydantic schemas for API
 """
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Literal
 from datetime import datetime
 from enum import Enum
 
@@ -12,6 +12,8 @@ class TaskStatus(str, Enum):
     CREATED = "created"
     RUNNING = "running"
     PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
+    BUILDING_IMAGE = "building_image"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -27,6 +29,11 @@ class TaskCreate(BaseModel):
     model: Optional[str] = None  # alias for llm_model (from curl/CLI)
     base_image: Optional[str] = None  # agent base image key (e.g. "zeroclaw")
     agent_profile: Optional[str] = None  # agent profile ID for display
+    # ── DAG context (optional) ──
+    workspace_id: Optional[str] = None   # share an existing workspace
+    dag_id: Optional[str] = None         # link to parent DAG
+    node_id: Optional[str] = None        # DAG node ID
+    auto_start: bool = True              # set False to create without starting
 
     @property
     def effective_description(self) -> Optional[str]:
@@ -53,6 +60,8 @@ class TaskResponse(BaseModel):
     workspace_id: str
     workflow_id: Optional[str]
     agent_profile: Optional[str] = None
+    dag_id: Optional[str] = None
+    node_id: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime]
     
@@ -168,7 +177,9 @@ class TaskOutputCreate(BaseModel):
     model_used: Optional[str] = None
     image_used: Optional[str] = None
     duration_ms: Optional[int] = None
-    deliverables: Optional[Dict[str, str]] = None
+    deliverables: Optional[Dict[str, Any]] = None
+    compact_summary: Optional[str] = None
+    external_assessment: Optional[Dict[str, Any]] = None
     raw_result: Optional[Dict[str, Any]] = None
 
 
@@ -185,7 +196,9 @@ class TaskOutputResponse(BaseModel):
     model_used: Optional[str]
     image_used: Optional[str]
     duration_ms: Optional[int]
-    deliverables: Optional[Dict[str, str]]
+    deliverables: Optional[Dict[str, Any]]
+    compact_summary: Optional[str]
+    external_assessment: Optional[Dict[str, Any]]
     raw_result: Optional[Dict[str, Any]]
     created_at: datetime
 
@@ -242,6 +255,7 @@ class DeploymentRequestCreate(BaseModel):
     entrypoint: str  # e.g. "python app.py"
     port: int = 5000
     files: Optional[Dict[str, str]] = None  # workspace files snapshot
+    agent_image: Optional[str] = None  # agent's committed image to use as deploy base
 
 
 class DeploymentResponse(BaseModel):
@@ -249,6 +263,7 @@ class DeploymentResponse(BaseModel):
     name: str
     task_id: str
     image_tag: Optional[str]
+    agent_image: Optional[str]
     entrypoint: Optional[str]
     port: Optional[int]
     status: DeploymentStatus
@@ -329,3 +344,518 @@ class SBOMDiffResponse(BaseModel):
     from_version: int
     to_version: int
     changes: List[SBOMDiffEntry]
+
+
+# =========================================================================
+# DAG Orchestration schemas — Task-Centric Skill-Based Execution
+# =========================================================================
+
+class DAGStatus(str, Enum):
+    PLANNING = "planning"
+    READY = "ready"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class NodeStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class ExecutionEnvironment(str, Enum):
+    DIND = "dind"
+    DEDICATED_VM = "dedicated_vm"
+
+
+# ── Skills ──────────────────────────────────────────────
+
+class SkillStepCreate(BaseModel):
+    """A single step within a skill."""
+    step_id: str
+    name: str
+    description: Optional[str] = None
+    base_image: Optional[str] = None  # override for this step
+    tool_hints: Optional[List[str]] = None  # suggested tools
+
+
+class SkillCreate(BaseModel):
+    """Create a reusable skill template."""
+    name: str
+    description: Optional[str] = None
+    instructions: Optional[str] = None  # full SKILL.md content
+    input_schema: Dict[str, str] = {}  # {key: type_description}
+    output_artifacts: List[str] = []  # expected output file paths
+    steps: List[SkillStepCreate] = []
+    tags: List[str] = []
+    source_url: Optional[str] = None  # clawhub.ai source URL
+
+
+class SkillUpdate(BaseModel):
+    """Update a skill (bumps version)."""
+    description: Optional[str] = None
+    instructions: Optional[str] = None
+    input_schema: Optional[Dict[str, str]] = None
+    output_artifacts: Optional[List[str]] = None
+    steps: Optional[List[SkillStepCreate]] = None
+    tags: Optional[List[str]] = None
+    source_url: Optional[str] = None
+
+
+class SkillResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    instructions: Optional[str] = None
+    version: int
+    input_schema: Dict[str, Any]
+    output_artifacts: List[str]
+    steps: List[Dict[str, Any]]
+    tags: List[str]
+    source_url: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+# ── DAG Nodes ───────────────────────────────────────────
+
+class DAGNodeCreate(BaseModel):
+    """A node in the Master DAG."""
+    node_id: str
+    skill_id: Optional[str] = None
+    skill_step_index: Optional[int] = None
+    description: Optional[str] = None
+    depends_on: List[str] = []
+    config: Dict[str, Any] = {}  # base_image, llm_model, env_id, timeout_minutes, deploy_authorized
+    input_mapping: Dict[str, Any] = {}  # supports dependency refs and literal constants
+
+
+class DAGNodePatch(BaseModel):
+    """Editable fields for a DAG node plus runtime fields from worker updates."""
+    # Runtime fields (used by worker)
+    status: Optional[NodeStatus] = None
+    output_data: Optional[Dict[str, Any]] = None
+    task_id: Optional[str] = None
+    container_id: Optional[str] = None
+
+    # User-editable fields (pre-run)
+    skill_id: Optional[str] = None
+    skill_step_index: Optional[int] = None
+    selected_skill_v2_id: Optional[str] = None
+    skill_selection_reason: Optional[str] = None
+    description: Optional[str] = None
+    depends_on: Optional[List[str]] = None
+    config: Optional[Dict[str, Any]] = None
+    input_mapping: Optional[Dict[str, Any]] = None
+
+
+class DAGGraphPatch(BaseModel):
+    """Atomic bulk rewire of node dependencies across a DAG.
+
+    Maps node_id -> new depends_on list. Only the listed nodes are touched;
+    nodes omitted keep their current dependencies. Applied and validated in a
+    single transaction.
+    """
+    node_dependencies: Dict[str, List[str]] = {}
+
+
+class DAGNodeResponse(BaseModel):
+    id: int
+    dag_id: str
+    node_id: str
+    skill_id: Optional[str]
+    skill_step_index: Optional[int]
+    description: Optional[str]
+    status: NodeStatus
+    depends_on: List[str]
+    config: Dict[str, Any]
+    input_mapping: Dict[str, Any]
+    output_data: Optional[Dict[str, Any]]
+    task_id: Optional[str]
+    container_id: Optional[str]
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    selected_skill_v2_id: Optional[str] = None
+    skill_selection_reason: Optional[str] = None
+    deliverables_keys: Optional[List[str]] = None  # quick lookup for node deliverables
+
+    class Config:
+        from_attributes = True
+
+
+class DAGEdge(BaseModel):
+    """A conditional edge in the DAG (e.g. rework loops)."""
+    from_node: str  # source node_id
+    to_node: str  # target node_id
+    condition: str  # e.g. "review-4.verdict == 'FAIL'"
+    edge_type: str = "rework"  # rework, skip, etc.
+
+
+# ── Master DAG ──────────────────────────────────────────
+
+class DAGCreate(BaseModel):
+    """Create a new DAG from an objective (invokes the Planner)."""
+    objective: str
+    llm_model: Optional[str] = None
+    base_image: Optional[str] = None
+    auto_start: bool = False
+    skill_ids: Optional[List[str]] = None  # selected skills from registry
+
+
+class DAGRevise(BaseModel):
+    """Request a revision on a completed/deployed DAG — plans a new DAG."""
+    comments: str
+    llm_model: Optional[str] = None
+
+
+class DAGRefine(BaseModel):
+    """Refine an existing pre-run DAG in-place with additional instructions."""
+    instructions: str = Field(..., min_length=1)
+    llm_model: Optional[str] = None
+
+
+class DAGNodeEnhanceRequest(BaseModel):
+    """Enhance one specific node with optional extra guidance."""
+    mode: Literal["rewrite", "split"] = "rewrite"
+    guidance: Optional[str] = None
+    llm_model: Optional[str] = None
+    split_count: int = Field(default=2, ge=2, le=4)
+
+
+class DAGManualCreate(BaseModel):
+    """Create a DAG with an explicit node graph (skip planner)."""
+    objective: str
+    nodes: List[DAGNodeCreate]
+    edges: List[DAGEdge] = []
+    default_image: str = "openclaw"
+    default_llm: str = "gemma3:4b"
+
+
+class TemplateParam(BaseModel):
+    """An input parameter of a locked DAG template (the function signature)."""
+    key: str
+    label: str
+    type: str = "string"  # string | number | boolean | list
+    default: Optional[str] = None
+    description: Optional[str] = None
+
+
+class DAGLockRequest(BaseModel):
+    """Lock a DAG as a template with an optional input parameter schema."""
+    parameters: List[TemplateParam] = []
+
+
+class DAGInstantiateRequest(BaseModel):
+    """Instantiate a template into a new DAG run (follow-the-guidance)."""
+    objective: Optional[str] = None
+    parameters: Dict[str, Any] = {}
+    auto_start: bool = False
+
+
+class TemplateSkillResponse(BaseModel):
+    id: str
+    dag_id: str
+    node_id: str
+    source_skill_id: Optional[str]
+    name: str
+    description: str = ""
+    instructions: str = ""
+    params: List[str] = []
+    status: str = "draft"
+    reviewer_score: Optional[int] = None
+    review_notes: str = ""
+    tags: List[str] = []
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TemplateSkillUpdate(BaseModel):
+    status: Optional[Literal["draft", "active", "archived"]] = None
+    reviewer_score: Optional[int] = None
+    review_notes: Optional[str] = None
+    edited_instructions: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class DAGResponse(BaseModel):
+    id: str
+    objective: str
+    status: DAGStatus
+    workspace_id: str
+    llm_model: Optional[str]
+    workflow_id: Optional[str]
+    created_by: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    locked: bool = False
+    template_params: Optional[List[Dict[str, Any]]] = None
+    template_source_dag_id: Optional[str] = None
+    archived: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class DAGDetail(DAGResponse):
+    """Full DAG detail including nodes and edges."""
+    dag_json: Dict[str, Any]
+    nodes: List[DAGNodeResponse] = []
+
+
+class DAGNodeStateSnapshotCreate(BaseModel):
+    task_id: Optional[str] = None
+    phase: str = "runtime"
+    status: str = "pending"
+    wave: Optional[int] = None
+    attempt: int = 1
+    input_context: Dict[str, Any] = {}
+    output_context: Dict[str, Any] = {}
+    completion_state: Dict[str, Any] = {}
+    acquisition_log: List[Dict[str, Any]] = []
+    acceptance_result: Dict[str, Any] = {}
+    pending_items: List[Any] = []
+    acceptance_state: Dict[str, Any] = {}  # structured acceptance data
+
+
+class DAGNodeStateSnapshotResponse(BaseModel):
+    id: int
+    dag_id: str
+    node_id: str
+    task_id: Optional[str]
+    phase: str
+    status: str
+    wave: Optional[int]
+    attempt: int
+    input_context: Dict[str, Any]
+    output_context: Dict[str, Any]
+    completion_state: Dict[str, Any]
+    acquisition_log: List[Dict[str, Any]]
+    acceptance_result: Dict[str, Any]
+    pending_items: List[Any]
+    acceptance_state: Dict[str, Any]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DAGNodeAuditEventCreate(BaseModel):
+    task_id: Optional[str] = None
+    event_type: str
+    severity: str = "info"
+    message: str
+    event_data: Dict[str, Any] = {}
+
+
+class DAGNodeAuditEventResponse(BaseModel):
+    id: int
+    dag_id: str
+    node_id: str
+    task_id: Optional[str]
+    event_type: str
+    severity: str
+    message: str
+    event_data: Dict[str, Any]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DAGNodeOutputResponse(BaseModel):
+    """Structured output envelope for DAG node execution."""
+    id: int
+    dag_id: str
+    node_id: str
+    task_id: Optional[str]
+    status: str  # "completed" | "failed" | "skipped"
+    completed_at: Optional[datetime]
+
+    # Acceptance verification
+    objective: Optional[str]
+    success_criteria: List[str]
+    criteria_met: Dict[str, bool]
+    acceptance_verdict: Optional[str]  # "pass" | "fail" | "partial"
+    acceptance_score: int
+
+    # Evidence of skill usage
+    skill_id: Optional[str]
+    skill_followed: Optional[bool]
+    skill_instruction_sections_used: List[str]
+
+    # Deterministic deliverables
+    deliverables_count: int
+    deliverables_keys: List[str]
+
+    # Links to provenance
+    acquisition_log: List[Dict[str, Any]]
+    llm_interaction_count: int
+
+    # Primary content
+    output_text: Optional[str]
+    error_text: Optional[str]
+
+    # Workspace provenance
+    workspace_step_path: Optional[str]
+
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class NodeAcceptanceResponse(BaseModel):
+    """Acceptance check result for a DAG node."""
+    node_id: str
+    status: str
+    acceptance_verdict: str  # "pass" | "fail" | "partial"
+    acceptance_score: int
+    success_criteria: List[str]
+    criteria_met: Dict[str, bool]
+    skill_id: Optional[str]
+    skill_followed: Optional[bool]
+    deliverables_keys: List[str]
+    workspace_step_path: Optional[str]
+
+
+class WorkspaceManifestResponse(BaseModel):
+    """Workspace file-to-node mapping."""
+    workspace_id: str
+    step_manifest: Dict[str, List[str]]  # {node_id: [deliverable_filepaths]}
+    total_files: int
+    steps_with_deliverables: List[str]
+
+
+# ── Node Environments ──────────────────────────────────
+
+class NodeEnvironmentCreate(BaseModel):
+    """Create a reusable execution environment."""
+    name: str
+    description: Optional[str] = None
+    base_image: str = "openclaw"
+    capabilities: List[str] = []  # initial packages/tools
+
+
+class NodeEnvironmentFork(BaseModel):
+    """Fork an existing environment."""
+    name: str
+    description: Optional[str] = None
+
+
+class NodeEnvironmentResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    capability_fingerprint: Optional[str]
+    capabilities: List[str]
+    base_image: str
+    current_image_tag: Optional[str]
+    version: int
+    parent_env_id: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+# =========================================================================
+# Supply Chain schemas — Package allowlist management
+# =========================================================================
+
+class SupplyChainPackageCreate(BaseModel):
+    """Add a package to the supply-chain allowlist."""
+    image_type: str
+    manager: str  # pip, apt, apk, npm
+    package_name: str
+    notes: Optional[str] = None
+    is_exception: bool = False
+
+
+class SupplyChainPackageResponse(BaseModel):
+    id: int
+    image_type: str
+    manager: str
+    package_name: str
+    notes: Optional[str]
+    is_exception: str
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class SupplyChainBulkAdd(BaseModel):
+    """Add multiple packages at once."""
+    image_type: str
+    manager: str
+    packages: List[str]
+    notes: Optional[str] = None
+    is_exception: bool = False
+
+
+class SupplyChainAliasCreate(BaseModel):
+    """Add a cross-distro alias mapping."""
+    direction: str  # apt_to_apk or apk_to_apt
+    from_name: str
+    to_name: str
+
+
+class SupplyChainAliasResponse(BaseModel):
+    id: int
+    direction: str
+    from_name: str
+    to_name: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SupplyChainImageTypeCreate(BaseModel):
+    """Create/update an image type."""
+    image_type: str
+    notes: Optional[str] = None
+
+
+class SupplyChainImageTypeResponse(BaseModel):
+    id: int
+    image_type: str
+    notes: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class SupplyChainImageTypeSummary(BaseModel):
+    """Summary of an image type with package counts."""
+    image_type: str
+    notes: Optional[str]
+    pip: int = 0
+    apt: int = 0
+    apk: int = 0
+    npm: int = 0
+    exceptions: int = 0
+
+
+class SupplyChainFullConfig(BaseModel):
+    """Full supply-chain config (mirrors the YAML structure)."""
+    image_types: List[SupplyChainImageTypeSummary]
+    aliases: Dict[str, Dict[str, str]]
+    raw: Dict[str, Any]

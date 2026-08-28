@@ -42,10 +42,12 @@ USER agent
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     OPENCLAW_WORKSPACE=/workspace \
     OPENCLAW_OUTPUT=/workspace/output \
     OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001 \
-    OPENCLAW_IMAGE_TYPE=nanobot
+    OPENCLAW_IMAGE_TYPE=nanobot \
+    OPENCLAW_RUNTIME_DESCRIPTION="- Python 3.11 (Alpine, standard library)\n- \`httpx\` (HTTP client)\n- \`pydantic\` (data validation)\n- \`structlog\` (logging)\n- \`git\`, \`curl\`, \`jq\`, \`bash\`"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \

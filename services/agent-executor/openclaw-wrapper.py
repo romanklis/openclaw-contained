@@ -21,13 +21,12 @@ from typing import Dict, Any, Optional, Tuple, List
 
 import httpx
 
-# ---------------------------------------------------------------------------
-# Configuration from environment
-# ---------------------------------------------------------------------------
+# Environment variables for DAG context
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 TASK_ID = os.getenv("TASK_ID")
 ITERATION = os.getenv("ITERATION", "0")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:4b")
+NODE_ID = os.getenv("NODE_ID", "")  # For step segregation in workspace
 # The LLM router base URL — OpenClaw will call this as if it were OpenAI
 LLM_ROUTER_URL = os.getenv("LLM_ROUTER_URL", f"{CONTROL_PLANE_URL}/api/llm")
 
@@ -183,6 +182,44 @@ def request_capability(capability_type: str, packages: List[str], justification:
 # OpenClaw configuration
 # ---------------------------------------------------------------------------
 
+
+def _resolve_writable_openclaw_dir():
+    """Return a writable directory for OpenClaw config/state.
+
+    Prefers $HOME/.openclaw when $HOME is writable (normal case, e.g. browser
+    images that set ENV HOME=/home/agent). If $HOME is read-only (e.g. /root on
+    the base 'openclaw' image), falls back to a writable temp directory so the
+    agent can still start. Derived images keep using their normal writable HOME.
+    """
+    candidates = []
+    home_dir = os.path.expanduser("~")
+    if home_dir:
+        candidates.append(os.path.join(home_dir, ".openclaw"))
+    # Writable temp locations, in priority order
+    candidates += [
+        os.path.join(os.environ.get("TMPDIR", "/tmp"), "openclaw"),
+        "/tmp/agent/.openclaw",
+        "/tmp/.openclaw",
+    ]
+
+    for candidate in candidates:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            # Probe writability
+            probe = os.path.join(candidate, ".write_test")
+            with open(probe, "w") as fh:
+                fh.write("ok")
+            os.remove(probe)
+            return candidate
+        except Exception:
+            continue
+
+    # Last resort: a per-uid dir under /tmp
+    fallback = "/tmp/openclaw-{}".format(os.getuid() if hasattr(os, "getuid") else "agent")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
 def setup_openclaw_config():
     """
     Configure OpenClaw to use the control-plane LLM router.
@@ -194,7 +231,11 @@ def setup_openclaw_config():
     talking to the actual model, but the router dispatches to
     Ollama / Gemini / Anthropic / OpenAI based on model name.
     """
-    openclaw_dir = os.path.expanduser("~/.openclaw")
+    # Resolve a writable OpenClaw home directory.
+    # Prefer $HOME/.openclaw when writable; fall back to a writable temp dir for
+    # base images where $HOME is read-only. Derived images (browser_v4, etc.)
+    # keep their normal writable $HOME.
+    openclaw_dir = _resolve_writable_openclaw_dir()
     agent_dir = os.path.join(openclaw_dir, "agents", "main", "agent")
     os.makedirs(openclaw_dir, exist_ok=True)
     os.makedirs(agent_dir, exist_ok=True)
@@ -290,11 +331,17 @@ def setup_workspace_context():
 
 You are running inside a managed container. Your workspace is `/workspace`.
 
+## DELIVERABLES (important)
+
+- **Final deliverables** (reports, parsed data files, code artifacts you intend as outputs) must be written to your **node's deliverables directory** — the task prompt tells you the exact path (e.g. `/workspace/<node_id>/`). Only files there are collected as deliverables.
+- **Intermediate products** (raw fetched HTML pages, caches, scratch/temporary files) must NOT go into the deliverables directory. Put them in `/tmp` or `/workspace/.cache/` — they are NOT collected.
+- When the task requires fetching data from the web, save the RAW fetched HTML to `/tmp` or `/workspace/.cache/` and extract/parse it into a structured data file (JSON/CSV) in the deliverables directory. Never treat a raw fetched page itself as a deliverable unless the task explicitly asks for an HTML file.
+
 ## YOUR WORKFLOW (follow this order)
 
-1. **Write** the code/files the task requires into `/workspace`.
+1. **Write** the code/files the task requires into your node's deliverables directory (see DELIVERABLES).
 2. **Execute** the code using the `exec` tool to verify it works.
-   - Example: `exec python3 /workspace/stats.py`
+   - Example: `exec python3 /workspace/<node_id>/stats.py`
 3. **If execution fails** with `ModuleNotFoundError`, ONLY THEN request the package (see below).
 4. **If execution succeeds**, you are DONE. Do not output anything else.
 
@@ -368,6 +415,7 @@ with the server starting). Just write the code and request deployment.
 - Model: {LLM_MODEL}
 - Image: {agent_image}
 - Workspace: `/workspace` (files here are collected as deliverables)
+- Deliverables: write final outputs to your node's deliverables directory (see DELIVERABLES above); intermediates to `/tmp` or `/workspace/.cache/`
 """
 
     agents_path = os.path.join(workspace, "AGENTS.md")
@@ -386,7 +434,8 @@ efficiently and correctly.
 - If you need a package that's not installed, request it (see AGENTS.md).
   Do NOT try workarounds — they will fail.
 - Test your code if possible before finishing.
-- Write all files to `/workspace`.
+- Write final deliverables to your node's deliverables directory (see AGENTS.md).
+  Intermediate/raw files (fetched HTML, caches, scratch) go to `/tmp` or `/workspace/.cache/`.
 """
     with open(os.path.join(workspace, "SOUL.md"), "w") as f:
         f.write(soul_md)
@@ -676,9 +725,10 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]
 
     # 3. pip install failures — extract package name from the command
     pip_patterns = [
-        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:error|denied|externally.managed|not allowed)",
-        r"(?:error|denied|permission).*pip3?\s+install\s+([a-zA-Z0-9_-]+)",
+        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:error|denied|externally.managed|not allowed|read.only)",
+        r"(?:error|denied|permission|read.only).*pip3?\s+install\s+([a-zA-Z0-9_-]+)",
         r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*failed",
+        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:OSError|errno\s*30)",
     ]
     for pattern in pip_patterns:
         match = re.search(pattern, normalised, re.IGNORECASE)
@@ -770,45 +820,90 @@ def _is_binary_file(fpath: str) -> bool:
         return True
 
 
-def collect_workspace_files() -> Dict[str, str]:
+def _make_file_ref(fpath: str, size: int) -> dict:
+    """Return a metadata reference for a deliverable too large to embed.
+
+    Keeps DB/Temporal payloads small while keeping the step's deliverables
+    non-empty, and gives downstream steps a real path into the shared
+    workspace to read the file from.
+    """
+    import hashlib
+    digest = hashlib.sha256()
+    try:
+        with open(fpath, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except Exception:
+        pass
+    return {"ref": "file", "path": fpath, "size": size, "sha256": digest.hexdigest()}
+
+
+def collect_workspace_files(node_id: str | None = None, segregate_steps: bool = False) -> Dict[str, Any]:
     """Scan /workspace for files created/modified by the agent.
 
-    Returns a dict of {relative_path: content} for text files,
-    and {relative_path: "base64:<encoded>"} for binary files.
-    Skips hidden dirs, node_modules, and common non-deliverable files.
+    Returns:
+        If segregate_steps is False: {relative_path: content} (backward compatible)
+        If segregate_steps is True: {
+            "deliverables": {relpath: content},
+            "step_path": "steps/{node_id}/deliverables/" if node_id else None,
+            "deliverables_keys": [relpath, ...]
+        }
+
+    Files in .steps/ or steps/ directories are NOT included in deliverables
+    (they are workspace housekeeping, not step outputs).
     """
     import base64
 
     workspace = "/workspace"
-    SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm"}
+    SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm", "steps"}
     SKIP_FILES = {"result.json", "AGENTS.md", "SOUL.md", "TOOLS.md",
                   "IDENTITY.md", "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md",
-                  "package-lock.json"}
-    MAX_FILE_SIZE = 500_000    # 500 KB per file
-    MAX_TOTAL = 2_000_000     # 2 MB total (base64 inflates ~33%)
+                  "package-lock.json", "step_manifest.json"}
+    MAX_FILE_SIZE = 100_000_000   # 100 MB per file (allows large PDFs)
+    MAX_TOTAL = 200_000_000      # 200 MB total
     collected: Dict[str, str] = {}
     total_size = 0
 
     if not os.path.isdir(workspace):
+        if segregate_steps:
+            return {
+                "deliverables": {},
+                "step_path": f"steps/{node_id}/deliverables/" if node_id else None,
+                "deliverables_keys": [],
+            }
         return collected
 
-    for root, dirs, files in os.walk(workspace):
-        # Prune skip dirs
+    # DAG nodes: scope collection to the node's own output directory so parallel
+    # steps sharing /workspace never mix their deliverables.
+    scan_root = os.path.join(workspace, node_id) if node_id else workspace
+    if not os.path.isdir(scan_root):
+        if segregate_steps:
+            return {
+                "deliverables": {},
+                "step_path": f"steps/{node_id}/deliverables/" if node_id else None,
+                "deliverables_keys": [],
+            }
+        return collected
+
+    for root, dirs, files in os.walk(scan_root):
+        # Prune skip dirs AND segregated step directories (they're housekeeping)
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         for fname in sorted(files):  # sorted for deterministic order
             if fname in SKIP_FILES:
                 continue
             fpath = os.path.join(root, fname)
-            relpath = os.path.relpath(fpath, workspace)
+            relpath = os.path.relpath(fpath, scan_root)
             try:
                 size = os.path.getsize(fpath)
-                if size == 0 or size > MAX_FILE_SIZE:
-                    print(f"  ⏭️  Skipping {relpath}: {size} bytes (max {MAX_FILE_SIZE})")
+                if size == 0:
                     continue
                 # Estimate base64 size for binary files
                 estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
-                if total_size + estimated_size > MAX_TOTAL:
-                    print(f"  ⏭️  Skipping {relpath}: would exceed total limit")
+                if size > MAX_FILE_SIZE or total_size + estimated_size > MAX_TOTAL:
+                    # Too large to embed — record a file reference so the step
+                    # still delivers (the file exists in the shared workspace).
+                    collected[relpath] = _make_file_ref(fpath, size)
+                    total_size += 160
                     continue
                 if _is_binary_file(fpath):
                     with open(fpath, "rb") as f:
@@ -822,6 +917,47 @@ def collect_workspace_files() -> Dict[str, str]:
                 collected[relpath] = content
             except Exception as e:
                 print(f"  ⚠️  Could not read {relpath}: {e}")
+
+    # Fallback: node dir empty but the agent wrote to the workspace root.
+    # Only root-level files are collected (no descent into .cache/, steps/, or
+    # sibling node dirs) so parallel steps' subdirs are not pulled in.
+    if node_id and not collected and os.path.isdir(workspace):
+        try:
+            for fname in sorted(os.listdir(workspace)):
+                if fname.startswith(".") or fname in SKIP_FILES:
+                    continue
+                fpath = os.path.join(workspace, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                relpath = fname
+                size = os.path.getsize(fpath)
+                if size == 0:
+                    continue
+                estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
+                if size > MAX_FILE_SIZE or total_size + estimated_size > MAX_TOTAL:
+                    collected[relpath] = _make_file_ref(fpath, size)
+                    total_size += 160
+                    continue
+                if _is_binary_file(fpath):
+                    with open(fpath, "rb") as f:
+                        raw = f.read()
+                    content = "base64:" + base64.b64encode(raw).decode("ascii")
+                    total_size += len(content)
+                else:
+                    with open(fpath, "r", errors="replace") as f:
+                        content = f.read()
+                    total_size += size
+                collected[relpath] = content
+        except Exception as e:
+            print(f"  ⚠️  Fallback scan failed: {e}")
+
+    if segregate_steps and node_id:
+        step_path = f"steps/{node_id}/deliverables/"
+        return {
+            "deliverables": collected,
+            "step_path": step_path,
+            "deliverables_keys": sorted(collected.keys()),
+        }
     return collected
 
 
@@ -839,6 +975,38 @@ def write_result(result: Dict[str, Any]):
     print(f"\n{RESULT_START}")
     print(result_json)
     print(RESULT_END)
+
+
+def _write_step_deliverables(deliverables: Dict[str, str], node_id: str | None = None):
+    """Write deliverables to step-specific directory in workspace.
+
+    Creates /workspace/steps/{node_id}/deliverables/ and writes each file there.
+    Also writes a step_manifest entry for workspace introspection.
+    """
+    if not node_id:
+        return
+
+    steps_dir = "/workspace/steps"
+    step_dir = os.path.join(steps_dir, node_id, "deliverables")
+    os.makedirs(step_dir, exist_ok=True)
+
+    for fname, content in deliverables.items():
+        # Strip leading path separators (fname may include relative path)
+        clean_name = fname.lstrip("/")
+        fpath = os.path.join(step_dir, clean_name)
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        try:
+            if isinstance(content, str) and content.startswith("base64:"):
+                import base64
+                raw = base64.b64decode(content[7:])
+                with open(fpath, "wb") as f:
+                    f.write(raw)
+            else:
+                with open(fpath, "w") as f:
+                    f.write(content)
+            print(f"  📦 Deliverable: {clean_name} → {fpath}")
+        except Exception as e:
+            print(f"  ⚠️ Could not write {clean_name}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -975,7 +1143,8 @@ def main():
         result["deployment_requested"] = True
         result["deployment"] = deploy
         # Collect workspace files for the deployment image
-        deliverables = collect_workspace_files()
+        seg_result = collect_workspace_files(node_id=NODE_ID if segregate else None, segregate_steps=segregate)
+        deliverables = seg_result.get("deliverables", {}) if segregate else seg_result
         if deliverables:
             result["deliverables"] = deliverables
             result["deployment"]["files"] = deliverables
@@ -1015,13 +1184,25 @@ def main():
         result["error"] = result.get("error", output[:1000])
         print(f"\n❌ Task failed")
 
-    # Collect workspace deliverables (files the agent created/modified)
-    deliverables = collect_workspace_files()
+    # Collect workspace deliverables with step segregation for DAG nodes
+    segregate = bool(NODE_ID)
+    workspace_result = collect_workspace_files(node_id=NODE_ID if segregate else None, segregate_steps=segregate)
+    if segregate:
+        deliverables = workspace_result.get("deliverables", {})
+        step_path = workspace_result.get("step_path")
+        result["workspace_step_path"] = step_path
+    else:
+        deliverables = workspace_result if isinstance(workspace_result, dict) and "deliverables" not in workspace_result else workspace_result
+        step_path = None
+
     if deliverables:
         result["deliverables"] = deliverables
+        result["deliverables_keys"] = sorted(deliverables.keys())
         print(f"\n📦 Collected {len(deliverables)} deliverable file(s):")
         for fp in deliverables:
             print(f"   📄 {fp}")
+        # Write deliverables to step-specific directory
+        _write_step_deliverables(deliverables, NODE_ID)
     else:
         print("\n📭 No deliverable files found in /workspace")
 

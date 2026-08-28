@@ -1,0 +1,37 @@
+# Zep CE Configuration — OpenClaw Agent Memory
+# Minimal setup: session memory only, no NLP/embeddings (keeps it lightweight).
+
+log:
+  level: info
+
+server:
+  host: 0.0.0.0
+  port: 8000
+
+store:
+  type: postgres
+  postgres:
+    dsn: "postgres://zep:zep@zep-postgres:5432/zep?sslmode=disable"
+
+auth:
+  required: false
+  secret: ""
+
+# Disable all heavy extractors — we only need raw session memory.
+extractors:
+  messages:
+    summarizer:
+      enabled: false
+    entities:
+      enabled: false
+    intent:
+      enabled: false
+    token_counter:
+      enabled: false
+    embeddings:
+      enabled: false
+  documents:
+    enabled: false
+
+memory:
+  message_window: 20     # number of messages returned by GET /memory

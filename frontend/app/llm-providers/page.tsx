@@ -55,11 +55,20 @@ export default function LLMProvidersPage() {
   const [configGeminiKey, setConfigGeminiKey] = useState('')
   const [configAnthropicKey, setConfigAnthropicKey] = useState('')
   const [configOpenaiKey, setConfigOpenaiKey] = useState('')
-  const [configStatus, setConfigStatus] = useState<{ gemini: boolean; anthropic: boolean; openai: boolean }>({
-    gemini: false, anthropic: false, openai: false,
+  const [configDeepseekKey, setConfigDeepseekKey] = useState('')
+  const [configStatus, setConfigStatus] = useState<{ gemini: boolean; anthropic: boolean; openai: boolean; deepseek: boolean }>({
+    gemini: false, anthropic: false, openai: false, deepseek: false,
   })
   const [savingConfig, setSavingConfig] = useState(false)
   const [configMsg, setConfigMsg] = useState<string | null>(null)
+
+  // DAG model defaults
+  const [dagPlanningModel, setDagPlanningModel] = useState('')
+  const [dagAgentModel, setDagAgentModel] = useState('')
+  const [dagDeepReviewModel, setDagDeepReviewModel] = useState('')
+  const [dagContextMode, setDagContextMode] = useState('none')
+  const [savingDagDefaults, setSavingDagDefaults] = useState(false)
+  const [dagDefaultsMsg, setDagDefaultsMsg] = useState<string | null>(null)
 
   // API URL imported at top-level
 
@@ -74,13 +83,55 @@ export default function LLMProvidersPage() {
       setConfigGeminiKey(data.gemini_api_key ?? '')
       setConfigAnthropicKey(data.anthropic_api_key ?? '')
       setConfigOpenaiKey(data.openai_api_key ?? '')
+      setConfigDeepseekKey(data.deepseek_api_key ?? '')
       setConfigStatus({
         gemini: data.gemini_configured ?? false,
         anthropic: data.anthropic_configured ?? false,
         openai: data.openai_configured ?? false,
+        deepseek: data.deepseek_configured ?? false,
       })
     } catch { /* ignore */ }
   }, [])
+
+  const fetchDagModelDefaults = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/dags/model-defaults`)
+      if (!res.ok) return
+      const data = await res.json()
+      setDagPlanningModel(data.planning_model ?? '')
+      setDagAgentModel(data.agent_model ?? '')
+      setDagDeepReviewModel(data.deep_review_model ?? '')
+      setDagContextMode(data.agent_context_mode ?? 'none')
+    } catch { /* ignore */ }
+  }, [])
+
+  const saveDagModelDefaults = async () => {
+    setSavingDagDefaults(true)
+    setDagDefaultsMsg(null)
+    try {
+      const res = await fetch(`${API}/api/dags/model-defaults`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          planning_model: dagPlanningModel,
+          agent_model: dagAgentModel,
+          deep_review_model: dagDeepReviewModel,
+          agent_context_mode: dagContextMode,
+        }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      setDagPlanningModel(data.planning_model)
+      setDagAgentModel(data.agent_model)
+      setDagDeepReviewModel(data.deep_review_model)
+      setDagContextMode(data.agent_context_mode ?? 'none')
+      setDagDefaultsMsg(`✓ Defaults saved — planning: ${data.planning_model}, agents: ${data.agent_model}, deep-review: ${data.deep_review_model}, context-mode: ${data.agent_context_mode}`)
+    } catch (err) {
+      setDagDefaultsMsg(`✗ ${err instanceof Error ? err.message : 'Failed'}`)
+    } finally {
+      setSavingDagDefaults(false)
+    }
+  }
 
   const saveConfig = async (field: string, value: string) => {
     setSavingConfig(true)
@@ -132,9 +183,10 @@ export default function LLMProvidersPage() {
   useEffect(() => {
     fetchAll()
     fetchConfig()
+    fetchDagModelDefaults()
     const interval = setInterval(fetchAll, 15000)
     return () => clearInterval(interval)
-  }, [fetchAll, fetchConfig])
+  }, [fetchAll, fetchConfig, fetchDagModelDefaults])
 
   // ─── Send message ──────────────────────────────────────────────
 
@@ -190,6 +242,7 @@ export default function LLMProvidersPage() {
     if (m.startsWith('gemini')) return 'gemini'
     if (m.startsWith('claude')) return 'anthropic'
     if (m.startsWith('gpt-') || m.startsWith('o1-') || m.startsWith('o3-')) return 'openai'
+    if (m.startsWith('deepseek')) return 'deepseek'
     return 'ollama'
   }
 
@@ -205,6 +258,7 @@ export default function LLMProvidersPage() {
       case 'gemini': return '✨'
       case 'anthropic': return '🧠'
       case 'openai': return '🤖'
+      case 'deepseek': return '🔵'
       default: return '🔌'
     }
   }
@@ -215,6 +269,7 @@ export default function LLMProvidersPage() {
       case 'gemini': return 'border-blue-500/30 bg-blue-500/5'
       case 'anthropic': return 'border-amber-500/30 bg-amber-500/5'
       case 'openai': return 'border-green-500/30 bg-green-500/5'
+      case 'deepseek': return 'border-blue-500/30 bg-blue-500/5'
       default: return 'border-gray-500/30 bg-gray-500/5'
     }
   }
@@ -303,7 +358,7 @@ export default function LLMProvidersPage() {
 
         {!showConfig && (
           <div className="flex gap-2 text-sm">
-            {(['gemini', 'anthropic', 'openai'] as const).map((p) => (
+            {(['gemini', 'anthropic', 'openai', 'deepseek'] as const).map((p) => (
               <span
                 key={p}
                 className={`px-2.5 py-1 rounded-full border text-xs font-medium capitalize ${
@@ -392,11 +447,116 @@ export default function LLMProvidersPage() {
               </div>
             </div>
 
+            {/* DeepSeek */}
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">
+                🔵 DeepSeek API Key
+                <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener" className="ml-2 text-indigo-400 hover:text-indigo-300">Get key →</a>
+              </label>
+              <div className="flex gap-2">
+                <input type="password" value={configDeepseekKey} onChange={(e) => setConfigDeepseekKey(e.target.value)} placeholder={configStatus.deepseek ? '••••••••  (configured)' : 'Paste API key'} className="input-field flex-1 font-mono text-sm" />
+                <button onClick={() => saveConfig('deepseek_api_key', configDeepseekKey)} disabled={savingConfig} className="btn-primary text-xs">Save</button>
+                {configStatus.deepseek && (
+                  <button onClick={() => { setConfigDeepseekKey(''); saveConfig('deepseek_api_key', '') }} disabled={savingConfig} className="btn-danger text-xs">✗</button>
+                )}
+              </div>
+            </div>
+
             <p className="text-xs text-gray-600 mt-2">
               Keys are stored in-memory on the control-plane and take effect immediately. They do not persist across container restarts.
             </p>
           </div>
         )}
+      </section>
+
+      {/* ─── DAG Model Defaults ──────────────────────────────── */}
+      <section className="mb-8">
+        <h2 className="section-title">DAG Model Defaults</h2>
+        <p className="text-xs text-gray-500 mb-3">
+          Choose which LLM is used for DAG planning (decomposing objectives) and which runs inside each agent container.
+        </p>
+        <div className="card p-5 space-y-4">
+          {dagDefaultsMsg && (
+            <div className={`p-3 rounded-lg text-sm ${
+              dagDefaultsMsg.startsWith('✓')
+                ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
+                : 'bg-red-500/10 border border-red-500/20 text-red-400'
+            }`}>
+              {dagDefaultsMsg}
+            </div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">📋 Planning Model</label>
+              <select
+                value={dagPlanningModel}
+                onChange={(e) => setDagPlanningModel(e.target.value)}
+                className="input-field w-full text-sm"
+              >
+                {allModels.map((m) => (
+                  <option key={`plan-${m.provider}-${m.id}`} value={m.id}>{m.id}</option>
+                ))}
+                {dagPlanningModel && !allModels.find(m => m.id === dagPlanningModel) && (
+                  <option value={dagPlanningModel}>{dagPlanningModel}</option>
+                )}
+              </select>
+              <p className="text-xs text-gray-600 mt-1">Decomposes objectives into DAG task graphs</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">🤖 Agent Model</label>
+              <select
+                value={dagAgentModel}
+                onChange={(e) => setDagAgentModel(e.target.value)}
+                className="input-field w-full text-sm"
+              >
+                {allModels.map((m) => (
+                  <option key={`agent-${m.provider}-${m.id}`} value={m.id}>{m.id}</option>
+                ))}
+                {dagAgentModel && !allModels.find(m => m.id === dagAgentModel) && (
+                  <option value={dagAgentModel}>{dagAgentModel}</option>
+                )}
+              </select>
+              <p className="text-xs text-gray-600 mt-1">Runs inside each agent container for task execution</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">🔍 Deep Review / Skill-Learning Model</label>
+              <select
+                value={dagDeepReviewModel}
+                onChange={(e) => setDagDeepReviewModel(e.target.value)}
+                className="input-field w-full text-sm"
+              >
+                {allModels.map((m) => (
+                  <option key={`review-${m.provider}-${m.id}`} value={m.id}>{m.id}</option>
+                ))}
+                {dagDeepReviewModel && !allModels.find(m => m.id === dagDeepReviewModel) && (
+                  <option value={dagDeepReviewModel}>{dagDeepReviewModel}</option>
+                )}
+              </select>
+              <p className="text-xs text-gray-600 mt-1">Used for examining logs, hallucination/synthetic-data audits, and skill extraction</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">🧠 Agent Context Management</label>
+              <select
+                value={dagContextMode}
+                onChange={(e) => setDagContextMode(e.target.value)}
+                className="input-field w-full text-sm"
+              >
+                <option value="none">none (no context management)</option>
+                <option value="linear">linear (trim + summarize old turns)</option>
+                <option value="graph">graph (short-term memory + compressed context graph)</option>
+              </select>
+              <p className="text-xs text-gray-600 mt-1">none replays the full history each turn (cost grows quadratically); linear folds old turns into a summary; graph keeps ~5 recent turns raw and compresses everything older into a JSON context graph.</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={saveDagModelDefaults} disabled={savingDagDefaults} className="btn-primary text-sm">
+              {savingDagDefaults ? 'Saving…' : 'Save Defaults'}
+            </button>
+            <span className="text-xs text-gray-600">
+              Current: <span className="font-mono text-gray-400">{dagPlanningModel}</span> / <span className="font-mono text-gray-400">{dagAgentModel}</span> / review: <span className="font-mono text-gray-400">{dagDeepReviewModel}</span> / context: <span className="font-mono text-gray-400">{dagContextMode}</span>
+            </span>
+          </div>
+        </div>
       </section>
 
       {/* ─── All Models ──────────────────────────────────────── */}

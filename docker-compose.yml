@@ -30,6 +30,8 @@ services:
     volumes:
       - ./workspaces:/workspaces
       - ./agent-images:/agent-images:ro
+      - ./config/supply-chain.yaml:/config/supply-chain.yaml:ro
+      - ./services/control-plane:/app
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -93,6 +95,7 @@ services:
       - ./docker-dind-daemon.json:/etc/docker/daemon.json:ro
       - ./workspaces:/workspaces
       - ./agent-images:/agent-images:ro
+      - ./services/agent-executor:/agent-executor:ro
     ports:
       - "9100-9120:9100-9120"
     networks:
@@ -109,7 +112,7 @@ services:
   # DOCKER REGISTRY — Stores built agent images
   # =============================================================================
   registry:
-    image: registry:2
+    image: registry:2.8.3
     container_name: openclaw-registry
     ports:
       - "5000:5000"
@@ -123,7 +126,7 @@ services:
   # TEMPORAL — Workflow orchestration
   # =============================================================================
   temporal-postgres:
-    image: postgres:13
+    image: postgres:13.22
     container_name: openclaw-temporal-postgres
     environment:
       POSTGRES_USER: temporal
@@ -137,7 +140,7 @@ services:
     restart: unless-stopped
 
   temporal:
-    image: temporalio/auto-setup:1.22
+    image: temporalio/auto-setup:1.22.7
     container_name: openclaw-temporal
     environment:
       - DB=postgres12
@@ -189,6 +192,9 @@ services:
       - AGENT_IMAGES_DIR=/agent-images
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
       - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-insecure-dind}
+      - RAG_TOOL_URL=${RAG_TOOL_URL:-http://docling-rag:8080}
+      - RAG_API_KEY=${RAG_API_KEYS:-my-local-secret-key}
+      - MAX_CONCURRENT_ACTIVITIES=${MAX_CONCURRENT_ACTIVITIES:-4}
     depends_on:
       temporal:
         condition: service_healthy
@@ -199,6 +205,7 @@ services:
     volumes:
       - ./workspaces:/workspaces
       - ./agent-images:/agent-images
+      - ./services/temporal-worker/worker.py:/app/worker.py
     networks:
       - openclaw-network
     deploy:
@@ -228,7 +235,7 @@ services:
   # REDIS — Lightweight session store for the API Gateway
   # =============================================================================
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.7-alpine3.21
     container_name: openclaw-redis
     command: redis-server --save "" --appendonly no
     networks:
@@ -283,19 +290,25 @@ services:
   # the "taskforge-iterator" model, and start chatting.
   # =============================================================================
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.6.5 
     container_name: openclaw-open-webui
     environment:
-      # Point Open WebUI exclusively at our gateway (disable Ollama direct access)
-      - OPENAI_API_BASE_URL=http://api-gateway:8080/v1
-      - OPENAI_API_BASE_URLS=http://api-gateway:8080/v1
-      - OPENAI_API_KEY=sk-openclaw-gateway
+      # Point Open WebUI at the DAG orchestrator endpoint
+      - OPENAI_API_BASE_URL=http://control-plane:8000/api/dag-ui/v1
+      - OPENAI_API_BASE_URLS=http://control-plane:8000/api/dag-ui/v1
+      - OPENAI_API_KEY=sk-openclaw-dag
       - OLLAMA_BASE_URL=
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-open-webui-secret}
       - WEBUI_NAME=OpenClaw Chat
-      - DEFAULT_MODELS=taskforge-iterator
+      - DEFAULT_MODELS=taskforge-dag
       - ENABLE_COMMUNITY_SHARING=false
       - ENABLE_MESSAGE_RATING=false
+      # Send full document content instead of RAG chunks
+      - RAG_FULL_CONTEXT=true
+      # Inject RAG context into system message (we parse it server-side)
+      - RAG_SYSTEM_CONTEXT=true
+      # Disable auxiliary requests that create spurious DAGs
+      - ENABLE_RETRIEVAL_QUERY_GENERATION=false
     depends_on:
       api-gateway:
         condition: service_healthy
@@ -311,7 +324,7 @@ services:
   # POSTGRESQL — Primary database
   # =============================================================================
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15.15-alpine3.21
     container_name: openclaw-postgres
     environment:
       - POSTGRES_USER=openclaw
@@ -331,6 +344,91 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # =============================================================================
+  # ZEP CE — Agent memory service (inter & intra-iteration memory)
+  # =============================================================================
+  zep-postgres:
+    image: pgvector/pgvector:pg15
+    container_name: openclaw-zep-postgres
+    environment:
+      POSTGRES_USER: zep
+      POSTGRES_PASSWORD: zep
+      POSTGRES_DB: zep
+    volumes:
+      - zep-postgres-data:/var/lib/postgresql/data
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -d zep -U zep"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  zep:
+    image: ghcr.io/getzep/zep:0.25.0
+    container_name: openclaw-zep
+    depends_on:
+      zep-postgres:
+        condition: service_healthy
+    environment:
+      ZEP_OPENAI_API_KEY: "sk-not-used"
+    volumes:
+      - ./config/zep/config.yaml:/app/config.yaml:ro
+    ports:
+      - "8198:8000"
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /proc/1/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # =============================================================================
+  # DOCLING RAG — external RAG tool (offline SQLite + Ollama embeddings)
+  # Web UI at http://localhost:8086 (host 8080 is used by api-gateway)
+  # =============================================================================
+  docling-rag:
+    build:
+      context: .
+      dockerfile: Dockerfile.docling-rag
+    container_name: docling-rag
+    restart: unless-stopped
+    ports:
+      - "8086:8080"
+    volumes:
+      - docling_data:/app/data
+    environment:
+      - RAG_HTTP_ADDR=0.0.0.0:8080
+      - RAG_API_KEYS=${RAG_API_KEYS:-my-local-secret-key}
+      - RAG_DB_BACKEND=sqlite
+      - RAG_DATABASE_URL=sqlite:///app/data/rag.db
+      - RAG_CHUNKER=${RAG_CHUNKER:-hierarchical}
+      - RAG_EMBED_PROVIDER=ollama
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - RAG_EMBED_MODEL=${RAG_EMBED_MODEL:-bge-m3}
+      - RAG_EMBED_DIM=1024
+    depends_on:
+      - ollama
+    networks:
+      - openclaw-network
+
+  # -----------------------------------------------------------------------------
+  # Local embeddings provider (internal-only: does NOT publish 11434, so it
+  # never shadows a host-installed Ollama used via host.docker.internal)
+  # -----------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: docling-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - openclaw-network
+
 # =============================================================================
 # NETWORKS
 # =============================================================================
@@ -344,6 +442,9 @@ networks:
 volumes:
   postgres-data:
   temporal-postgres-data:
+  zep-postgres-data:
   registry-data:
   docker-data:
   open-webui-data:
+  docling_data:
+  ollama_models:
