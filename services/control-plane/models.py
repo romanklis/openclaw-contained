@@ -371,6 +371,9 @@ class MasterDAG(Base):
     template_params = Column(JSON, default=list)  # [{key,label,type,default,description}]
     template_source_dag_id = Column(String, nullable=True)  # set on instances
 
+    # Archiving: hides the DAG from the default list (soft delete), keeps data.
+    archived = Column(Boolean, default=False, nullable=False)
+
     # Relationships
     nodes = relationship("DAGNode", back_populates="dag", cascade="all, delete-orphan")
     tasks = relationship("Task", backref="dag", foreign_keys="Task.dag_id")

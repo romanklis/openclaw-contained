@@ -40,6 +40,201 @@ RUNTIME_DESCRIPTION_OVERRIDE = os.getenv("OPENCLAW_RUNTIME_DESCRIPTION")
 MAX_TURNS = int(os.getenv("MAX_AGENT_TURNS", "30"))
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "60"))
 
+# Agent context-management mode (set from the LLM Providers page via
+# AGENT_CONTEXT_MODE env):
+#   "none"   — replay the full history each turn (quadratic cost)
+#   "linear" — trim old turns into a condensed note so growth is bounded
+#   "graph"  — short-term memory (last ~5 turns) raw; older turns folded into a
+#              compressed JSON context graph (context-graph-compressor approach)
+AGENT_CONTEXT_MODE = os.getenv("AGENT_CONTEXT_MODE", "none")
+CONTEXT_BUDGET_TOKENS = int(os.getenv("AGENT_CONTEXT_BUDGET", "24000"))
+KEEP_RECENT_MESSAGES = int(os.getenv("AGENT_KEEP_RECENT_MESSAGES", "16"))
+SHORT_TERM_MESSAGES = int(os.getenv("AGENT_SHORT_TERM_MESSAGES", "12"))  # ~5 turns
+
+# Condensed instructions for compressing old turns into a context graph
+# (compact mode of context-graph-compressor).
+_GRAPH_COMPRESS_SYSTEM = (
+    "You compress an agent conversation into a minimal, portable JSON context graph "
+    "so a model can resume with the most important state at minimal token cost.\n"
+    "Node types: F=fact, D=decision, P=problem, G=goal, C=code (verbatim snippets), "
+    "A=assumption (inferred — add conf), X=context/open thread.\n"
+    "Importance: h=high (losing breaks continuity), m=medium, l=low.\n"
+    "Status (only when meaningful): active, open, resolved, deferred, blocked, abandoned.\n"
+    "Relationships (top-level \"rel\"): depends_on, caused_by, resolves, supersedes, "
+    "references, related_to.\n"
+    "Rules: code/method names/versions exact, never paraphrase; keep negatives "
+    "('decided NOT to use X'); superseded != deleted (use supersedes + abandoned); "
+    "assumptions explicit with conf; status over recency; open threads are nodes; "
+    "strip conversational filler.\n"
+    "Return ONLY valid JSON (compact):\n"
+    '{"v":2,"mode":"compact","desc":"one tight sentence: topic and current state",'
+    '"n":[{"id":"n1","t":"F","i":"h","s":"summary","c":[{"id":"n1.1","t":"A","i":"m","conf":0.8,"s":"..."}]}],'
+    '"rel":[{"from":"n2","to":"n5","type":"depends_on"}],'
+    '"handoff":"one paragraph telling a resuming model exactly where things stand and what is active/open/deferred."}\n'
+    "Target 400-800 tokens total; hard cap 1200. If the existing graph + new turns "
+    "overlap, dedupe (latest wins), link changes with supersedes, renumber n1..nN."
+)
+
+
+def _extract_json_object(text):
+    """Robustly extract the first JSON object from an LLM response."""
+    if not text:
+        return None
+    import re
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1)
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except Exception:
+                        break
+        start = text.find("{", start + 1)
+    return None
+
+
+# In-agent graph state: how many leading `messages` entries are already folded
+# into the compressed graph summary.
+_graph_state: dict = {"summary": "", "folded_upto": 2}
+
+
+def _call_graph_compress(client, completions_url, api_key, segment):
+    """Fold `segment` (new turns) into the compressed context graph via one LLM call."""
+    try:
+        existing = _graph_state.get("summary") or "(none)"
+        user = (
+            "Existing compressed context graph:\n" + existing + "\n\n"
+            "New conversation turns to merge into the graph:\n" + segment[:20000]
+        )
+        resp = client.post(
+            completions_url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": _GRAPH_COMPRESS_SYSTEM},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 2048,
+            },
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = (data.get("choices", [{}])[0].get("message", {}).get("content", "")) or ""
+        graph = _extract_json_object(content)
+        return graph if graph else None
+    except Exception:
+        return None
+
+
+def _build_graph_send_messages(messages, client, completions_url, api_key):
+    """In 'graph' mode: keep the short-term window raw and fold older turns into
+    a compressed context graph. Returns the messages to send (the authoritative
+    `messages` list is kept for continuation)."""
+    if len(messages) <= 2 + SHORT_TERM_MESSAGES:
+        return messages
+    start = len(messages) - SHORT_TERM_MESSAGES
+    while start > 2 and start < len(messages) and messages[start].get("role") == "tool":
+        start -= 1
+    if start > _graph_state.get("folded_upto", 2):
+        new_segment = messages[_graph_state.get("folded_upto", 2):start]
+        segment_text = "\n".join(
+            f"[{m.get('role')}] {(m.get('content') or '')[:600]}" for m in new_segment
+        )
+        graph = _call_graph_compress(client, completions_url, api_key, segment_text)
+        if graph:
+            _graph_state["summary"] = graph
+            _graph_state["folded_upto"] = start
+        else:
+            # Fallback: lossy text fold (like linear) so we never grow unbounded.
+            folded_text = "\n".join(
+                f"[{m.get('role')}] {(m.get('content') or '')[:400]}" for m in messages[2:start]
+            )
+            _graph_state["summary"] = "[Earlier conversation (condensed)]:\n" + folded_text[:8000]
+            _graph_state["folded_upto"] = start
+
+    out = messages[:2]
+    if _graph_state.get("summary"):
+        out.append({
+            "role": "user",
+            "content": "Context graph (compressed memory):\n" + _graph_state["summary"] + "\n\nResume from this state.",
+        })
+    out.extend(messages[_graph_state.get("folded_upto", 2):])
+    return out
+
+
+def _estimate_tokens(messages) -> int:
+    """Rough token estimate (chars / 3.5) — no tiktoken dependency."""
+    total = 0
+    for m in messages or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    total += len(b["text"])
+    return int(total / 3.5)
+
+
+def _trim_messages(messages):
+    """LangChain-style trim: always keep system + the original task prompt +
+    the most recent turns (never starting on an orphaned tool result), and fold
+    the older middle into a single condensed history note. Returns the list to
+    SEND (the authoritative `messages` list is kept for continuation).
+    """
+    if not messages or _estimate_tokens(messages) <= CONTEXT_BUDGET_TOKENS:
+        return messages
+    if len(messages) <= 2 + KEEP_RECENT_MESSAGES:
+        return messages
+    keep_head = messages[:2]
+    start = len(messages) - KEEP_RECENT_MESSAGES
+    while start > 2 and start < len(messages) and messages[start].get("role") == "tool":
+        start -= 1
+    tail = messages[start:]
+    mid = messages[2:start]
+
+    folded_parts = []
+    for m in mid:
+        role = m.get("role") or "?"
+        c = m.get("content") or ""
+        if isinstance(c, list):
+            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("text"))
+        snippet = str(c)[:400].replace("\n", " ")
+        folded_parts.append(f"[{role}] {snippet}")
+    summary = "\n".join(folded_parts)[:8000]
+
+    out = list(keep_head)
+    if summary:
+        out.append({"role": "user", "content": "[Earlier conversation (condensed)]:\n" + summary})
+    out.extend(tail)
+    return out
+
 
 def _kill_tree(proc):
     """Kill a process and its entire process group.
@@ -625,9 +820,10 @@ def build_system_prompt() -> str:
         "IMPORTANT RULES:",
         "1. Always write code to /workspace",
         "2. Always exec your code to verify it works",
-        "3. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:<type>/<pkg>:<reason> and STOP (type is pip, npm, apt, or auto)",
-        "4. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>",
-        "5. Do NOT try pip install or apt-get — they will fail",
+        "3. If the skill instructions include a complete, ready-to-run script, COPY it into your deliverables directory and EXECUTE it. Only modify it if it errors or the deliverable is wrong — do NOT rewrite or re-derive a working script from scratch; re-discovering what the skill already encodes is wasteful.",
+        "4. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:<type>/<pkg>:<reason> and STOP (type is pip, npm, apt, or auto)",
+        "5. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>",
+        "6. Do NOT try pip install or apt-get — they will fail",
         "",
     ]
 
@@ -687,7 +883,11 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
                         },
                         json={
                             "model": LLM_MODEL,
-                            "messages": messages,
+                            "messages": (
+                                _build_graph_send_messages(messages, client, completions_url, api_key)
+                                if AGENT_CONTEXT_MODE == "graph"
+                                else (_trim_messages(messages) if AGENT_CONTEXT_MODE == "linear" else messages)
+                            ),
                             "tools": TOOLS,
                             "tool_choice": "auto",
                             "temperature": 0.2,
@@ -810,11 +1010,17 @@ def _parse_typed_package(raw: str) -> Tuple[str, str]:
 
 
 def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]]:
-    """Parse output for CAPABILITY_REQUEST markers or ModuleNotFoundError.
+    """Parse output for explicit CAPABILITY_REQUEST markers ONLY.
 
     Returns (cap_type, packages, reason) where *packages* may contain a
     type prefix ("pip/pandas") that callers should process via
     ``_parse_typed_package``.
+
+    Capability requests are raised ONLY when the LLM explicitly emits a
+    CAPABILITY_REQUEST marker. The previous heuristic fallbacks
+    (ModuleNotFoundError / pip-install failure / "command not found" /
+    shared-library scans) are removed: they produced false positives that
+    blocked workflows on bogus approvals.
     """
     normalised = output.replace("\\n", "\n").replace("\\r", "\r")
 
@@ -837,67 +1043,6 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]
 
     if all_packages and cap_type_found:
         return (cap_type_found, all_packages, "; ".join(all_reasons) if all_reasons else "Required for task execution")
-
-    # Fallback: ModuleNotFoundError
-    matches = re.findall(
-        r"(?:ModuleNotFoundError|ImportError):.*?no module named ['\"]?([a-zA-Z0-9_]+)",
-        normalised, re.IGNORECASE,
-    )
-    if not matches:
-        matches = re.findall(r"no module named ['\"]([^'\"]+)['\"]", normalised, re.IGNORECASE)
-    if matches:
-        packages = list(dict.fromkeys(m.split(".")[0] for m in matches))
-        return ("python_packages", packages, "ModuleNotFoundError detected")
-
-    # pip install failures
-    for pattern in [
-        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:error|denied|externally.managed|not allowed|read.only)",
-        r"(?:error|denied|permission|read.only).*pip3?\s+install\s+([a-zA-Z0-9_-]+)",
-        r"pip3?\s+install\s+([a-zA-Z0-9_-]+).*(?:OSError|errno\s*30)",
-    ]:
-        match = re.search(pattern, normalised, re.IGNORECASE)
-        if match:
-            return ("python_packages", [match.group(1)], "pip install failure detected")
-
-    # Fallback: "command not found" (exit 127) for CLI tools
-    # Matches patterns like:
-    #   /bin/sh: 1: agent-browser: not found
-    #   bash: agent-browser: command not found
-    #   agent-browser: not found
-    cmd_not_found = re.findall(
-        r"(?:/bin/sh|bash)?:?\s*\d*:?\s*([a-zA-Z0-9_][a-zA-Z0-9_.-]*):\s*(?:command\s+)?not found",
-        normalised, re.IGNORECASE,
-    )
-    if cmd_not_found:
-        # Deduplicate, skip common shell builtins
-        skip = {"sh", "bash", "cd", "echo", "test", "[", "true", "false"}
-        commands = list(dict.fromkeys(c for c in cmd_not_found if c not in skip))
-        if commands:
-            return ("tool_install", commands, "Command not found (exit 127) — CLI tool needs to be installed")
-
-    # Fallback: shared library errors
-    # Matches: error while loading shared libraries: libfoo.so.N: cannot open
-    so_missing = re.findall(
-        r"error while loading shared libraries:\s*(lib[a-zA-Z0-9_.+-]+\.so[.0-9]*):\s*cannot open",
-        normalised, re.IGNORECASE,
-    )
-    if so_missing:
-        # Map .so names to apt package names:
-        #   libglib-2.0.so.0  → libglib2.0-0
-        #   libnss3.so        → libnss3
-        #   libatk-1.0.so.0   → libatk1.0-0
-        apt_packages = []
-        for so in dict.fromkeys(so_missing):  # deduplicate, preserve order
-            # Strip trailing .so.N.N... to get the base name
-            base = re.sub(r'\.so[.0-9]*$', '', so)
-            # Common mapping: libfoo-X.Y → libfooX.Y-0
-            apt_name = re.sub(r'-([0-9])', r'\1', base) + "-0"
-            # If the base already ends with a digit (libnss3), just use it directly
-            if re.search(r'[0-9]$', base):
-                apt_name = base
-            apt_packages.append(apt_name)
-        return ("apt_package", apt_packages,
-                f"Shared library missing: {', '.join(so_missing)} — required by a binary in the container")
 
     return None
 
@@ -993,8 +1138,26 @@ def _is_binary_file(fpath: str) -> bool:
         return True
 
 
+def _make_file_ref(fpath: str, size: int) -> dict:
+    """Return a metadata reference for a deliverable too large to embed.
+
+    Keeps DB/Temporal payloads small while keeping the step's deliverables
+    non-empty, and gives downstream steps a real path into the shared
+    workspace to read the file from.
+    """
+    import hashlib
+    digest = hashlib.sha256()
+    try:
+        with open(fpath, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except Exception:
+        pass
+    return {"ref": "file", "path": fpath, "size": size, "sha256": digest.hexdigest()}
+
+
 def _scan_workspace_tree(scan_root: str, workspace: str, SKIP_DIRS, SKIP_FILES,
-                         MAX_FILE_SIZE: int, MAX_TOTAL: int, collected: Dict[str, str], total_size: int):
+                         MAX_FILE_SIZE: int, MAX_TOTAL: int, collected: Dict[str, Any], total_size: int):
     """Walk scan_root collecting files into `collected`. Returns updated total_size."""
     import base64
     for root, dirs, files in os.walk(scan_root):
@@ -1006,10 +1169,14 @@ def _scan_workspace_tree(scan_root: str, workspace: str, SKIP_DIRS, SKIP_FILES,
             relpath = os.path.relpath(fpath, scan_root)
             try:
                 size = os.path.getsize(fpath)
-                if size == 0 or size > MAX_FILE_SIZE:
+                if size == 0:
                     continue
                 estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
-                if total_size + estimated_size > MAX_TOTAL:
+                if size > MAX_FILE_SIZE or total_size + estimated_size > MAX_TOTAL:
+                    # Too large to embed — record a file reference so the step
+                    # still delivers (the file exists in the shared workspace).
+                    collected[relpath] = _make_file_ref(fpath, size)
+                    total_size += 160
                     continue
                 if _is_binary_file(fpath):
                     with open(fpath, "rb") as f:
@@ -1026,7 +1193,7 @@ def _scan_workspace_tree(scan_root: str, workspace: str, SKIP_DIRS, SKIP_FILES,
     return total_size
 
 
-def collect_workspace_files(node_id: str | None = None) -> Dict[str, str]:
+def collect_workspace_files(node_id: str | None = None) -> Dict[str, Any]:
     """Scan the workspace for deliverable files.
 
     For DAG nodes (node_id set) /workspace/{node_id}/ is scanned so files written
@@ -1042,7 +1209,7 @@ def collect_workspace_files(node_id: str | None = None) -> Dict[str, str]:
                   "package-lock.json", "input_prompt.md", "attached_context.md"}
     MAX_FILE_SIZE = 500_000
     MAX_TOTAL = 2_000_000
-    collected: Dict[str, str] = {}
+    collected: Dict[str, Any] = {}
     total_size = 0
 
     scan_root = os.path.join(workspace, node_id) if node_id else workspace
@@ -1063,10 +1230,12 @@ def collect_workspace_files(node_id: str | None = None) -> Dict[str, str]:
                     continue
                 relpath = fname
                 size = os.path.getsize(fpath)
-                if size == 0 or size > MAX_FILE_SIZE:
+                if size == 0:
                     continue
                 estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
-                if total_size + estimated_size > MAX_TOTAL:
+                if size > MAX_FILE_SIZE or total_size + estimated_size > MAX_TOTAL:
+                    collected[relpath] = _make_file_ref(fpath, size)
+                    total_size += 160
                     continue
                 if _is_binary_file(fpath):
                     with open(fpath, "rb") as f:

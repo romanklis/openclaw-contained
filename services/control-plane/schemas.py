@@ -177,7 +177,7 @@ class TaskOutputCreate(BaseModel):
     model_used: Optional[str] = None
     image_used: Optional[str] = None
     duration_ms: Optional[int] = None
-    deliverables: Optional[Dict[str, str]] = None
+    deliverables: Optional[Dict[str, Any]] = None
     compact_summary: Optional[str] = None
     external_assessment: Optional[Dict[str, Any]] = None
     raw_result: Optional[Dict[str, Any]] = None
@@ -196,7 +196,7 @@ class TaskOutputResponse(BaseModel):
     model_used: Optional[str]
     image_used: Optional[str]
     duration_ms: Optional[int]
-    deliverables: Optional[Dict[str, str]]
+    deliverables: Optional[Dict[str, Any]]
     compact_summary: Optional[str]
     external_assessment: Optional[Dict[str, Any]]
     raw_result: Optional[Dict[str, Any]]
@@ -603,6 +603,7 @@ class DAGResponse(BaseModel):
     locked: bool = False
     template_params: Optional[List[Dict[str, Any]]] = None
     template_source_dag_id: Optional[str] = None
+    archived: bool = False
 
     class Config:
         from_attributes = True

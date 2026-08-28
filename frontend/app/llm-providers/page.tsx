@@ -66,6 +66,7 @@ export default function LLMProvidersPage() {
   const [dagPlanningModel, setDagPlanningModel] = useState('')
   const [dagAgentModel, setDagAgentModel] = useState('')
   const [dagDeepReviewModel, setDagDeepReviewModel] = useState('')
+  const [dagContextMode, setDagContextMode] = useState('none')
   const [savingDagDefaults, setSavingDagDefaults] = useState(false)
   const [dagDefaultsMsg, setDagDefaultsMsg] = useState<string | null>(null)
 
@@ -100,6 +101,7 @@ export default function LLMProvidersPage() {
       setDagPlanningModel(data.planning_model ?? '')
       setDagAgentModel(data.agent_model ?? '')
       setDagDeepReviewModel(data.deep_review_model ?? '')
+      setDagContextMode(data.agent_context_mode ?? 'none')
     } catch { /* ignore */ }
   }, [])
 
@@ -114,6 +116,7 @@ export default function LLMProvidersPage() {
           planning_model: dagPlanningModel,
           agent_model: dagAgentModel,
           deep_review_model: dagDeepReviewModel,
+          agent_context_mode: dagContextMode,
         }),
       })
       if (!res.ok) throw new Error(await res.text())
@@ -121,7 +124,8 @@ export default function LLMProvidersPage() {
       setDagPlanningModel(data.planning_model)
       setDagAgentModel(data.agent_model)
       setDagDeepReviewModel(data.deep_review_model)
-      setDagDefaultsMsg(`✓ Defaults saved — planning: ${data.planning_model}, agents: ${data.agent_model}, deep-review: ${data.deep_review_model}`)
+      setDagContextMode(data.agent_context_mode ?? 'none')
+      setDagDefaultsMsg(`✓ Defaults saved — planning: ${data.planning_model}, agents: ${data.agent_model}, deep-review: ${data.deep_review_model}, context-mode: ${data.agent_context_mode}`)
     } catch (err) {
       setDagDefaultsMsg(`✗ ${err instanceof Error ? err.message : 'Failed'}`)
     } finally {
@@ -530,13 +534,26 @@ export default function LLMProvidersPage() {
               </select>
               <p className="text-xs text-gray-600 mt-1">Used for examining logs, hallucination/synthetic-data audits, and skill extraction</p>
             </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5">🧠 Agent Context Management</label>
+              <select
+                value={dagContextMode}
+                onChange={(e) => setDagContextMode(e.target.value)}
+                className="input-field w-full text-sm"
+              >
+                <option value="none">none (no context management)</option>
+                <option value="linear">linear (trim + summarize old turns)</option>
+                <option value="graph">graph (short-term memory + compressed context graph)</option>
+              </select>
+              <p className="text-xs text-gray-600 mt-1">none replays the full history each turn (cost grows quadratically); linear folds old turns into a summary; graph keeps ~5 recent turns raw and compresses everything older into a JSON context graph.</p>
+            </div>
           </div>
           <div className="flex items-center gap-3">
             <button onClick={saveDagModelDefaults} disabled={savingDagDefaults} className="btn-primary text-sm">
               {savingDagDefaults ? 'Saving…' : 'Save Defaults'}
             </button>
             <span className="text-xs text-gray-600">
-              Current: <span className="font-mono text-gray-400">{dagPlanningModel}</span> / <span className="font-mono text-gray-400">{dagAgentModel}</span> / review: <span className="font-mono text-gray-400">{dagDeepReviewModel}</span>
+              Current: <span className="font-mono text-gray-400">{dagPlanningModel}</span> / <span className="font-mono text-gray-400">{dagAgentModel}</span> / review: <span className="font-mono text-gray-400">{dagDeepReviewModel}</span> / context: <span className="font-mono text-gray-400">{dagContextMode}</span>
             </span>
           </div>
         </div>

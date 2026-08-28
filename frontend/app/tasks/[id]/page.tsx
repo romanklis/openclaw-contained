@@ -17,11 +17,18 @@ interface TaskOutput {
   model_used: string | null;
   image_used: string | null;
   duration_ms: number | null;
-  deliverables: Record<string, string> | null;
+  deliverables: Record<string, any> | null;
   raw_result: any;
   created_at: string | null;
   source_task_id?: string;
   source_role?: string;
+}
+
+interface FileRef {
+  ref: string
+  path: string
+  size: number
+  sha256: string
 }
 
 interface SBOMPackage {
@@ -743,7 +750,10 @@ export default function TaskDetailPage() {
     return null;
   };
 
-  const isBinaryContent = (content: string) => content.startsWith('base64:');
+  const isBinaryContent = (content: any) => typeof content === 'string' && content.startsWith('base64:');
+
+  const isFileRef = (content: any): content is FileRef =>
+    typeof content === 'object' && content !== null && content.ref === 'file';
 
   const getMimeType = (filename: string): string => {
     const ext = filename.split('.').pop()?.toLowerCase() || '';
@@ -765,14 +775,22 @@ export default function TaskDetailPage() {
     return '\u{1F4CE}';
   };
 
-  const formatFileSize = (content: string, binary: boolean): string => {
+  const formatFileSize = (content: any, binary: boolean): string => {
+    if (isFileRef(content)) {
+      const bytes = content.size;
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    }
+    if (typeof content !== 'string') return '';
     const bytes = binary ? Math.round((content.length - 7) * 0.75) : new Blob([content]).size;
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  const downloadFile = (filename: string, content: string) => {
+  const downloadFile = (filename: string, content: any) => {
+    if (isFileRef(content) || typeof content !== 'string') return;
     let blob: Blob;
     if (isBinaryContent(content)) {
       const b64 = content.slice(7); // strip "base64:" prefix
@@ -793,8 +811,9 @@ export default function TaskDetailPage() {
     URL.revokeObjectURL(url);
   };
 
-  const downloadAllDeliverables = (deliverables: Record<string, string>) => {
+  const downloadAllDeliverables = (deliverables: Record<string, any>) => {
     Object.entries(deliverables).forEach(([filename, content], i) => {
+      if (isFileRef(content) || typeof content !== 'string') return;
       setTimeout(() => downloadFile(filename, content), i * 100);
     });
   };
@@ -1265,6 +1284,24 @@ export default function TaskDetailPage() {
                             </div>
                             <div className="space-y-3">
                               {Object.entries(o.deliverables).map(([filename, content]) => {
+                                if (isFileRef(content)) {
+                                  return (
+                                    <div key={filename} className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
+                                      <div className="flex items-center justify-between px-3 py-2 bg-gray-800/80 border-b border-gray-700">
+                                        <div className="flex items-center gap-2">
+                                          <span className="text-sm">{getFileIcon(filename, false)}</span>
+                                          <span className="text-sm font-mono text-emerald-400">{filename}</span>
+                                        </div>
+                                        <span className="text-xs text-gray-500">{formatFileSize(content, false)}</span>
+                                      </div>
+                                      <div className="p-3 text-xs text-gray-500 font-mono space-y-1">
+                                        <div>📎 File stored in workspace (too large to embed)</div>
+                                        <div>path: {content.path}</div>
+                                        <div>sha256: {content.sha256}</div>
+                                      </div>
+                                    </div>
+                                  );
+                                }
                                 const binary = isBinaryContent(content);
                                 const isImage = binary && /\.(png|jpg|jpeg|gif|webp|bmp|svg)$/i.test(filename);
                                 return (

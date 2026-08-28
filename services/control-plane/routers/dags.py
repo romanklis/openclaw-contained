@@ -4,7 +4,7 @@ DAGs Router — CRUD and lifecycle for Master DAGs.
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from database import get_db
 from models import (
     MasterDAG,
@@ -19,6 +19,9 @@ from models import (
     SkillV2,
     TemplateSkill,
     TemplateSkillStatus,
+    CapabilityRequest,
+    TaskOutput,
+    DeepReview,
 )
 from schemas import (
     DAGCreate,
@@ -46,7 +49,7 @@ from schemas import (
 from dag_validator import validate_dag
 from planner import plan_dag
 from routers.openai_dag import MODEL_CONFIGS
-from temporal_client import start_dag_workflow
+from temporal_client import start_dag_workflow, get_temporal_client
 import uuid
 import logging
 import json
@@ -58,11 +61,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Default model config — persisted to DB (llm_provider_config) so it survives restarts
-_DAG_MODEL_KEYS = ["planning_model", "agent_model", "deep_review_model"]
+_DAG_MODEL_KEYS = ["planning_model", "agent_model", "deep_review_model", "agent_context_mode"]
 _dag_model_defaults: dict[str, str] = {
     "planning_model": "gemini-flash-lite-latest",
     "agent_model": "gemini-flash-lite-latest",
     "deep_review_model": "gemini-flash-lite-latest",
+    # none = full history replay each turn (quadratic cost);
+    # linear = trim + fold old turns into a summary (bounded growth)
+    "agent_context_mode": "none",
 }
 
 
@@ -74,8 +80,8 @@ async def _load_dag_model_defaults_from_db():
         session = async_session()
         async with session:
             result = await session.execute(
-                text("SELECT key, value FROM llm_provider_config WHERE key IN (:k1, :k2, :k3)"),
-                {"k1": "planning_model", "k2": "agent_model", "k3": "deep_review_model"},
+                text("SELECT key, value FROM llm_provider_config WHERE key IN (:k1, :k2, :k3, :k4)"),
+                {"k1": "planning_model", "k2": "agent_model", "k3": "deep_review_model", "k4": "agent_context_mode"},
             )
             for key, value in result.fetchall():
                 if key in _DAG_MODEL_KEYS and value:
@@ -327,8 +333,14 @@ async def set_model_defaults(body: dict):
     if "deep_review_model" in body and body["deep_review_model"]:
         _dag_model_defaults["deep_review_model"] = body["deep_review_model"]
         changed.append(f"deep_review_model={body['deep_review_model']}")
+    if "agent_context_mode" in body and body["agent_context_mode"]:
+        mode = str(body["agent_context_mode"])
+        if mode not in ("none", "linear", "graph"):
+            mode = "none"
+        _dag_model_defaults["agent_context_mode"] = mode
+        changed.append(f"agent_context_mode={mode}")
     # Persist changed keys to DB so they survive restarts
-    for key in ("planning_model", "agent_model", "deep_review_model"):
+    for key in ("planning_model", "agent_model", "deep_review_model", "agent_context_mode"):
         if key in _dag_model_defaults and (key in body and body[key]):
             await _save_dag_model_default_to_db(key, _dag_model_defaults[key])
     logger.info(f"DAG model defaults updated: {', '.join(changed)}")
@@ -336,10 +348,15 @@ async def set_model_defaults(body: dict):
 
 
 @router.get("", response_model=list[DAGResponse])
-async def list_dags(skip: int = 0, limit: int = 50, db: AsyncSession = Depends(get_db)):
-    """List all DAGs."""
+async def list_dags(skip: int = 0, limit: int = 50, archived: bool = False, db: AsyncSession = Depends(get_db)):
+    """List DAGs. By default excludes archived (soft-deleted) DAGs; pass
+    `archived=true` to list archived DAGs instead."""
     result = await db.execute(
-        select(MasterDAG).order_by(MasterDAG.created_at.desc()).offset(skip).limit(limit)
+        select(MasterDAG)
+        .where(MasterDAG.archived.is_(True) if archived else MasterDAG.archived.is_(False))
+        .order_by(MasterDAG.created_at.desc())
+        .offset(skip)
+        .limit(limit)
     )
     return list(result.scalars().all())
 
@@ -393,16 +410,125 @@ async def cancel_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     dag.status = DAGStatus.CANCELLED
     dag.completed_at = datetime.utcnow()
 
-    # Cancel pending nodes
+    # Cancel pending nodes; also release RUNNING nodes so none is left stuck
+    # in "running" forever (previously only pending nodes were skipped).
     nodes_result = await db.execute(
-        select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.status == NodeStatus.PENDING)
+        select(DAGNode).where(
+            DAGNode.dag_id == dag_id,
+            DAGNode.status.in_([NodeStatus.PENDING, NodeStatus.RUNNING]),
+        )
     )
+    running_node_ids = []
     for node in nodes_result.scalars().all():
+        if node.status == NodeStatus.RUNNING:
+            running_node_ids.append(node.node_id)
         node.status = NodeStatus.SKIPPED
 
     await db.commit()
     await db.refresh(dag)
+
+    # Stop the Temporal workflow(s) so the orchestration actually halts and
+    # does not keep running or overwrite node statuses afterwards.
+    try:
+        client = await get_temporal_client()
+    except Exception as exc:
+        logger.warning(f"cancel_dag: could not connect to Temporal for {dag_id}: {exc}")
+        return dag
+
+    if dag.workflow_id:
+        try:
+            handle = client.get_workflow_handle(dag.workflow_id)
+            await handle.cancel()
+        except Exception:
+            try:
+                await handle.terminate(reason="cancelled via API")
+            except Exception as exc:
+                logger.warning(f"cancel_dag: could not stop DAG workflow {dag.workflow_id}: {exc}")
+
+    # Also stop any node (and agent-task) workflows that were running so they
+    # cannot keep advancing their nodes after cancellation.
+    for node_id in running_node_ids:
+        for wf_id in (
+            f"dag-node-{dag_id}-{node_id}",
+            f"agent-task-{dag_id}-{node_id}",
+            f"agent-task-{dag_id}-{node_id}-assessment-retry",
+        ):
+            try:
+                handle = client.get_workflow_handle(wf_id)
+                await handle.cancel()
+            except Exception:
+                try:
+                    await handle.terminate(reason="cancelled via API")
+                except Exception:
+                    pass
+
     return dag
+
+
+@router.post("/{dag_id}/archive", response_model=DAGResponse)
+async def archive_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Archive (soft-delete) a DAG so it is hidden from the default list."""
+    dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_mutable(dag)
+    if dag.status == DAGStatus.RUNNING:
+        raise HTTPException(status_code=400, detail="Cannot archive a running DAG")
+    dag.archived = True
+    await db.commit()
+    await db.refresh(dag)
+    return dag
+
+
+@router.post("/{dag_id}/unarchive", response_model=DAGResponse)
+async def unarchive_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Restore an archived DAG to the default list."""
+    dag = await _get_dag_or_404(dag_id, db)
+    dag.archived = False
+    await db.commit()
+    await db.refresh(dag)
+    return dag
+
+
+@router.delete("/{dag_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Hard-delete a DAG and all related records + its workspace directory."""
+    import os
+    import shutil
+
+    dag = await _get_dag_or_404(dag_id, db)
+    if dag.status == DAGStatus.RUNNING:
+        raise HTTPException(status_code=400, detail="Cannot delete a running DAG")
+    if dag.locked:
+        raise HTTPException(status_code=400, detail="Cannot delete a locked template DAG")
+
+    workspace_path = f"/workspaces/{dag.workspace_id}"
+
+    # Task-scoped children first (need task ids before deleting the tasks).
+    task_ids_result = await db.execute(select(Task.id).where(Task.dag_id == dag_id))
+    task_ids = [row[0] for row in task_ids_result.all()]
+    if task_ids:
+        await db.execute(delete(CapabilityRequest).where(CapabilityRequest.task_id.in_(task_ids)))
+        await db.execute(delete(TaskOutput).where(TaskOutput.task_id.in_(task_ids)))
+
+    # DAG-scoped rows.
+    await db.execute(delete(DAGNodeStateSnapshot).where(DAGNodeStateSnapshot.dag_id == dag_id))
+    await db.execute(delete(DAGNodeAuditEvent).where(DAGNodeAuditEvent.dag_id == dag_id))
+    await db.execute(delete(DAGNodeOutput).where(DAGNodeOutput.dag_id == dag_id))
+    await db.execute(delete(DeepReview).where(DeepReview.dag_id == dag_id))
+    await db.execute(delete(SkillSelectionEvent).where(SkillSelectionEvent.dag_id == dag_id))
+
+    if task_ids:
+        await db.execute(delete(Task).where(Task.dag_id == dag_id))
+    await db.execute(delete(DAGNode).where(DAGNode.dag_id == dag_id))
+    await db.delete(dag)
+    await db.commit()
+
+    # Best-effort workspace cleanup.
+    try:
+        if os.path.isdir(workspace_path):
+            shutil.rmtree(workspace_path, ignore_errors=True)
+            logger.info(f"Removed workspace {workspace_path}")
+    except Exception as exc:
+        logger.warning(f"Could not remove workspace {workspace_path}: {exc}")
 
 
 @router.post("/{dag_id}/lock", response_model=DAGDetail)
@@ -446,16 +572,10 @@ async def lock_dag(dag_id: str, body: DAGLockRequest, db: AsyncSession = Depends
             src_skill = await db.get(SkillV2, skill_id)
             src_instructions = (src_skill.instructions if src_skill else "") or ""
             if src_instructions:
-                generalized = await _generalize_skill_instructions(
-                    src_instructions, nd.get("description") or "", params
-                )
-                if generalized.get("instructions"):
-                    generalized_instructions = generalized["instructions"]
-                    tskill_name = generalized.get("name") or tskill_name
-                    tskill_desc = generalized.get("description") or ""
-                    tskill_params = generalized.get("params_used") or sorted(param_keys)
-            if not generalized_instructions:
-                # Fallback: mechanical string parameterization.
+                # Deterministic generalization: replace old concrete values with
+                # {key} placeholders (case-insensitive, word-boundary). This
+                # preserves the exact original procedure and cannot hallucinate
+                # an unrelated platform, which the LLM has proven to do.
                 generalized_instructions = _parameterize_text(src_instructions, params)
 
         if generalized_instructions:
@@ -536,18 +656,38 @@ def _parameterize_text(text: str, params: list) -> str:
 
     Turns the template's current values into placeholders so a future
     instantiation can substitute new inputs. Longer defaults first to avoid
-    partial overlaps.
+    partial overlaps. Uses word-boundary, case-insensitive matching so:
+      - "Electrolux" / "electrolux" both become {company}
+      - substrings inside URLs/tokens (e.g. "electrolux" in
+        "electroluxgroup.com") are NOT touched
     """
+    import re as _re
     if not text:
         return text
-    out = text
+    out = str(text)
     ordered = sorted(
         (p for p in params if p.get("default") and p.get("key")),
         key=lambda p: len(str(p.get("default"))),
         reverse=True,
     )
     for p in ordered:
-        out = out.replace(str(p["default"]), "{" + p["key"] + "}")
+        default = str(p["default"])
+        key = p["key"]
+        if not default:
+            continue
+        out = _re.sub(
+            r"\b" + _re.escape(default) + r"\b",
+            "{" + key + "}",
+            out,
+            flags=_re.IGNORECASE,
+        )
+    return out
+
+
+def _slugify(text: str) -> str:
+    """Lowercase alphanumeric slug (used to rewrite filenames with old values)."""
+    import re
+    out = re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
     return out
 
 
@@ -568,12 +708,16 @@ async def _generalize_skill_instructions(skill_instructions: str, node_desc: str
         "template input parameters, and the skill's current pseudo-code instructions (which "
         "likely hardcode concrete values from the run it was learned on).\n"
         "Rewrite the skill into a GENERALIZED pseudo-code form that:\n"
-        "- Declares its inputs at the top as: INPUT: <param_key1>, <param_key2> (only params it actually uses).\n"
-        "- Replaces hardcoded concrete values (target models, markets, currencies, hosts, filenames) "
-        "with {param_key} placeholders from the provided parameter list.\n"
-        "- Keeps the procedural logic (fetching, parsing, verification, error handling) intact.\n"
-        "- Generalizes hardcoded variant/rejection lists to be derived from the parameter where possible "
-        "(e.g. accepted variants built from the {camera_model} value), while keeping genuinely fixed rules.\n"
+        "- Declares its inputs at the top as: INPUT: <param_key1>, <param_key2> (only params it actually uses, "
+        "chosen from the provided parameter list).\n"
+        "- Replaces EVERY hardcoded concrete value (company names, products, markets, currencies, hosts, "
+        "URLs that embed such values, filenames) with {param_key} placeholders from the provided parameter list.\n"
+        "- Keeps the procedural logic (fetching, parsing, verification, error handling) intact and uses the "
+        "SAME sources/tools/steps as the original skill.\n"
+        "- NEVER invents or substitutes a different source, platform, service, or site (e.g. do not change an "
+        "investor-relations site into a different platform). Only generalize the existing procedure.\n"
+        "- The output MUST NOT contain the original company/product/marketplace names anywhere — any leftover "
+        "concrete value is a failure.\n"
         "- Ends with an explicit RETURN.\n"
         "Return ONLY a valid JSON object (no markdown, no commentary):\n"
         '{"name": "<skill name>", "description": "<one line>", "instructions": "<generalized pseudo-code>", "params_used": ["key", ...]}'
@@ -631,6 +775,74 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
     """
     source = await _get_dag_or_404(dag_id, db)
 
+    params = body.parameters or {}
+
+    # Old-default -> new-value replacements (exact + slugified) so any leftover
+    # old concrete values (e.g. the company name "Electrolux") in the prior-run
+    # guidance and node text become the NEW inputs, not just {key} placeholders.
+    source_param_defaults = {
+        (p or {}).get("key"): (p or {}).get("default")
+        for p in (source.template_params or [])
+    }
+    _repl_pairs: list[tuple[str, str]] = []
+    for _k, _v in (params or {}).items():
+        _old = source_param_defaults.get(_k)
+        if _old and str(_v):
+            _repl_pairs.append((str(_old), str(_v)))
+            _slug_old = _slugify(str(_old))
+            _slug_new = _slugify(str(_v))
+            if _slug_old and _slug_old != _slug_new:
+                _repl_pairs.append((_slug_old, _slug_new))
+    _repl_pairs.sort(key=lambda x: len(x[0]), reverse=True)
+
+    def _apply_old_new(text: str) -> str:
+        import re as _re2
+        if not text:
+            return text
+        out = str(text)
+        for _old, _new in _repl_pairs:
+            # Word-boundary, case-insensitive so "Electrolux"/"electrolux" both
+            # map to the new company, while substrings inside URLs/tokens (e.g.
+            # "electrolux" in "electroluxgroup.com") are left intact.
+            out = _re2.sub(
+                r"\b" + _re2.escape(_old) + r"\b",
+                _new,
+                out,
+                flags=_re2.IGNORECASE,
+            )
+        return out
+
+    # Hyphen-slug pairs (old default slug -> new value slug) for generalizing
+    # node_ids and path references (e.g. "download-electrolux-q2-2026-report"
+    # -> "download-whirlpool-q2-2026-report", "/workspace/download-electrolux-…"
+    # -> "/workspace/download-whirlpool-…").
+    import re as _re3
+
+    def _hyphenize(s: str) -> str:
+        return _re3.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")
+
+    _hyphen_pairs: list[tuple[str, str]] = []
+    for _k, _v in (params or {}).items():
+        _old = source_param_defaults.get(_k)
+        if _old and str(_v):
+            _oh = _hyphenize(str(_old))
+            _nh = _hyphenize(str(_v))
+            if _oh and _oh != _nh:
+                _hyphen_pairs.append((_oh, _nh))
+    _hyphen_pairs.sort(key=lambda x: len(x[0]), reverse=True)
+
+    def _generalize_node_id(nid: str) -> str:
+        out = str(nid or "")
+        for _oh, _nh in _hyphen_pairs:
+            out = out.replace(_oh, _nh)
+        return out
+
+    def _apply_hyphen_pairs(text: str) -> str:
+        out = str(text or "")
+        for _oh, _nh in _hyphen_pairs:
+            out = out.replace(_oh, _nh)
+        return out
+
     # Per-node prior-run guidance (bounded, one step at a time).
     outputs_result = await db.execute(
         select(DAGNodeOutput).where(DAGNodeOutput.dag_id == dag_id)
@@ -640,34 +852,57 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
         outcome = (o.output_text or o.error_text or "").strip()
         lines = []
         if o.objective:
-            lines.append(f"Objective: {o.objective[:300]}")
+            lines.append(f"Objective: {_apply_old_new(o.objective[:300])}")
         if outcome:
-            lines.append(f"Outcome: {outcome[:500]}")
+            lines.append(f"Outcome: {_apply_old_new(outcome[:500])}")
         if o.deliverables_keys:
-            lines.append(f"Deliverables: {', '.join(o.deliverables_keys[:20])}")
+            lines.append(f"Deliverables: {_apply_old_new(', '.join(o.deliverables_keys[:20]))}")
         if o.acceptance_verdict:
-            lines.append(f"Verdict: {o.acceptance_verdict}")
+            lines.append(f"Verdict: {_apply_old_new(o.acceptance_verdict)}")
         guidance_by_node[o.node_id] = "\n".join(lines)[:1500]
 
-    params = body.parameters or {}
-    objective = _substitute_params(body.objective or source.objective, params)
+    objective = _apply_old_new(_apply_hyphen_pairs(_substitute_params(body.objective or source.objective, params)))
 
     src_dag_json = deepcopy(source.dag_json or {})
     nodes_defs = src_dag_json.get("nodes", [])
+
+    node_id_map = {nid: _generalize_node_id(nid) for nid in [nd.get("node_id") for nd in nodes_defs]}
+
+    def _generalize_input_spec(spec):
+        if isinstance(spec, dict) and spec.get("from"):
+            s = dict(spec)
+            s["from"] = node_id_map.get(str(s["from"]), str(s["from"]))
+            return s
+        if isinstance(spec, str) and "." in spec:
+            src, _, field = spec.partition(".")
+            if src in node_id_map:
+                return f"{node_id_map[src]}.{field}"
+        return spec
+
     new_nodes = []
     for nd in nodes_defs:
         node_id = nd.get("node_id")
-        desc = _substitute_params(nd.get("description"), params)
+        new_node_id = _generalize_node_id(node_id)
+        desc = _apply_old_new(_apply_hyphen_pairs(_substitute_params(nd.get("description"), params)))
+        depends_on = [_generalize_node_id(d) for d in (nd.get("depends_on") or [])]
+        input_mapping = nd.get("input_mapping")
+        if isinstance(input_mapping, dict):
+            input_mapping = {k: _generalize_input_spec(v) for k, v in input_mapping.items()}
         cfg = dict(nd.get("config") or {})
         cfg = _substitute_params(cfg, params)
         for k in _RUNTIME_CONFIG_KEYS:
             cfg.pop(k, None)
+        if cfg.get("template_skill_instructions"):
+            cfg["template_skill_instructions"] = _apply_hyphen_pairs(cfg["template_skill_instructions"])
         guidance = guidance_by_node.get(node_id)
         if guidance:
-            cfg["template_guidance"] = guidance
+            cfg["template_guidance"] = _apply_old_new(_apply_hyphen_pairs(guidance))
         new_nodes.append({
             **nd,
+            "node_id": new_node_id,
             "description": desc,
+            "depends_on": depends_on,
+            "input_mapping": input_mapping,
             "config": cfg,
         })
     new_dag_json = {

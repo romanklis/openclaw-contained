@@ -194,7 +194,7 @@ services:
       - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-insecure-dind}
       - RAG_TOOL_URL=${RAG_TOOL_URL:-http://docling-rag:8080}
       - RAG_API_KEY=${RAG_API_KEYS:-my-local-secret-key}
-      - MAX_CONCURRENT_ACTIVITIES=${MAX_CONCURRENT_ACTIVITIES:-1}
+      - MAX_CONCURRENT_ACTIVITIES=${MAX_CONCURRENT_ACTIVITIES:-4}
     depends_on:
       temporal:
         condition: service_healthy

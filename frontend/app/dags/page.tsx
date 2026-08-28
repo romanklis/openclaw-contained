@@ -16,6 +16,7 @@ interface DAG {
   started_at: string | null
   completed_at: string | null
   locked: boolean
+  archived: boolean
 }
 
 interface Skill {
@@ -34,10 +35,11 @@ export default function DAGsPage() {
   const [skills, setSkills] = useState<Skill[]>([])
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([])
   const [modelDefaults, setModelDefaults] = useState<{planning_model: string, agent_model: string} | null>(null)
+  const [showArchived, setShowArchived] = useState(false)
 
   const fetchDags = async () => {
     try {
-      const res = await fetch(`${API}/api/dags`)
+      const res = await fetch(`${API}/api/dags?archived=${showArchived}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setDags(await res.json())
     } catch (err: any) {
@@ -65,7 +67,7 @@ export default function DAGsPage() {
     }
   }
 
-  useEffect(() => { fetchDags(); fetchSkills(); fetchModelDefaults() }, [])
+  useEffect(() => { fetchDags(); fetchSkills(); fetchModelDefaults() }, [showArchived])
 
   const createDag = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -105,6 +107,47 @@ export default function DAGsPage() {
     }
   }
 
+  const archiveDag = async (dagId: string) => {
+    if (!window.confirm(`Archive DAG ${dagId}? It will be hidden from the list.`)) return
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/archive`, { method: 'POST' })
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}))
+        throw new Error(detail.detail || `HTTP ${res.status}`)
+      }
+      fetchDags()
+    } catch (err: any) {
+      setError(err.message)
+    }
+  }
+
+  const unarchiveDag = async (dagId: string) => {
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/unarchive`, { method: 'POST' })
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}))
+        throw new Error(detail.detail || `HTTP ${res.status}`)
+      }
+      fetchDags()
+    } catch (err: any) {
+      setError(err.message)
+    }
+  }
+
+  const deleteDag = async (dagId: string) => {
+    if (!window.confirm(`Permanently delete DAG ${dagId} and ALL its data (tasks, outputs, reviews, workspace)? This cannot be undone.`)) return
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}))
+        throw new Error(detail.detail || `HTTP ${res.status}`)
+      }
+      fetchDags()
+    } catch (err: any) {
+      setError(err.message)
+    }
+  }
+
   const getWorkflowLink = (workflowId: string) => {
     return `${TEMPORAL_UI}/namespaces/default/workflows/${encodeURIComponent(workflowId)}`
   }
@@ -115,6 +158,9 @@ export default function DAGsPage() {
         <h1 className="text-2xl font-bold">DAGs</h1>
         <div className="flex gap-2 items-center">
           <Link href="/template-skills" className="btn-primary text-sm !bg-purple-700 hover:!bg-purple-600">🧩 Template Skills</Link>
+          <button onClick={() => setShowArchived(!showArchived)} className="btn-primary text-sm">
+            {showArchived ? 'Show active' : '📁 Show archived'}
+          </button>
           <button onClick={() => setShowForm(!showForm)} className="btn-primary text-sm">
             {showForm ? 'Cancel' : '+ New DAG'}
           </button>
@@ -229,12 +275,42 @@ export default function DAGsPage() {
                     ▶ Start
                   </button>
                 )}
+                {!dag.locked && dag.status !== 'running' && (
+                  <div className="mt-1 flex justify-end gap-1">
+                    {showArchived ? (
+                      <button
+                        onClick={(e) => { e.preventDefault(); e.stopPropagation(); unarchiveDag(dag.id) }}
+                        className="btn-primary text-xs"
+                        title="Restore to active list"
+                      >
+                        ↩ Restore
+                      </button>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.preventDefault(); e.stopPropagation(); archiveDag(dag.id) }}
+                        className="btn-warning text-xs"
+                        title="Hide from the list (can be restored)"
+                      >
+                        📁 Archive
+                      </button>
+                    )}
+                    <button
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteDag(dag.id) }}
+                      className="btn-danger text-xs"
+                      title="Permanently delete DAG and all its data"
+                    >
+                      🗑 Delete
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           </Link>
         ))}
         {dags.length === 0 && (
-          <div className="text-center text-gray-500 py-12">No DAGs yet. Create one to get started.</div>
+          <div className="text-center text-gray-500 py-12">
+            {showArchived ? 'No archived DAGs.' : 'No DAGs yet. Create one to get started.'}
+          </div>
         )}
       </div>
     </div>

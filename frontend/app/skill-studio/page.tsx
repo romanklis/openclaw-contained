@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { API } from '../lib/api'
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -78,6 +78,7 @@ export default function SkillStudioPage() {
   const [images, setImages] = useState<AgentImage[]>([])
   const [selectedImage, setSelectedImage] = useState<string>('')
   const [skills, setSkills] = useState<SkillV2[]>([])
+  const [hideArchived, setHideArchived] = useState(true)
   const [reviewQueue, setReviewQueue] = useState<SkillV2[]>([])
   const [demos, setDemos] = useState<Demo[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -103,6 +104,10 @@ export default function SkillStudioPage() {
   const [newSkillInstructions, setNewSkillInstructions] = useState('')
   const [newSkillTags, setNewSkillTags] = useState('')
   const [createSubmitting, setCreateSubmitting] = useState(false)
+
+  // Export / import
+  const [importResult, setImportResult] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Skill edit modal
   const [editingSkill, setEditingSkill] = useState<SkillV2 | null>(null)
@@ -178,6 +183,43 @@ async function loadDemos() {
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       setDemos(await r.json())
     } catch (e: any) { setError(e.message) } finally { setLoading(false) }
+  }
+
+  async function exportSkills(qs: string) {
+    try {
+      const r = await fetch(`${API}/api/skill-learning/skills/export${qs}`)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const blob = await r.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'skills-export.json'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e: any) { setError(e.message) }
+  }
+
+  async function importSkills(file: File) {
+    setImportResult(null)
+    setError(null)
+    try {
+      const text = await file.text()
+      const r = await fetch(`${API}/api/skill-learning/skills/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: text,
+      })
+      if (!r.ok) throw new Error(await r.text())
+      const res = await r.json()
+      const errs = (res.errors || []).length
+      setImportResult(`Imported ${res.imported}, skipped ${res.skipped}${errs ? `, ${errs} error(s)` : ''}`)
+      if (tab === 'tree') loadTree()
+    } catch (e: any) { setError(e.message) }
+    finally {
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
   }
 
   async function submitDemo() {
@@ -340,7 +382,7 @@ async function loadDemos() {
         )}
 
         {/* Image selector */}
-        <div className="mb-6 flex items-center gap-3">
+        <div className="mb-6 flex items-center gap-3 flex-wrap">
           <label className="text-sm text-gray-400">Image:</label>
           <select
             value={selectedImage}
@@ -351,7 +393,39 @@ async function loadDemos() {
               <option key={img.id} value={img.id}>{img.id} — {img.name}</option>
             ))}
           </select>
+          <div className="flex items-center gap-2 ml-2">
+            <button
+              onClick={() => exportSkills(`?image_id=${encodeURIComponent(selectedImage)}`)}
+              className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+              title="Export this image's skills to a JSON text file"
+            >
+              ⬇ Export
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+              title="Import skills from a JSON text file"
+            >
+              ⬆ Import
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,.txt,application/json,text/plain"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                if (f) importSkills(f)
+              }}
+            />
+          </div>
         </div>
+
+        {importResult && (
+          <div className="mb-4 p-3 bg-green-900/40 border border-green-700 rounded text-green-300 text-sm">
+            {importResult}
+          </div>
+        )}
 
         {/* Tabs */}
         <div className="flex gap-1 mb-0 border-b border-gray-700">
@@ -370,15 +444,30 @@ async function loadDemos() {
           {/* ── Skill Tree ─────────────────────────────── */}
           {tab === 'tree' && !loading && (
             <div className="space-y-3">
-              {skills.length === 0 && (
+              <div className="flex items-center justify-between">
+                <label className="flex items-center gap-2 cursor-pointer text-xs text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={hideArchived}
+                    onChange={(e) => setHideArchived(e.target.checked)}
+                    className="accent-gray-500"
+                  />
+                  Hide archived
+                </label>
+                <span className="text-xs text-gray-600">
+                  {skills.filter(s => !hideArchived || s.status !== 'archived').length} / {skills.length} shown
+                </span>
+              </div>
+              {skills.filter(s => !hideArchived || s.status !== 'archived').length === 0 && (
                 <p className="text-gray-500 text-sm">No skills for this image yet. Capture a demo or create one manually.</p>
               )}
-              {skills.map(skill => (
+              {skills.filter(s => !hideArchived || s.status !== 'archived').map(skill => (
                 <SkillCard key={skill.id} skill={skill} onReview={() => {
                   setReviewingSkill(skill)
                   setEditedInstructions(skill.instructions)
                   setTab('review-queue')
-                }} onEdit={() => openEditor(skill)} onDelete={handleDelete} />
+                }} onEdit={() => openEditor(skill)} onDelete={handleDelete}
+                onExport={() => exportSkills(`?ids=${encodeURIComponent(skill.id)}`)} />
               ))}
             </div>
           )}
@@ -666,7 +755,7 @@ async function loadDemos() {
 
 // ── SkillCard component ───────────────────────────────────────────────────────
 
-function SkillCard({ skill, onReview, onEdit, onDelete }: { skill: SkillV2; onReview: () => void; onEdit: () => void; onDelete?: (id: string) => void }) {
+function SkillCard({ skill, onReview, onEdit, onDelete, onExport }: { skill: SkillV2; onReview: () => void; onEdit: () => void; onDelete?: (id: string) => void; onExport?: () => void }) {
   const [expanded, setExpanded] = useState(false)
 
   return (
@@ -680,6 +769,15 @@ function SkillCard({ skill, onReview, onEdit, onDelete }: { skill: SkillV2; onRe
         </button>
         <div className="flex items-center gap-2 flex-shrink-0 ml-4">
           {statusBadge(skill.status)}
+          {onExport && (
+            <button
+              onClick={onExport}
+              className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium"
+              title="Export this skill to a JSON text file"
+            >
+              ⬇
+            </button>
+          )}
           <button
             onClick={onEdit}
             className="px-2 py-0.5 bg-blue-800 hover:bg-blue-700 rounded text-xs font-medium"

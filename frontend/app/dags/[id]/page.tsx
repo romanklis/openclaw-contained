@@ -194,6 +194,7 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [deepReviewLoading, setDeepReviewLoading] = useState(false)
   const [deepReviews, setDeepReviews] = useState<Record<string, any>>({})
   const [includeSkillInReview, setIncludeSkillInReview] = useState(true)
+  const [skillFormat, setSkillFormat] = useState('pseudo-code')
   const [correctSkillLoading, setCorrectSkillLoading] = useState(false)
   const [correctSkillResult, setCorrectSkillResult] = useState<any>(null)
 
@@ -607,7 +608,7 @@ setNodeState(prev => {
     setShowSkillDialog(true)
     try {
       const img = selectedNode.config?.base_image || 'openclaw'
-      const res = await fetch(`${API}/api/skill-learning/skills?image_id=${encodeURIComponent(img)}&limit=200`)
+      const res = await fetch(`${API}/api/skill-learning/skills?image_id=${encodeURIComponent(img)}&limit=200&exclude_archived=true`)
       if (res.ok) setAvailableSkills(await res.json())
     } catch {
       setAvailableSkills([])
@@ -942,6 +943,7 @@ setNodeState(prev => {
           dag_id: dag?.id,
           created_by: 'dag-review',
           include_skill: includeSkillInReview,
+          skill_format: skillFormat,
         }),
       })
       if (!res.ok) throw new Error(await res.text())
@@ -996,6 +998,7 @@ setNodeState(prev => {
           node_id: nodeId,
           dag_id: dag?.id,
           created_by: 'dag-review',
+          skill_format: skillFormat,
         }),
       })
       if (!res.ok) throw new Error(await res.text())
@@ -1424,6 +1427,18 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                           />
                           <span className="text-xs text-gray-400">Include skill context in review</span>
                         </label>
+                        <div className="mt-2">
+                          <label className="block text-[10px] text-gray-500 mb-1">Skill format (learn / correct)</label>
+                          <select
+                            value={skillFormat}
+                            onChange={(e) => setSkillFormat(e.target.value)}
+                            className="w-full bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-[11px] text-gray-300"
+                          >
+                            <option value="pseudo-code">pseudo-code (algorithmic)</option>
+                            <option value="easy">easy (structured steps)</option>
+                            <option value="code">code (ready-to-run script in original language)</option>
+                          </select>
+                        </div>
                       </div>
                       <div className="border-t border-gray-700 my-1" />
                       <button
@@ -1509,6 +1524,18 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                           />
                           <span className="text-xs text-gray-400">Include skill context in review</span>
                         </label>
+                        <div className="mt-2">
+                          <label className="block text-[10px] text-gray-500 mb-1">Skill format (learn / correct)</label>
+                          <select
+                            value={skillFormat}
+                            onChange={(e) => setSkillFormat(e.target.value)}
+                            className="w-full bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-[11px] text-gray-300"
+                          >
+                            <option value="pseudo-code">pseudo-code (algorithmic)</option>
+                            <option value="easy">easy (structured steps)</option>
+                            <option value="code">code (ready-to-run script in original language)</option>
+                          </select>
+                        </div>
                       </div>                      <div className="border-t border-gray-700 my-1" />
                       <button
                         onClick={() => {

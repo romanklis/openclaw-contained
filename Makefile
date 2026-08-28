@@ -2,7 +2,8 @@
 # Auditable Agent Orchestration for OpenClaw
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
-		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images
+		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images \
+		docker-clean-dag docker-clean-dag-dry-run
 
 # ─────────────────────────────────────────────────────────
 # Help
@@ -181,6 +182,16 @@ build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build
 	@echo "      openclaw-agent:browser   (Chromium + agent-browser)"
 	@echo "      openclaw-agent:browser_v2 (Chromium + agent-browser + obscura)"
 	@echo "      openclaw-agent:browser_v3 (Chromium + agent-browser + lightpanda)"
+
+# ─────────────────────────────────────────────────────────
+# Logs & Status
+# ─────────────────────────────────────────────────────────
+
+docker-clean-dag: ## Remove old DAG agent images from DinD (default retention 5 days; override with DAG_RETENTION_DAYS)
+	@scripts/cleanup-dag-images.sh $(DAG_RETENTION_DAYS)
+
+docker-clean-dag-dry-run: ## Dry-run: list old DAG images that would be removed (deletes nothing)
+	@scripts/cleanup-dag-images.sh $(DAG_RETENTION_DAYS) --dry-run
 
 # ─────────────────────────────────────────────────────────
 # Logs & Status

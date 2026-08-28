@@ -48,6 +48,8 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE"))
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS template_params JSON"))
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS template_source_dag_id VARCHAR"))
+        # DAG archiving (soft delete / declutter)
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
         # Task status enum values (kept in sync with models.TaskStatus)
         await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'WAITING_APPROVAL'"))
         await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'BUILDING_IMAGE'"))

@@ -1,7 +1,7 @@
 """
 Skill Learning System v2 — Demo ingestion, audit mining, human review, tree browsing.
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update as sa_update, func as sa_func
 from sqlalchemy.orm import selectinload
@@ -12,7 +12,7 @@ from models import (
     AgentImage, TaskOutput, Task, DAGNode, Skill, DeepReview,
     TemplateSkill, TemplateSkillStatus,
 )
-from typing import Optional, List
+from typing import Optional, List, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
 import uuid
@@ -189,16 +189,86 @@ async def create_skill_v2(data: SkillV2Create, db: AsyncSession = Depends(get_db
     return skill
 
 
+@router.post("/skills/import")
+async def import_skills_v2(payload: Any = Body(...), db: AsyncSession = Depends(get_db)):
+    """Import skills from a JSON text payload (single object or array).
+
+    Creates new skills (fresh ids, DRAFT status); skips entries with a missing
+    image_id or an existing (image_id, name) pair. Returns counts + errors.
+    """
+    entries = payload if isinstance(payload, list) else [payload]
+    imported = 0
+    skipped = 0
+    errors: List[str] = []
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            errors.append("entry is not an object")
+            skipped += 1
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            errors.append("missing 'name'")
+            skipped += 1
+            continue
+        image_id = str(entry.get("image_id") or "").strip()
+        img = await db.get(AgentImage, image_id) if image_id else None
+        if not img:
+            errors.append(f"skill '{name}': image_id '{image_id}' not found")
+            skipped += 1
+            continue
+
+        dup = await db.execute(
+            select(SkillV2).where(SkillV2.image_id == image_id, SkillV2.name == name)
+        )
+        if dup.scalar_one_or_none():
+            skipped += 1
+            continue
+
+        parent_id = entry.get("parent_id")
+        if parent_id:
+            parent = await db.get(SkillV2, str(parent_id))
+            if not parent:
+                parent_id = None
+
+        tags_raw = entry.get("tags") or []
+        tags = [str(t) for t in tags_raw if str(t).strip()] if isinstance(tags_raw, list) else []
+
+        source_name = str(entry.get("source_type") or "manual")
+        try:
+            source_type = SkillV2Source(source_name)
+        except ValueError:
+            source_type = SkillV2Source.MANUAL
+
+        skill = SkillV2(
+            id=_skv2_id(),
+            image_id=image_id,
+            name=name,
+            description=str(entry.get("description") or ""),
+            instructions=str(entry.get("instructions") or ""),
+            parent_id=parent_id,
+            tags=tags,
+            source_type=source_type,
+            status=SkillV2Status.DRAFT,
+        )
+        db.add(skill)
+        imported += 1
+
+    await db.commit()
+    return {"imported": imported, "skipped": skipped, "errors": errors}
+
+
 @router.get("/skills", response_model=List[SkillV2Response])
 async def list_skills_v2(
     image_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     tag: Optional[str] = Query(None),
+    exclude_archived: bool = Query(False),
     skip: int = 0,
     limit: int = 100,
     db: AsyncSession = Depends(get_db),
 ):
-    """List v2 skills, optionally filtered by image, status, or tag."""
+    """List v2 skills, optionally filtered by image, status, tag, or excluding archived."""
     q = select(SkillV2).offset(skip).limit(limit)
     if image_id:
         q = q.where(SkillV2.image_id == image_id)
@@ -207,11 +277,53 @@ async def list_skills_v2(
             q = q.where(SkillV2.status == SkillV2Status(status_filter))
         except ValueError:
             raise HTTPException(status_code=422, detail=f"Invalid status '{status_filter}'")
+    if exclude_archived:
+        q = q.where(SkillV2.status != SkillV2Status.ARCHIVED)
     result = await db.execute(q)
     skills = list(result.scalars().all())
     if tag:
         skills = [s for s in skills if tag in (s.tags or [])]
     return skills
+
+
+@router.get("/skills/export")
+async def export_skills_v2(
+    image_id: Optional[str] = Query(None),
+    ids: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Export skills as a downloadable JSON text file.
+
+    Declared before GET /skills/{skill_id} so 'export' is not captured as an id.
+    """
+    q = select(SkillV2)
+    if image_id:
+        q = q.where(SkillV2.image_id == image_id)
+    if ids:
+        id_list = [i.strip() for i in ids.split(",") if i.strip()]
+        if id_list:
+            q = q.where(SkillV2.id.in_(id_list))
+    result = await db.execute(q.order_by(SkillV2.created_at))
+    skills = list(result.scalars().all())
+    payload = [
+        {
+            "image_id": s.image_id,
+            "name": s.name,
+            "description": s.description or "",
+            "instructions": s.instructions or "",
+            "parent_id": s.parent_id,
+            "tags": s.tags or [],
+            "source_type": s.source_type.value if hasattr(s.source_type, "value") else str(s.source_type),
+            "status": s.status.value if hasattr(s.status, "value") else str(s.status),
+        }
+        for s in skills
+    ]
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    return Response(
+        content=text,
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="skills-export.json"'},
+    )
 
 
 @router.get("/skills/{skill_id}", response_model=SkillV2Response)
@@ -734,6 +846,7 @@ class SkillAnalysisRequest(BaseModel):
     node_id: Optional[str] = None
     dag_id: Optional[str] = None
     created_by: Optional[str] = None
+    skill_format: Optional[str] = "pseudo-code"  # pseudo-code | easy
 
 
 class SkillAnalysisResponse(BaseModel):
@@ -816,9 +929,10 @@ def _build_execution_summary(task: Task, outputs: List[TaskOutput], node: Option
     for out in outputs:
         deliverables = out.deliverables or {}
         turns = []
+        agent_logs = ""
         final_output = ""
         if out.raw_result and isinstance(out.raw_result, dict):
-            agent_logs = out.raw_result.get("agent_logs", "")
+            agent_logs = out.raw_result.get("agent_logs", "") or ""
             turns = _extract_turns_from_agent_logs(agent_logs)
             final_output = out.raw_result.get("output", "")
         iter_data = {
@@ -828,6 +942,7 @@ def _build_execution_summary(task: Task, outputs: List[TaskOutput], node: Option
             "deliverables": deliverables,          # full file contents (keyed by filename)
             "turns": turns,
             "turn_count": len(turns),
+            "agent_logs": agent_logs,              # raw tool log (truncated for the LLM in _trim_execution_summary_for_llm)
             "error": out.error,
             "output": final_output[:3000] if final_output else "",
         }
@@ -864,70 +979,6 @@ def _build_execution_summary(task: Task, outputs: List[TaskOutput], node: Option
         },
         "iterations": iterations,
     }
-
-
-
-
-def _detect_integrity_signals(summary: dict) -> List[str]:
-    """Rule-based pre-scan of the summary for concrete integrity signals.
-
-    Returns a list of concrete findings (strings) that are passed to the LLM as
-    explicit hints, so critical issues (e.g. placeholder/synthetic data) are never
-    missed even if the model is lenient.
-    """
-    import re
-    signals: List[str] = []
-
-    placeholders = re.compile(r"\b(?:N/A|TBD|TBA|TODO|placeholder|dummy|sample|example|Lorem ipsum|\bnull\b|\[\])\b", re.IGNORECASE)
-    empty_vals = re.compile(r'\b(?:total_count|count|records|rows|results)\s*[:=]\s*0\b', re.IGNORECASE)
-
-    for it in summary.get("iterations", []):
-        deliverables = it.get("deliverables", {}) or {}
-        status = it.get("status", "")
-        error = it.get("error")
-
-        # 1. Placeholder markers in deliverable contents (only flag DATA files,
-        #    not source code where N/A is legitimately handled in logic).
-        #    .html is excluded: markup naturally contains N/A/null and is not
-        #    tabular data — it is validated by the agent's claims + presence.
-        data_exts = (".json", ".csv", ".tsv", ".txt", ".md", ".xml", ".yaml", ".yml")
-        for fname, content in deliverables.items():
-            if not isinstance(content, str):
-                continue
-            lower_name = fname.lower()
-            is_code = not lower_name.endswith(data_exts)
-            if is_code:
-                continue  # skip source files (e.g. .py) — N/A may be legit logic
-            matches = set(m.group(0) for m in placeholders.finditer(content))
-            if matches:
-                signals.append(
-                    f"[{fname}] deliverable contains placeholder/synthetic markers: {', '.join(sorted(matches))}. "
-                    f"Likely fabricated/mocked data."
-                )
-            if empty_vals.search(content):
-                signals.append(
-                    f"[{fname}] deliverable reports zero/empty count or empty results, which contradicts a successful fetch."
-                )
-
-        # 2. Task marked completed but error present
-        if status == "completed" and error:
-            signals.append(f"Iteration {it.get('iteration')} is marked completed but has an error: {error}")
-
-        # 3. Deliverables but no turns (no actual work evidence)
-        if deliverables and not it.get("turns"):
-            signals.append(f"Iteration {it.get('iteration')} lists deliverables but has no recorded tool turns — no evidence of how they were produced.")
-
-        # 4. Output claims success while zero items
-        output = it.get("output", "") or ""
-        for fname, content in deliverables.items():
-            if not isinstance(content, str):
-                continue
-            if ("success" in output.lower() or "completed" in output.lower()) and empty_vals.search(content):
-                signals.append(
-                    f"Final output claims success for iteration {it.get('iteration')} but [{fname}] shows empty/zero results."
-                )
-
-    return signals
 
 
 def _extract_turns_from_agent_logs(agent_logs: str) -> List[dict]:
@@ -1136,23 +1187,84 @@ def _extract_json_object(text: str):
     return None
 
 
-def _build_skill_analysis_system_prompt() -> str:
+def _skill_instructions_spec(skill_format: str) -> str:
+    """Return the format requirements for the skill `instructions` field.
+
+    "pseudo-code" → an explicit algorithm; "easy" → a structured, plain-language
+    procedure with numbered sections; "code" → a complete, ready-to-run Python
+    script so the agent can execute the task directly and fast.
+    """
+    fmt = skill_format or "pseudo-code"
+    if fmt == "code":
+        return (
+            '  "instructions": "<a complete, ready-to-run source file in the SAME language the original solution used '
+            '(Python, Octave, JavaScript, R, shell, etc.), with brief comments, that the agent can copy and execute>",\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "WRITE THE INSTRUCTIONS AS A COMPLETE, READY-TO-RUN SOURCE FILE (plus any brief notes needed) in the EXACT "
+            "LANGUAGE OF THE ORIGINAL SOLUTION from the execution log (e.g. Python, Octave, JavaScript, R, shell) — "
+            "do NOT translate it to another language. Another AI agent will copy this code and EXECUTE it to perform "
+            "the task, so it must be self-contained and correct — no placeholders, no TODOs, no pseudo-code fragments.\n"
+            "Critical: EXTRACT the actual working code VERBATIM from the execution log's delivered source file(s). "
+            "Do NOT re-derive or rewrite a fresh script from the description — copy the proven code that the agent "
+            "actually ran successfully, fixing only genuine minor bugs.\n"
+            "Requirements:\n"
+            "- Use the same language, entry point, and file naming as the original solution (e.g. a `main()` + "
+            "`if __name__ == '__main__':` for Python; a `.m` script/function for Octave; etc.).\n"
+            "- Hardcode the exact input values from the step (URLs, query terms, target product/company) as constants.\n"
+            "- Use the exact tools/libs available and the real fetch flow the previous run proved works (e.g. "
+            "homepage warm-up before search, session reuse, retries + backoff).\n"
+            "- Include parsing, filtering, and verification (minimum size/non-empty checks, real-data validation), "
+            "and write the final deliverable(s) to the deliverables directory with explicit paths.\n"
+            "- Print clear SUCCESS/FAILURE output and set proper exit codes.\n"
+            "- Keep the code faithful to what actually worked in the execution log (URLs, selectors, thresholds) — do not invent.\n"
+            "If no reusable skill is evident, set learning_potential=false and skills=[]. "
+            "If the agent generated synthetic/fabricated data or mocked outputs, surface it clearly in warnings."
+        )
+    if fmt == "easy":
+        return (
+            '  "instructions": "<an easy, structured plain-language procedure an agent can follow step by step>",\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "WRITE THE INSTRUCTIONS AS AN EASY, STRUCTURED PROCEDURE — clear numbered steps in plain language "
+            "(no code syntax, no pseudo-code operators). This is critical: another AI agent executes this skill, "
+            "so it must be unambiguous and step-by-step.\n"
+            "Structure of \"instructions\":\n"
+            "- A short title line describing the procedure.\n"
+            "- An 'Inputs:' block listing every input variable with a plain-language example (e.g. "
+            "COMPANY_NAME: Target company (e.g. 'Whirlpool Corporation')).\n"
+            "- Numbered top-level sections with descriptive UPPERCASE names (e.g. 1. INITIALIZE, 2. LOCATE "
+            "REPORT URL, 3. DOWNLOAD PDF, 4. VERIFY, 5. RULES & CONSTRAINTS, 6. OUTPUT).\n"
+            "- Under each section, write explicit, sequential bullet/step actions in plain English: exactly what "
+            "to fetch (the URL/endpoint and tool), how to parse it, and the exact threshold checks and "
+            "validations to run.\n"
+            "- Name every exact source, URL/API endpoint, and tool call explicitly.\n"
+            "- Include mandatory verification: what counts as fabricated/placeholder data (e.g. 'N/A', 'TBD', "
+            "empty results), the minimum size/page checks, and how to react on failure (retry up to N times, "
+            "then fail).\n"
+            "- End with an 'OUTPUT' section describing the final deliverable(s) and the success/failure messages.\n"
+            "Example easy style:\n"
+            "  Download Company Quarterly Investor Relations PDF\n"
+            "  Inputs: COMPANY_NAME (e.g. 'Whirlpool Corporation'), QUARTER (e.g. 'Q2'), YEAR (e.g. '2026'), "
+            "IR_URL (official investor relations website)\n"
+            "  1. INITIALIZE\n"
+            "     - Build the output path and ensure the output directories exist.\n"
+            "  2. LOCATE REPORT URL\n"
+            "     - Open the IR site with a browser-impersonating HTTP client and look for a direct PDF link "
+            "matching the target quarter/year; if not visible, query the site's IR feed API.\n"
+            "  3. DOWNLOAD PDF\n"
+            "     - Download the identified PDF (retry up to 3 times); verify the response starts with %PDF-.\n"
+            "  4. VERIFY DELIVERABLE\n"
+            "     - Confirm the file exists, its size is at least 50 KB, and it has multiple pages; otherwise "
+            "delete it and abort.\n"
+            "  5. OUTPUT\n"
+            "     - Return the PDF path with a success message, or the failure reason.\n"
+            "If no reusable skill is evident, set learning_potential=false and skills=[]. "
+            "If the agent generated synthetic/fabricated data or mocked outputs, surface it clearly in warnings."
+        )
     return (
-        "You are a senior skill-extraction and code-review analyst for an autonomous agent platform. "
-        "You examine an agent's execution log for a task and decide whether it reveals a reusable/improveable "
-        "procedural skill. You must also critically assess whether the agent completed the task CORRECTLY, "
-        "flagging any hallucinations, fabrication of data, or generation of synthetic/mock content in code or "
-        "output files (this is a serious quality problem we must prevent).\n\n"
-        "Respond with ONLY valid JSON, no surrounding text, in this exact shape:\n"
-        "{\n"
-        '  "learning_potential": <bool>,\n'
-        '  "assessment": "<string: overall quality + whether a skill can be learned>",\n'
-        '  "warnings": ["<string: hallucination/synthetic-data/quality concerns>", ...],\n'
-        '  "suggested_improvements": ["<string: how to improve the skill to avoid these issues>", ...],\n'
-        '  "skills": [\n'
-        "    {\n"
-        '      "name": "<skill name>",\n'
-        '      "description": "<one-line description>",\n'
         '      "instructions": "<pseudo-code: an explicit, step-by-step algorithm an agent can follow verbatim>",\n'
         '      "tags": ["<tag>", ...]\n'
         "    }\n"
@@ -1183,7 +1295,28 @@ def _build_skill_analysis_system_prompt() -> str:
     )
 
 
-async def _call_skill_analysis_llm(summary: dict, skill_used: Optional[dict], task: Task) -> dict:
+def _build_skill_analysis_system_prompt(skill_format: str = "pseudo-code") -> str:
+    return (
+        "You are a senior skill-extraction and code-review analyst for an autonomous agent platform. "
+        "You examine an agent's execution log for a task and decide whether it reveals a reusable/improveable "
+        "procedural skill. You must also critically assess whether the agent completed the task CORRECTLY, "
+        "flagging any hallucinations, fabrication of data, or generation of synthetic/mock content in code or "
+        "output files (this is a serious quality problem we must prevent).\n\n"
+        "Respond with ONLY valid JSON, no surrounding text, in this exact shape:\n"
+        "{\n"
+        '  "learning_potential": <bool>,\n'
+        '  "assessment": "<string: overall quality + whether a skill can be learned>",\n'
+        '  "warnings": ["<string: hallucination/synthetic-data/quality concerns>", ...],\n'
+        '  "suggested_improvements": ["<string: how to improve the skill to avoid these issues>", ...],\n'
+        '  "skills": [\n'
+        "    {\n"
+        '      "name": "<skill name>",\n'
+        '      "description": "<one-line description>",\n'
+        + _skill_instructions_spec(skill_format)
+    )
+
+
+async def _call_skill_analysis_llm(summary: dict, skill_used: Optional[dict], task: Task, skill_format: str = "pseudo-code") -> dict:
     """Call the LLM to analyze the execution and propose skill(s).
 
     Uses a single, explicitly configured model (no silent cross-model fallback).
@@ -1212,7 +1345,7 @@ async def _call_skill_analysis_llm(summary: dict, skill_used: Optional[dict], ta
                 system = "Output ONLY a single valid JSON object. No markdown, no code fences, no commentary, no trailing text. Begin with { and end with }."
                 user = f"Return your analysis as valid JSON only.\n\n{user_content}"
             else:
-                system = _build_skill_analysis_system_prompt()
+                system = _build_skill_analysis_system_prompt(skill_format)
                 user = user_content
             payload = {
                 "model": model,
@@ -1289,7 +1422,7 @@ async def analyze_task_for_skill(data: SkillAnalysisRequest, db: AsyncSession = 
     summary = _build_execution_summary(task, outputs, node=node, image_id=image_id)
 
     # Call LLM
-    analysis = await _call_skill_analysis_llm(summary, skill_used, task)
+    analysis = await _call_skill_analysis_llm(summary, skill_used, task, skill_format=data.skill_format or "pseudo-code")
 
     learning_potential = bool(analysis.get("learning_potential"))
     warnings = analysis.get("warnings", []) or []
@@ -1400,13 +1533,13 @@ def _deep_review_model() -> str:
 
 def _trim_execution_summary_for_llm(summary: dict, max_deliverable_chars: int = 4000,
                                     max_turn_output_chars: int = 400,
-                                    max_iter_output_chars: int = 800) -> dict:
+                                    max_iter_output_chars: int = 800,
+                                    max_agent_logs_chars: int = 12000) -> dict:
     """Return a context-safe copy of the execution summary for LLM review.
 
-    Large deliverable file contents and long turn outputs are truncated to keep
-    the prompt within the model's context window. The structure is preserved so
-    parsing/analysis still works. Full deliverables remain available for the
-    rule-based integrity scan (which runs separately).
+    Large deliverable file contents, long turn outputs and raw agent logs are
+    truncated to keep the prompt within the model's context window. The
+    structure is preserved so parsing/analysis still works.
     """
     def _trim_deliverables(deliverables):
         if not isinstance(deliverables, dict):
@@ -1442,6 +1575,8 @@ def _trim_execution_summary_for_llm(summary: dict, max_deliverable_chars: int = 
                 else:
                     new_turns.append(t)
             trimmed["turns"] = new_turns
+        if "agent_logs" in it and isinstance(it["agent_logs"], str) and len(it["agent_logs"]) > max_agent_logs_chars:
+            trimmed["agent_logs"] = it["agent_logs"][:max_agent_logs_chars] + "\n...[truncated]..."
         return trimmed
 
     out = dict(summary)
@@ -1521,8 +1656,8 @@ async def _call_deep_review_llm(summary: dict, skill_used: Optional[dict], task:
     import httpx
     model = _deep_review_model()
     # Send a context-safe copy of the summary (truncated to fit the model's
-    # context window). Structure preserved for parsing. Full deliverables are
-    # still scanned by the rule-based integrity detector separately.
+    # context window). Structure preserved for parsing. The last iteration's
+    # raw agent_logs and deliverable contents are included for verification.
     user_content = _trim_execution_summary_for_llm(summary)
     if include_skill and skill_used:
         user_content["skill_used"] = skill_used
@@ -1596,39 +1731,22 @@ async def deep_review_task(data: DeepReviewRequest, db: AsyncSession = Depends(g
     outputs = list(result.scalars().all())
     if not outputs:
         raise HTTPException(status_code=404, detail=f"No outputs found for task '{data.task_id}'")
-    summary = _build_execution_summary(task, outputs, node=node, image_id=image_id)
+    # Audit only the FINAL iteration: earlier iterations are intermediate work
+    # products (often incomplete/stale) and must not sink the final deliverable.
+    # Same rule as the worker gate's collect_node_output.
+    summary = _build_execution_summary(task, outputs[-1:], node=node, image_id=image_id)
 
     review = await _call_deep_review_llm(summary, skill_used, task, include_skill=data.include_skill)
 
-    # Hard-integrity safety net: placeholder/synthetic markers in DATA files are an
-    # unambiguous fabrication signal (e.g. description_snippet "N/A", empty results
-    # reported as success). These are concrete facts, so surface them as high-severity
-    # issues and prevent a "clean" verdict. This only triggers on hard evidence, not on
-    # the LLM's opinion — the LLM remains the primary judge.
-    llm_issues = [DeepReviewIssue(**i) for i in (review.get("issues") or []) if isinstance(i, dict)]
-    hard_signals = _detect_integrity_signals(summary)
-    merged_issues = list(llm_issues)
-    if hard_signals:
-        for sig in hard_signals:
-            merged_issues.append(DeepReviewIssue(
-                severity="high",
-                category="synthetic_data",
-                finding=sig,
-                evidence="rule-based scan of deliverable data files",
-                recommendation="Verify deliverable contents contain real fetched data (not placeholders); add validation before reporting success.",
-            ))
+    merged_issues = [DeepReviewIssue(**i) for i in (review.get("issues") or []) if isinstance(i, dict)]
 
-    if hard_signals:
-        verdict = "issues_found"
-        score = min(_normalize_score(review.get("score")), 55) if review.get("score") else 50
-    else:
-        verdict = _normalize_verdict(review.get("verdict"))
-        if not verdict:
-            # Model returned a malformed/wrong-shaped payload (e.g. echoed task
-            # status instead of a verdict). Fall back gracefully instead of
-            # surfacing the raw value (e.g. "completed").
-            verdict = "needs_attention" if (review.get("issues") or []) else "clean"
-        score = _normalize_score(review.get("score"))
+    verdict = _normalize_verdict(review.get("verdict"))
+    if not verdict:
+        # Model returned a malformed/wrong-shaped payload (e.g. echoed task
+        # status instead of a verdict). Fall back gracefully instead of
+        # surfacing the raw value (e.g. "completed").
+        verdict = "needs_attention" if (review.get("issues") or []) else "clean"
+    score = _normalize_score(review.get("score"))
 
     review_model = review.get("model") or _deep_review_model()
 
@@ -1721,6 +1839,7 @@ class SkillCorrectRequest(BaseModel):
     dag_id: Optional[str] = None
     skill_id: Optional[str] = None   # optional explicit skill to correct
     created_by: Optional[str] = None
+    skill_format: Optional[str] = "pseudo-code"  # pseudo-code | easy
 
 
 class CorrectedSkill(BaseModel):
@@ -1791,7 +1910,84 @@ def _build_correction_context(summary: dict, skill: dict, issues: List[dict]) ->
     }
 
 
-async def _correct_skill_llm(summary: dict, skill: dict, issues: List[dict], task: Task) -> dict:
+def _build_correction_system_prompt(skill_format: str) -> str:
+    base = (
+        "You are a senior skill-quality engineer. You are given a skill and an integrity-audit "
+        "report listing concrete issues found when the agent executed that skill (hallucinations, "
+        "synthetic/mock data generation, shortcuts, quality problems). You must produce an IMPROVED "
+        "version of the skill whose instructions PREVENT these issues from recurring.\n"
+        "Keep the working, correct parts of the original skill. Respond with ONLY valid JSON, no "
+        "surrounding text, in this exact shape:\n"
+        "{\n"
+        '  "name": "<corrected skill name>",\n'
+        '  "description": "<one-line description>",\n'
+    )
+    fmt = skill_format or "pseudo-code"
+    if fmt == "code":
+        return base + (
+            '  "instructions": "<full corrected instructions as a complete, ready-to-run source file in the '
+            'original solution language (Python, Octave, JavaScript, R, shell, …)>",\n'
+            '  "tags": ["<tag>", ...],\n'
+            '  "addressed_issues": ["<issue this correction addresses>", ...]\n'
+            "}\n"
+            "Write the corrected instructions as a COMPLETE, READY-TO-RUN SOURCE FILE in the EXACT LANGUAGE OF THE "
+            "ORIGINAL SOLUTION (do NOT translate it). Base it on the existing working code — keep it verbatim and "
+            "fix ONLY the flagged issues; do NOT re-derive a fresh script. Another AI agent will copy and execute it, "
+            "so it must be self-contained and correct — no placeholders, no TODOs, no pseudo-code fragments.\n"
+            "- Keep the same language, entry point, and file naming as the original.\n"
+            "- Hardcode the exact input values from the step as constants.\n"
+            "- Add mandatory verification: validate fetched data is real, check for placeholders/N-A, verify row "
+            "counts, confirm non-empty results and minimum file sizes before declaring success; retry up to N times "
+            "then fail.\n"
+            "- Add explicit 'do NOT' rules against the specific failure modes found (no mock/synthetic data, no "
+            "fabricating URLs/descriptions, no declaring success on empty results).\n"
+            "- Write the final deliverable(s) to the deliverables directory with explicit paths; print clear "
+            "SUCCESS/FAILURE and exit codes.\n"
+        )
+    if fmt == "easy":
+        return base + (
+            '  "instructions": "<full corrected instructions as an easy, structured plain-language '
+            'procedure>",\n'
+            '  "tags": ["<tag>", ...],\n'
+            '  "addressed_issues": ["<issue this correction addresses>", ...]\n'
+            "}\n"
+            "Write the corrected instructions as an EASY, STRUCTURED PROCEDURE — clear numbered steps in plain "
+            "language (no code syntax, no pseudo-code operators). It is executed by another AI agent, so it "
+            "must be unambiguous.\n"
+            "Structure:\n"
+            "- A short title line.\n"
+            "- An 'Inputs:' block listing each input with a plain-language example.\n"
+            "- Numbered UPPERCASE sections (e.g. 1. INITIALIZE, 2. LOCATE, 3. DOWNLOAD, 4. VERIFY, "
+            "5. RULES & CONSTRAINTS, 6. OUTPUT) with explicit sequential actions.\n"
+            "- Name every exact source, URL/API endpoint, and tool call explicitly.\n"
+            "- Include mandatory verification: validate fetched data is real, check for placeholders/N-A, verify "
+            "row counts, confirm non-empty results and minimum file sizes before declaring success; spell out how "
+            "to react (retry up to N times, then fail) when a check fails.\n"
+            "- Add explicit 'do NOT' rules against the specific failure modes found (no mock/synthetic data, "
+            "no fabricating URLs/descriptions, no declaring success on empty results).\n"
+            "- End with an 'OUTPUT' section describing the final deliverable(s) and the success/failure messages.\n"
+        )
+    return base + (
+        '  "instructions": "<full corrected instructions as pseudo-code>",\n'
+        '  "tags": ["<tag>", ...],\n'
+        '  "addressed_issues": ["<issue this correction addresses>", ...]\n'
+        "}\n"
+        "Write the corrected instructions as PSEUDO-CODE, not prose — the skill is executed by "
+        "another AI agent, so instructions must be an explicit, structured algorithm it can follow "
+        "verbatim. Requirements:\n"
+        "- One statement per line (plain text, no JSON nesting); use indentation for block scope.\n"
+        "- Name every exact source, URL/API endpoint, and tool call explicitly.\n"
+        "- Make control flow explicit: IF/ELSE, FOR EACH, WHILE, RETRY / ON FAILURE.\n"
+        "- Include mandatory verification steps: validate fetched data is real, check for "
+        "placeholders/N-A, verify row counts, confirm non-empty results before declaring success; "
+        "spell out how to react (retry, fail, or mark an issue) when a check fails.\n"
+        "- Add explicit 'do NOT' rules against the specific failure modes found (no mock/synthetic "
+        "data, no fabricating URLs/descriptions, no declaring success on empty results).\n"
+        "- End with an explicit RETURN of the final deliverable/result.\n"
+    )
+
+
+async def _correct_skill_llm(summary: dict, skill: dict, issues: List[dict], task: Task, skill_format: str = "pseudo-code") -> dict:
     """Ask the LLM to produce a corrected version of the skill that prevents the issues."""
     import httpx
     user_context = _build_correction_context(summary, skill, issues)
@@ -1802,33 +1998,7 @@ async def _correct_skill_llm(summary: dict, skill: dict, issues: List[dict], tas
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are a senior skill-quality engineer. You are given a skill and an integrity-audit "
-                    "report listing concrete issues found when the agent executed that skill (hallucinations, "
-                    "synthetic/mock data generation, shortcuts, quality problems). You must produce an IMPROVED "
-                    "version of the skill whose instructions PREVENT these issues from recurring.\n"
-                    "Write the corrected instructions as PSEUDO-CODE, not prose — the skill is executed by "
-                    "another AI agent, so instructions must be an explicit, structured algorithm it can follow "
-                    "verbatim. Requirements:\n"
-                    "- One statement per line (plain text, no JSON nesting); use indentation for block scope.\n"
-                    "- Name every exact source, URL/API endpoint, and tool call explicitly.\n"
-                    "- Make control flow explicit: IF/ELSE, FOR EACH, WHILE, RETRY / ON FAILURE.\n"
-                    "- Include mandatory verification steps: validate fetched data is real, check for "
-                    "placeholders/N-A, verify row counts, confirm non-empty results before declaring success; "
-                    "spell out how to react (retry, fail, or mark an issue) when a check fails.\n"
-                    "- Add explicit 'do NOT' rules against the specific failure modes found (no mock/synthetic "
-                    "data, no fabricating URLs/descriptions, no declaring success on empty results).\n"
-                    "- End with an explicit RETURN of the final deliverable/result.\n"
-                    "Keep the working, correct parts of the original skill. Respond with ONLY valid JSON, no "
-                    "surrounding text, in this exact shape:\n"
-                    "{\n"
-                    '  "name": "<corrected skill name>",\n'
-                    '  "description": "<one-line description>",\n'
-                    '  "instructions": "<full corrected instructions as pseudo-code>",\n'
-                    '  "tags": ["<tag>", ...],\n'
-                    '  "addressed_issues": ["<issue this correction addresses>", ...]\n'
-                    "}\n"
-                ),
+                "content": _build_correction_system_prompt(skill_format),
             },
             {
                 "role": "user",
@@ -1896,19 +2066,18 @@ async def correct_skill_from_review(data: SkillCorrectRequest, db: AsyncSession 
     if not skill:
         raise HTTPException(status_code=404, detail="No skill to correct — provide skill_id or a node with a skill assigned")
 
-    # Build summary
+    # Build summary from the FINAL iteration only (intermediate iterations are
+    # stale work products and must not drive the correction).
     result = await db.execute(select(TaskOutput).where(TaskOutput.task_id == data.task_id).order_by(TaskOutput.iteration))
     outputs = list(result.scalars().all())
     if not outputs:
         raise HTTPException(status_code=404, detail=f"No outputs found for task '{data.task_id}'")
-    summary = _build_execution_summary(task, outputs, node=node, image_id=image_id)
+    summary = _build_execution_summary(task, outputs[-1:], node=node, image_id=image_id)
 
     # Run deep review to get the issues
     review = await _call_deep_review_llm(summary, skill, task, include_skill=False)
-    llm_issues = review.get("issues", []) or []
-    hard_signals = _detect_integrity_signals(summary)
     issues_for_correction = []
-    for i in llm_issues:
+    for i in (review.get("issues", []) or []):
         if isinstance(i, dict):
             issues_for_correction.append({
                 "severity": i.get("severity", "medium"),
@@ -1916,13 +2085,6 @@ async def correct_skill_from_review(data: SkillCorrectRequest, db: AsyncSession 
                 "finding": i.get("finding", ""),
                 "recommendation": i.get("recommendation", ""),
             })
-    for sig in hard_signals:
-        issues_for_correction.append({
-            "severity": "high",
-            "category": "synthetic_data",
-            "finding": sig,
-            "recommendation": "Verify deliverable contents contain real fetched data; add validation before reporting success.",
-        })
 
     # If no issues, nothing to correct
     if not issues_for_correction:
@@ -1931,7 +2093,7 @@ async def correct_skill_from_review(data: SkillCorrectRequest, db: AsyncSession 
             skill_name=skill["name"], corrected=[], unchanged=True,
         )
 
-    corrected_data = await _correct_skill_llm(summary, skill, issues_for_correction, task)
+    corrected_data = await _correct_skill_llm(summary, skill, issues_for_correction, task, skill_format=data.skill_format or "pseudo-code")
     if not corrected_data:
         raise HTTPException(status_code=500, detail="Failed to generate corrected skill")
 

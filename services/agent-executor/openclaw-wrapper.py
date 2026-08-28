@@ -820,6 +820,24 @@ def _is_binary_file(fpath: str) -> bool:
         return True
 
 
+def _make_file_ref(fpath: str, size: int) -> dict:
+    """Return a metadata reference for a deliverable too large to embed.
+
+    Keeps DB/Temporal payloads small while keeping the step's deliverables
+    non-empty, and gives downstream steps a real path into the shared
+    workspace to read the file from.
+    """
+    import hashlib
+    digest = hashlib.sha256()
+    try:
+        with open(fpath, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except Exception:
+        pass
+    return {"ref": "file", "path": fpath, "size": size, "sha256": digest.hexdigest()}
+
+
 def collect_workspace_files(node_id: str | None = None, segregate_steps: bool = False) -> Dict[str, Any]:
     """Scan /workspace for files created/modified by the agent.
 
@@ -877,13 +895,15 @@ def collect_workspace_files(node_id: str | None = None, segregate_steps: bool = 
             relpath = os.path.relpath(fpath, scan_root)
             try:
                 size = os.path.getsize(fpath)
-                if size == 0 or size > MAX_FILE_SIZE:
-                    print(f"  ⏭️  Skipping {relpath}: {size} bytes (max {MAX_FILE_SIZE})")
+                if size == 0:
                     continue
                 # Estimate base64 size for binary files
                 estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
-                if total_size + estimated_size > MAX_TOTAL:
-                    print(f"  ⏭️  Skipping {relpath}: would exceed total limit")
+                if size > MAX_FILE_SIZE or total_size + estimated_size > MAX_TOTAL:
+                    # Too large to embed — record a file reference so the step
+                    # still delivers (the file exists in the shared workspace).
+                    collected[relpath] = _make_file_ref(fpath, size)
+                    total_size += 160
                     continue
                 if _is_binary_file(fpath):
                     with open(fpath, "rb") as f:
@@ -911,10 +931,12 @@ def collect_workspace_files(node_id: str | None = None, segregate_steps: bool = 
                     continue
                 relpath = fname
                 size = os.path.getsize(fpath)
-                if size == 0 or size > MAX_FILE_SIZE:
+                if size == 0:
                     continue
                 estimated_size = int(size * 1.37) if _is_binary_file(fpath) else size
-                if total_size + estimated_size > MAX_TOTAL:
+                if size > MAX_FILE_SIZE or total_size + estimated_size > MAX_TOTAL:
+                    collected[relpath] = _make_file_ref(fpath, size)
+                    total_size += 160
                     continue
                 if _is_binary_file(fpath):
                     with open(fpath, "rb") as f:

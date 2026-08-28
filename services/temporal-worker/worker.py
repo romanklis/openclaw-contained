@@ -820,6 +820,45 @@ async def initialize_task(task_id: str) -> Dict[str, Any]:
     return {"status": "initialized"}
 
 
+# Cache for the persisted "DAG Model Defaults" (fetched from the LLM Providers
+# config on the control plane so values survive across launches).
+_dag_model_defaults_cache: dict = {"data": {}, "ts": 0.0}
+
+
+def _get_dag_model_defaults() -> dict:
+    """Return the persisted DAG model defaults (planning/agent/deep_review
+    model + context mode) from GET /api/dags/model-defaults, cached 120s."""
+    import time as _t
+    now = _t.time()
+    if now - _dag_model_defaults_cache["ts"] < 120:
+        return _dag_model_defaults_cache["data"]
+    try:
+        import httpx as _h
+        cp = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+        r = _h.get(f"{cp}/api/dags/model-defaults", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                _dag_model_defaults_cache.update(data=data, ts=now)
+                return data
+    except Exception:
+        pass
+    return _dag_model_defaults_cache["data"]
+
+
+def _get_agent_context_mode() -> str:
+    """Return the agent context-management mode (none|linear|graph).
+
+    Env override wins; otherwise the persisted value from the DAG model
+    defaults (cached 120s) is used.
+    """
+    env_val = os.getenv("AGENT_CONTEXT_MODE")
+    if env_val:
+        return env_val if env_val in ("none", "linear", "graph") else "none"
+    mode = str(_get_dag_model_defaults().get("agent_context_mode") or "none").lower()
+    return mode if mode in ("none", "linear", "graph") else "none"
+
+
 @activity.defn
 async def start_agent_container(
     task_id: str,
@@ -1089,6 +1128,9 @@ async def start_agent_container(
             "RAG_TOOL_URL": rag_url_for_agent,
             "RAG_API_KEY": os.getenv("RAG_API_KEY", "my-local-secret-key"),
             "LLM_MODEL": llm_model,
+            # Context-management mode for the agent loop (none|linear), from the
+            # LLM Providers DAG model defaults; env override wins.
+            "AGENT_CONTEXT_MODE": _get_agent_context_mode(),
             "TASK_DESCRIPTION": task_description[:2000],
             "AGENT_IMAGE": agent_image,
             "AGENT_DOCKERFILE": agent_dockerfile[:4000],
@@ -2974,7 +3016,7 @@ async def post_node_structured_output(dag_id: str, node_id: str, task_id: str, o
         "objective": output.get("node_objective", ""),
         "success_criteria": output.get("success_criteria", []),
         "acceptance_verdict": "pass" if output.get("gate_result", {}).get("valid") else "fail",
-        "acceptance_score": output.get("gate_result", {}).get("external_assessment", {}).get("score", 0),
+        "acceptance_score": output.get("gate_result", {}).get("deep_review", {}).get("score") if output.get("gate_result", {}).get("deep_review") else output.get("gate_result", {}).get("external_assessment", {}).get("score", 0),
         "criteria_met": {c: True for c in output.get("success_criteria", [])} if output.get("gate_result", {}).get("valid") else {},
         "skill_id": output.get("skill_id"),
         "skill_followed": None,  # Will be populated by skill reference extraction
@@ -3223,96 +3265,6 @@ def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
     return "\n\n".join(blocks)
 
 
-async def _assess_objective_alignment_external(
-    task_id: str,
-    output: Dict[str, Any],
-    config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Assess step outcome against objective using external LLM router."""
-    import httpx
-    import json as _json
-
-    cfg = config or {}
-    assess_cfg = cfg.get("objective_assessment") or {}
-    if assess_cfg.get("enabled") is False:
-        return {"enabled": False, "verdict": "skip", "reason": "disabled by node config"}
-
-    objective_text = (
-        cfg.get("node_objective")
-        or cfg.get("objective")
-        or cfg.get("description")
-        or ""
-    )
-    objective_text = str(objective_text).strip()
-    if not objective_text:
-        return {"enabled": True, "verdict": "skip", "reason": "no objective text"}
-
-    model = assess_cfg.get("model") or "gemini-flash-lite-latest"
-    compact_summary = _build_compact_step_summary(output)
-    deliverable_keys = list(((output.get("deliverables") or {}) if isinstance(output.get("deliverables"), dict) else {}).keys())[:20]
-    acquisition_log = (output.get("acquisition_log") or [])[:20]
-
-    prompt = (
-        "You are a strict workflow step assessor. Compare ACTUAL RESULT to STEP OBJECTIVE. "
-        "Return JSON only with keys: verdict, score, summary, missing_requirements, next_actions, evidence_quality.\n"
-        "verdict must be 'pass' or 'fail'. score must be integer 0-100.\n\n"
-        f"STEP OBJECTIVE:\n{objective_text[:2400]}\n\n"
-        f"RESULT SUMMARY:\n{compact_summary}\n\n"
-        f"DELIVERABLE KEYS:\n{deliverable_keys}\n\n"
-        f"ACQUISITION LOG (truncated):\n{_json.dumps(acquisition_log)[:2400]}\n"
-    )
-
-    cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
-    req = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You output strict JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "temperature": 0,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(f"{cp_url}/api/llm/v1/chat/completions", json=req)
-            resp.raise_for_status()
-            data = resp.json()
-            content = (
-                (((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
-                or "{}"
-            )
-            text = str(content).strip()
-            if "```" in text:
-                text = text.replace("```json", "").replace("```", "").strip()
-            start = text.find("{")
-            end = text.rfind("}")
-            parsed = _json.loads(text[start:end + 1] if start != -1 and end != -1 else text)
-            verdict = str(parsed.get("verdict", "fail")).lower()
-            score = int(parsed.get("score", 0) or 0)
-            return {
-                "enabled": True,
-                "verdict": "pass" if verdict == "pass" else "fail",
-                "score": max(0, min(score, 100)),
-                "summary": str(parsed.get("summary", ""))[:400],
-                "missing_requirements": parsed.get("missing_requirements") or [],
-                "next_actions": parsed.get("next_actions") or [],
-                "evidence_quality": str(parsed.get("evidence_quality", ""))[:120],
-                "model": model,
-            }
-    except Exception as exc:
-        return {
-            "enabled": True,
-            "verdict": "error",
-            "score": 0,
-            "summary": f"assessment_error: {str(exc)[:220]}",
-            "missing_requirements": [],
-            "next_actions": [],
-            "evidence_quality": "unknown",
-            "model": model,
-        }
-
-
 def _bounded_payload(obj: Any, max_str: int = 40000, max_total: int = 700000) -> Any:
     """Recursively trim a payload to stay under Temporal's 2 MB payload limit.
 
@@ -3372,6 +3324,15 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
             outputs = outputs_payload.get("outputs", []) or []
         elif isinstance(outputs_payload, list):
             outputs = outputs_payload
+        # The /outputs endpoint aggregates sibling DAG tasks (and older runs);
+        # keep only THIS task's own iterations so the gate evaluates the right
+        # node's final output.
+        own_outputs = []
+        for o in outputs:
+            src = o.get("source_task_id") or o.get("task_id")
+            if src is None or str(src) == str(task_id):
+                own_outputs.append(o)
+        outputs = own_outputs
 
         result = {
             "task_id": task_id,
@@ -3380,7 +3341,9 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
         }
 
         if outputs:
-            latest = outputs[-1]
+            # Select the HIGHEST iteration's output so the node always reflects
+            # the final, most complete run (ordering is not relied upon).
+            latest = max(outputs, key=lambda o: int(o.get("iteration") or 0))
             result["output"] = _extract_task_output_text(latest)
             result["agent_logs"] = latest.get("agent_logs", "")
             result["completed"] = latest.get("completed")
@@ -3497,11 +3460,13 @@ def _build_prior_state_review_prompt(upstream_state_review: List[Dict[str, Any]]
 
 
 async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], assessment: Dict[str, Any]) -> Dict[str, Any]:
-    """Gate fallback: when the objective-alignment reviewer errors, validate the
-    node via the deep review (the control-plane's integrity audit). A clean or
-    needs_attention verdict passes the node; issues_found fails it; and if the
-    deep review itself is unavailable the node passes (a broken reviewer must
-    never sink a well-executed step).
+    """Judge the node via the deep review (the control-plane's integrity audit
+    of the task's FINAL iteration).
+
+    A clean or needs_attention verdict passes the node; issues_found only
+    hard-fails when the score is <= 55 (a convincing LLM failure); if the deep
+    review is unavailable the node passes (a broken reviewer must never sink a
+    well-executed step).
     """
     import httpx as _httpx_dr
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
@@ -3519,31 +3484,31 @@ async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], asses
             resp.raise_for_status()
             review = resp.json()
     except Exception as exc:
-        logger.warning(f"objective_assessment_error: deep-review fallback failed ({exc}) — passing node {node_id}")
+        logger.warning(f"deep_review_gate: deep review unavailable ({exc}) — passing node {node_id}")
         return {
             "valid": True,
-            "reason": "objective_assessment_error (deep review unavailable)",
+            "reason": "deep review unavailable",
             "external_assessment": assessment,
             "deep_review": None,
         }
 
     verdict = str((review or {}).get("verdict") or "").lower()
     score = review.get("score")
-    # The deep review is LLM-nondeterministic (same task can come back clean or
-    # issues_found on different calls). Only treat it as a HARD failure when
-    # deterministic rule-based integrity signals fired: deep_review_task caps
-    # the score at <=55 in that case. An LLM-only "issues_found" (score > 55)
-    # is reviewer judgment and must not sink a well-executed step.
+    # The deep review is LLM-nondeterministic (the same task can come back
+    # clean or issues_found on different calls). Only treat issues_found as a
+    # HARD failure when the score is <= 55; an LLM-only "issues_found" at a
+    # mid/high score is reviewer judgment and must not sink a well-executed
+    # step.
     if verdict == "issues_found" and score is not None and score <= 55:
         return {
             "valid": False,
-            "reason": "objective_assessment_error → deep_review: issues_found (hard integrity signals)",
+            "reason": f"deep_review: issues_found (hard integrity signals, score {score})",
             "external_assessment": assessment,
             "deep_review": review,
         }
     return {
         "valid": True,
-        "reason": f"objective_assessment_error → deep_review: {verdict or 'n/a'}" + (f" (score {score})" if score is not None else ""),
+        "reason": f"ok (deep review: {verdict or 'n/a'}" + (f", score {score})" if score is not None else ")"),
         "external_assessment": assessment,
         "deep_review": review,
     }
@@ -3617,24 +3582,13 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
                 "reason": "hallucination_risk: logs contain mock/placeholder patterns with no evidence of real network fetch",
             }
 
-    assessment = await _assess_objective_alignment_external(task_id, output, config)
-    if assessment.get("enabled") and assessment.get("verdict") == "fail":
-        missing = assessment.get("missing_requirements") or []
-        missing_text = ", ".join(str(x) for x in missing[:3])
-        reason = "objective_alignment_failed"
-        if missing_text:
-            reason = f"{reason}: missing {missing_text}"
-        return {
-            "valid": False,
-            "reason": reason,
-            "external_assessment": assessment,
-        }
-    if assessment.get("enabled") and assessment.get("verdict") == "error":
-        # The objective-alignment reviewer errored (LLM parse/call failure). Do
-        # NOT fail the node for the reviewer's failure — validate via the deep
-        # review instead, and treat an unavailable deep review as non-blocking.
-        return await _deep_review_gate_fallback(task_id, output, assessment)
-    return {"valid": True, "reason": "ok", "external_assessment": assessment}
+    # The evidence-based deep review (control-plane integrity audit of the
+    # task's FINAL iteration) is the sole LLM judge: it sees the actual
+    # deliverable contents, tool turns and agent logs — unlike a summary-only
+    # reviewer. A clean/needs_attention verdict passes; issues_found hard-fails
+    # only at score <= 55 (a convincing failure); an unavailable deep review
+    # passes (a broken reviewer must never sink a well-executed step).
+    return await _deep_review_gate_fallback(task_id, output, {})
 
 
 @activity.defn
@@ -3707,16 +3661,24 @@ async def persist_task_workflow_id(task_id: str, workflow_id: str) -> bool:
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.patch(
-                f"{control_plane_url}/api/tasks/{task_id}",
-                json={"workflow_id": workflow_id},
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.patch(
+                    f"{control_plane_url}/api/tasks/{task_id}",
+                    json={"workflow_id": workflow_id},
+                )
+                if resp.status_code in (200, 204):
+                    return True
+                logger.warning(
+                    f"persist_task_workflow_id: unexpected status {resp.status_code} for "
+                    f"{task_id} (attempt {attempt + 1}/3): {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Could not persist workflow_id for {task_id} (attempt {attempt + 1}/3): {e}"
             )
-            return resp.status_code in (200, 204)
-    except Exception as e:
-        logger.warning(f"Could not persist workflow_id for {task_id}: {e}")
-        return False
+    return False
 
 
 # =============================================================================
@@ -3893,46 +3855,79 @@ class DAGNodeWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             )
 
+            # Surface that the task finished and the gate is being evaluated,
+            # so a gate that is queued (e.g. worker concurrency contention) does
+            # not look like the node is stuck mid-execution.
+            await workflow.execute_activity(
+                post_node_state_snapshot,
+                args=[
+                    dag_id,
+                    node_id,
+                    {
+                        "task_id": task_id,
+                        "phase": "gate_pending",
+                        "status": "running",
+                        "output_context": {
+                            "deliverables_keys": output.get("deliverables_keys"),
+                            "completed": output.get("completed"),
+                            "status": output.get("status"),
+                        },
+                        "completion_state": {
+                            "description": "Task completed; awaiting gate evaluation",
+                        },
+                    },
+                ],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+
             gate_result = await workflow.execute_activity(
                 evaluate_node_gate,
                 args=[task_id, output, config],
                 start_to_close_timeout=timedelta(seconds=30),
             )
 
-            # Soft-fail retry policy: when objective assessment fails,
-            # run one corrective retry before final failure.
+            # Soft-fail retry policy: when the deep review reports a hard
+            # integrity failure (issues_found, score <= 55), run one corrective
+            # retry feeding the review's findings back to the agent before the
+            # final failure.
             should_retry_assessment = (
                 not gate_result.get("valid", False)
-                and str(gate_result.get("reason", "")).startswith("objective_alignment_failed")
+                and str(gate_result.get("reason", "")).startswith("deep_review:")
                 and ((config.get("objective_assessment") or {}).get("retry_on_fail", True))
             )
             if should_retry_assessment:
-                external = gate_result.get("external_assessment") or {}
-                corrective_actions = external.get("next_actions") or []
-                missing_requirements = external.get("missing_requirements") or []
-                assessment_summary = str(external.get("summary") or "").strip()
-                assessment_score = external.get("score")
+                review = gate_result.get("deep_review") or {}
+                verdict = str(review.get("verdict") or "")
+                score = review.get("score")
+                review_summary = str(review.get("summary") or "").strip()
+                issues = [i for i in (review.get("issues") or []) if isinstance(i, dict)]
+                positives = [p for p in (review.get("positives") or []) if isinstance(p, str)]
                 retry_lines = [
                     "",
-                    "--- External Step Assessment (Retry Required) ---",
-                    "Your previous output did not satisfy the step objective.",
-                    "You must close ALL gaps below before finishing this retry.",
+                    "--- Deep Review (Retry Required) ---",
+                    "Your previous output failed the integrity review and needs correction.",
+                    "You must close ALL issues below before finishing this retry.",
                 ]
-                if assessment_score is not None:
-                    retry_lines.append(f"Assessment score: {assessment_score}/100")
-                if assessment_summary:
-                    retry_lines.append(f"Assessment summary: {assessment_summary[:500]}")
-                if missing_requirements:
-                    retry_lines.append("Missing required deliverables:")
-                    for item in missing_requirements[:20]:
-                        retry_lines.append(f"- {str(item)[:280]}")
-                retry_lines.append("Corrective actions to apply:")
-                for action in corrective_actions[:8]:
-                    retry_lines.append(f"- {str(action)[:280]}")
+                if score is not None:
+                    retry_lines.append(f"Review score: {score}/100")
+                if verdict:
+                    retry_lines.append(f"Review verdict: {verdict}")
+                if review_summary:
+                    retry_lines.append(f"Review summary: {review_summary[:500]}")
+                if issues:
+                    retry_lines.append("Issues to fix:")
+                    for issue in issues[:8]:
+                        finding = str(issue.get("finding") or "")[:300]
+                        recommendation = str(issue.get("recommendation") or "")[:200]
+                        retry_lines.append(f"- {finding}")
+                        if recommendation:
+                            retry_lines.append(f"  Fix: {recommendation}")
+                if positives:
+                    retry_lines.append("Keep: " + "; ".join(str(p)[:150] for p in positives[:5]))
                 retry_lines.extend(
                     [
                         "Before you finish, include an explicit 'Acceptance Criteria Check' section",
-                        "listing each missing requirement and where it was produced.",
+                        "listing each issue and where it was resolved.",
                     ]
                 )
                 retry_follow_up = follow_up + "\n" + "\n".join(retry_lines)
@@ -3944,11 +3939,11 @@ class DAGNodeWorkflow:
                         node_id,
                         {
                             "task_id": task_id,
-                            "event_type": "objective_assessment_retry",
+                            "event_type": "deep_review_retry",
                             "severity": "warning",
-                            "message": "Objective assessment failed; running one corrective retry",
+                            "message": "Deep review reported a hard integrity failure; running one corrective retry",
                             "event_data": {
-                                "assessment": external,
+                                "review": review,
                                 "task_id": task_id,
                             },
                         },
@@ -3960,6 +3955,14 @@ class DAGNodeWorkflow:
                     AgentTaskWorkflow.run,
                     args=[task_id, llm_model, result.get("current_image", agent_image), retry_follow_up, dag_id],
                     id=f"{child_workflow_id}-assessment-retry",
+                )
+
+                # The retry runs under a different workflow id; re-point the
+                # task so capability approval signals reach the live workflow.
+                await workflow.execute_activity(
+                    persist_task_workflow_id,
+                    args=[task_id, f"{child_workflow_id}-assessment-retry"],
+                    start_to_close_timeout=timedelta(seconds=10),
                 )
 
                 output = await workflow.execute_activity(
@@ -4101,7 +4104,7 @@ class DAGNodeWorkflow:
                         "acceptance_result": gate_result,
                         "acceptance_state": {
                             "verdict": "pass" if gate_result.get("valid") else "fail",
-                            "score": gate_result.get("external_assessment", {}).get("score", 0),
+                            "score": (gate_result.get("deep_review") or {}).get("score") or gate_result.get("external_assessment", {}).get("score", 0),
                             "criteria_results": [],
                             "checked_at": workflow.now().isoformat(),
                         },
@@ -4793,9 +4796,10 @@ async def main():
             persist_task_workflow_id,
             update_task_status,
         ],
-        # Limit concurrency to avoid OOM on constrained hosts: only ONE activity
-        # (i.e. one agent container) runs at a time. Configurable via env.
-        max_concurrent_activities=int(os.getenv("MAX_CONCURRENT_ACTIVITIES", "1")),
+        # Limit concurrency to avoid OOM on constrained hosts: only a few
+        # activities (agent containers, LLM/gate calls) run at once.
+        # Configurable via env.
+        max_concurrent_activities=int(os.getenv("MAX_CONCURRENT_ACTIVITIES", "4")),
     )
     
     logger.info(f"Worker starting on task queue: {TASK_QUEUE}")
