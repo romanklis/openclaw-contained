@@ -9,7 +9,6 @@ interface Stats {
   tasks: { total: number; running: number; completed: number; failed: number }
   deployments: { total: number; running: number; pending: number }
   approvals: { pending: number }
-  taskForces: { total: number; running: number; draft: number }
 }
 
 interface RecentTask {
@@ -33,7 +32,6 @@ export default function DashboardPage() {
     tasks: { total: 0, running: 0, completed: 0, failed: 0 },
     deployments: { total: 0, running: 0, pending: 0 },
     approvals: { pending: 0 },
-    taskForces: { total: 0, running: 0, draft: 0 },
   })
   const [recentTasks, setRecentTasks] = useState<RecentTask[]>([])
   const [recentDeployments, setRecentDeployments] = useState<RecentDeployment[]>([])
@@ -41,17 +39,15 @@ export default function DashboardPage() {
   useEffect(() => {
     const fetchAll = async () => {
       try {
-        const [tasksRes, deploysRes, approvalsRes, taskForcesRes] = await Promise.all([
+        const [tasksRes, deploysRes, approvalsRes] = await Promise.all([
           fetch(`${API}/api/tasks`).then(r => r.json()).catch(() => []),
           fetch(`${API}/api/deployments`).then(r => r.json()).catch(() => []),
           fetch(`${API}/api/capabilities/requests?status_filter=pending`).then(r => r.json()).catch(() => []),
-          fetch(`${API}/api/task-forces`).then(r => r.json()).catch(() => []),
         ])
 
         const tasks = Array.isArray(tasksRes) ? tasksRes : []
         const deploys = Array.isArray(deploysRes) ? deploysRes : []
         const approvals = Array.isArray(approvalsRes) ? approvalsRes : []
-        const tfs = Array.isArray(taskForcesRes) ? taskForcesRes : []
 
         setStats({
           tasks: {
@@ -66,11 +62,6 @@ export default function DashboardPage() {
             pending: deploys.filter((d: any) => d.status === 'pending_approval').length,
           },
           approvals: { pending: approvals.length },
-          taskForces: {
-            total: tfs.length,
-            running: tfs.filter((t: any) => t.status === 'running').length,
-            draft: tfs.filter((t: any) => t.status === 'draft').length,
-          },
         })
         setRecentTasks(tasks.slice(0, 5))
         setRecentDeployments(deploys.slice(0, 5))
@@ -105,13 +96,6 @@ export default function DashboardPage() {
           icon="⚡"
           color="text-blue-400"
           pulse={stats.tasks.running > 0}
-        />
-        <StatCard
-          label="Task Forces"
-          value={stats.taskForces.total}
-          icon="🎯"
-          color="text-purple-400"
-          pulse={stats.taskForces.running > 0}
         />
         <StatCard
           label="Deployments Live"
@@ -217,9 +201,6 @@ export default function DashboardPage() {
         <div className="flex flex-wrap gap-3">
           <Link href="/tasks" className="btn-primary text-sm">
             + New Task
-          </Link>
-          <Link href="/task-forces" className="btn-primary text-sm">
-            🎯 New Task Force
           </Link>
           <Link href="/approvals" className="btn-warning text-sm">
             Review Approvals {stats.approvals.pending > 0 && `(${stats.approvals.pending})`}

@@ -79,43 +79,61 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Supply-chain auto-seed skipped: {exc}")
 
-    # Auto-seed agent images from agent_profiles.yaml if DB is empty
+    # Sync agent images from agent_profiles.yaml (upsert) so the DB catalog
+    # stays the single source of truth for the image catalog.
     try:
         from sqlalchemy import select
         from models import AgentImage
         from pathlib import Path
         import yaml as _yaml
         async with async_session() as session:
-            result = await session.execute(select(AgentImage).limit(1))
-            if not result.scalar_one_or_none():
-                candidates = [
-                    Path("/agent-images/agent_profiles.yaml"),
-                    Path(__file__).resolve().parent.parent.parent / "agent-images" / "agent_profiles.yaml",
-                ]
-                for p in candidates:
-                    if p.is_file():
-                        data = _yaml.safe_load(p.read_text()) or {}
-                        base_images = data.get("base_images", {})
-                        for img_id, info in base_images.items():
-                            if not isinstance(info, dict):
-                                continue
-                            enabled = info.get("enabled", True)
+            candidates = [
+                Path("/agent-images/agent_profiles.yaml"),
+                Path(__file__).resolve().parent.parent.parent / "agent-images" / "agent_profiles.yaml",
+            ]
+            source = None
+            for p in candidates:
+                if p.is_file():
+                    source = p
+                    break
+            if source is not None:
+                data = _yaml.safe_load(source.read_text()) or {}
+                base_images = data.get("base_images", {})
+                created = 0
+                updated = 0
+                if isinstance(base_images, dict):
+                    for img_id, info in base_images.items():
+                        if not isinstance(info, dict):
+                            continue
+                        result = await session.execute(select(AgentImage).where(AgentImage.id == img_id))
+                        existing = result.scalar_one_or_none()
+                        if existing is None:
                             session.add(AgentImage(
                                 id=img_id,
                                 name=info.get("name", img_id.capitalize()),
                                 description=info.get("description", ""),
                                 tag=info.get("tag", f"openclaw-agent:{img_id}"),
-                                enabled=bool(enabled),
+                                enabled=bool(info.get("enabled", True)),
                                 runtime=info.get("runtime", ""),
                                 capabilities=info.get("capabilities", []),
                                 best_for=info.get("best_for", []),
                                 avoid_for=info.get("avoid_for", []),
                             ))
-                        await session.commit()
-                        logger.info("Agent images seeded from %s", p)
-                        break
+                            created += 1
+                        else:
+                            existing.name = info.get("name", existing.name)
+                            existing.description = info.get("description", existing.description)
+                            existing.tag = info.get("tag", existing.tag)
+                            existing.enabled = bool(info.get("enabled", True))
+                            existing.runtime = info.get("runtime", existing.runtime)
+                            existing.capabilities = info.get("capabilities", existing.capabilities)
+                            existing.best_for = info.get("best_for", existing.best_for)
+                            existing.avoid_for = info.get("avoid_for", existing.avoid_for)
+                            updated += 1
+                await session.commit()
+                logger.info("Agent images synced from %s (created=%s updated=%s)", source, created, updated)
     except Exception as exc:
-        logger.warning(f"Agent images auto-seed skipped: {exc}")
+        logger.warning(f"Agent images sync skipped: {exc}")
 
     yield
     

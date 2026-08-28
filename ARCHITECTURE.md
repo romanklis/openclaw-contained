@@ -366,11 +366,10 @@ OpenAI-compatible chat completions gateway that bridges stateless HTTP clients
 - Deployment status summary at task completion with `[Manage Deployments]` link
 - Fast-path proxy for Open WebUI meta-requests (title/tag/follow-up generation)
 
-**Agent Profile support:**
-- `GET /v1/models` returns Agent Profiles (not raw LLM models) — each profile combines a base image with an LLM model
-- `GET/POST/PUT/DELETE /v1/agent-profiles` — CRUD for the agent profiles registry (`agent-images/profiles.yaml`)
-- Profile metadata includes icon, tags, strengths, runtime environment
-- Profile resolution at chat time: model field → profile ID → base_image + llm_model
+**Model & image selection:**
+- `GET /v1/models` returns the configured LLM models (OpenAI-compatible).
+- The planner assigns a **base image** (from the `agent_images` DB catalog, seeded from `agent-images/agent_profiles.yaml` → `base_images:`) and a **skill** to each DAG node.
+- No agent-profile indirection: a model selects the LLM; a node selects its image.
 
 **Session management:**
 - Deterministic conversation ID from `model + system_prompt + first_user_message`

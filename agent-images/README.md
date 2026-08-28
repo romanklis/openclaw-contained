@@ -48,13 +48,12 @@ agent-images/
 
 ## Agent Profiles
 
-Agent Profiles abstract LLM selection away from users. Instead of picking a raw
-model name, users select a **profile** which is a pre-defined combination of:
+The platform has no "agent profile" concept. The catalog is just **base images**:
+each base image is an execution environment (Docker tag) that the planner can
+assign to a DAG node, alongside a skill and an LLM model.
 
-- **Base Image** (Docker tag) — the execution environment
-- **LLM Model** (API name) — the AI model powering the agent
-
-See [`agent_profiles.yaml`](agent_profiles.yaml) for the full registry.
+See [`agent_profiles.yaml`](agent_profiles.yaml) — the `base_images:` section is
+the seed source for the `agent_images` DB table (the runtime catalog).
 
 ### Example
 

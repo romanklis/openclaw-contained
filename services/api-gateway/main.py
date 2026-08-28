@@ -47,7 +47,6 @@ from fastapi.responses import StreamingResponse
 from config import settings
 from control_plane_client import ControlPlaneClient
 from schemas import (
-    AgentProfileCard,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
@@ -57,11 +56,6 @@ from schemas import (
     Usage,
 )
 from session_manager import SessionStore
-from agent_profiles import (
-    load_profiles, get_profiles, get_profile, get_base_image_info,
-    create_profile, update_profile, delete_profile,
-    AgentProfile, AgentProfileMetadata,
-)
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
@@ -603,10 +597,6 @@ async def stream_task_execution(
     try:
         _task_info = await cp.get_task(task_id)
         _wf_id = _task_info.get("workflow_id", "")
-        # Detect Task Force coordinator tasks — legacy, now replaced by DAGs.
-        _agent_profile = _task_info.get("agent_profile", "")
-        if _agent_profile.startswith("taskforce-"):
-            _task_force_id = _task_info.get("task_force_id") or _agent_profile
         if _wf_id:
             _temporal_url = (
                 f"{settings.TEMPORAL_UI_URL}/namespaces/default/workflows/{_wf_id}"
@@ -957,9 +947,6 @@ async def lifespan(app: FastAPI):
     logger.info("    Control-Plane : %s", settings.CONTROL_PLANE_URL)
     logger.info("    Redis         : %s", settings.REDIS_URL or "(none — in-memory)")
     logger.info("    Default LLM   : %s", settings.DEFAULT_LLM_MODEL)
-    load_profiles()
-    profiles = get_profiles()
-    logger.info("    Agent Profiles: %d loaded", len(profiles))
     yield
     logger.info("🔴  OpenClaw API Gateway shutting down")
 
@@ -1006,212 +993,34 @@ async def health():
 
 @app.get("/v1/models", tags=["openai-compat"])
 async def list_models():
-    """Return available Agent Profiles (OpenAI /v1/models compatible).
+    """Return available LLM models (OpenAI /v1/models compatible).
 
-    Instead of exposing raw LLM model names, this endpoint returns
-    **Agent Profiles** — pre-defined combinations of a Base Image
-    (the "body") and a specific LLM (the "brain").
-
-    Each profile includes metadata such as the runtime environment,
-    icon, tags, and strengths so the UI can display rich information
-    about what the user is selecting.
-
-    Two "meta-models" are always appended at the end of the list:
-
-    * **taskforge-iterator** — selects the default profile and runs in
-      multi-turn (iterate) mode.
-    * **taskforge-oneshot** — single-shot task execution.
+    Lists the LLM models configured on the control plane, plus two
+    meta-models:
+      * **taskforge-iterator** — multi-turn (iterate) mode.
+      * **taskforge-oneshot** — single-shot task execution.
     """
-    cards: list[AgentProfileCard] = []
+    cards: list[ModelCard] = []
 
-    # ── Load agent profiles from registry ────────────────────────────────
-    profiles = get_profiles()
-    for p in profiles:
-        img_info = get_base_image_info(p.base_image)
-        runtime = p.metadata.runtime or (img_info.runtime if img_info else p.base_image)
-        cards.append(
-            AgentProfileCard(
-                id=p.id,
-                owned_by="openclaw",
-                profile_name=p.name,
-                profile_description=p.description,
-                base_image=p.base_image,
-                llm_model=p.llm_model,
-                runtime=runtime,
-                icon=p.icon,
-                tags=p.tags,
-                strengths=p.metadata.strengths,
-            )
-        )
-
-    # ── Fallback: if no profiles loaded, expose raw LLM models ───────────
-    if not cards:
-        logger.warning("No agent profiles loaded — falling back to raw LLM models")
-        try:
-            models = await cp.get_llm_models()
-            for m in models:
-                mid = m.get("id", "")
-                provider = m.get("provider", "openclaw")
-                if mid:
-                    cards.append(AgentProfileCard(id=mid, owned_by=provider))
-        except Exception as exc:
-            logger.warning("Could not fetch models from control-plane: %s", exc)
+    try:
+        models = await cp.get_llm_models()
+        for m in models:
+            mid = m.get("id", "")
+            provider = m.get("provider", "openclaw")
+            if mid:
+                cards.append(ModelCard(id=mid, owned_by=provider))
+    except Exception as exc:
+        logger.warning("Could not fetch models from control-plane: %s", exc)
 
     # Always include at least one option
     if not cards:
-        cards.append(AgentProfileCard(id=settings.DEFAULT_LLM_MODEL, owned_by="openclaw"))
+        cards.append(ModelCard(id=settings.DEFAULT_LLM_MODEL, owned_by="openclaw"))
 
     # ── Meta-models (always present) ─────────────────────────────────────
-    cards.append(AgentProfileCard(
-        id="taskforge-iterator",
-        owned_by="openclaw-gateway",
-        profile_name="TaskForge Iterator",
-        profile_description="Multi-turn iterative agent using the default profile.",
-        icon="🔄",
-    ))
-    cards.append(AgentProfileCard(
-        id="taskforge-oneshot",
-        owned_by="openclaw-gateway",
-        profile_name="TaskForge One-Shot",
-        profile_description="Single-shot task execution using the default profile.",
-        icon="🎯",
-    ))
+    cards.append(ModelCard(id="taskforge-iterator", owned_by="openclaw-gateway"))
+    cards.append(ModelCard(id="taskforge-oneshot", owned_by="openclaw-gateway"))
 
     return ModelList(data=cards)
-
-
-@app.get("/v1/agent-profiles", tags=["agent-profiles"])
-async def list_agent_profiles():
-    """Return the full agent profiles registry with all metadata.
-
-    Unlike /v1/models (which is OpenAI-compatible), this endpoint returns
-    the complete profile data including base image details.
-
-    Also includes active Task Forces as virtual agent profiles so they
-    appear in the agent selection dropdown.
-    """
-    profiles = get_profiles()
-    result = []
-    for p in profiles:
-        img_info = get_base_image_info(p.base_image)
-        result.append({
-            "id": p.id,
-            "name": p.name,
-            "description": p.description,
-            "base_image": p.base_image,
-            "llm_model": p.llm_model,
-            "tags": p.tags,
-            "icon": p.icon,
-            "is_task_force": False,
-            "metadata": p.metadata.model_dump(),
-            "image_info": img_info.model_dump() if img_info else None,
-        })
-
-    # Merge in active Task Forces as virtual agent profiles
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"{settings.CONTROL_PLANE_URL}/api/task-forces/as-profiles"
-            )
-            if resp.status_code == 200:
-                tf_profiles = resp.json().get("profiles", [])
-                result.extend(tf_profiles)
-    except Exception as e:
-        logger.warning(f"Could not fetch Task Force profiles: {e}")
-
-    return {"profiles": result}
-
-
-@app.get("/v1/agent-profiles/{profile_id}", tags=["agent-profiles"])
-async def get_agent_profile(profile_id: str):
-    """Return a single agent profile by ID."""
-    p = get_profile(profile_id)
-    if not p:
-        raise HTTPException(status_code=404, detail=f"Agent profile '{profile_id}' not found")
-    img_info = get_base_image_info(p.base_image)
-    return {
-        "id": p.id,
-        "name": p.name,
-        "description": p.description,
-        "base_image": p.base_image,
-        "llm_model": p.llm_model,
-        "tags": p.tags,
-        "icon": p.icon,
-        "metadata": p.metadata.model_dump(),
-        "image_info": img_info.model_dump() if img_info else None,
-    }
-
-
-@app.post("/v1/agent-profiles", tags=["agent-profiles"], status_code=201)
-async def create_agent_profile(body: dict):
-    """Create a new agent profile.
-
-    Required fields: ``id``, ``name``, ``base_image``, ``llm_model``.
-    """
-    try:
-        profile = AgentProfile(**body)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-    try:
-        created = create_profile(profile)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    img_info = get_base_image_info(created.base_image)
-    return {
-        "id": created.id,
-        "name": created.name,
-        "description": created.description,
-        "base_image": created.base_image,
-        "llm_model": created.llm_model,
-        "tags": created.tags,
-        "icon": created.icon,
-        "metadata": created.metadata.model_dump(),
-        "image_info": img_info.model_dump() if img_info else None,
-    }
-
-
-@app.put("/v1/agent-profiles/{profile_id}", tags=["agent-profiles"])
-async def update_agent_profile(profile_id: str, body: dict):
-    """Update an existing agent profile (partial update)."""
-    try:
-        updated = update_profile(profile_id, body)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    if not updated:
-        raise HTTPException(status_code=404, detail=f"Agent profile '{profile_id}' not found")
-
-    img_info = get_base_image_info(updated.base_image)
-    return {
-        "id": updated.id,
-        "name": updated.name,
-        "description": updated.description,
-        "base_image": updated.base_image,
-        "llm_model": updated.llm_model,
-        "tags": updated.tags,
-        "icon": updated.icon,
-        "metadata": updated.metadata.model_dump(),
-        "image_info": img_info.model_dump() if img_info else None,
-    }
-
-
-@app.delete("/v1/agent-profiles/{profile_id}", tags=["agent-profiles"])
-async def delete_agent_profile(profile_id: str):
-    """Delete an agent profile."""
-    try:
-        deleted = delete_profile(profile_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"Agent profile '{profile_id}' not found")
-
-    return {"status": "deleted", "id": profile_id}
 
 
 # ---------------------------------------------------------------------------
@@ -1336,44 +1145,17 @@ async def chat_completions(
     # Meta-names like "taskforge-iterator" are not real LLM models;
     # they indicate the gateway *mode*, so we skip them.
     #
-    # Agent Profile resolution: if the model field matches a profile ID
-    # (e.g. "senior-reviewer"), resolve it to the profile's real LLM model.
+    # Model resolution: the model field maps directly to an LLM model.
+    # Meta-names like "taskforge-iterator" are not real LLM models; they
+    # indicate the gateway *mode*, so we skip them and use the default.
     _META_MODELS = {"taskforge-iterator", "taskforge-oneshot"}
-    _raw_model = body.llm_model or body.model
+    _raw_model = (body.llm_model or body.model or "").strip()
 
-    # Task Force virtual profiles are deprecated — DAG-based orchestration
-    # is now handled via /api/dags endpoints.
-    _is_task_force = bool(_raw_model and _raw_model.startswith("taskforce-"))
-
-    _resolved_profile = get_profile(_raw_model) if _raw_model else None
-    llm_model: str
-    agent_profile: str | None
-    base_image: str | None
-
-    if _raw_model and _raw_model.startswith("taskforce-"):
-        # Legacy task force references — treat as default model
-        llm_model = settings.DEFAULT_LLM_MODEL
-        agent_profile = _raw_model
-        base_image = None
-        logger.info("Legacy TaskForce profile '%s' detected → llm=%s", _raw_model, llm_model)
-    elif _resolved_profile:
-        llm_model = _resolved_profile.llm_model
-        agent_profile = _resolved_profile.id
-        base_image = _resolved_profile.base_image
-        logger.info("Agent profile '%s' resolved → llm=%s, image=%s",
-                     _raw_model, llm_model, _resolved_profile.base_image)
-    elif body.llm_model:
-        llm_model = body.llm_model
-        agent_profile = None
-        base_image = None
-    elif body.model and body.model not in _META_MODELS:
-        llm_model = body.model
-        agent_profile = None
-        base_image = None
+    if _raw_model and _raw_model not in _META_MODELS and not _raw_model.startswith("taskforce-"):
+        llm_model = _raw_model
     else:
         llm_model = settings.DEFAULT_LLM_MODEL
-        agent_profile = None
-        base_image = None
+    base_image = None
 
     # ── Fast-path: lightweight LLM-only requests ──────────────────────────
     # Open WebUI sends auto-generated meta-requests after every conversation
@@ -1473,12 +1255,6 @@ async def chat_completions(
                 desc_parts.append(f"[USER]\n{m.text()}")
         description = "\n\n".join(desc_parts) or instruction
 
-        # Determine agent_profile to send to the control-plane.
-        _agent_profile_for_task = (
-            _raw_model if _is_task_force
-            else (_resolved_profile.id if _resolved_profile else None)
-        )
-
         logger.info("[%s] Creating new task: %s…", conv_id, task_name[:60])
         try:
             task_data = await cp.create_task(
@@ -1486,7 +1262,6 @@ async def chat_completions(
                 description=description,
                 llm_model=llm_model,
                 base_image=base_image,
-                agent_profile=agent_profile,
             )
         except httpx.HTTPStatusError as exc:
             raise HTTPException(

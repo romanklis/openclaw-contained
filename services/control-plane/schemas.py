@@ -28,7 +28,6 @@ class TaskCreate(BaseModel):
     llm_model: Optional[str] = None
     model: Optional[str] = None  # alias for llm_model (from curl/CLI)
     base_image: Optional[str] = None  # agent base image key (e.g. "zeroclaw")
-    agent_profile: Optional[str] = None  # agent profile ID for display
     # ── DAG context (optional) ──
     workspace_id: Optional[str] = None   # share an existing workspace
     dag_id: Optional[str] = None         # link to parent DAG
@@ -59,7 +58,6 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     workspace_id: str
     workflow_id: Optional[str]
-    agent_profile: Optional[str] = None
     dag_id: Optional[str] = None
     node_id: Optional[str] = None
     created_at: datetime
