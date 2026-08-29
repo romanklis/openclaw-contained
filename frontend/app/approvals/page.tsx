@@ -63,6 +63,37 @@ function ApprovalsContent() {
   const [actionLoading, setActionLoading] = useState<number | null>(null)
   const [taskCache, setTaskCache] = useState<Record<string, TaskInfo>>({})
 
+  // ── Workflow inputs (decision / input steps) ─────────────────────────
+  const [userRequests, setUserRequests] = useState<any[]>([])
+  const [userAnswers, setUserAnswers] = useState<Record<number, any>>({})
+
+  const fetchUserRequests = async () => {
+    try {
+      const res = await fetch(`${API}/api/dags/user-requests?status=pending`)
+      if (res.ok) setUserRequests(await res.json())
+    } catch {}
+  }
+
+  const answerUserRequest = async (id: number, dagId: string, answer: any) => {
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/user-requests/${id}/answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer, answered_by: 'web-ui' }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      await fetchUserRequests()
+    } catch (e: any) {
+      alert(e.message)
+    }
+  }
+
+  useEffect(() => {
+    fetchUserRequests()
+    const iv = setInterval(fetchUserRequests, 5000)
+    return () => clearInterval(iv)
+  }, [])
+
   const fetchTaskInfo = async (taskId: string): Promise<TaskInfo | null> => {
     if (taskCache[taskId]) return taskCache[taskId]
     try {
@@ -187,6 +218,63 @@ function ApprovalsContent() {
           Review agent requests for packages, network access, and other capabilities
         </p>
       </div>
+
+      {/* Workflow Inputs (decision / input steps) */}
+      {userRequests.length > 0 && (
+        <div className="mb-6 rounded border border-amber-700/50 bg-amber-950/20 p-4">
+          <div className="text-sm font-semibold text-amber-200 mb-3">
+            ⏸ Workflow Inputs ({userRequests.length}) — decision / data-input steps awaiting you
+          </div>
+          <div className="space-y-3">
+            {userRequests.map((req) => (
+              <div key={req.id} className="rounded border border-amber-800/40 bg-black/10 p-3">
+                <div className="text-xs font-mono text-amber-300 mb-1">
+                  {req.dag_id} · {req.node_id}
+                </div>
+                <div className="text-sm text-amber-100 mb-2">
+                  {req.kind === 'decision' ? '🛑 ' : '📥 '}
+                  {req.prompt}
+                </div>
+                {req.kind === 'decision' ? (
+                  <div className="flex flex-wrap gap-2">
+                    {(req.payload?.options || []).map((opt: any) => (
+                      <button
+                        key={opt.value}
+                        onClick={() => answerUserRequest(req.id, req.dag_id, { choice: opt.value })}
+                        className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white"
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {(req.payload?.fields || []).map((f: any) => (
+                      <div key={f.key}>
+                        <label className="block text-xs text-gray-400 mb-1">{f.label || f.key}</label>
+                        <input
+                          type={f.type === 'number' ? 'number' : 'text'}
+                          onChange={(e) => setUserAnswers((prev) => ({
+                            ...prev,
+                            [req.id]: { ...(prev[req.id] || {}), fields: { ...((prev[req.id] || {}).fields || {}), [f.key]: e.target.value } },
+                          }))}
+                          className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                        />
+                      </div>
+                    ))}
+                    <button
+                      onClick={() => answerUserRequest(req.id, req.dag_id, { fields: userAnswers[req.id]?.fields || {} })}
+                      className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white"
+                    >
+                      Submit
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Task filter banner */}
       {filterTaskId && (

@@ -13,6 +13,14 @@ interface DAGNodeData {
   skill_id: string | null
   started_at: string | null
   completed_at: string | null
+  node_type?: string
+}
+
+interface DAGEdgeData {
+  from_node?: string
+  to_node?: string
+  condition?: string
+  edge_type?: string
 }
 
 interface DAGGraphProps {
@@ -21,6 +29,7 @@ interface DAGGraphProps {
   editable?: boolean
   onConnect?: (source: string, target: string) => void
   onDisconnect?: (source: string, target: string) => void
+  edges?: DAGEdgeData[]
 }
 
 const STATUS_COLORS: Record<string, { bg: string; border: string; text: string }> = {
@@ -39,7 +48,12 @@ function getColors(status: string) {
 const EDGE_MARKER = { type: MarkerType.ArrowClosed, color: '#6b7280' }
 const EDGE_STYLE = { stroke: '#6b7280', strokeWidth: 2 }
 
-export default function DAGGraph({ nodes, onNodeClick, editable = false, onConnect, onDisconnect }: DAGGraphProps) {
+const TYPE_STYLES: Record<string, { bg: string; border: string; text: string; label: string; radius: string }> = {
+  decision: { bg: '#78350f', border: '#f59e0b', text: '#fcd34d', label: '🛑', radius: '2px' },
+  input: { bg: '#164e63', border: '#06b6d4', text: '#67e8f9', label: '📥', radius: '50%' },
+}
+
+export default function DAGGraph({ nodes, onNodeClick, editable = false, onConnect, onDisconnect, edges: explicitEdges }: DAGGraphProps) {
   const { flowNodes, flowEdges } = useMemo(() => {
     // Build adjacency for layout: group into waves (topological layers)
     const nodeMap = new Map(nodes.map(n => [n.node_id, n]))
@@ -76,18 +90,22 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
       for (let ni = 0; ni < wave.length; ni++) {
         const nodeId = wave[ni]
         const data = nodeMap.get(nodeId)!
-        const colors = getColors(data.status)
+        const tstyle = data.node_type === 'decision' || data.node_type === 'input' ? TYPE_STYLES[data.node_type] : null
+        const colors = tstyle
+          ? { bg: tstyle.bg, border: tstyle.border, text: tstyle.text }
+          : getColors(data.status)
+        const label = tstyle ? `${tstyle.label} ${nodeId}` : nodeId
         flowNodes.push({
           id: nodeId,
           position: { x: wi * X_GAP, y: startY + ni * Y_GAP },
-          data: { label: nodeId, description: data.description, status: data.status },
+          data: { label, description: data.description, status: data.status },
           sourcePosition: Position.Right,
           targetPosition: Position.Left,
           style: {
             background: colors.bg,
             border: `2px solid ${colors.border}`,
             color: colors.text,
-            borderRadius: '8px',
+            borderRadius: tstyle ? tstyle.radius : '8px',
             padding: '10px 14px',
             fontSize: '12px',
             fontFamily: 'monospace',
@@ -122,8 +140,35 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
       }
     }
 
+    // Explicit edges (e.g. conditional/loop edges) not already implied by
+    // depends_on. Loop-back edges are drawn dashed + labeled.
+    const seen = new Set(flowEdges.map((e) => `${e.source}->${e.target}`))
+    for (const e of explicitEdges || []) {
+      const src = e.from_node || ''
+      const tgt = e.to_node || ''
+      if (!src || !tgt) continue
+      const key = `${src}->${tgt}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const isLoop = e.edge_type === 'loop' || e.condition === 'loop'
+      flowEdges.push({
+        id: key,
+        source: src,
+        target: tgt,
+        type: 'smoothstep',
+        markerEnd: EDGE_MARKER,
+        style: isLoop ? { stroke: '#f59e0b', strokeWidth: 2, strokeDasharray: '6 4' } : EDGE_STYLE,
+        label: isLoop ? 're-approve' : undefined,
+        labelStyle: { fill: '#f59e0b', fontSize: 10 },
+        labelBgStyle: { fill: '#1f2937' },
+        labelBgPadding: [4, 2] as [number, number],
+        labelBgBorderRadius: 4,
+        pathOptions: isLoop ? { offset: 40 } : undefined,
+      })
+    }
+
     return { flowNodes, flowEdges }
-  }, [nodes, editable])
+  }, [nodes, explicitEdges, editable])
 
   const [edges, setEdges] = useState<Edge[]>(flowEdges)
 

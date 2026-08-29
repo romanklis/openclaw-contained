@@ -47,7 +47,7 @@ from schemas import (
     DAGInstantiateRequest,
 )
 from dag_validator import validate_dag
-from planner import plan_dag
+from planner import plan_dag, _normalize_interactive_nodes
 from routers.openai_dag import MODEL_CONFIGS
 from temporal_client import start_dag_workflow, get_temporal_client
 import uuid
@@ -187,6 +187,7 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=422, detail=str(e))
 
     # Store DAG JSON and create node records
+    dag_json = _normalize_interactive_nodes(dag_json)
     dag.dag_json = dag_json
     dag.status = DAGStatus.READY
 
@@ -211,6 +212,9 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
             input_mapping=node_def.get("input_mapping", {}),
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
+            node_type=node_def.get("node_type", "agent")
+            if node_def.get("node_type", "agent") in ("agent", "decision", "input")
+            else "agent",
         )
         db.add(node)
         nodes.append(node)
@@ -245,6 +249,8 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
         "default_image": data.default_image,
         "default_llm": data.default_llm,
     }
+
+    dag_json = _normalize_interactive_nodes(dag_json)
 
     # Validate
     is_valid, errors = validate_dag(dag_json)
@@ -289,6 +295,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
             input_mapping=node_def.input_mapping,
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
+            node_type=node_def.node_type if node_def.node_type in ("agent", "decision", "input") else "agent",
         )
         db.add(node)
         nodes.append(node)
@@ -1383,6 +1390,10 @@ async def patch_dag(dag_id: str, payload: dict, db: AsyncSession = Depends(get_d
     dag = await _get_dag_or_404(dag_id, db)
     if "status" in payload:
         dag.status = DAGStatus(payload["status"])
+    if "llm_model" in payload and payload["llm_model"]:
+        dag.llm_model = payload["llm_model"]
+        if dag.dag_json:
+            dag.dag_json["default_llm"] = payload["llm_model"]
     if "completed_at" in payload:
         # Handle ISO format with timezone (e.g., "2026-07-16T21:02:20.123456+00:00")
         # Convert to offset-naive UTC for DB storage
@@ -1444,6 +1455,8 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
         node.skill_selection_reason = patch["skill_selection_reason"]
     if "description" in patch:
         node.description = patch["description"]
+    if "node_type" in patch and patch["node_type"] in ("agent", "decision", "input"):
+        node.node_type = patch["node_type"]
     if "depends_on" in patch and patch["depends_on"] is not None:
         node.depends_on = _dedupe_node_ids(patch["depends_on"])
     if "input_mapping" in patch and patch["input_mapping"] is not None:
@@ -1657,6 +1670,7 @@ async def add_node(dag_id: str, payload: DAGNodeCreate, db: AsyncSession = Depen
         depends_on=depends_on,
         config=config,
         input_mapping=payload.input_mapping or {},
+        node_type=payload.node_type if payload.node_type in ("agent", "decision", "input") else "agent",
     )
     db.add(new_node)
 
@@ -2111,7 +2125,7 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
         if skill_selection_reason:
             node_def.setdefault("config", {})["skill_selection_reason"] = skill_selection_reason
         node = DAGNode(
-            dag_id=new_dag_id,
+            dag_id=dag_id,
             node_id=node_def["node_id"],
             skill_id=skill_id,
             skill_step_index=node_def.get("skill_step_index"),
@@ -2122,6 +2136,9 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
             input_mapping=node_def.get("input_mapping", {}),
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
+            node_type=node_def.get("node_type", "agent")
+            if node_def.get("node_type", "agent") in ("agent", "decision", "input")
+            else "agent",
         )
         db.add(node)
         nodes.append(node)
@@ -2324,6 +2341,7 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
         "template_params": list(getattr(dag, "template_params", []) or []),
         "template_source_dag_id": getattr(dag, "template_source_dag_id", None),
         "dag_json": dag.dag_json,
+        "edges": [dict(e) for e in (dag.dag_json or {}).get("edges", [])],
         "nodes": [
             {
                 "id": n.id,
@@ -2344,6 +2362,7 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
                 "selected_skill_v2_id": n.selected_skill_v2_id,
                 "skill_selection_reason": n.skill_selection_reason,
                 "deliverables_keys": (n.output_data or {}).get("deliverables_keys"),
+                "node_type": n.node_type or "agent",
             }
             for n in nodes
         ],

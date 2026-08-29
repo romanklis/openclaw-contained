@@ -11,6 +11,7 @@ from routers import tasks, capabilities, policies, auth, llm, tasks_extended, de
 from routers import openai_dag
 from routers import agent_images as agent_images_router
 from routers import skill_learning as skill_learning_router
+from routers import dag_user_requests
 from database import engine, Base, async_session
 from config import settings
 
@@ -50,6 +51,24 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS template_source_dag_id VARCHAR"))
         # DAG archiving (soft delete / declutter)
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
+        # Interactive steps: decision / input node type on DAG nodes
+        await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS node_type VARCHAR DEFAULT 'agent'"))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dag_user_requests (
+                id SERIAL PRIMARY KEY,
+                dag_id VARCHAR NOT NULL,
+                node_id VARCHAR NOT NULL,
+                task_id VARCHAR,
+                kind VARCHAR NOT NULL,
+                prompt TEXT DEFAULT '',
+                payload JSON DEFAULT '{}'::json,
+                status VARCHAR DEFAULT 'pending',
+                answer JSON,
+                answered_by VARCHAR,
+                created_at TIMESTAMP DEFAULT now(),
+                answered_at TIMESTAMP
+            )
+        """))
         # Task status enum values (kept in sync with models.TaskStatus)
         await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'WAITING_APPROVAL'"))
         await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'BUILDING_IMAGE'"))
@@ -171,10 +190,12 @@ app.include_router(sbom.router)
 app.include_router(supply_chain.router)
 app.include_router(skills.router, prefix="/api/skills", tags=["skills"])
 app.include_router(environments.router, prefix="/api/environments", tags=["environments"])
+app.include_router(dag_user_requests.router, prefix="/api/dags", tags=["dag-user-requests"])
 app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
 app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
 app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
 app.include_router(skill_learning_router.router, prefix="/api/skill-learning", tags=["skill-learning"])
+app.include_router(dag_user_requests.router, prefix="/api/dags", tags=["dag-user-requests"])
 
 
 @app.get("/health")

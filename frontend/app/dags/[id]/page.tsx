@@ -168,6 +168,11 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [addNodeImage, setAddNodeImage] = useState('openclaw')
   const [addNodeMode, setAddNodeMode] = useState<'after' | 'parallel' | 'custom'>('after')
   const [addNodeDeps, setAddNodeDeps] = useState<string[]>([])
+  const [addNodeType, setAddNodeType] = useState<'agent' | 'decision' | 'input'>('agent')
+  const [addNodeQuestion, setAddNodeQuestion] = useState('')
+  const [addNodeOptions, setAddNodeOptions] = useState('Approve,approve\nRework,rework')
+  const [addNodePrompt, setAddNodePrompt] = useState('')
+  const [addNodeFields, setAddNodeFields] = useState('measurement,Measurement,number')
   const [showImageDialog, setShowImageDialog] = useState(false)
   const [nodeImage, setNodeImage] = useState('')
   const [showEditConnectionsDialog, setShowEditConnectionsDialog] = useState(false)
@@ -238,6 +243,41 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
 
   useEffect(() => { fetchDag() }, [fetchDag])
   useEffect(() => { loadDeepReviews() }, [loadDeepReviews])
+
+  // ── Pending interactive steps (decision / input) ──────────────────────
+  const [userRequests, setUserRequests] = useState<any[]>([])
+  const [userRequestAnswers, setUserRequestAnswers] = useState<Record<number, any>>({})
+  const [userRequestBusy, setUserRequestBusy] = useState<number | null>(null)
+
+  const loadUserRequests = async () => {
+    try {
+      const r = await fetch(`${API}/api/dags/${dagId}/user-requests?status=pending`)
+      if (r.ok) setUserRequests(await r.json())
+    } catch { /* ignore */ }
+  }
+  useEffect(() => {
+    loadUserRequests()
+    const iv = setInterval(loadUserRequests, 5000)
+    return () => clearInterval(iv)
+  }, [dagId])
+
+  const answerUserRequest = async (id: number, answer?: any) => {
+    setUserRequestBusy(id)
+    try {
+      const r = await fetch(`${API}/api/dags/${dagId}/user-requests/${id}/answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer: answer || userRequestAnswers[id] || {}, answered_by: 'web-ui' }),
+      })
+      if (!r.ok) throw new Error(await r.text())
+      await loadUserRequests()
+      await fetchDag()
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setUserRequestBusy(null)
+    }
+  }
 
   // Auto-refresh while running, and fetch once more when status changes from running
   useEffect(() => {
@@ -565,6 +605,29 @@ setNodeState(prev => {
       } else {
         deps = [selectedNode.node_id]
       }
+      const config: any = {
+        base_image: addNodeImage.trim() || 'openclaw',
+        llm_model: dag.llm_model || undefined,
+      }
+      if (addNodeType === 'decision') {
+        config.type = 'decision'
+        config.question = addNodeQuestion.trim() || 'Proceed?'
+        config.payload = {
+          options: addNodeOptions.split('\n').filter(Boolean).map((line) => {
+            const [label, value] = line.split(',').map((s) => s.trim())
+            return { label: label || value, value: value || label }
+          }),
+        }
+      } else if (addNodeType === 'input') {
+        config.type = 'input'
+        config.prompt = addNodePrompt.trim() || 'Provide the requested input'
+        config.payload = {
+          fields: addNodeFields.split('\n').filter(Boolean).map((line) => {
+            const [key, label, type] = line.split(',').map((s) => s.trim())
+            return { key: key || label, label: label || key, type: type || 'text' }
+          }),
+        }
+      }
       const res = await fetch(`${API}/api/dags/${dagId}/nodes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -572,10 +635,8 @@ setNodeState(prev => {
           node_id: newId,
           description: addNodeDesc.trim() || 'New step',
           depends_on: deps,
-          config: {
-            base_image: addNodeImage.trim() || 'openclaw',
-            llm_model: dag.llm_model || undefined,
-          },
+          node_type: addNodeType,
+          config,
         }),
       })
       const data = await res.json().catch(() => ({}))
@@ -1219,6 +1280,64 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
         </div>
       </div>
 
+      {/* Pending interactive steps (decision / input) */}
+      {userRequests.length > 0 && (
+        <div className="mb-4 rounded border border-amber-700/50 bg-amber-950/30 p-4">
+          <div className="text-sm font-semibold text-amber-200 mb-3">
+            ⏸ Waiting for your input ({userRequests.length})
+          </div>
+          <div className="space-y-3">
+            {userRequests.map((req) => (
+              <div key={req.id} className="rounded border border-amber-800/40 bg-black/10 p-3">
+                <div className="text-xs font-mono text-amber-300 mb-1">{req.node_id}</div>
+                <div className="text-sm text-amber-100 mb-2">
+                  {req.kind === 'decision' ? '🛑 ' : '📥 '}
+                  {req.prompt}
+                </div>
+                {req.kind === 'decision' ? (
+                  <div className="flex flex-wrap gap-2">
+                    {(req.payload?.options || []).map((opt: any) => (
+                      <button
+                        key={opt.value}
+                        onClick={() => answerUserRequest(req.id, { choice: opt.value })}
+                        disabled={userRequestBusy === req.id}
+                        className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {(req.payload?.fields || []).map((f: any) => (
+                      <div key={f.key}>
+                        <label className="block text-xs text-gray-400 mb-1">{f.label || f.key}</label>
+                        <input
+                          type={f.type === 'number' ? 'number' : 'text'}
+                          defaultValue=""
+                          onChange={(e) => setUserRequestAnswers((prev) => ({
+                            ...prev,
+                            [req.id]: { ...(prev[req.id] || {}), fields: { ...((prev[req.id] || {}).fields || {}), [f.key]: e.target.value } },
+                          }))}
+                          className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                        />
+                      </div>
+                    ))}
+                    <button
+                      onClick={() => answerUserRequest(req.id, { fields: userRequestAnswers[req.id]?.fields || {} })}
+                      disabled={userRequestBusy === req.id}
+                      className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
+                    >
+                      Submit
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {failedNodeSummaries.length > 0 && (
         <div className="mb-4 rounded border border-red-700/50 bg-red-950/40 p-4">
           <div className="text-sm font-semibold text-red-200 mb-2">DAG Failure Summary</div>
@@ -1259,7 +1378,9 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             skill_id: n.skill_id,
             started_at: n.started_at,
             completed_at: n.completed_at,
+            node_type: (n as any).node_type,
           }))}
+          edges={(dag as any).edges || []}
           onNodeClick={(nodeId) => {
             setSelectedNodeId(nodeId === selectedNodeId ? null : nodeId)
             setActiveTab('overview')
@@ -1913,6 +2034,51 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       )
                     })}
                   </div>
+                </div>
+              )}
+              <div className="flex gap-2 mb-2">
+                {(['agent', 'decision', 'input'] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setAddNodeType(t)}
+                    className={`text-xs px-2 py-1 rounded border ${addNodeType === t ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+                  >
+                    {t === 'agent' ? '🤖 Agent' : t === 'decision' ? '🛑 Decision' : '📥 Input'}
+                  </button>
+                ))}
+              </div>
+              {addNodeType === 'decision' && (
+                <div className="mb-2 space-y-2">
+                  <input
+                    value={addNodeQuestion}
+                    onChange={(e) => setAddNodeQuestion(e.target.value)}
+                    placeholder="Question (e.g. Proceed with the report?)"
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                  />
+                  <textarea
+                    value={addNodeOptions}
+                    onChange={(e) => setAddNodeOptions(e.target.value)}
+                    rows={3}
+                    placeholder={'Options — one per line: Label,value\nApprove,approve\nRework,rework'}
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                  />
+                </div>
+              )}
+              {addNodeType === 'input' && (
+                <div className="mb-2 space-y-2">
+                  <input
+                    value={addNodePrompt}
+                    onChange={(e) => setAddNodePrompt(e.target.value)}
+                    placeholder="Prompt (e.g. Enter the measured value)"
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                  />
+                  <textarea
+                    value={addNodeFields}
+                    onChange={(e) => setAddNodeFields(e.target.value)}
+                    rows={3}
+                    placeholder={'Fields — one per line: key,label,type (text|number|select)\nmeasurement,Measurement,number'}
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                  />
                 </div>
               )}
               <textarea
@@ -2621,6 +2787,12 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <span className="font-mono text-sm font-semibold">{node.node_id}</span>
+                  {(node as any).node_type === 'decision' && (
+                    <span className="text-xs bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded" title="Pauses for a user decision">🛑 Decision</span>
+                  )}
+                  {(node as any).node_type === 'input' && (
+                    <span className="text-xs bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded" title="Pauses for user-provided data">📥 Input</span>
+                  )}
                   <StatusBadge status={node.status} />
                   {node.skill_id && (
                     <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">

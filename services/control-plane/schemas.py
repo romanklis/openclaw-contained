@@ -433,6 +433,7 @@ class DAGNodeCreate(BaseModel):
     depends_on: List[str] = []
     config: Dict[str, Any] = {}  # base_image, llm_model, env_id, timeout_minutes, deploy_authorized
     input_mapping: Dict[str, Any] = {}  # supports dependency refs and literal constants
+    node_type: str = "agent"  # agent | decision | input
 
 
 class DAGNodePatch(BaseModel):
@@ -452,6 +453,7 @@ class DAGNodePatch(BaseModel):
     depends_on: Optional[List[str]] = None
     config: Optional[Dict[str, Any]] = None
     input_mapping: Optional[Dict[str, Any]] = None
+    node_type: Optional[str] = None  # agent | decision | input
 
 
 class DAGGraphPatch(BaseModel):
@@ -483,6 +485,7 @@ class DAGNodeResponse(BaseModel):
     selected_skill_v2_id: Optional[str] = None
     skill_selection_reason: Optional[str] = None
     deliverables_keys: Optional[List[str]] = None  # quick lookup for node deliverables
+    node_type: str = "agent"  # agent | decision | input
 
     class Config:
         from_attributes = True
@@ -611,6 +614,7 @@ class DAGDetail(DAGResponse):
     """Full DAG detail including nodes and edges."""
     dag_json: Dict[str, Any]
     nodes: List[DAGNodeResponse] = []
+    edges: List[DAGEdge] = []
 
 
 class DAGNodeStateSnapshotCreate(BaseModel):

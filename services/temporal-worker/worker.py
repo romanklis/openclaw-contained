@@ -2968,6 +2968,28 @@ async def post_dag_progress(dag_id: str, message: str) -> bool:
 
 
 @activity.defn
+async def create_user_request(dag_id: str, node_id: str, kind: str, prompt: str, payload: dict) -> bool:
+    """Create a pending interactive step request on the control plane."""
+    import httpx
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{control_plane_url}/api/dags/{dag_id}/user-requests",
+                json={
+                    "node_id": node_id,
+                    "kind": kind,
+                    "prompt": prompt,
+                    "payload": payload,
+                },
+            )
+            return resp.status_code in (200, 201)
+    except Exception as e:
+        logger.warning(f"create_user_request failed for {dag_id}/{node_id}: {e}")
+        return False
+
+
+@activity.defn
 async def post_node_state_snapshot(dag_id: str, node_id: str, payload: Dict[str, Any]) -> bool:
     """Persist node execution-state snapshot for provenance and continuity."""
     import httpx
@@ -3605,7 +3627,9 @@ async def evaluate_edge_condition(
     """
     edges = dag_json.get("edges", [])
     for edge in edges:
-        if edge.get("from") == from_node and edge.get("to") == to_node:
+        edge_from = edge.get("from_node") or edge.get("from")
+        edge_to = edge.get("to_node") or edge.get("to")
+        if edge_from == from_node and edge_to == to_node:
             condition = edge.get("condition")
             if not condition:
                 return True
@@ -3621,6 +3645,10 @@ async def evaluate_edge_condition(
                 return source_status in ("failed", "error")
             elif condition == "on_success":
                 return source_status in ("completed", "success")
+            elif condition.startswith("decision:"):
+                # Decision routing: follow if the decision node's answer chose this value.
+                expected = condition.split(":", 1)[1].strip()
+                return str(source_output.get("choice", "")) == expected
             elif condition.startswith("on_output_contains:"):
                 search_text = condition.split(":", 1)[1]
                 logs = source_output.get("agent_logs", "")
@@ -3692,7 +3720,21 @@ class DAGNodeWorkflow:
     Creates a Task record, then delegates execution to AgentTaskWorkflow
     as a child workflow, reusing all existing agent infrastructure
     (container launch, LLM polling, capability approval, deployment).
+
+    Nodes of type `decision` / `input` do NOT run an agent: they create a
+    pending DagUserRequest, pause until the user answers (via the
+    `user_input` signal), record the answer, and route accordingly.
     """
+
+    def __init__(self) -> None:
+        self.user_input_received = False
+        self.user_input_payload: Dict[str, Any] = {}
+
+    @workflow.signal
+    async def user_input(self, payload) -> None:
+        """Called by the control-plane when the user answers a pending request."""
+        self.user_input_payload = payload if isinstance(payload, dict) else {"value": payload}
+        self.user_input_received = True
 
     @workflow.run
     async def run(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -3703,6 +3745,7 @@ class DAGNodeWorkflow:
         input_data = params.get("input_data", {})
         state_context = params.get("state_context", {})
         workspace_id = params.get("workspace_id", "")
+        node_type = str(params.get("node_type") or config.get("type") or "agent").lower()
 
         # Prefer the DAG-inherited enriched image over the static base_image
         # from the node config.  dag_image is injected by DAGWorkflow when a
@@ -3726,6 +3769,10 @@ class DAGNodeWorkflow:
             args=[dag_id, node_id, "running"],
             start_to_close_timeout=timedelta(seconds=15),
         )
+
+        # ── Interactive steps: decision / input (pause for the user) ───────
+        if node_type in ("decision", "input"):
+            return await self._run_interactive(dag_id, node_id, node_type, config)
 
         # Post start message indicating base image and skill consumed
         base_img = config.get("base_image", "openclaw")
@@ -4222,6 +4269,102 @@ class DAGNodeWorkflow:
                 "error": str(e),
             }
 
+    async def _run_interactive(self, dag_id: str, node_id: str, node_type: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle a decision/input node: create a pending request, wait for the
+        user's answer, record it, and return the answer as the node output."""
+        payload = dict(config.get("payload") or {})
+        prompt = str(
+            config.get("prompt")
+            or config.get("question")
+            or config.get("node_objective")
+            or f"Please provide {'a decision' if node_type == 'decision' else 'the requested input'} for step '{node_id}'."
+        )
+        timeout_days = int(config.get("timeout_days") or 7)
+
+        label = "decision" if node_type == "decision" else "input"
+        await workflow.execute_activity(
+            post_node_state_snapshot,
+            args=[
+                dag_id,
+                node_id,
+                {
+                    "phase": "awaiting_user_input",
+                    "status": "running",
+                    "completion_state": {
+                        "description": f"Awaiting user {label}",
+                    },
+                },
+            ],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        await workflow.execute_activity(
+            post_node_audit_event,
+            args=[
+                dag_id,
+                node_id,
+                {
+                    "event_type": "user_input_requested",
+                    "severity": "info",
+                    "message": f"Awaiting user {label}",
+                    "event_data": {"prompt": prompt, "payload": payload},
+                },
+            ],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        # Create the pending request on the control plane.
+        await workflow.execute_activity(
+            create_user_request,
+            args=[dag_id, node_id, node_type, prompt, payload],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        # Pause until the user answers (the control-plane signals `user_input`).
+        await workflow.wait_condition(
+            lambda: self.user_input_received,
+            timeout=timedelta(days=timeout_days),
+        )
+        answer = dict(self.user_input_payload or {})
+
+        if node_type == "decision":
+            output: Dict[str, Any] = {
+                "status": "completed",
+                "choice": str(answer.get("choice") or ""),
+                "answer": answer,
+                "node_type": node_type,
+            }
+        else:
+            output = {
+                "status": "completed",
+                "fields": answer.get("fields", answer),
+                "answer": answer,
+                "node_type": node_type,
+            }
+
+        await workflow.execute_activity(
+            update_node_status,
+            args=[dag_id, node_id, "completed", output],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        await workflow.execute_activity(
+            post_node_state_snapshot,
+            args=[
+                dag_id,
+                node_id,
+                {
+                    "phase": "completed",
+                    "status": "completed",
+                    "output_context": output,
+                    "completion_state": {
+                        "description": f"User {label} recorded",
+                    },
+                },
+            ],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        return {"status": "completed", "output": output, "current_image": ""}
+
 
 @workflow.defn
 class DAGWorkflow:
@@ -4262,6 +4405,21 @@ class DAGWorkflow:
             nid = n["node_id"]
             node_map[nid] = n
 
+        # Transitive ancestors per node (for input pass-through). A node after a
+        # decision/input step must still see the deliverables produced by deeper
+        # ancestors (e.g. "rework" after an approval decision).
+        ancestors: Dict[str, Set[str]] = {}
+        for nid in node_map:
+            seen: Set[str] = set()
+            stack = list(node_map[nid].get("depends_on", []) or [])
+            while stack:
+                a = stack.pop()
+                if a in seen or a not in node_map:
+                    continue
+                seen.add(a)
+                stack.extend(node_map[a].get("depends_on", []) or [])
+            ancestors[nid] = seen
+
         # Track node statuses and outputs.
         # This allows restart/resume flows to preserve completed predecessors.
         node_statuses: Dict[str, str] = {}
@@ -4287,9 +4445,11 @@ class DAGWorkflow:
             start_to_close_timeout=timedelta(seconds=15),
         )
 
-        max_waves = len(node_map) + 5  # safety limit
+        max_waves = len(node_map) * 4 + 10  # safety limit (loop-back edges add waves)
         wave = 0
         failed_nodes = []
+        MAX_LOOP_REENTRY = 5  # per-node loop re-entry cap (closed-loop guard)
+        reentry_count: Dict[str, int] = {}
 
         # Track the richest capability-enriched image across waves so
         # downstream nodes inherit installed packages and file-system
@@ -4341,7 +4501,9 @@ class DAGWorkflow:
                         # Check if there's an on_failure edge that allows continuation
                         has_failure_edge = False
                         for edge in dag_json.get("edges", []):
-                            if edge.get("from") == dep and edge.get("to") == nid and edge.get("condition") == "on_failure":
+                            edge_from = edge.get("from_node") or edge.get("from")
+                            edge_to = edge.get("to_node") or edge.get("to")
+                            if edge_from == dep and edge_to == nid and edge.get("condition") == "on_failure":
                                 has_failure_edge = True
                                 break
                         if not has_failure_edge:
@@ -4472,13 +4634,22 @@ class DAGWorkflow:
                             "value": source_spec,
                         })
 
-                # If no explicit mapping, pass all dependency outputs.
+                # If no explicit mapping, pass ALL upstream outputs (transitively)
+                # so nodes after decision/input steps still receive the deeper
+                # agent deliverables produced earlier in the flow.
                 if not input_mapping:
+                    included: Set[str] = set()
+                    for anc in ancestors.get(nid, ()):
+                        if anc in node_outputs and anc not in included:
+                            input_data[anc] = node_outputs[anc]
+                            resolution_report["dependency_inputs"].append(anc)
+                            included.add(anc)
                     for dep in node_info.get("depends_on", []):
-                        if dep in node_outputs:
+                        if dep in node_outputs and dep not in included:
                             input_data[dep] = node_outputs[dep]
                             resolution_report["dependency_inputs"].append(dep)
-                        else:
+                            included.add(dep)
+                        elif dep not in node_outputs:
                             resolution_report["missing_dependency_outputs"].append(dep)
 
                 # Bound the aggregated upstream input so activity/child-workflow
@@ -4589,6 +4760,7 @@ class DAGWorkflow:
                     "description": node_info.get("description", ""),
                     "config": node_config,
                     "input_data": input_data,
+                    "node_type": node_info.get("node_type", "agent"),
                     "state_context": {
                         "wave": wave,
                         "input_resolution": resolution_report,
@@ -4608,10 +4780,13 @@ class DAGWorkflow:
                 child_handles.append((nid, handle))
 
             # Wait for all children in this wave
+            completed_this_wave: Set[str] = set()
             for nid, handle in child_handles:
                 try:
                     result = await handle
                     node_statuses[nid] = result.get("status", "failed")
+                    if node_statuses[nid] == "completed":
+                        completed_this_wave.add(nid)
                     if result.get("output"):
                         node_outputs[nid] = result["output"]
                     if node_statuses[nid] == "failed":
@@ -4634,6 +4809,64 @@ class DAGWorkflow:
                     node_outputs[nid] = {"error": str(e), "status": "failed"}
                     abort_requested = True
                     abort_reason = str(e)
+
+            # ── Loop-back edges: re-enter a target node for closed loops ────
+            # e.g. rework-report → approve-report for re-approval. An edge with
+            # edge_type "loop" (or condition "loop") resets its target to pending
+            # when the source completes, so the next wave re-runs it (a fresh
+            # decision/step). A per-node re-entry cap prevents infinite loops.
+            for edge in dag_json.get("edges", []):
+                if str(edge.get("edge_type")) != "loop" and str(edge.get("condition")) != "loop":
+                    continue
+                src = edge.get("from_node") or edge.get("from")
+                tgt = edge.get("to_node") or edge.get("to")
+                if not src or not tgt:
+                    continue
+                # Only fire when the source completed in THIS wave — otherwise the
+                # edge would re-fire every wave while the source stays completed,
+                # endlessly re-entering the target.
+                if src not in completed_this_wave:
+                    continue
+                if node_statuses.get(src) == "completed" and node_statuses.get(tgt) != "running":
+                    reentry_count[tgt] = reentry_count.get(tgt, 0) + 1
+                    if reentry_count[tgt] > MAX_LOOP_REENTRY:
+                        logger.warning(f"⚠️ Loop re-entry limit exceeded for node '{tgt}'")
+                        continue
+                    node_statuses[tgt] = "pending"
+                    node_outputs.pop(tgt, None)
+                    await workflow.execute_activity(
+                        update_node_status,
+                        args=[dag_id, tgt, "pending"],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    # Re-open downstream nodes that were skipped because of the
+                    # PREVIOUS decision (e.g. the deselected branch), so they are
+                    # re-evaluated against the new choice.
+                    for other in node_map:
+                        if other == tgt or node_statuses.get(other) != "skipped":
+                            continue
+                        if tgt in ancestors.get(other, ()):
+                            node_statuses[other] = "pending"
+                            node_outputs.pop(other, None)
+                            await workflow.execute_activity(
+                                update_node_status,
+                                args=[dag_id, other, "pending"],
+                                start_to_close_timeout=timedelta(seconds=15),
+                            )
+                    await workflow.execute_activity(
+                        post_node_audit_event,
+                        args=[
+                            dag_id,
+                            tgt,
+                            {
+                                "event_type": "loop_reentry",
+                                "severity": "info",
+                                "message": f"Re-entering node '{tgt}' after '{src}' (loop-back)",
+                                "event_data": {"source_node": src, "reentry": reentry_count[tgt]},
+                            },
+                        ],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
 
             # Fail-fast gate: stop scheduling new work when any node fails.
             if abort_requested:
@@ -4795,6 +5028,7 @@ async def main():
             finalize_dag,
             persist_task_workflow_id,
             update_task_status,
+            create_user_request,
         ],
         # Limit concurrency to avoid OOM on constrained hosts: only a few
         # activities (agent containers, LLM/gate calls) run at once.

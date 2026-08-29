@@ -411,6 +411,9 @@ class DAGNode(Base):
     task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
     container_id = Column(String)
 
+    # Step type: agent | decision | input (decision/input pause for user input)
+    node_type = Column(String, default="agent", nullable=False)
+
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
 
@@ -849,3 +852,28 @@ class SkillSelectionEvent(Base):
     skill = relationship("SkillV2", back_populates="selection_events")
     dag = relationship("MasterDAG", foreign_keys=[dag_id])
     task = relationship("Task", foreign_keys=[task_id])
+
+
+class DagUserRequest(Base):
+    """A pending interactive step in a DAG: a user decision or data input.
+
+    The DAGNodeWorkflow creates one when it reaches a `decision` or `input`
+    node, pauses, and waits for the user's answer via the `user_input` signal.
+    """
+    __tablename__ = "dag_user_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+
+    kind = Column(String, nullable=False)  # decision | input
+    prompt = Column(Text, default="")
+    payload = Column(JSON, default=dict)   # options (decision) or fields (input)
+
+    status = Column(String, default="pending")  # pending | answered | cancelled
+    answer = Column(JSON, nullable=True)
+    answered_by = Column(String, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    answered_at = Column(DateTime, nullable=True)
