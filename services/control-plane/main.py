@@ -12,6 +12,7 @@ from routers import openai_dag
 from routers import agent_images as agent_images_router
 from routers import skill_learning as skill_learning_router
 from routers import dag_user_requests
+from routers import projects as projects_router
 from database import engine, Base, async_session
 from config import settings
 
@@ -51,6 +52,17 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS template_source_dag_id VARCHAR"))
         # DAG archiving (soft delete / declutter)
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
+        # Projects (DAG/skill namespaces)
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id VARCHAR PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                description TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT now()
+            )
+        """))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE skills_v2 ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
         # Interactive steps: decision / input node type on DAG nodes
         await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS node_type VARCHAR DEFAULT 'agent'"))
         await conn.execute(text("""
@@ -195,7 +207,7 @@ app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
 app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
 app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
 app.include_router(skill_learning_router.router, prefix="/api/skill-learning", tags=["skill-learning"])
-app.include_router(dag_user_requests.router, prefix="/api/dags", tags=["dag-user-requests"])
+app.include_router(projects_router.router, prefix="/api/projects", tags=["projects"])
 
 
 @app.get("/health")

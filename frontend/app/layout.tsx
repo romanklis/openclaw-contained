@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import './globals.css'
 import { Sidebar } from './components/Sidebar'
 import { SecurityBanner } from './components/SecurityBanner'
+import { ProjectProvider } from './lib/ProjectContext'
 
 export const metadata: Metadata = {
   title: 'TaskForge',
@@ -16,11 +17,13 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className="min-h-screen flex">
-        <Sidebar />
-        <main className="flex-1 ml-60 min-h-screen p-8">
-          <SecurityBanner />
-          {children}
-        </main>
+        <ProjectProvider>
+          <Sidebar />
+          <main className="flex-1 ml-60 min-h-screen p-8">
+            <SecurityBanner />
+            {children}
+          </main>
+        </ProjectProvider>
       </body>
     </html>
   )

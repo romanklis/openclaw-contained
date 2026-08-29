@@ -3,6 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { API } from '../lib/api'
+import { useProject } from '../lib/ProjectContext'
 
 const navigation = [
   {
@@ -104,6 +105,7 @@ const externalLinks = [
 
 export function Sidebar() {
   const pathname = usePathname()
+  const { projects, activeProject, setActiveProject } = useProject()
 
   const isActive = (href: string) => {
     if (href === '/') return pathname === '/'
@@ -127,6 +129,22 @@ export function Sidebar() {
 
       {/* Navigation */}
       <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+        <div className="section-title px-3 mb-2">Project</div>
+        <div className="px-3 mb-3">
+          <select
+            value={activeProject}
+            onChange={(e) => setActiveProject(e.target.value)}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-white"
+            title="Active project — scopes the dashboard"
+          >
+            <option value="">All projects</option>
+            <option value="__general__">General (unassigned)</option>
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        </div>
+
         <div className="section-title px-3 mb-3">Navigation</div>
         {navigation.map((item) => (
           <Link

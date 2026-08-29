@@ -1,0 +1,35 @@
+# Banking-architecture example — extra infrastructure.
+
+# Joins the platform network so the platform's agents (in dind) can reach
+# these services by name (e.g. http://bank-mock:8080).
+networks:
+  default:
+    name: openclaw-contained_openclaw-network
+    external: true
+
+services:
+  bank-mock:
+    image: nginx:alpine
+    container_name: bank-mock
+    volumes:
+      - ./infra/bank-mock:/usr/share/nginx/html:ro
+    networks:
+      - default
+    # TODO: replace with a real mock bank API (e.g. FastAPI + WireMock) that
+    # the example DAGs query. This nginx stub lets the network wiring work.
+
+  bank-db:
+    image: postgres:16-alpine
+    container_name: bank-db
+    environment:
+      POSTGRES_DB: bank
+      POSTGRES_USER: bank
+      POSTGRES_PASSWORD: bank
+    volumes:
+      - bank-db-data:/var/lib/postgresql/data
+      - ./data:/docker-entrypoint-initdb.d:ro
+    networks:
+      - default
+
+volumes:
+  bank-db-data:

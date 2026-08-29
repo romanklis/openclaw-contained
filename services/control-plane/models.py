@@ -369,6 +369,7 @@ class MasterDAG(Base):
     locked = Column(Boolean, default=False, nullable=False)
     template_params = Column(JSON, default=list)  # [{key,label,type,default,description}]
     template_source_dag_id = Column(String, nullable=True)  # set on instances
+    project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)  # project namespace
 
     # Archiving: hides the DAG from the default list (soft delete), keeps data.
     archived = Column(Boolean, default=False, nullable=False)
@@ -733,6 +734,7 @@ class SkillV2(Base):
 
     id = Column(String, primary_key=True)           # skv2-<uuid8>
     image_id = Column(String, ForeignKey("agent_images.id"), nullable=False, index=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)
 
     name = Column(String, nullable=False)
     description = Column(Text, default="")
@@ -822,6 +824,16 @@ class SkillReview(Base):
     reviewed_at = Column(DateTime, server_default=func.now())
 
     skill = relationship("SkillV2", back_populates="reviews")
+
+
+class Project(Base):
+    """A project/namespace that DAGs (and the skills learned from them) belong to."""
+    __tablename__ = "projects"
+
+    id = Column(String, primary_key=True)  # slug, e.g. banking-architecture
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class SkillSelectionEvent(Base):

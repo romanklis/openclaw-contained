@@ -1,0 +1,106 @@
+{
+  "objective": "Fetch a sample PDF from an external source, ingest it into Docling RAG, search it, generate a report, and run an approval loop (accept/reject/cancel).",
+  "default_image": "openclaw",
+  "default_llm": "deepseek-v4-flash",
+  "nodes": [
+    {
+      "node_id": "fetch-sample-doc",
+      "node_type": "agent",
+      "description": "Download the sample PDF from the external document source",
+      "depends_on": [],
+      "config": {
+        "base_image": "browser_v4",
+        "llm_model": "deepseek-v4-flash",
+        "node_objective": "Download http://sample-docs:8080/sample.pdf to /workspace/fetch-sample-doc/sample.pdf and verify it is a valid PDF (starts with %PDF)."
+      },
+      "input_mapping": {}
+    },
+    {
+      "node_id": "upload-to-rag",
+      "node_type": "agent",
+      "description": "Upload the PDF to Docling RAG and wait until indexed",
+      "depends_on": ["fetch-sample-doc"],
+      "config": {
+        "base_image": "openclaw",
+        "llm_model": "deepseek-v4-flash",
+        "node_objective": "Upload /workspace/fetch-sample-doc/sample.pdf to http://docling-rag:8080/api/upload (multipart field 'file'). Verify the ingestion receipt contains a document_id, then poll GET /api/documents until status is indexed. Write /workspace/upload-to-rag/receipt.json."
+      },
+      "input_mapping": {}
+    },
+    {
+      "node_id": "search-rag",
+      "node_type": "agent",
+      "description": "Search the indexed PDF for key facts",
+      "depends_on": ["upload-to-rag"],
+      "config": {
+        "base_image": "openclaw",
+        "llm_model": "deepseek-v4-flash",
+        "node_objective": "POST http://docling-rag:8080/api/search with {'query': 'what does the sample document say about document processing?', 'mode': 'hybrid', 'k': 5} and header 'X-Api-Key: docling-rag'. Save the results to /workspace/search-rag/results.json. Only report facts present in the returned snippets."
+      },
+      "input_mapping": {}
+    },
+    {
+      "node_id": "generate-report",
+      "node_type": "agent",
+      "description": "Build a report from the RAG search results",
+      "depends_on": ["search-rag"],
+      "config": {
+        "base_image": "openclaw",
+        "llm_model": "deepseek-v4-flash",
+        "node_objective": "Read /workspace/search-rag/results.json and write /workspace/generate-report/report.md summarising what the document says about intelligent document processing, citing the retrieved snippets."
+      },
+      "input_mapping": {}
+    },
+    {
+      "node_id": "approve-report",
+      "node_type": "decision",
+      "description": "User approves, rejects (rework loop), or cancels the RAG report",
+      "depends_on": ["generate-report"],
+      "config": {
+        "type": "decision",
+        "question": "Approve the RAG report? (reject will rework and re-ask)",
+        "payload": {
+          "options": [
+            { "label": "Accept", "value": "accept" },
+            { "label": "Reject", "value": "reject" },
+            { "label": "Cancel request", "value": "cancel" }
+          ]
+        }
+      },
+      "input_mapping": {}
+    },
+    {
+      "node_id": "rework-report",
+      "node_type": "agent",
+      "description": "Revise the report after rejection",
+      "depends_on": ["approve-report"],
+      "config": {
+        "base_image": "openclaw",
+        "llm_model": "deepseek-v4-flash",
+        "node_objective": "Read the previous report inputs and write /workspace/rework-report/REWORKED.md with a revised RAG-based report."
+      },
+      "input_mapping": {}
+    },
+    {
+      "node_id": "finalize-report",
+      "node_type": "agent",
+      "description": "Mark the RAG report final",
+      "depends_on": ["approve-report"],
+      "config": {
+        "base_image": "openclaw",
+        "llm_model": "deepseek-v4-flash",
+        "node_objective": "Write /workspace/finalize-report/FINAL.md stating the RAG report is accepted and final."
+      },
+      "input_mapping": {}
+    }
+  ],
+  "edges": [
+    { "from_node": "fetch-sample-doc", "to_node": "upload-to-rag", "condition": "on_success" },
+    { "from_node": "upload-to-rag", "to_node": "search-rag", "condition": "on_success" },
+    { "from_node": "search-rag", "to_node": "generate-report", "condition": "on_success" },
+    { "from_node": "generate-report", "to_node": "approve-report", "condition": "on_success" },
+    { "from_node": "approve-report", "to_node": "finalize-report", "condition": "decision:accept" },
+    { "from_node": "approve-report", "to_node": "rework-report", "condition": "decision:reject" },
+    { "from_node": "rework-report", "to_node": "approve-report", "condition": "on_success", "edge_type": "loop" }
+  ]
+}

@@ -1,0 +1,11 @@
+name: banking-architecture
+description: Bank landscape — accounts, transactions, approval loop
+infra: docker-compose.yml
+services:
+  - { name: bank-mock, url: http://bank-mock:8080 }
+dags:
+  - config/dags/bank-onboarding.json
+skills:
+  - config/skills/bank-query.md
+seed:
+  - data/bank_seed.sql

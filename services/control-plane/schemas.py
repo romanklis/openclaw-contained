@@ -508,6 +508,7 @@ class DAGCreate(BaseModel):
     base_image: Optional[str] = None
     auto_start: bool = False
     skill_ids: Optional[List[str]] = None  # selected skills from registry
+    project_id: Optional[str] = None
 
 
 class DAGRevise(BaseModel):
@@ -537,6 +538,7 @@ class DAGManualCreate(BaseModel):
     edges: List[DAGEdge] = []
     default_image: str = "openclaw"
     default_llm: str = "gemma3:4b"
+    project_id: Optional[str] = None
 
 
 class TemplateParam(BaseModel):
@@ -605,6 +607,7 @@ class DAGResponse(BaseModel):
     template_params: Optional[List[Dict[str, Any]]] = None
     template_source_dag_id: Optional[str] = None
     archived: bool = False
+    project_id: Optional[str] = None
 
     class Config:
         from_attributes = True

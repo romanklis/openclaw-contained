@@ -1,7 +1,7 @@
 """
 DAGs Router — CRUD and lifecycle for Master DAGs.
 """
-from typing import Any
+from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -173,6 +173,7 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
         dag_json={},
         workspace_id=workspace_id,
         llm_model=agent_model,
+        project_id=data.project_id,
     )
     db.add(dag)
     await db.commit()
@@ -264,6 +265,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
         dag_json=dag_json,
         workspace_id=workspace_id,
         llm_model=data.default_llm,
+        project_id=data.project_id,
     )
     db.add(dag)
 
@@ -355,16 +357,16 @@ async def set_model_defaults(body: dict):
 
 
 @router.get("", response_model=list[DAGResponse])
-async def list_dags(skip: int = 0, limit: int = 50, archived: bool = False, db: AsyncSession = Depends(get_db)):
+async def list_dags(skip: int = 0, limit: int = 50, archived: bool = False, project_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
     """List DAGs. By default excludes archived (soft-deleted) DAGs; pass
-    `archived=true` to list archived DAGs instead."""
-    result = await db.execute(
-        select(MasterDAG)
-        .where(MasterDAG.archived.is_(True) if archived else MasterDAG.archived.is_(False))
-        .order_by(MasterDAG.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-    )
+    `archived=true` to list archived DAGs instead. Pass `project_id` to filter
+    to a project namespace."""
+    q = select(MasterDAG).where(MasterDAG.archived.is_(True) if archived else MasterDAG.archived.is_(False))
+    if project_id == "__general__":
+        q = q.where(MasterDAG.project_id.is_(None))
+    elif project_id:
+        q = q.where(MasterDAG.project_id == project_id)
+    result = await db.execute(q.order_by(MasterDAG.created_at.desc()).offset(skip).limit(limit))
     return list(result.scalars().all())
 
 
@@ -931,6 +933,7 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
         llm_model=new_dag_json.get("default_llm") or source.llm_model,
         template_params=list(source.template_params or []),
         template_source_dag_id=source.id,
+        project_id=source.project_id,
     )
     db.add(new_dag)
 
@@ -952,6 +955,9 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
             input_mapping=nd.get("input_mapping"),
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
+            node_type=nd.get("node_type", "agent")
+            if nd.get("node_type", "agent") in ("agent", "decision", "input")
+            else "agent",
         )
         db.add(node)
         created_nodes.append(node)
@@ -2340,6 +2346,7 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
         "locked": bool(getattr(dag, "locked", False)),
         "template_params": list(getattr(dag, "template_params", []) or []),
         "template_source_dag_id": getattr(dag, "template_source_dag_id", None),
+        "project_id": getattr(dag, "project_id", None),
         "dag_json": dag.dag_json,
         "edges": [dict(e) for e in (dag.dag_json or {}).get("edges", [])],
         "nodes": [
