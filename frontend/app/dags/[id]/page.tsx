@@ -1507,6 +1507,17 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             started_at: n.started_at,
             completed_at: n.completed_at,
             node_type: (n as any).node_type,
+            deliverables_keys: (n as any).deliverables_keys
+              || (n as any).output_data?.deliverables_keys
+              || Object.keys(((n as any).output_data?.deliverables) || {})
+              || [],
+            selected_skill_v2_id: (n as any).selected_skill_v2_id,
+            base_image: (n as any).config?.base_image,
+            error: (n as any).output_data?.error,
+            gate_failure: (n as any).output_data?.gate_failure,
+            output_message: (n as any).output_data?.output || (n as any).output_data?.compact_summary || '',
+            dag_id: dagId,
+            iteration: (n as any).output_data?.iteration,
           }))}
           edges={(dag as any).edges || []}
           onNodeClick={(nodeId) => {

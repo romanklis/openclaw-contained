@@ -2453,7 +2453,8 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
                 "completed_at": n.completed_at,
                 "selected_skill_v2_id": n.selected_skill_v2_id,
                 "skill_selection_reason": n.skill_selection_reason,
-                "deliverables_keys": (n.output_data or {}).get("deliverables_keys"),
+                "deliverables_keys": (n.output_data or {}).get("deliverables_keys")
+                or (list((((n.output_data or {}).get("deliverables") or {}).keys())) if isinstance((n.output_data or {}).get("deliverables"), dict) else []),
                 "node_type": n.node_type or "agent",
             }
             for n in nodes

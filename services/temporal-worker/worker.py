@@ -3379,7 +3379,8 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
             result["completed"] = latest.get("completed")
             result["error"] = latest.get("error")
             result["deliverables"] = latest.get("deliverables")
-            result["deliverables_keys"] = latest.get("deliverables_keys")
+            _dl = latest.get("deliverables") or {}
+            result["deliverables_keys"] = latest.get("deliverables_keys") or (list(_dl.keys()) if isinstance(_dl, dict) else [])
             # Add output_path for downstream input mappings (e.g., "fetch-investor-pdf.output_path")
             deliverables = latest.get("deliverables") or {}
             if deliverables:

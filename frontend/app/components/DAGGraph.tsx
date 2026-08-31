@@ -1,8 +1,9 @@
 'use client'
 
-import { useMemo, useState, useEffect, useCallback } from 'react'
-import ReactFlow, { Node, Edge, Position, MarkerType, applyEdgeChanges, BaseEdge, EdgeProps, EdgeLabelRenderer } from 'reactflow'
+import { useMemo, useState, useEffect, useCallback, useRef } from 'react'
+import ReactFlow, { Node, Edge, Position, MarkerType, applyEdgeChanges, BaseEdge, EdgeProps, EdgeLabelRenderer, Handle, NodeProps } from 'reactflow'
 import 'reactflow/dist/style.css'
+import { API_GATEWAY, TEMPORAL_UI } from '../lib/api'
 
 interface DAGNodeData {
   node_id: string
@@ -14,6 +15,14 @@ interface DAGNodeData {
   started_at: string | null
   completed_at: string | null
   node_type?: string
+  deliverables_keys?: string[]
+  selected_skill_v2_id?: string | null
+  base_image?: string
+  error?: string
+  gate_failure?: string
+  dag_id?: string
+  iteration?: number | null
+  output_message?: string
 }
 
 interface DAGEdgeData {
@@ -91,34 +100,140 @@ const TYPE_STYLES: Record<string, { bg: string; border: string; text: string; la
   input: { bg: '#164e63', border: '#06b6d4', text: '#67e8f9', label: '📥', radius: '50%' },
 }
 
+// Custom step node: label + a compact info sub-box (deliverables/skill/image);
+// clicking expands the box to show full details (image, skill, deliverables,
+// error). As deliverables appear (live poll), they animate in below the step.
+function DagStepNode({ data }: NodeProps) {
+  const d = data as any
+  const tstyle = d.node_type === 'decision' || d.node_type === 'input' ? TYPE_STYLES[d.node_type] : null
+  const colors = tstyle ? { bg: tstyle.bg, border: tstyle.border, text: tstyle.text } : getColors(d.status)
+  const deliverables: string[] = d.deliverables_keys || []
+  const skill = d.skill || d.selected_skill_v2_id || ''
+  const image = d.base_image || ''
+  const error = d.error || d.gate_failure || ''
+  const expanded = !!d.expanded
+  const label = d.label || d.node_id || ''
+
+  return (
+    <div
+      style={{
+        background: colors.bg,
+        border: `2px solid ${colors.border}`,
+        color: colors.text,
+        borderRadius: tstyle ? tstyle.radius : '8px',
+        padding: '8px 10px',
+        fontSize: '12px',
+        fontFamily: 'monospace',
+        fontWeight: 600,
+        minWidth: '150px',
+        maxWidth: expanded ? '280px' : '200px',
+        cursor: 'pointer',
+        transition: 'all 0.2s ease',
+      }}
+    >
+      <Handle type="target" position={Position.Left} style={{ width: 10, height: 10, background: '#38bdf8', border: '1px solid #0c4a6e' }} />
+      <div className="flex items-center gap-1">
+        {tstyle?.label && <span>{tstyle.label}</span>}
+        <span>{label}</span>
+      </div>
+      {!expanded && (
+        <div className="mt-1 border-t border-white/15 pt-1 text-[10px] font-normal flex flex-wrap gap-x-2">
+          <span title="deliverables">📦 {deliverables.length}</span>
+          <span title="skill">{skill ? `🧠 ${skill}` : '🧠 —'}</span>
+          <span title="image">{image ? `🛠 ${image}` : '🛠 —'}</span>
+        </div>
+      )}
+      {expanded && (
+        <div className="mt-1 border-t border-white/15 pt-1 text-[10px] font-normal space-y-1">
+          {image && <div>🛠 image: {image}</div>}
+          {skill && <div>🧠 skill: {skill}</div>}
+          {deliverables.length > 0 && (
+            <div>
+              <div>📦 deliverables:</div>
+              <ul className="list-disc pl-4 space-y-0.5">
+                {deliverables.map((dl) => (
+                  <li key={dl} style={{ animation: 'fadeIn 0.4s ease' }}>
+                    <a
+                      href={`${API_GATEWAY}/v1/files/${d.task_id}/${d.iteration}/${encodeURIComponent(dl)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline decoration-dotted hover:text-white"
+                      title="Open deliverable"
+                    >
+                      {dl}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {error && <div className="text-red-300">⚠ {error.slice(0, 180)}</div>}
+          {d.output_message && !error && (
+            <div className="pt-1 text-gray-300 whitespace-pre-wrap">{d.output_message.slice(0, 320)}</div>
+          )}
+          {d.dag_id && (
+            <div className="pt-1">
+              <a
+                href={`${TEMPORAL_UI}/namespaces/default/workflows/${d.task_id ? `agent-task-${d.dag_id}-${label}` : `dag-node-${d.dag_id}-${label}`}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-indigo-300 underline decoration-dotted hover:text-white"
+                title="Track in Temporal"
+              >
+                » Temporal step
+              </a>
+            </div>
+          )}
+        </div>
+      )}
+      <Handle type="source" position={Position.Right} style={{ width: 10, height: 10, background: '#38bdf8', border: '1px solid #0c4a6e' }} />
+    </div>
+  )
+}
+
+const nodeTypes = { step: DagStepNode }
+
 export default function DAGGraph({ nodes, onNodeClick, editable = false, onConnect, onDisconnect, edges: explicitEdges }: DAGGraphProps) {
+  // Expanded node ids (click a step to expand/collapse its details).
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
+  // Manual drag positions — only reset when the set of node ids changes.
+  const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({})
+  const layoutSigRef = useRef('')
+
+  const sig = nodes.map((n) => n.node_id).sort().join('|')
+  useEffect(() => {
+    if (layoutSigRef.current && layoutSigRef.current !== sig) {
+      setPositions({})
+      setExpandedIds(new Set())
+    }
+    layoutSigRef.current = sig
+  }, [sig])
+
   const { flowNodes, flowEdges } = useMemo(() => {
     // Build adjacency for layout: group into waves (topological layers)
-    const nodeMap = new Map(nodes.map(n => [n.node_id, n]))
+    const nodeMap = new Map(nodes.map((n) => [n.node_id, n]))
     const waves: string[][] = []
     const assigned = new Set<string>()
 
-    // Simple layering: nodes with no deps first, then those depending on assigned, etc.
     while (assigned.size < nodes.length) {
       const wave: string[] = []
       for (const n of nodes) {
         if (assigned.has(n.node_id)) continue
-        if (n.depends_on.every(d => assigned.has(d))) {
+        if (n.depends_on.every((d) => assigned.has(d))) {
           wave.push(n.node_id)
         }
       }
       if (wave.length === 0) {
-        // Remaining nodes have circular deps — just add them
         for (const n of nodes) {
           if (!assigned.has(n.node_id)) wave.push(n.node_id)
         }
       }
-      wave.forEach(id => assigned.add(id))
+      wave.forEach((id) => assigned.add(id))
       waves.push(wave)
     }
 
     const X_GAP = 300
-    const Y_GAP = 140
+    const Y_GAP = 150
 
     const flowNodes: Node[] = []
     for (let wi = 0; wi < waves.length; wi++) {
@@ -128,39 +243,16 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
       for (let ni = 0; ni < wave.length; ni++) {
         const nodeId = wave[ni]
         const data = nodeMap.get(nodeId)!
-        const tstyle = data.node_type === 'decision' || data.node_type === 'input' ? TYPE_STYLES[data.node_type] : null
-        const colors = tstyle
-          ? { bg: tstyle.bg, border: tstyle.border, text: tstyle.text }
-          : getColors(data.status)
-        const label = tstyle ? `${tstyle.label} ${nodeId}` : nodeId
+        const autoPos = { x: wi * X_GAP, y: startY + ni * Y_GAP }
         flowNodes.push({
           id: nodeId,
-          position: { x: wi * X_GAP, y: startY + ni * Y_GAP },
-          data: { label, description: data.description, status: data.status },
-          sourcePosition: Position.Right,
-          targetPosition: Position.Left,
-          style: {
-            background: colors.bg,
-            border: `2px solid ${colors.border}`,
-            color: colors.text,
-            borderRadius: tstyle ? tstyle.radius : '8px',
-            padding: '10px 14px',
-            fontSize: '12px',
-            fontFamily: 'monospace',
-            fontWeight: 600,
-            minWidth: '140px',
-            cursor: 'pointer',
+          type: 'step',
+          position: positions[nodeId] || autoPos,
+          data: {
+            ...data,
+            label: data.node_id,
+            expanded: expandedIds.has(nodeId),
           },
-          ...(editable
-            ? {
-                handleStyle: {
-                  width: 10,
-                  height: 10,
-                  background: '#38bdf8',
-                  border: '1px solid #0c4a6e',
-                },
-              }
-            : {}),
         })
       }
     }
@@ -178,8 +270,6 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
       }
     }
 
-    // Explicit edges (e.g. conditional/loop edges) not already implied by
-    // depends_on. Loop-back edges are drawn dashed + labeled.
     const seen = new Set(flowEdges.map((e) => `${e.source}->${e.target}`))
     for (const e of explicitEdges || []) {
       const src = e.from_node || ''
@@ -205,12 +295,10 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
     }
 
     return { flowNodes, flowEdges }
-  }, [nodes, explicitEdges, editable])
+  }, [nodes, explicitEdges, editable, positions, expandedIds])
 
   const [edges, setEdges] = useState<Edge[]>(flowEdges)
 
-  // Resync local edge state whenever the derived graph changes (e.g. after a
-  // successful mutation/refetch from the parent).
   useEffect(() => {
     setEdges(flowEdges)
   }, [flowEdges])
@@ -219,9 +307,8 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
     (conn: { source: string; target: string }) => {
       if (!onConnect || conn.source === conn.target) return
       onConnect(conn.source, conn.target)
-      // Show the new connection immediately; the parent refetch reconciles it.
-      setEdges(eds =>
-        eds.some(e => e.source === conn.source && e.target === conn.target)
+      setEdges((eds) =>
+        eds.some((e) => e.source === conn.source && e.target === conn.target)
           ? eds
           : [...eds, { id: `${conn.source}->${conn.target}`, source: conn.source, target: conn.target, markerEnd: EDGE_MARKER, style: EDGE_STYLE }]
       )
@@ -233,28 +320,47 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
     (changes: any[]) => {
       for (const ch of changes) {
         if (ch.type === 'remove' && onDisconnect) {
-          const e = edges.find(x => x.id === ch.id)
+          const e = edges.find((x) => x.id === ch.id)
           if (e) onDisconnect(e.source, e.target)
         }
       }
-      setEdges(eds => applyEdgeChanges(changes, eds))
+      setEdges((eds) => applyEdgeChanges(changes, eds))
     },
     [edges, onDisconnect]
   )
 
+  const handleNodeClick = useCallback(
+    (_: any, node: any) => {
+      setExpandedIds((prev) => {
+        const next = new Set(prev)
+        if (next.has(node.id)) next.delete(node.id)
+        else next.add(node.id)
+        return next
+      })
+      onNodeClick(node.id)
+    },
+    [onNodeClick]
+  )
+
+  const handleNodeDragStop = useCallback((_: any, node: any) => {
+    setPositions((prev) => ({ ...prev, [node.id]: { x: node.position.x, y: node.position.y } }))
+  }, [])
+
   return (
-    <div className="card" style={{ height: Math.max(500, nodes.length * 80 + 150), position: 'relative' }}>
+    <div className="card" style={{ height: Math.max(500, nodes.length * 90 + 150), position: 'relative' }}>
       <ReactFlow
         nodes={flowNodes}
         edges={edges}
         edgeTypes={edgeTypes}
-        onNodeClick={(_, node) => onNodeClick(node.id)}
+        nodeTypes={nodeTypes}
+        onNodeClick={handleNodeClick}
         onConnect={editable ? handleConnect : undefined}
         onEdgesChange={editable ? handleEdgesChange : undefined}
+        onNodeDragStop={handleNodeDragStop}
         fitView
         fitViewOptions={{ padding: 0.2 }}
         proOptions={{ hideAttribution: true }}
-        nodesDraggable={false}
+        nodesDraggable
         nodesConnectable={editable}
         elementsSelectable={true}
         deleteKeyCode={editable ? ['Backspace', 'Delete'] : null}
@@ -263,7 +369,7 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
       />
       {editable && (
         <div className="absolute top-2 left-2 z-10 rounded bg-gray-900/80 border border-indigo-700/40 px-2 py-1 text-[10px] text-indigo-200">
-          Drag from a step's right edge to another step's left edge to connect · select an edge and press Delete to remove
+          Drag steps to rearrange · click a step to expand its details · drag right→left edges to connect · Delete removes an edge
         </div>
       )}
     </div>
