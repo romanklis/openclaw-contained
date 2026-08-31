@@ -2,7 +2,7 @@
 DAGs Router — CRUD and lifecycle for Master DAGs.
 """
 from typing import Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from database import get_db
@@ -1510,6 +1510,81 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
     return {"ok": True}
 
 
+@router.post("/{dag_id}/nodes/{node_id}/rename", response_model=DAGDetail)
+async def rename_node(dag_id: str, node_id: str, body: dict = Body(...), db: AsyncSession = Depends(get_db)):
+    """Rename a DAG node (pre-run only), cascading to depends_on, edges,
+    input_mapping and dag_json so the whole graph stays consistent."""
+    import re as _re4
+    new_id = str(body.get("node_id") or "").strip()
+    if not _re4.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", new_id):
+        raise HTTPException(status_code=422, detail="new node_id must be a valid slug (letters/digits/-/_)")
+
+    dag = await _get_dag_or_404(dag_id, db)
+    if dag.status in (DAGStatus.RUNNING, DAGStatus.COMPLETED):
+        raise HTTPException(status_code=400, detail="Cannot rename a node while the DAG is running or completed")
+    if dag.locked:
+        raise HTTPException(status_code=400, detail="Cannot rename nodes of a locked template")
+
+    if new_id == node_id:
+        all_nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+        return _build_dag_detail(dag, list(all_nodes_result.scalars().all()))
+
+    result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id))
+    node = result.scalar_one_or_none()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+    dup = await db.execute(select(DAGNode.id).where(DAGNode.dag_id == dag_id, DAGNode.node_id == new_id))
+    if dup.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"Node '{new_id}' already exists")
+
+    all_nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(all_nodes_result.scalars().all())
+
+    # Rename the node row + cascade depends_on in other nodes.
+    node.node_id = new_id
+    for n in all_nodes:
+        deps = n.depends_on or []
+        if node_id in deps:
+            n.depends_on = [new_id if d == node_id else d for d in deps]
+
+    # Mirror into dag_json (node_id, depends_on, input_mapping, edges).
+    dag_json = deepcopy(dag.dag_json or {})
+    for nd in dag_json.get("nodes", []):
+        if nd.get("node_id") == node_id:
+            nd["node_id"] = new_id
+        deps = nd.get("depends_on") or []
+        if node_id in deps:
+            nd["depends_on"] = [new_id if d == node_id else d for d in deps]
+        im = nd.get("input_mapping") or {}
+        if isinstance(im, dict):
+            new_im = {}
+            for k, spec in im.items():
+                if isinstance(spec, dict) and spec.get("from") == node_id:
+                    spec = dict(spec)
+                    spec["from"] = new_id
+                elif isinstance(spec, str) and spec.split(".")[0] == node_id:
+                    spec = new_id + spec[len(node_id):]
+                new_im[k] = spec
+            nd["input_mapping"] = new_im
+    for edge in dag_json.get("edges", []):
+        if edge.get("from_node") == node_id:
+            edge["from_node"] = new_id
+        if edge.get("to_node") == node_id:
+            edge["to_node"] = new_id
+
+    is_valid, errors = validate_dag(dag_json)
+    if not is_valid:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    dag.dag_json = dag_json
+    await db.commit()
+    await db.refresh(dag)
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(nodes_result.scalars().all())
+    return _build_dag_detail(dag, all_nodes)
+
+
 @router.patch("/{dag_id}/graph", response_model=DAGDetail)
 async def patch_dag_graph(dag_id: str, payload: DAGGraphPatch, db: AsyncSession = Depends(get_db)):
     """Atomically rewire node dependencies across a DAG.
@@ -1532,7 +1607,7 @@ async def patch_dag_graph(dag_id: str, payload: DAGGraphPatch, db: AsyncSession 
         if node_id not in valid_ids:
             raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
 
-    if not node_deps:
+    if not node_deps and payload.edges is None:
         return _build_dag_detail(dag, all_nodes)
 
     # Apply new depends_on to DAGNode rows.
@@ -1548,6 +1623,16 @@ async def patch_dag_graph(dag_id: str, payload: DAGGraphPatch, db: AsyncSession 
             await db.rollback()
             raise HTTPException(status_code=500, detail=f"Node '{node_id}' missing from dag_json")
         dag_node["depends_on"] = _dedupe_node_ids(deps)
+
+    # Apply explicit edges (conditional edges + loop-backs) if provided.
+    if payload.edges is not None:
+        for edge in payload.edges:
+            frm = str(edge.get("from_node") or edge.get("from") or "")
+            to = str(edge.get("to_node") or edge.get("to") or "")
+            if frm not in valid_ids or to not in valid_ids:
+                await db.rollback()
+                raise HTTPException(status_code=422, detail=f"Edge references unknown node: '{frm}' -> '{to}'")
+        dag_json["edges"] = payload.edges
 
     is_valid, errors = validate_dag(dag_json)
     if not is_valid:

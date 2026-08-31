@@ -457,13 +457,14 @@ class DAGNodePatch(BaseModel):
 
 
 class DAGGraphPatch(BaseModel):
-    """Atomic bulk rewire of node dependencies across a DAG.
+    """Atomic bulk rewire of node dependencies + explicit edges across a DAG.
 
     Maps node_id -> new depends_on list. Only the listed nodes are touched;
-    nodes omitted keep their current dependencies. Applied and validated in a
-    single transaction.
+    nodes omitted keep their current dependencies. `edges` (optional) fully
+    replaces dag_json.edges (conditional edges + loop-backs).
     """
     node_dependencies: Dict[str, List[str]] = {}
+    edges: Optional[List[Dict[str, Any]]] = None
 
 
 class DAGNodeResponse(BaseModel):

@@ -66,6 +66,8 @@ function ApprovalsContent() {
   // ── Workflow inputs (decision / input steps) ─────────────────────────
   const [userRequests, setUserRequests] = useState<any[]>([])
   const [userAnswers, setUserAnswers] = useState<Record<number, any>>({})
+  const [decisionPending, setDecisionPending] = useState<Record<number, { choice: string; label: string } | null>>({})
+  const [decisionJustification, setDecisionJustification] = useState<Record<number, string>>({})
 
   const fetchUserRequests = async () => {
     try {
@@ -236,16 +238,46 @@ function ApprovalsContent() {
                   {req.prompt}
                 </div>
                 {req.kind === 'decision' ? (
-                  <div className="flex flex-wrap gap-2">
-                    {(req.payload?.options || []).map((opt: any) => (
+                  <div>
+                    <div className="flex flex-wrap gap-2">
+                      {(req.payload?.options || []).map((opt: any) => {
+                        const selected = decisionPending[req.id]?.choice === opt.value
+                        return (
+                          <button
+                            key={opt.value}
+                            onClick={() => setDecisionPending((prev) => ({ ...prev, [req.id]: { choice: opt.value, label: opt.label } }))}
+                            className={`px-3 py-1.5 text-xs rounded ${selected ? 'bg-amber-500 text-black' : 'bg-indigo-600 hover:bg-indigo-500 text-white'}`}
+                          >
+                            {opt.label}
+                          </button>
+                        )
+                      })}
+                    </div>
+                    <div className="mt-2 space-y-2">
+                      <textarea
+                        value={decisionJustification[req.id] || ''}
+                        onChange={(e) => setDecisionJustification((prev) => ({ ...prev, [req.id]: e.target.value }))}
+                        rows={2}
+                        placeholder="Justification (optional — e.g. what the rework should focus on)"
+                        className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                      />
                       <button
-                        key={opt.value}
-                        onClick={() => answerUserRequest(req.id, req.dag_id, { choice: opt.value })}
-                        className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white"
+                        onClick={() => {
+                          const choice = decisionPending[req.id]?.choice
+                          if (!choice) { alert('Select a decision option first'); return }
+                          const needsJust = req.payload?.require_justification === true ||
+                            (req.payload?.options || []).find((o: any) => o.value === choice)?.require_justification === true
+                          const j = (decisionJustification[req.id] || '').trim()
+                          if (needsJust && !j) { alert('Justification is required for this option'); return }
+                          answerUserRequest(req.id, req.dag_id, { choice, justification: j })
+                          setDecisionPending((prev) => ({ ...prev, [req.id]: null }))
+                          setDecisionJustification((prev) => ({ ...prev, [req.id]: '' }))
+                        }}
+                        className="px-3 py-1.5 text-xs rounded bg-amber-500 hover:bg-amber-400 text-black"
                       >
-                        {opt.label}
+                        Submit decision
                       </button>
-                    ))}
+                    </div>
                   </div>
                 ) : (
                   <div className="space-y-2">

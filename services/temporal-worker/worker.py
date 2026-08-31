@@ -3242,6 +3242,14 @@ def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
             outcome.append(f"error={error[:200]}")
         if gate_failure:
             outcome.append(f"gate_failure={gate_failure[:200]}")
+        # Decision nodes carry choice/justification — surface the user's
+        # feedback so a rework step knows what to focus on.
+        decision_choice = str(data.get("choice") or "").strip()
+        decision_justification = str(data.get("justification") or "").strip()
+        if decision_choice:
+            outcome.append(f"choice={decision_choice}")
+        if decision_justification:
+            outcome.append(f"justification={decision_justification[:400]}")
         outcome_str = "; ".join(outcome) if outcome else "ok"
 
         # What was done — structured tool/action trace
@@ -3426,6 +3434,11 @@ def _summarize_upstream_state(input_data: Dict[str, Any]) -> List[Dict[str, Any]
                 if isinstance(entry, dict) and entry.get("tool")
             ][:10]
 
+        # Decision nodes carry choice/justification instead of output text —
+        # surface them so a downstream rework step sees the user's feedback.
+        decision_choice = data.get("choice")
+        decision_justification = data.get("justification")
+
         summary = {
             "node_id": src_node,
             "status": data.get("status"),
@@ -3436,6 +3449,8 @@ def _summarize_upstream_state(input_data: Dict[str, Any]) -> List[Dict[str, Any]
             "acquisition_tools": acquisition_tools,
             "output_preview": output_text[:1200],
             "log_preview": str(data.get("agent_logs") or "")[:800],
+            "decision_choice": str(decision_choice)[:200] if decision_choice else "",
+            "decision_justification": str(decision_justification)[:2000] if decision_justification else "",
         }
         summaries.append(summary)
 
@@ -3467,6 +3482,10 @@ def _build_prior_state_review_prompt(upstream_state_review: List[Dict[str, Any]]
         lines.append(f"  status: {summary.get('status')}")
         if summary.get("completed") is not None:
             lines.append(f"  completed: {summary.get('completed')}")
+        if summary.get("decision_choice"):
+            lines.append(f"  decision: {summary.get('decision_choice')}")
+        if summary.get("decision_justification"):
+            lines.append(f"  justification: {summary.get('decision_justification')}")
         if summary.get("gate_failure"):
             lines.append(f"  gate failure: {summary.get('gate_failure')}")
         if summary.get("error"):
@@ -4330,6 +4349,7 @@ class DAGNodeWorkflow:
             output: Dict[str, Any] = {
                 "status": "completed",
                 "choice": str(answer.get("choice") or ""),
+                "justification": str(answer.get("justification") or ""),
                 "answer": answer,
                 "node_type": node_type,
             }

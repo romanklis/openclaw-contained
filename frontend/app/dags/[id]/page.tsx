@@ -178,7 +178,15 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [showEditConnectionsDialog, setShowEditConnectionsDialog] = useState(false)
   const [editConnInputs, setEditConnInputs] = useState<string[]>([])
   const [editConnOutputs, setEditConnOutputs] = useState<string[]>([])
+  const [dagEdges, setDagEdges] = useState<any[]>([])
+  const [newEdgeFrom, setNewEdgeFrom] = useState('')
+  const [newEdgeTo, setNewEdgeTo] = useState('')
+  const [newEdgeCondition, setNewEdgeCondition] = useState('on_success')
+  const [newEdgeType, setNewEdgeType] = useState('rework')
+  const [graphMode, setGraphMode] = useState<'relations' | 'rework'>('relations')
   const [showSkillDialog, setShowSkillDialog] = useState(false)
+  const [showRenameDialog, setShowRenameDialog] = useState(false)
+  const [renameValue, setRenameValue] = useState('')
   const [availableSkills, setAvailableSkills] = useState<any[]>([])
   const [selectedSkillId, setSelectedSkillId] = useState<string>('')
   const [skillDialogLoading, setSkillDialogLoading] = useState(false)
@@ -247,6 +255,8 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   // ── Pending interactive steps (decision / input) ──────────────────────
   const [userRequests, setUserRequests] = useState<any[]>([])
   const [userRequestAnswers, setUserRequestAnswers] = useState<Record<number, any>>({})
+  const [decisionPending, setDecisionPending] = useState<Record<number, { choice: string; label: string } | null>>({})
+  const [decisionJustification, setDecisionJustification] = useState<Record<number, string>>({})
   const [userRequestBusy, setUserRequestBusy] = useState<number | null>(null)
 
   const loadUserRequests = async () => {
@@ -657,12 +667,45 @@ setNodeState(prev => {
     if (!selectedNode || !dag) return
     setEditConnInputs(selectedNode.depends_on || [])
     setEditConnOutputs((dag.nodes || []).filter(n => (n.depends_on || []).includes(selectedNode.node_id)).map(n => n.node_id))
+    setDagEdges(Array.isArray((dag as any).edges) ? (dag as any).edges : [])
+    setNewEdgeFrom('')
+    setNewEdgeTo('')
+    setNewEdgeCondition('on_success')
+    setNewEdgeType('rework')
     setShowEditConnectionsDialog(true)
     setShowNodeActions(false)
   }
 
-  const openChangeSkillDialog = async () => {
-    if (!selectedNode || !dag) return
+  const openRenameDialog = () => {
+    if (!selectedNode) return
+    setRenameValue(selectedNode.node_id)
+    setShowRenameDialog(true)
+    setShowNodeActions(false)
+  }
+
+  const saveRename = async () => {
+    if (!dag || !selectedNode) return
+    const newId = renameValue.trim()
+    if (!newId || newId === selectedNode.node_id) { setShowRenameDialog(false); return }
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes/${encodeURIComponent(selectedNode.node_id)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: newId }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail ? (typeof (data as any).detail === 'string' ? (data as any).detail : JSON.stringify((data as any).detail)) : `HTTP ${res.status}`)
+      setShowRenameDialog(false)
+      await applyDagMutationResult(data as DAGDetail, false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
+  const openChangeSkillDialog = async () => {    if (!selectedNode || !dag) return
     setShowNodeActions(false)
     setSelectedSkillId(selectedNode.selected_skill_v2_id || '')
     setSkillDialogLoading(true)
@@ -805,10 +848,13 @@ setNodeState(prev => {
     }
   }
 
-  const applyGraphPatch = async (nodeDependencies: Record<string, string[]>): Promise<DAGDetail> => {    const res = await fetch(`${API}/api/dags/${dagId}/graph`, {
+  const applyGraphPatch = async (nodeDependencies: Record<string, string[]>, edges?: any[]): Promise<DAGDetail> => {
+    const body: any = { node_dependencies: nodeDependencies }
+    if (edges) body.edges = edges
+    const res = await fetch(`${API}/api/dags/${dagId}/graph`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ node_dependencies: nodeDependencies }),
+      body: JSON.stringify(body),
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error((data as any).detail ? (typeof (data as any).detail === 'string' ? (data as any).detail : JSON.stringify((data as any).detail)) : `HTTP ${res.status}`)
@@ -831,7 +877,13 @@ setNodeState(prev => {
           nodeDependencies[n.node_id] = deps
         }
       }
-      const updated = await applyGraphPatch(nodeDependencies)
+      let edgesToSave = dagEdges
+      // Forgiving UX: if the add-edge selects are filled, include that draft
+      // edge even if "+ Add edge" was not clicked before Save.
+      if (newEdgeFrom && newEdgeTo) {
+        edgesToSave = [...dagEdges, { from_node: newEdgeFrom, to_node: newEdgeTo, condition: newEdgeCondition, edge_type: newEdgeType }]
+      }
+      const updated = await applyGraphPatch(nodeDependencies, edgesToSave)
       setShowEditConnectionsDialog(false)
       setShowNodeActions(false)
       await applyDagMutationResult(updated, false)
@@ -845,6 +897,27 @@ setNodeState(prev => {
   const handleGraphConnect = async (source: string, target: string) => {
     if (!dag) return
     if (source === target) return
+
+    if (graphMode === 'rework') {
+      // Rework mode: add an explicit loop-back edge (NOT a depends_on — a loop
+      // must not add the source to the target's dependencies).
+      const edges = ((dag as any).edges || []).filter(
+        (e: any) => !((e.from_node || e.from) === source && (e.to_node || e.to) === target)
+      )
+      edges.push({ from_node: source, to_node: target, condition: 'on_success', edge_type: 'loop' })
+      setNodeActionLoading(true)
+      try {
+        const updated = await applyGraphPatch({}, edges)
+        await applyDagMutationResult(updated, false)
+      } catch (err: any) {
+        setError(err.message)
+        await applyDagMutationResult(null, false)
+      } finally {
+        setNodeActionLoading(false)
+      }
+      return
+    }
+
     const targetNode = dag.nodes.find(n => n.node_id === target)
     if (!targetNode || (targetNode.depends_on || []).includes(source)) return
     setNodeActionLoading(true)
@@ -862,10 +935,15 @@ setNodeState(prev => {
   const handleGraphDisconnect = async (source: string, target: string) => {
     if (!dag) return
     const targetNode = dag.nodes.find(n => n.node_id === target)
-    if (!targetNode || !(targetNode.depends_on || []).includes(source)) return
+    const hasDep = targetNode && (targetNode.depends_on || []).includes(source)
+    const edges = (dag as any).edges || []
+    const hadEdge = edges.some((e: any) => (e.from_node || e.from) === source && (e.to_node || e.to) === target)
+    const nodeDeps: Record<string, string[]> = hasDep ? { [target]: (targetNode.depends_on || []).filter(d => d !== source) } : {}
+    const newEdges = hadEdge ? edges.filter((e: any) => !((e.from_node || e.from) === source && (e.to_node || e.to) === target)) : undefined
+    if (!hasDep && !hadEdge) return
     setNodeActionLoading(true)
     try {
-      const updated = await applyGraphPatch({ [target]: (targetNode.depends_on || []).filter(d => d !== source) })
+      const updated = await applyGraphPatch(nodeDeps, newEdges)
       await applyDagMutationResult(updated, false)
     } catch (err: any) {
       setError(err.message)
@@ -1295,17 +1373,47 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   {req.prompt}
                 </div>
                 {req.kind === 'decision' ? (
-                  <div className="flex flex-wrap gap-2">
-                    {(req.payload?.options || []).map((opt: any) => (
+                  <div>
+                    <div className="flex flex-wrap gap-2">
+                      {(req.payload?.options || []).map((opt: any) => {
+                        const selected = decisionPending[req.id]?.choice === opt.value
+                        return (
+                          <button
+                            key={opt.value}
+                            onClick={() => setDecisionPending((prev) => ({ ...prev, [req.id]: { choice: opt.value, label: opt.label } }))}
+                            className={`px-3 py-1.5 text-xs rounded ${selected ? 'bg-amber-500 text-black' : 'bg-indigo-600 hover:bg-indigo-500 text-white'}`}
+                          >
+                            {opt.label}
+                          </button>
+                        )
+                      })}
+                    </div>
+                    <div className="mt-2 space-y-2">
+                      <textarea
+                        value={decisionJustification[req.id] || ''}
+                        onChange={(e) => setDecisionJustification((prev) => ({ ...prev, [req.id]: e.target.value }))}
+                        rows={2}
+                        placeholder="Justification (optional — e.g. what the rework should focus on)"
+                        className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                      />
                       <button
-                        key={opt.value}
-                        onClick={() => answerUserRequest(req.id, { choice: opt.value })}
+                        onClick={() => {
+                          const choice = decisionPending[req.id]?.choice
+                          if (!choice) { alert('Select a decision option first'); return }
+                          const needsJust = req.payload?.require_justification === true ||
+                            (req.payload?.options || []).find((o: any) => o.value === choice)?.require_justification === true
+                          const j = (decisionJustification[req.id] || '').trim()
+                          if (needsJust && !j) { alert('Justification is required for this option'); return }
+                          answerUserRequest(req.id, { choice, justification: j })
+                          setDecisionPending((prev) => ({ ...prev, [req.id]: null }))
+                          setDecisionJustification((prev) => ({ ...prev, [req.id]: '' }))
+                        }}
                         disabled={userRequestBusy === req.id}
-                        className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
+                        className="px-3 py-1.5 text-xs rounded bg-amber-500 hover:bg-amber-400 text-black disabled:opacity-50"
                       >
-                        {opt.label}
+                        Submit decision
                       </button>
-                    ))}
+                    </div>
                   </div>
                 ) : (
                   <div className="space-y-2">
@@ -1368,6 +1476,26 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
 
       {/* DAG Graph */}
       <div className="mb-4">
+        {dagEditable && (
+          <div className="flex items-center gap-2 mb-2 text-xs">
+            <span className="text-gray-500">Draw mode:</span>
+            <button
+              onClick={() => setGraphMode('relations')}
+              className={`px-2 py-1 rounded border ${graphMode === 'relations' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+            >
+              ⇢ Relations (depends on)
+            </button>
+            <button
+              onClick={() => setGraphMode('rework')}
+              className={`px-2 py-1 rounded border ${graphMode === 'rework' ? 'border-amber-400 text-amber-200 bg-amber-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+            >
+              ↻ Rework loop
+            </button>
+            {graphMode === 'rework' && (
+              <span className="text-amber-300/80">Drag from the rework step back to the decision step to create a loop.</span>
+            )}
+          </div>
+        )}
         <DAGGraph
           nodes={dag.nodes.map(n => ({
             node_id: n.node_id,
@@ -1469,6 +1597,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         🔗 Edit Connections
+                      </button>
+                      <button
+                        onClick={openRenameDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ✏️ Rename
                       </button>
                       <button
                         onClick={openChangeSkillDialog}
@@ -1575,6 +1710,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         🔗 Edit Connections
+                      </button>
+                      <button
+                        onClick={openRenameDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ✏️ Rename
                       </button>
                       <button
                         onClick={openChangeSkillDialog}
@@ -1688,6 +1830,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         🔗 Edit Connections
+                      </button>
+                      <button
+                        onClick={openRenameDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ✏️ Rename
                       </button>
                       <button
                         onClick={openChangeSkillDialog}
@@ -2156,10 +2305,82 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   </div>
                 </div>
               </div>
+
+              {/* Explicit edges (conditional / loop) */}
+              <div className="mt-3">
+                <p className="text-[11px] text-gray-500 mb-1">
+                  Edges — conditional routes &amp; rework loops (e.g. <code className="font-mono text-amber-300">edge_type: loop</code> back to a decision):
+                </p>
+                <div className="space-y-1 max-h-40 overflow-y-auto border border-gray-700 rounded p-1.5">
+                  {dagEdges.length === 0 && <p className="text-[11px] text-gray-600">No explicit edges.</p>}
+                  {dagEdges.map((e, idx) => (
+                    <div key={idx} className="flex items-center gap-2 text-[11px] text-gray-300">
+                      <span className="font-mono">{e.from_node || e.from}</span>
+                      <span className="text-gray-600">→</span>
+                      <span className="font-mono">{e.to_node || e.to}</span>
+                      <span className="text-gray-500 font-mono">({e.condition || '—'}, {e.edge_type || 'rework'})</span>
+                      <button
+                        onClick={() => setDagEdges(prev => prev.filter((_, i) => i !== idx))}
+                        className="ml-auto text-red-400 hover:text-red-300"
+                        title="Remove edge"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-4 gap-1.5 mt-1.5">
+                  <select value={newEdgeFrom} onChange={(e) => setNewEdgeFrom(e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-1 text-[11px] text-gray-200">
+                    <option value="">from…</option>
+                    {(dag?.nodes || []).map(n => <option key={n.node_id} value={n.node_id}>{n.node_id}</option>)}
+                  </select>
+                  <select value={newEdgeTo} onChange={(e) => setNewEdgeTo(e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-1 text-[11px] text-gray-200">
+                    <option value="">to…</option>
+                    {(dag?.nodes || []).map(n => <option key={n.node_id} value={n.node_id}>{n.node_id}</option>)}
+                  </select>
+                  <select value={newEdgeCondition} onChange={(e) => setNewEdgeCondition(e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-1 text-[11px] text-gray-200">
+                    {['on_success', 'on_failure', 'decision:accept', 'decision:reject', 'decision:cancel', 'loop'].map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <select value={newEdgeType} onChange={(e) => setNewEdgeType(e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-1 text-[11px] text-gray-200">
+                    {['rework', 'loop', 'skip'].map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </div>
+                <button
+                  onClick={() => {
+                    if (!newEdgeFrom || !newEdgeTo) return
+                    setDagEdges(prev => [...prev, { from_node: newEdgeFrom, to_node: newEdgeTo, condition: newEdgeCondition, edge_type: newEdgeType }])
+                    setNewEdgeFrom(''); setNewEdgeTo('')
+                  }}
+                  className="mt-1.5 px-2 py-0.5 text-[11px] rounded bg-amber-600 hover:bg-amber-500 text-black"
+                >
+                  + Add edge
+                </button>
+              </div>
+
               <div className="flex justify-end gap-2 mt-2">
                 <button onClick={() => setShowEditConnectionsDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
                 <button onClick={saveEditConnections} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
                   {nodeActionLoading ? 'Saving...' : 'Save Connections'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showRenameDialog && selectedNode && (
+            <div className="mb-3 rounded border border-teal-700/40 bg-teal-950/20 p-3">
+              <div className="text-xs uppercase tracking-wide text-teal-300 mb-2">
+                Rename step "{selectedNode.node_id}"
+              </div>
+              <input
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                className="input-field w-full text-sm"
+                placeholder="new node id"
+              />
+              <div className="flex justify-end gap-2 mt-2">
+                <button onClick={() => setShowRenameDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
+                <button onClick={saveRename} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-teal-600 hover:bg-teal-500 text-white disabled:opacity-50">
+                  {nodeActionLoading ? 'Saving…' : 'Rename'}
                 </button>
               </div>
             </div>

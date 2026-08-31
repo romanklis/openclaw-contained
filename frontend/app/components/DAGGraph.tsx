@@ -1,7 +1,7 @@
 'use client'
 
 import { useMemo, useState, useEffect, useCallback } from 'react'
-import ReactFlow, { Node, Edge, Position, MarkerType, applyEdgeChanges } from 'reactflow'
+import ReactFlow, { Node, Edge, Position, MarkerType, applyEdgeChanges, BaseEdge, EdgeProps, EdgeLabelRenderer } from 'reactflow'
 import 'reactflow/dist/style.css'
 
 interface DAGNodeData {
@@ -48,6 +48,44 @@ function getColors(status: string) {
 const EDGE_MARKER = { type: MarkerType.ArrowClosed, color: '#6b7280' }
 const EDGE_STYLE = { stroke: '#6b7280', strokeWidth: 2 }
 
+// Custom loop-back edge: draws a U-arc that dips BELOW the connected nodes so
+// the re-approval return is clearly separate from the forward flow.
+function LoopEdge(props: EdgeProps) {
+  const { id, sourceX, sourceY, targetX, targetY, markerEnd, style, label, labelStyle, labelBgStyle, labelBgPadding, labelBgBorderRadius } = props
+  const dip = 140
+  const midY = Math.max(sourceY, targetY) + dip
+  // Go down from the source, across, and back up to the target (a rounded U).
+  const path = `M ${sourceX} ${sourceY} C ${sourceX} ${midY}, ${targetX} ${midY}, ${targetX} ${targetY}`
+  const labelX = (sourceX + targetX) / 2
+  const labelY = midY
+  return (
+    <>
+      <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} />
+      {label && (
+        <EdgeLabelRenderer>
+          <div
+            style={{
+              position: 'absolute',
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+              pointerEvents: 'all',
+              fontSize: 10,
+              color: labelStyle?.fill ?? '#f59e0b',
+              background: labelBgStyle?.fill ?? '#1f2937',
+              padding: 3,
+              borderRadius: 4,
+              zIndex: 10,
+            }}
+          >
+            {label}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  )
+}
+
+const edgeTypes = { loop: LoopEdge }
+
 const TYPE_STYLES: Record<string, { bg: string; border: string; text: string; label: string; radius: string }> = {
   decision: { bg: '#78350f', border: '#f59e0b', text: '#fcd34d', label: '🛑', radius: '2px' },
   input: { bg: '#164e63', border: '#06b6d4', text: '#67e8f9', label: '📥', radius: '50%' },
@@ -79,8 +117,8 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
       waves.push(wave)
     }
 
-    const X_GAP = 280
-    const Y_GAP = 100
+    const X_GAP = 300
+    const Y_GAP = 140
 
     const flowNodes: Node[] = []
     for (let wi = 0; wi < waves.length; wi++) {
@@ -155,7 +193,7 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
         id: key,
         source: src,
         target: tgt,
-        type: 'smoothstep',
+        type: isLoop ? 'loop' : 'smoothstep',
         markerEnd: EDGE_MARKER,
         style: isLoop ? { stroke: '#f59e0b', strokeWidth: 2, strokeDasharray: '6 4' } : EDGE_STYLE,
         label: isLoop ? 're-approve' : undefined,
@@ -163,7 +201,6 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
         labelBgStyle: { fill: '#1f2937' },
         labelBgPadding: [4, 2] as [number, number],
         labelBgBorderRadius: 4,
-        pathOptions: isLoop ? { offset: 40 } : undefined,
       })
     }
 
@@ -210,6 +247,7 @@ export default function DAGGraph({ nodes, onNodeClick, editable = false, onConne
       <ReactFlow
         nodes={flowNodes}
         edges={edges}
+        edgeTypes={edgeTypes}
         onNodeClick={(_, node) => onNodeClick(node.id)}
         onConnect={editable ? handleConnect : undefined}
         onEdgesChange={editable ? handleEdgesChange : undefined}

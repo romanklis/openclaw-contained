@@ -343,9 +343,12 @@ Some steps require HUMAN input mid-flow. Use them ONLY when the objective explic
 
 ### decision node (node_type: "decision")
 Pauses the workflow and asks the user to pick one option. The runtime then runs ONLY the branch matching the chosen option; other branches are skipped.
-- config: {{ "type": "decision", "question": "Approve the generated report?", "payload": {{ "options": [ {{ "label": "Approve", "value": "approve" }}, {{ "label": "Rework", "value": "rework" }} ] }} }}
+- config: {{ "type": "decision", "question": "Approve the generated report?", "payload": {{ "require_justification": false, "options": [ {{ "label": "Approve", "value": "approve" }}, {{ "label": "Rework", "value": "rework", "require_justification": true }} ] }} }}
+- "require_justification": true (either on the payload — all options — or on a specific option) makes the UI show a REQUIRED text field where the user explains their choice (e.g. why they reject/rework). Set it on options where an explanation matters (reject/rework/cancel), not on simple accepts.
+- The user may always add an optional justification; the chosen option is stored on the node output as "choice" and "justification".
+- When a rework node follows a rejected decision, its node_objective MUST tell the agent to read the rejection justification from input_data (the decision node's output contains "justification", e.g. input_data.approve-report.justification) and address it specifically.
 - Routing: add one edge per option from the decision node to that option's next node, with condition "decision:<value>" (e.g. "decision:approve", "decision:rework").
-- The chosen option is stored on the node output as "choice".
+- The chosen option is stored on the node output as "choice" (and "justification" if the user provided one).
 - IMPORTANT: do NOT put a single downstream node that depends on BOTH branch targets (the skipped branch would block it). Keep the branches separate (they may terminate the flow, or each lead to its own next step).
 - For APPROVAL gates, prefer THREE options: "accept", "reject", "cancel" — accept proceeds, reject routes to a rework step, and cancel ends the DAG (no edge for the cancel option, so the remaining steps are skipped).
 - CLOSED LOOP: to re-approve after rework, add a loop-back edge from the rework node back to the decision node with edge_type "loop" (and condition "on_success"). The runtime then re-runs the decision node after rework so the user can re-approve. Example:
