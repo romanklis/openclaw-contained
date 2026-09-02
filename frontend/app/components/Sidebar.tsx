@@ -10,7 +10,7 @@ const navigation = [
     name: 'Dashboard',
     href: '/',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
       </svg>
     ),
@@ -19,7 +19,7 @@ const navigation = [
     name: 'Tasks',
     href: '/tasks',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15a2.25 2.25 0 012.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25zM6.75 12h.008v.008H6.75V12zm0 3h.008v.008H6.75V15zm0 3h.008v.008H6.75V18z" />
       </svg>
     ),
@@ -28,7 +28,7 @@ const navigation = [
     name: 'Deployments',
     href: '/deployments',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6m-16.5-3a3 3 0 013-3h13.5a3 3 0 013 3m-19.5 0a4.5 4.5 0 01.9-2.7L5.737 5.1a3.375 3.375 0 012.7-1.35h7.126c1.062 0 2.062.5 2.7 1.35l2.587 3.45a4.5 4.5 0 01.9 2.7m0 0a3 3 0 01-3 3m0 3h.008v.008h-.008v-.008zm0-6h.008v.008h-.008v-.008zm-3 6h.008v.008h-.008v-.008zm0-6h.008v.008h-.008v-.008z" />
       </svg>
     ),
@@ -37,7 +37,7 @@ const navigation = [
     name: 'Approvals',
     href: '/approvals',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
       </svg>
     ),
@@ -46,7 +46,7 @@ const navigation = [
     name: 'LLM Providers',
     href: '/llm-providers',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z" />
       </svg>
     ),
@@ -55,7 +55,7 @@ const navigation = [
     name: 'DAGs',
     href: '/dags',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6z" />
       </svg>
     ),
@@ -64,7 +64,7 @@ const navigation = [
     name: 'Agent Images',
     href: '/agent-images',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20.25 7.5l-.625 10.632a2.25 2.25 0 01-2.247 2.118H6.622a2.25 2.25 0 01-2.247-2.118L3.75 7.5M10 11.25h4M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z" />
       </svg>
     ),
@@ -73,7 +73,7 @@ const navigation = [
     name: 'Supply Chain',
     href: '/supply-chain',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20.25 7.5l-.625 10.632a2.25 2.25 0 01-2.247 2.118H6.622a2.25 2.25 0 01-2.247-2.118L3.75 7.5M10 11.25h4M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z" />
       </svg>
     ),
@@ -82,7 +82,7 @@ const navigation = [
     name: 'Skill Studio',
     href: '/skill-studio',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714c0 .597.237 1.17.659 1.591L19.8 15.3M14.25 3.104c.251.023.501.05.75.082M19.8 15.3l-1.57.393A9.065 9.065 0 0112 15a9.065 9.065 0 00-6.23-.693L5 14.5m14.8.8l1.402 1.402c1 1 .03 2.668-1.328 2.45l-1.884-.314a4.5 4.5 0 00-4.58 1.88 4.5 4.5 0 01-4.58-1.88l-1.884.314c-1.358.218-2.33-1.45-1.328-2.45L5 14.5" />
       </svg>
     ),
@@ -91,7 +91,7 @@ const navigation = [
     name: 'About',
     href: '/about',
     icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" />
       </svg>
     ),
@@ -103,7 +103,7 @@ const externalLinks = [
   { name: 'Temporal UI', href: 'http://localhost:8088', icon: '⚡' },
 ]
 
-export function Sidebar() {
+export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
   const pathname = usePathname()
   const { projects, activeProject, setActiveProject } = useProject()
 
@@ -112,74 +112,113 @@ export function Sidebar() {
     return pathname.startsWith(href)
   }
 
+  const linkCls = (href: string) =>
+    `nav-link ${isActive(href) ? 'nav-link-active' : 'nav-link-inactive'} ${collapsed ? 'justify-center px-0' : 'px-3'}`
+
   return (
-    <aside className="fixed left-0 top-0 bottom-0 w-60 bg-[#0c0c14] border-r border-[#1a1a2a] flex flex-col z-50">
+    <aside className={`fixed left-0 top-0 bottom-0 ${collapsed ? 'w-16' : 'w-60'} bg-[#0c0c14] border-r border-[#1a1a2a] flex flex-col z-50 transition-all duration-200`}>
       {/* Logo */}
-      <div className="px-5 py-5 border-b border-[#1a1a2a]">
+      <div className="px-4 py-4 border-b border-[#1a1a2a]">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm shrink-0">
             TF
           </div>
-          <div>
-            <div className="font-semibold text-sm text-white">TaskForge</div>
-            <div className="text-[10px] text-gray-500 uppercase tracking-wider">Platform</div>
-          </div>
+          {!collapsed && (
+            <div className="overflow-hidden">
+              <div className="font-semibold text-sm text-white whitespace-nowrap">TaskForge</div>
+              <div className="text-[10px] text-gray-500 uppercase tracking-wider">Platform</div>
+            </div>
+          )}
+          <button
+            onClick={onToggle}
+            className="ml-auto text-gray-500 hover:text-gray-200 transition-colors p-1 rounded hover:bg-[#1c1c28]"
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            <svg className={`w-4 h-4 transition-transform duration-200 ${collapsed ? '' : 'rotate-180'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.75 19.5L8.25 12l7.5-7.5" />
+            </svg>
+          </button>
         </div>
       </div>
 
       {/* Navigation */}
       <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
-        <div className="section-title px-3 mb-2">Project</div>
-        <div className="px-3 mb-3">
-          <select
-            value={activeProject}
-            onChange={(e) => setActiveProject(e.target.value)}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-white"
-            title="Active project — scopes the dashboard"
-          >
-            <option value="">All projects</option>
-            <option value="__general__">General (unassigned)</option>
-            {projects.map((p) => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
-          </select>
-        </div>
+        {!collapsed && <div className="section-title px-3 mb-2">Project</div>}
+        {!collapsed ? (
+          <div className="px-3 mb-3">
+            <select
+              value={activeProject}
+              onChange={(e) => setActiveProject(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-white"
+              title="Active project — scopes the dashboard"
+            >
+              <option value="">All projects</option>
+              <option value="__general__">General (unassigned)</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </div>
+        ) : (
+          <div className="px-3 mb-3 flex justify-center">
+            <select
+              value={activeProject}
+              onChange={(e) => setActiveProject(e.target.value)}
+              className="bg-gray-800 border border-gray-700 rounded px-1 py-1.5 text-xs text-white w-full text-center"
+              title="Active project"
+            >
+              <option value="">All</option>
+              <option value="__general__">Gen</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
-        <div className="section-title px-3 mb-3">Navigation</div>
+        {!collapsed && <div className="section-title px-3 mb-3">Navigation</div>}
         {navigation.map((item) => (
           <Link
             key={item.name}
             href={item.href}
-            className={`nav-link ${isActive(item.href) ? 'nav-link-active' : 'nav-link-inactive'}`}
+            title={item.name}
+            className={linkCls(item.href)}
           >
             {item.icon}
-            {item.name}
+            {!collapsed && <span className="whitespace-nowrap">{item.name}</span>}
           </Link>
         ))}
 
-        <div className="section-title px-3 mt-6 mb-3">External</div>
+        {!collapsed && <div className="section-title px-3 mt-6 mb-3">External</div>}
         {externalLinks.map((item) => (
           <a
             key={item.name}
             href={item.href}
             target="_blank"
             rel="noopener noreferrer"
-            className="nav-link nav-link-inactive"
+            title={item.name}
+            className={`nav-link nav-link-inactive ${collapsed ? 'justify-center px-0' : 'px-3'}`}
           >
-            <span className="text-base w-5 text-center">{item.icon}</span>
-            <span>{item.name}</span>
-            <svg className="w-3 h-3 ml-auto opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-            </svg>
+            <span className="text-base w-5 text-center shrink-0">{item.icon}</span>
+            {!collapsed && (
+              <>
+                <span>{item.name}</span>
+                <svg className="w-3 h-3 ml-auto opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+              </>
+            )}
           </a>
         ))}
       </nav>
 
       {/* Footer */}
-      <div className="px-4 py-3 border-t border-[#1a1a2a] text-[10px] text-gray-600">
-        <div>Policy-Driven Agent Orchestration</div>
-        <div className="mt-1">© 2025 Roman Pawel Klis</div>
-      </div>
+      {!collapsed && (
+        <div className="px-4 py-3 border-t border-[#1a1a2a] text-[10px] text-gray-600">
+          <div>Policy-Driven Agent Orchestration</div>
+          <div className="mt-1">© 2025 Roman Pawel Klis</div>
+        </div>
+      )}
     </aside>
   )
 }

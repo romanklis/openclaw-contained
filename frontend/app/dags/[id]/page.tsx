@@ -1,11 +1,12 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import dynamic from 'next/dynamic'
 import { StatusBadge } from '../../components/StatusComponents'
-import { API, TEMPORAL_UI } from '../../lib/api'
+import DeliverablePreview from '../../components/DeliverablePreview'
+import { API, API_GATEWAY, TEMPORAL_UI } from '../../lib/api'
 
 const DAGGraph = dynamic(() => import('../../components/DAGGraph'), { ssr: false })
 
@@ -199,6 +200,8 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [executeObjective, setExecuteObjective] = useState('')
   const [executeAutoStart, setExecuteAutoStart] = useState(false)
   const [executeSaving, setExecuteSaving] = useState(false)
+  const [previewFile, setPreviewFile] = useState<{ url: string; filename: string } | null>(null)
+  const [nodeTurnCounts, setNodeTurnCounts] = useState<Record<string, number>>({})
 
   // Skill extraction state
   const [miningSkill, setMiningSkill] = useState(false)
@@ -300,6 +303,54 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
       fetchDag()
     }
   }, [dag?.status, fetchDag])
+
+  // Live LLM-turn counter for running agent nodes (polled from the control-plane
+  // in-memory interaction log; frozen once the node leaves the running state).
+  const dagRef = useRef(dag)
+  dagRef.current = dag
+  const prevRunningRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (dag?.status !== 'running') {
+      prevRunningRef.current = new Set()
+      return
+    }
+    const iv = setInterval(async () => {
+      const d = dagRef.current
+      if (!d || d.status !== 'running') return
+      const runningNodes = d.nodes.filter(n => n.status === 'running' && n.task_id)
+      const nowRunning = new Set(runningNodes.map(n => n.node_id))
+      for (const n of runningNodes) {
+        if (!prevRunningRef.current.has(n.node_id)) {
+          // Fresh run (e.g. loop re-entry) — restart its counter.
+          setNodeTurnCounts(prev => ({ ...prev, [n.node_id]: 0 }))
+        }
+      }
+      prevRunningRef.current = nowRunning
+
+      const results = await Promise.all(runningNodes.map(async (n) => {
+        try {
+          const r = await fetch(`${API}/api/llm/interactions/${n.task_id}/count`)
+          if (!r.ok) return null
+          const data = await r.json()
+          return [n.node_id, data.total] as const
+        } catch {
+          return null
+        }
+      }))
+      setNodeTurnCounts(prev => {
+        const next = { ...prev }
+        for (const item of results) {
+          if (!item) continue
+          const [id, total] = item
+          // Max-guard: the worker clears the interaction log right before the
+          // node flips to completed, so never let the counter flicker down to 0.
+          next[id] = Math.max(next[id] ?? 0, total)
+        }
+        return next
+      })
+    }, 2000)
+    return () => clearInterval(iv)
+  }, [dag?.status, dagId])
 
   // Fetch task data when a node with task_id is selected
   useEffect(() => {
@@ -576,7 +627,7 @@ setNodeState(prev => {
 
   const deleteSelectedNode = async () => {
     if (!dag || !selectedNode) return
-    if (!(dag.status === 'failed' || dag.status === 'ready')) return
+    if (!(dag.status === 'failed' || dag.status === 'ready' || dag.status === 'cancelled')) return
 
     const confirmed = window.confirm(`Delete step '${selectedNode.node_id}'? Dependencies will be rewired automatically.`)
     if (!confirmed) return
@@ -976,7 +1027,7 @@ setNodeState(prev => {
 
   const enhanceSelectedNode = async () => {
     if (!dag || !selectedNode) return
-    if (!(dag.status === 'failed' || dag.status === 'ready')) return
+    if (!(dag.status === 'failed' || dag.status === 'ready' || dag.status === 'cancelled')) return
 
     setNodeActionLoading(true)
     try {
@@ -1006,7 +1057,7 @@ setNodeState(prev => {
 
   const retryFromSelectedNode = async () => {
     if (!dag || !selectedNode) return
-    if (dag.status !== 'failed') return
+    if (!(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled')) return
 
     setNodeActionLoading(true)
     try {
@@ -1163,16 +1214,32 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
    const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
   // Graph-level editing (drag-to-connect / edge deletion) allowed when the DAG
   // itself is in a pre-run editable state, independent of node selection.
-  const dagEditable = !!(dag?.status === 'failed' || dag?.status === 'ready')
+  const dagEditable = !!(dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'cancelled')
   const selectedReview = deepReviews[selectedNode?.node_id || ''] || null
+  // Compact per-node deep-review summaries (verdict/score/top finding) for the
+  // graph nodes, so completed-but-flagged steps are visible at a glance.
+  const deepReviewSummaries = useMemo(() => {
+    const out: Record<string, { verdict?: string; score?: number; finding?: string }> = {}
+    for (const [nid, r] of Object.entries(deepReviews)) {
+      const rec = r as any
+      const issues = Array.isArray(rec?.issues) ? rec.issues : []
+      const top = (issues[0] as any)?.finding || rec?.summary || ''
+      out[nid] = { verdict: rec?.verdict, score: rec?.score, finding: top }
+    }
+    return out
+  }, [deepReviews])
+  // Deep-review flag severity: red only when the quality score is below 50.
+  const selectedDrFlagged = !!(selectedReview && (selectedReview.verdict === 'issues_found' || selectedReview.verdict === 'needs_attention'))
+  const selectedDrScore = selectedReview?.score
+  const drRed = selectedDrFlagged && selectedDrScore !== undefined && selectedDrScore !== null && selectedDrScore < 50
   // Read actions (download logs, examine logs) allowed on completed/failed/ready DAGs
   const nodeReadActionsAllowed = !!(
     selectedNode &&
-    (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'completed')
+    (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'completed' || dag?.status === 'cancelled')
   )
   // Write actions (delete, enhance, retry) only on failed/ready DAGs
   const nodeWriteActionsAllowed = !!(
-    selectedNode && (dag?.status === 'failed' || dag?.status === 'ready')
+    selectedNode && (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'cancelled')
   )
   // Legacy alias for backward compat (used in some places)
   const nodeActionsAllowed = nodeWriteActionsAllowed
@@ -1524,9 +1591,16 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             setSelectedNodeId(nodeId === selectedNodeId ? null : nodeId)
             setActiveTab('overview')
           }}
+          onSelectNode={(nodeId) => {
+            setSelectedNodeId(nodeId)
+            setActiveTab('overview')
+          }}
           editable={dagEditable}
           onConnect={dagEditable ? handleGraphConnect : undefined}
           onDisconnect={dagEditable ? handleGraphDisconnect : undefined}
+          onOpenDeliverable={(url, filename) => setPreviewFile({ url, filename })}
+          turnCounts={nodeTurnCounts}
+          deepReviews={deepReviewSummaries}
         />
       </div>
 
@@ -1630,11 +1704,11 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🖼️ Change Image
                       </button>
-                      {(dag.status === 'failed' || dag.status === 'completed') && (
+                      {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
                         <button
                           onClick={retryFromSelectedNode}
                           disabled={nodeActionLoading}
-                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 border-t border-gray-700 disabled:opacity-50"
+                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
                         >
                           ▶ Run From This Step
                         </button>
@@ -1863,11 +1937,11 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🖼️ Change Image
                       </button>
-                      {(dag.status === 'failed' || dag.status === 'completed') && (
+                      {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
                         <button
                           onClick={retryFromSelectedNode}
                           disabled={nodeActionLoading}
-                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 border-t border-gray-700 disabled:opacity-50"
+                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
                         >
                           ▶ Run From This Step
                         </button>
@@ -1892,6 +1966,23 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             <div className="mb-3 p-4 rounded border border-red-700/60 bg-red-950/50">
               <div className="text-[11px] uppercase tracking-wide text-red-300 mb-1">Failure Reason</div>
               <div className="text-base font-medium text-red-100">{selectedFailureReason}</div>
+            </div>
+          )}
+
+          {selectedNode.status === 'completed' && selectedReview && (selectedReview.verdict === 'issues_found' || selectedReview.verdict === 'needs_attention') && (
+            <div className={`mb-3 p-4 rounded border ${drRed ? 'border-red-700/60 bg-red-950/50' : 'border-amber-700/60 bg-amber-950/40'}`}>
+              <div className={`text-[11px] uppercase tracking-wide mb-1 ${drRed ? 'text-red-300' : 'text-amber-300'}`}>
+                ⚠ Deep Review: {selectedReview.verdict === 'issues_found' ? 'Issues Found' : 'Needs Attention'}
+                <span className="ml-2 normal-case opacity-80">score {selectedReview.score ?? '?'}/100</span>
+              </div>
+              {selectedReview.summary && (
+                <div className={`text-sm mb-2 ${drRed ? 'text-red-100/90' : 'text-amber-100/90'}`}>{selectedReview.summary}</div>
+              )}
+              {(Array.isArray(selectedReview.issues) ? selectedReview.issues : []).slice(0, 2).map((issue: any, i: number) => (
+                <div key={i} className={`text-xs mb-1 ${drRed ? 'text-red-200/80' : 'text-amber-200/80'}`}>
+                  <span className="font-semibold uppercase">{issue.severity}:</span> {issue.finding}
+                </div>
+              ))}
             </div>
           )}
 
@@ -2002,7 +2093,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               )}
 
               <div className="mb-2 flex items-center gap-3">
-                <span className={'px-2 py-0.5 rounded font-semibold ' + (selectedReview.verdict === 'clean' ? 'bg-emerald-800/50 text-emerald-200' : selectedReview.verdict === 'issues_found' ? 'bg-red-800/50 text-red-200' : 'bg-amber-800/50 text-amber-200')}>
+                <span className={'px-2 py-0.5 rounded font-semibold ' + (selectedReview.verdict === 'clean' ? 'bg-emerald-800/50 text-emerald-200' : drRed ? 'bg-red-800/50 text-red-200' : 'bg-amber-800/50 text-amber-200')}>
                   verdict: {selectedReview.verdict}
                 </span>
                 <span className="text-gray-300">quality score: <span className="font-semibold text-amber-200">{selectedReview.score}/100</span></span>
@@ -3079,6 +3170,42 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             {JSON.stringify(dag.dag_json, null, 2)}
           </pre>
         </details>
+      )}
+
+      {/* Deliverable preview drawer */}
+      {previewFile && (
+        <div className="fixed inset-0 z-[60] flex justify-end">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setPreviewFile(null)} />
+          <div className="relative w-[640px] max-w-[85vw] h-full bg-[#0e0e18] border-l border-[#1a1a2a] shadow-2xl flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-[#1a1a2a]">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-sm text-gray-300">📄</span>
+                <span className="text-sm font-mono text-white truncate">{previewFile.filename}</span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <a
+                  href={previewFile.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white"
+                  title="Open in new tab"
+                >
+                  ↗ Open
+                </a>
+                <button
+                  onClick={() => setPreviewFile(null)}
+                  className="text-gray-500 hover:text-gray-200 p-1 rounded hover:bg-[#1c1c28]"
+                  title="Close preview"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 bg-[#0d1117] min-h-0 overflow-hidden">
+              <DeliverablePreview url={previewFile.url} filename={previewFile.filename} />
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

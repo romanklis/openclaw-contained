@@ -99,6 +99,12 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
 # =============================================================================
 AGENT_SANDBOX_MODE = os.getenv("AGENT_SANDBOX_MODE", "insecure-dind")
 
+# Dynamic agent turn-budget tuning (read at import time so the Temporal
+# workflow sandbox can access them; workflows may not call os.getenv).
+DAG_MAX_TURNS_BASE = int(os.getenv("DAG_MAX_TURNS_BASE", "30"))
+DAG_MAX_TURNS_PER_UPSTREAM = int(os.getenv("DAG_MAX_TURNS_PER_UPSTREAM", "8"))
+DAG_MAX_TURNS_CAP = int(os.getenv("DAG_MAX_TURNS_CAP", "150"))
+
 if AGENT_SANDBOX_MODE == "insecure-dind":
     logger.warning(
         "⚠️  CRITICAL SECURITY RISK: Agent sandbox is running in 'insecure-dind' mode. "
@@ -299,6 +305,8 @@ class AgentTaskWorkflow:
         current_image: str = "",
         follow_up: str = "",
         dag_id: str = "",
+        deliverables_required: bool = True,
+        max_agent_turns: int = 30,
     ) -> Dict[str, Any]:
         """Execute agent task.
 
@@ -377,7 +385,7 @@ class AgentTaskWorkflow:
 
             result = await workflow.execute_child_workflow(
                 AgentStepWorkflow.run,
-                args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id],
+                args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns],
                 id=f"agent-step-{task_id}-iter-{iteration}",
             )
 
@@ -726,6 +734,8 @@ class AgentStepWorkflow:
         llm_model: str = "gemma3:4b",
         follow_up: str = "",
         dag_id: str = "",
+        deliverables_required: bool = True,
+        max_agent_turns: int = 30,
     ) -> Dict[str, Any]:
         logger.info(
             f"🔬 AgentStepWorkflow | Task: {task_id} | Iteration: {iteration} | "
@@ -735,7 +745,7 @@ class AgentStepWorkflow:
         # 1. Launch the container (returns container_id + workspace info)
         launch_info = await workflow.execute_activity(
             start_agent_container,
-            args=[task_id, iteration, agent_image, llm_model, follow_up],
+            args=[task_id, iteration, agent_image, llm_model, follow_up, deliverables_required, max_agent_turns],
             start_to_close_timeout=timedelta(minutes=5),
         )
 
@@ -866,6 +876,8 @@ async def start_agent_container(
     agent_image: str = "localhost:5000/openclaw-agent:openclaw",
     llm_model: str = "gemma3:4b",
     follow_up: str = "",
+    deliverables_required: bool = True,
+    max_agent_turns: int = 30,
 ) -> Dict[str, Any]:
     """Launch the agent container (detached) and return container_id + workspace_dir.
 
@@ -1139,6 +1151,11 @@ async def start_agent_container(
             "ZEP_URL": zep_url_for_agent,
             "ZEP_SESSION_ID": zep_session_id,
             "SKILL_INSTRUCTIONS": skill_instructions[:8000],
+            # Mirrors config.deliverable_gate.require_deliverables so the agent
+            # loop refuses to end on a bare text reply before a deliverable exists.
+            "DELIVERABLES_REQUIRED": "true" if deliverables_required else "false",
+            # Dynamic turn budget (scaled by the number of upstream step outputs).
+            "MAX_AGENT_TURNS": str(max(1, max_agent_turns)),
         }
 
 
@@ -3214,6 +3231,30 @@ def _build_compact_step_summary(output: Dict[str, Any]) -> str:
     return " | ".join(parts)[:1200]
 
 
+def _lookup_input_field(source_value: Any, path: str) -> Any:
+    """Resolve a dotted field path on a source node's output.
+
+    Walks each segment through nested dicts (e.g. ``fields.question``,
+    ``answer.fields.question``); a segment matching a ``deliverables``
+    entry is read from the deliverables map (agent-produced artifacts
+    keyed by filename). Returns ``None`` when any segment is missing.
+    """
+    if not path:
+        return source_value
+    cur = source_value
+    for seg in path.split("."):
+        if isinstance(cur, dict):
+            if seg in cur:
+                cur = cur[seg]
+            elif isinstance(cur.get("deliverables"), dict) and seg in cur["deliverables"]:
+                cur = cur["deliverables"][seg]
+            else:
+                return None
+        else:
+            return None
+    return cur
+
+
 def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
     """Build a bounded 'stage handoff' block describing each predecessor node:
     what was done (tool/action trace), what was produced (deliverables + paths),
@@ -3250,6 +3291,14 @@ def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
             outcome.append(f"choice={decision_choice}")
         if decision_justification:
             outcome.append(f"justification={decision_justification[:400]}")
+        # Input nodes carry the collected user data under "fields" — surface it
+        # so downstream agents actually see the value the user provided.
+        input_fields = data.get("fields")
+        if not isinstance(input_fields, dict) or not input_fields:
+            ans = data.get("answer")
+            input_fields = (ans or {}).get("fields") if isinstance(ans, dict) else None
+        if isinstance(input_fields, dict) and input_fields:
+            outcome.append("user_input_provided")
         outcome_str = "; ".join(outcome) if outcome else "ok"
 
         # What was done — structured tool/action trace
@@ -3288,6 +3337,10 @@ def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
             f"  WHAT WAS DONE:\n{what_done}\n"
             f"  PRODUCED:\n{produced_str}"
         )
+        if isinstance(input_fields, dict) and input_fields:
+            block += "\n  USER INPUT:"
+            for fk, fv in list(input_fields.items())[:10]:
+                block += f"\n    {fk} = {str(fv)[:300]}"
         if output_preview:
             block += f"\n  OUTPUT: {output_preview}"
         blocks.append(block)
@@ -3439,6 +3492,12 @@ def _summarize_upstream_state(input_data: Dict[str, Any]) -> List[Dict[str, Any]
         # surface them so a downstream rework step sees the user's feedback.
         decision_choice = data.get("choice")
         decision_justification = data.get("justification")
+        # Input nodes carry the collected user data under "fields".
+        raw_fields = data.get("fields")
+        if not isinstance(raw_fields, dict):
+            ans = data.get("answer")
+            raw_fields = (ans or {}).get("fields") if isinstance(ans, dict) else None
+        input_fields = {str(k): str(v)[:500] for k, v in (raw_fields or {}).items()}
 
         summary = {
             "node_id": src_node,
@@ -3452,6 +3511,7 @@ def _summarize_upstream_state(input_data: Dict[str, Any]) -> List[Dict[str, Any]
             "log_preview": str(data.get("agent_logs") or "")[:800],
             "decision_choice": str(decision_choice)[:200] if decision_choice else "",
             "decision_justification": str(decision_justification)[:2000] if decision_justification else "",
+            "input_fields": input_fields,
         }
         summaries.append(summary)
 
@@ -3487,6 +3547,10 @@ def _build_prior_state_review_prompt(upstream_state_review: List[Dict[str, Any]]
             lines.append(f"  decision: {summary.get('decision_choice')}")
         if summary.get("decision_justification"):
             lines.append(f"  justification: {summary.get('decision_justification')}")
+        if summary.get("input_fields"):
+            lines.append("  user input:")
+            for fk, fv in list(summary.get("input_fields", {}).items())[:10]:
+                lines.append(f"    {fk} = {fv}")
         if summary.get("gate_failure"):
             lines.append(f"  gate failure: {summary.get('gate_failure')}")
         if summary.get("error"):
@@ -3783,6 +3847,22 @@ class DAGNodeWorkflow:
         task_id: Optional[str] = None
         upstream_state_review = _summarize_upstream_state(input_data)
 
+        # Dynamic turn budget: a node that aggregates many parallel upstream
+        # step outputs needs more rounds to read them AND write its deliverable.
+        upstream_count = max(
+            1, len([k for k in input_data if isinstance(k, str) and not k.startswith("__")])
+        )
+        _base_turns = DAG_MAX_TURNS_BASE
+        _per_upstream = DAG_MAX_TURNS_PER_UPSTREAM
+        _cap_turns = DAG_MAX_TURNS_CAP
+        max_agent_turns = int(
+            config.get("max_turns")
+            or min(_cap_turns, _base_turns + _per_upstream * upstream_count)
+        )
+        logger.info(
+            f"🔧 DAGNodeWorkflow | Node {node_id} | upstream_count={upstream_count} | max_agent_turns={max_agent_turns}"
+        )
+
         # Update node to RUNNING
         await workflow.execute_activity(
             update_node_status,
@@ -3836,6 +3916,12 @@ class DAGNodeWorkflow:
             follow_up_parts.append("--- Success Criteria ---")
             for criterion in success_criteria[:8]:
                 follow_up_parts.append(f"- {str(criterion)[:240]}")
+        follow_up_parts.append(
+            f"--- Turn budget ---\n"
+            f"You have up to {max_agent_turns} turns for this step (scaled for {upstream_count} "
+            f"upstream step output(s) you must aggregate). Write your deliverable(s) incrementally — "
+            f"do not spend the whole budget exploring."
+        )
         template_guidance = config.get("template_guidance")
         if template_guidance:
             follow_up_parts.append(
@@ -3903,6 +3989,11 @@ class DAGNodeWorkflow:
             # capability approval, deployment requests, and finalization.
             child_workflow_id = f"agent-task-{dag_id}-{node_id}"
 
+            # Deliverable requirement mirrors config.deliverable_gate so the
+            # agent loop only enforces writing files when the gate expects them.
+            _gate_cfg = (config.get("deliverable_gate") or {}) if isinstance(config, dict) else {}
+            _deliverables_required = (_gate_cfg.get("enabled", True) is not False) and bool(_gate_cfg.get("require_deliverables", True))
+
             await workflow.execute_activity(
                 persist_task_workflow_id,
                 args=[task_id, child_workflow_id],
@@ -3911,7 +4002,7 @@ class DAGNodeWorkflow:
 
             result = await workflow.execute_child_workflow(
                 AgentTaskWorkflow.run,
-                args=[task_id, llm_model, agent_image, follow_up, dag_id],
+                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns],
                 id=child_workflow_id,
             )
 
@@ -4020,7 +4111,7 @@ class DAGNodeWorkflow:
 
                 retry_result = await workflow.execute_child_workflow(
                     AgentTaskWorkflow.run,
-                    args=[task_id, llm_model, result.get("current_image", agent_image), retry_follow_up, dag_id],
+                    args=[task_id, llm_model, result.get("current_image", agent_image), retry_follow_up, dag_id, _deliverables_required, max_agent_turns],
                     id=f"{child_workflow_id}-assessment-retry",
                 )
 
@@ -4599,22 +4690,21 @@ class DAGWorkflow:
                                 "reason": "missing source node output",
                             })
                     elif isinstance(source_spec, str):
-                        source_node = source_spec
+                        spec = source_spec
+                        if spec.startswith("${") and spec.endswith("}"):
+                            spec = spec[2:-1].strip()
+                        source_node = spec
                         source_field = None
-                        if "." in source_spec:
-                            source_node, source_field = source_spec.split(".", 1)
+                        if "." in spec:
+                            source_node, source_field = spec.split(".", 1)
 
                         if source_node in node_outputs:
                             source_value = node_outputs[source_node]
                             if source_field:
                                 if source_field == "output":
                                     source_value = _extract_task_output_text(source_value)
-                                elif isinstance(source_value, dict) and source_field in source_value:
-                                    source_value = source_value.get(source_field)
-                                elif isinstance(source_value, dict) and source_value.get("deliverables") and source_field in source_value["deliverables"]:
-                                    source_value = source_value["deliverables"][source_field]
                                 else:
-                                    source_value = None
+                                    source_value = _lookup_input_field(source_value, source_field)
 
                             if source_value is not None:
                                 input_data[key] = source_value

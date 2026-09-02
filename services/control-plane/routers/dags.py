@@ -2014,8 +2014,8 @@ async def enhance_node(
 async def retry_dag_from_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_db)):
     """Resume execution from one failed node onward."""
     dag = await _get_dag_or_404(dag_id, db)
-    if dag.status not in (DAGStatus.FAILED, DAGStatus.COMPLETED):
-        raise HTTPException(status_code=400, detail="Run-from-node is only available for failed or completed DAGs")
+    if dag.status not in (DAGStatus.FAILED, DAGStatus.COMPLETED, DAGStatus.CANCELLED):
+        raise HTTPException(status_code=400, detail="Run-from-node is only available for failed, completed or cancelled DAGs")
 
     nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
     all_nodes = list(nodes_result.scalars().all())

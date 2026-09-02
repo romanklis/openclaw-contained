@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" width="100%" height="100%">
+  <defs>
+    <!-- Gradient for the purple logo square -->
+    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#9d4edd" />
+      <stop offset="100%" stop-color="#5a189a" />
+    </linearGradient>
+  </defs>
+
+  <!-- Logo Icon (Purple Square) -->
+  <rect x="40" y="70" width="160" height="160" rx="36" ry="36" fill="url(#logoGradient)" />
+
+  <!-- Logo Icon Text (TF) -->
+  <text x="120" y="172" font-family="Arial, Helvetica, sans-serif" font-size="60" font-weight="bold" fill="#ffffff" text-anchor="middle">TF</text>
+
+  <!-- Main Text (TaskForge) - Inverted to black -->
+  <text x="230" y="145" font-family="Arial, Helvetica, sans-serif" font-size="58" font-weight="bold" fill="#000000" letter-spacing="1">TaskForge</text>
+
+  <!-- Subtitle Text (PLATFORM) - Inverted to dark gray -->
+  <text x="230" y="195" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="normal" fill="#333333" letter-spacing="2">PLATFORM</text>
+</svg>

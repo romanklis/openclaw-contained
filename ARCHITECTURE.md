@@ -10,6 +10,10 @@ a formal approval process and trigger an agent image rebuild.
 
 Built on top of [OpenClaw](https://github.com/openclaw/openclaw).
 
+For a concrete end-to-end walk-through, see the
+[Docling RAG example](examples/docling-rag/README.md) and its
+[architecture & workflow diagram](examples/docling-rag/taskforge-docling-rag-integration.xml).
+
 ## Core Principles
 
 1. **Agent as Requesting Actor** — agents never self-authorize actions

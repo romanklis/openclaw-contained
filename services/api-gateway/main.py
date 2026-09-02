@@ -1029,13 +1029,17 @@ async def list_models():
 
 
 @app.get("/v1/files/{task_id}/{iteration:int}/{filename:path}", tags=["files"])
-async def download_file(task_id: str, iteration: int, filename: str):
+async def download_file(task_id: str, iteration: int, filename: str, inline: int = 0):
     """Serve a deliverable file from a task output.
 
     URL: ``/v1/files/{task_id}/{iteration}/{filename}``
 
     Looks up the specific task + iteration directly, decodes base64 binary
     files, and returns the raw content with proper MIME type.
+
+    Pass ``?inline=1`` to serve the file with ``Content-Disposition: inline``
+    so it can be rendered in an iframe (preview); otherwise it is served as an
+    attachment (download).
     """
     import base64
     from fastapi.responses import Response
@@ -1045,28 +1049,45 @@ async def download_file(task_id: str, iteration: int, filename: str):
     except Exception:
         raise HTTPException(status_code=502, detail="Cannot reach control-plane")
 
+    disposition = "inline" if inline else "attachment"
+
+    # The control-plane /outputs endpoint aggregates outputs across sibling
+    # DAG tasks (and older runs), so iteration numbers collide between tasks.
+    # Restrict to THIS task's own outputs before matching iterations.
+    own_outputs = []
     for o in outputs_resp.get("outputs", []):
+        src = o.get("source_task_id") or o.get("task_id")
+        if src is None or str(src) != str(task_id):
+            continue
+        own_outputs.append(o)
+
+    def _serve(content) -> Response:
+        headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
+        if isinstance(content, str) and content.startswith("base64:"):
+            raw = base64.b64decode(content[7:])
+            return Response(content=raw, media_type=_guess_mime(filename), headers=headers)
+        return Response(
+            content=content.encode("utf-8") if isinstance(content, str) else content,
+            media_type=_guess_mime(filename),
+            headers=headers,
+        )
+
+    # 1) Exact iteration first.
+    for o in own_outputs:
         if o.get("iteration") != iteration:
             continue
         deliverables = o.get("deliverables") or {}
-        if filename not in deliverables:
-            raise HTTPException(status_code=404, detail=f"File '{filename}' not in deliverables")
-        content = deliverables[filename]
-        if isinstance(content, str) and content.startswith("base64:"):
-            raw = base64.b64decode(content[7:])
-            return Response(
-                content=raw,
-                media_type=_guess_mime(filename),
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-            )
-        else:
-            return Response(
-                content=content.encode("utf-8") if isinstance(content, str) else content,
-                media_type=_guess_mime(filename),
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-            )
+        if filename in deliverables:
+            return _serve(deliverables[filename])
 
-    raise HTTPException(status_code=404, detail=f"Iteration {iteration} not found for task {task_id}")
+    # 2) Fallback: the latest iteration of this task that contains the file
+    #    (covers output_data.iteration drift across re-runs).
+    for o in sorted(own_outputs, key=lambda x: int(x.get("iteration") or 0), reverse=True):
+        deliverables = o.get("deliverables") or {}
+        if filename in deliverables:
+            return _serve(deliverables[filename])
+
+    raise HTTPException(status_code=404, detail=f"File '{filename}' not in deliverables for task {task_id}")
 
 
 def _guess_mime(filename: str) -> str:

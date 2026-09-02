@@ -10,8 +10,8 @@ skills and agent images **under a project namespace** so examples stay isolated.
 ```
 examples/
 ├── _shared/example.sh       # example tooling (up/down/status/list)
-├── banking-architecture/    # e.g. banking landscape showcase
-└── garage-assistant/        # e.g. mechanic-garage assistant showcase
+├── banking-architecture/    # bank landscape showcase (mock bank API → approved report)
+└── docling-rag/             # external RAG tool showcase (PDF ingest → search → approved report)
 ```
 
 ## Per-example structure
@@ -25,6 +25,7 @@ examples/<name>/
 │   ├── dags/               # dag_json files → locked DAG templates
 │   ├── skills/             # skill definitions
 │   └── agent-images.yaml   # optional example-specific images
+├── *.xml                   # optional draw.io architecture diagrams (linked from README)
 ├── data/                   # seed data + seed scripts
 └── README.md               # what it demonstrates + how to run
 ```
@@ -62,3 +63,5 @@ seed:
 - Examples never modify core platform files (`services/`, `frontend/`, `docker-compose.yml`).
 - Example infra joins the shared network `openclaw-contained_openclaw-network` so agents can reach it by service name.
 - Setup is idempotent (safe to re-run).
+- Examples may ship draw.io (`.xml`) architecture diagrams — open them in
+  diagrams.net and link them from the example's README.

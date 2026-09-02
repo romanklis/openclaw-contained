@@ -304,6 +304,30 @@ Configure providers via the UI at http://localhost:3000/llm-providers or via env
 
 ---
 
+## Examples & Showcases
+
+Self-contained, project-scoped showcases live under [`examples/`](examples/README.md).
+Each brings up its own infrastructure on the platform network and imports its DAG
+templates, skills and seed data under a project namespace, without touching core
+files:
+
+- **[Docling RAG](examples/docling-rag/README.md)** — TaskForge drives an *external*
+  RAG service end-to-end: a PDF served by `sample-docs` is ingested and indexed by
+  Docling RAG (SQLite + local Ollama `bge-m3`), hybrid-searched, and turned into an
+  approved report through a closed-loop approval gate. Ships an editable
+  [architecture & workflow diagram](examples/docling-rag/taskforge-docling-rag-integration.xml)
+  (draw.io, two pages: system architecture + swimlane RAG workflow).
+- **[Banking Architecture](examples/banking-architecture/README.md)** — agents query
+  a mock bank API/database and produce an approved account/transaction report.
+
+```bash
+make examples                    # list all examples
+make example-up NAME=docling-rag # start infra + import DAG templates/skills/seed
+make example-down NAME=docling-rag
+```
+
+---
+
 ## Makefile Commands
 
 ```
