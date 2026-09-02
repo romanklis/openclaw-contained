@@ -530,7 +530,13 @@ async def mine_task_audit(data: AuditMineRequest, db: AsyncSession = Depends(get
             log_summary_parts.append(f"[iteration {out.iteration}]\n{out.agent_logs[:2000]}")
     log_summary = "\n---\n".join(log_summary_parts[:5])  # cap at 5 iterations
 
-    image_id = task.agent_profile or "openclaw"
+    image_id = "openclaw"
+    if task.current_image:
+        # e.g. localhost:5000/openclaw-agent:browser_v4 → browser_v4
+        tag = task.current_image.rsplit(":", 1)[-1]
+        if "/" in tag:
+            tag = tag.rsplit("/", 1)[-1]
+        image_id = tag
     prompt_parts = [
         f"Task: {task.name}",
         f"Description: {task.description or ''}",
@@ -867,21 +873,16 @@ def _resolve_image_id(task: Task, node: Optional[object], db: AsyncSession) -> O
     """Resolve the AgentImage.id for a task.
 
     Priority:
-      1. task.agent_profile (if it matches an AgentImage id)
-      2. DAG node config.base_image
-      3. Extract the tag suffix from task.current_image (e.g. browser_v4)
+      1. DAG node config.base_image
+      2. Extract the tag suffix from task.current_image (e.g. browser_v4)
     """
     import re
 
-    # 1. agent_profile
-    if task.agent_profile:
-        return task.agent_profile
-
-    # 2. node config.base_image
+    # 1. node config.base_image
     if node and getattr(node, "config", None) and node.config.get("base_image"):
         return node.config["base_image"]
 
-    # 3. current_image -> last segment after ':' stripped of registry prefix
+    # 2. current_image -> last segment after ':' stripped of registry prefix
     if task.current_image:
         # e.g. localhost:5000/openclaw-agent:browser_v4  OR  registry:5000/openclaw-agent:dag-...-task-...
         # last colon segment

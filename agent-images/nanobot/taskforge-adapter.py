@@ -32,6 +32,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:4b")
 LLM_ROUTER_URL = os.getenv("LLM_ROUTER_URL", f"{CONTROL_PLANE_URL}/api/llm")
 IMAGE_TYPE = os.getenv("OPENCLAW_IMAGE_TYPE", "nanobot")
 NODE_ID = os.getenv("NODE_ID", "")  # For step-scoped deliverables in DAG nodes
+# Whether the step must produce at least one deliverable file before the run
+# may end. Mirrors config.deliverable_gate.require_deliverables on the worker;
+# when false, a bare no-tool-call message ends the run as before.
+DELIVERABLES_REQUIRED = os.getenv("DELIVERABLES_REQUIRED", "true").strip().lower() in ("1", "true", "yes", "y")
 
 # Runtime description can be overridden via OPENCLAW_RUNTIME_DESCRIPTION env var
 # (set in each image's Dockerfile). Falls back to get_runtime_description().
@@ -839,6 +843,43 @@ def build_system_prompt() -> str:
     return "\n".join(parts)
 
 
+# Mirrors the include/exclude rules of collect_workspace_files() so the loop can
+# decide cheaply (no file-content reads) whether the step has produced a
+# deliverable yet. Counts any collectible file in the node dir (or the workspace
+# root fallback), skipping bookkeeping files/dirs.
+_STEP_DELIVERABLE_SKIP_DIRS = {".git", "node_modules", ".openclaw", "__pycache__", ".cache", ".npm"}
+_STEP_DELIVERABLE_SKIP_FILES = {
+    "result.json", "AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md",
+    "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md", "package-lock.json",
+    "input_prompt.md", "attached_context.md",
+}
+
+
+def _step_deliverable_dirs() -> list:
+    if NODE_ID:
+        return [os.path.join("/workspace", NODE_ID), "/workspace"]
+    return ["/workspace"]
+
+
+def _step_deliverables_exist() -> bool:
+    for d in _step_deliverable_dirs():
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            if name in _STEP_DELIVERABLE_SKIP_FILES or name in _STEP_DELIVERABLE_SKIP_DIRS:
+                continue
+            full = os.path.join(d, name)
+            if os.path.isfile(full):
+                return True
+            if os.path.isdir(full):
+                for _root, _dirs, files in os.walk(full):
+                    for fn in files:
+                        if fn in _STEP_DELIVERABLE_SKIP_FILES:
+                            continue
+                        return True
+    return False
+
+
 def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
     """Run a native agentic tool-use loop against the LLM router.
 
@@ -872,6 +913,20 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
             while turn < MAX_TURNS:
                 turn += 1
                 print(f"\n── Turn {turn}/{MAX_TURNS} ──")
+
+                # Stagnation nudge: if a deliverable is required and none exists
+                # yet, once ~60% of the budget is spent, push the agent to write
+                # instead of exploring (fires even while it keeps calling tools).
+                if DELIVERABLES_REQUIRED and not _step_deliverables_exist():
+                    budget_floor = max(1, int(MAX_TURNS * 0.6))
+                    if turn >= budget_floor and (turn - budget_floor) % 3 == 0:
+                        nudge = (
+                            f"⏱ You have used {turn} of {MAX_TURNS} turns and still no "
+                            f"deliverable in {_step_deliverable_dirs()[0]}. STOP exploring — "
+                            f"write the deliverable file(s) now, then you may finish."
+                        )
+                        print(f"   ⚠ Nudge: {nudge}")
+                        messages.append({"role": "user", "content": nudge})
 
                 # Call LLM
                 try:
@@ -930,10 +985,25 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
                 # Handle tool calls
                 tool_calls = message.get("tool_calls", [])
                 if not tool_calls:
-                    # No tool calls and finish_reason is stop — agent is done
-                    if finish_reason == "stop":
-                        print(f"   ✅ Agent finished (stop)")
-                    break
+                    # A bare text message ends the run ONLY when the step already
+                    # has a deliverable (or deliverables aren't required).
+                    # Otherwise nudge the agent to actually write its output so a
+                    # premature textual "completion" cannot fail the acceptance
+                    # gate with an empty deliverables directory.
+                    if not DELIVERABLES_REQUIRED or _step_deliverables_exist():
+                        if finish_reason == "stop":
+                            print(f"   ✅ Agent finished (stop)")
+                        break
+                    nudge = (
+                        f"You have NOT produced the required deliverable: no file "
+                        f"exists in {_step_deliverable_dirs()[0]}. Write your "
+                        f"deliverable file(s) there now with the write/exec tool "
+                        f"before you finish. A reply without a tool call will not "
+                        f"end the task."
+                    )
+                    print(f"   ⚠ Nudge: {nudge}")
+                    messages.append({"role": "user", "content": nudge})
+                    continue
 
                 # Execute each tool call
                 for tc in tool_calls:
@@ -962,6 +1032,11 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
                         "tool_call_id": tc.get("id", f"call_{turn}_{tool_name}"),
                         "content": tool_result[:10000],
                     })
+
+        if DELIVERABLES_REQUIRED and not _step_deliverables_exist():
+            warn = "[WARN] Run ended without producing any deliverable in the step directory"
+            print(f"   ⚠ {warn}")
+            all_output_parts.append(warn)
 
         combined = "\n".join(all_output_parts)
         agent_output = ""

@@ -27,8 +27,6 @@ async def create_task(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new task."""
-    profile = task_data.agent_profile or ""
-
     # ── Normal single-agent path ─────────────────────────────────────
     
     # Generate task ID
@@ -50,7 +48,6 @@ async def create_task(
         current_policy_id=None,
         llm_model=llm_model,
         current_image=base_image_tag,
-        agent_profile=task_data.agent_profile,
         dag_id=task_data.dag_id,
         node_id=task_data.node_id,
     )
@@ -519,7 +516,6 @@ async def get_subtasks(
                 "name": s.name,
                 "status": s.status.value if s.status else "unknown",
                 "node_id": s.node_id,
-                "agent_profile": s.agent_profile,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
                 "capability_requests": cap_reqs_by_task.get(s.id, []),
                 "has_pending_approval": any(
@@ -557,7 +553,6 @@ async def export_audit_logs(task_id: str, db: AsyncSession = Depends(get_db)):
         "task_id": task_id,
         "task_name": task.name,
         "task_description": task.description,
-        "agent_profile": task.agent_profile,
         "base_image": task.current_image,
         "llm_model": task.llm_model,
         "status": task.status.value if task.status else "unknown",

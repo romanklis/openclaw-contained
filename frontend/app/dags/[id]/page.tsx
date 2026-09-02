@@ -1,11 +1,12 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import dynamic from 'next/dynamic'
 import { StatusBadge } from '../../components/StatusComponents'
-import { API, TEMPORAL_UI } from '../../lib/api'
+import DeliverablePreview from '../../components/DeliverablePreview'
+import { API, API_GATEWAY, TEMPORAL_UI } from '../../lib/api'
 
 const DAGGraph = dynamic(() => import('../../components/DAGGraph'), { ssr: false })
 
@@ -168,12 +169,25 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [addNodeImage, setAddNodeImage] = useState('openclaw')
   const [addNodeMode, setAddNodeMode] = useState<'after' | 'parallel' | 'custom'>('after')
   const [addNodeDeps, setAddNodeDeps] = useState<string[]>([])
+  const [addNodeType, setAddNodeType] = useState<'agent' | 'decision' | 'input'>('agent')
+  const [addNodeQuestion, setAddNodeQuestion] = useState('')
+  const [addNodeOptions, setAddNodeOptions] = useState('Approve,approve\nRework,rework')
+  const [addNodePrompt, setAddNodePrompt] = useState('')
+  const [addNodeFields, setAddNodeFields] = useState('measurement,Measurement,number')
   const [showImageDialog, setShowImageDialog] = useState(false)
   const [nodeImage, setNodeImage] = useState('')
   const [showEditConnectionsDialog, setShowEditConnectionsDialog] = useState(false)
   const [editConnInputs, setEditConnInputs] = useState<string[]>([])
   const [editConnOutputs, setEditConnOutputs] = useState<string[]>([])
+  const [dagEdges, setDagEdges] = useState<any[]>([])
+  const [newEdgeFrom, setNewEdgeFrom] = useState('')
+  const [newEdgeTo, setNewEdgeTo] = useState('')
+  const [newEdgeCondition, setNewEdgeCondition] = useState('on_success')
+  const [newEdgeType, setNewEdgeType] = useState('rework')
+  const [graphMode, setGraphMode] = useState<'relations' | 'rework'>('relations')
   const [showSkillDialog, setShowSkillDialog] = useState(false)
+  const [showRenameDialog, setShowRenameDialog] = useState(false)
+  const [renameValue, setRenameValue] = useState('')
   const [availableSkills, setAvailableSkills] = useState<any[]>([])
   const [selectedSkillId, setSelectedSkillId] = useState<string>('')
   const [skillDialogLoading, setSkillDialogLoading] = useState(false)
@@ -186,6 +200,8 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [executeObjective, setExecuteObjective] = useState('')
   const [executeAutoStart, setExecuteAutoStart] = useState(false)
   const [executeSaving, setExecuteSaving] = useState(false)
+  const [previewFile, setPreviewFile] = useState<{ url: string; filename: string } | null>(null)
+  const [nodeTurnCounts, setNodeTurnCounts] = useState<Record<string, number>>({})
 
   // Skill extraction state
   const [miningSkill, setMiningSkill] = useState(false)
@@ -239,6 +255,43 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   useEffect(() => { fetchDag() }, [fetchDag])
   useEffect(() => { loadDeepReviews() }, [loadDeepReviews])
 
+  // ── Pending interactive steps (decision / input) ──────────────────────
+  const [userRequests, setUserRequests] = useState<any[]>([])
+  const [userRequestAnswers, setUserRequestAnswers] = useState<Record<number, any>>({})
+  const [decisionPending, setDecisionPending] = useState<Record<number, { choice: string; label: string } | null>>({})
+  const [decisionJustification, setDecisionJustification] = useState<Record<number, string>>({})
+  const [userRequestBusy, setUserRequestBusy] = useState<number | null>(null)
+
+  const loadUserRequests = async () => {
+    try {
+      const r = await fetch(`${API}/api/dags/${dagId}/user-requests?status=pending`)
+      if (r.ok) setUserRequests(await r.json())
+    } catch { /* ignore */ }
+  }
+  useEffect(() => {
+    loadUserRequests()
+    const iv = setInterval(loadUserRequests, 5000)
+    return () => clearInterval(iv)
+  }, [dagId])
+
+  const answerUserRequest = async (id: number, answer?: any) => {
+    setUserRequestBusy(id)
+    try {
+      const r = await fetch(`${API}/api/dags/${dagId}/user-requests/${id}/answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer: answer || userRequestAnswers[id] || {}, answered_by: 'web-ui' }),
+      })
+      if (!r.ok) throw new Error(await r.text())
+      await loadUserRequests()
+      await fetchDag()
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setUserRequestBusy(null)
+    }
+  }
+
   // Auto-refresh while running, and fetch once more when status changes from running
   useEffect(() => {
     if (dag?.status === 'running') {
@@ -250,6 +303,54 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
       fetchDag()
     }
   }, [dag?.status, fetchDag])
+
+  // Live LLM-turn counter for running agent nodes (polled from the control-plane
+  // in-memory interaction log; frozen once the node leaves the running state).
+  const dagRef = useRef(dag)
+  dagRef.current = dag
+  const prevRunningRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (dag?.status !== 'running') {
+      prevRunningRef.current = new Set()
+      return
+    }
+    const iv = setInterval(async () => {
+      const d = dagRef.current
+      if (!d || d.status !== 'running') return
+      const runningNodes = d.nodes.filter(n => n.status === 'running' && n.task_id)
+      const nowRunning = new Set(runningNodes.map(n => n.node_id))
+      for (const n of runningNodes) {
+        if (!prevRunningRef.current.has(n.node_id)) {
+          // Fresh run (e.g. loop re-entry) — restart its counter.
+          setNodeTurnCounts(prev => ({ ...prev, [n.node_id]: 0 }))
+        }
+      }
+      prevRunningRef.current = nowRunning
+
+      const results = await Promise.all(runningNodes.map(async (n) => {
+        try {
+          const r = await fetch(`${API}/api/llm/interactions/${n.task_id}/count`)
+          if (!r.ok) return null
+          const data = await r.json()
+          return [n.node_id, data.total] as const
+        } catch {
+          return null
+        }
+      }))
+      setNodeTurnCounts(prev => {
+        const next = { ...prev }
+        for (const item of results) {
+          if (!item) continue
+          const [id, total] = item
+          // Max-guard: the worker clears the interaction log right before the
+          // node flips to completed, so never let the counter flicker down to 0.
+          next[id] = Math.max(next[id] ?? 0, total)
+        }
+        return next
+      })
+    }, 2000)
+    return () => clearInterval(iv)
+  }, [dag?.status, dagId])
 
   // Fetch task data when a node with task_id is selected
   useEffect(() => {
@@ -526,7 +627,7 @@ setNodeState(prev => {
 
   const deleteSelectedNode = async () => {
     if (!dag || !selectedNode) return
-    if (!(dag.status === 'failed' || dag.status === 'ready')) return
+    if (!(dag.status === 'failed' || dag.status === 'ready' || dag.status === 'cancelled')) return
 
     const confirmed = window.confirm(`Delete step '${selectedNode.node_id}'? Dependencies will be rewired automatically.`)
     if (!confirmed) return
@@ -565,6 +666,29 @@ setNodeState(prev => {
       } else {
         deps = [selectedNode.node_id]
       }
+      const config: any = {
+        base_image: addNodeImage.trim() || 'openclaw',
+        llm_model: dag.llm_model || undefined,
+      }
+      if (addNodeType === 'decision') {
+        config.type = 'decision'
+        config.question = addNodeQuestion.trim() || 'Proceed?'
+        config.payload = {
+          options: addNodeOptions.split('\n').filter(Boolean).map((line) => {
+            const [label, value] = line.split(',').map((s) => s.trim())
+            return { label: label || value, value: value || label }
+          }),
+        }
+      } else if (addNodeType === 'input') {
+        config.type = 'input'
+        config.prompt = addNodePrompt.trim() || 'Provide the requested input'
+        config.payload = {
+          fields: addNodeFields.split('\n').filter(Boolean).map((line) => {
+            const [key, label, type] = line.split(',').map((s) => s.trim())
+            return { key: key || label, label: label || key, type: type || 'text' }
+          }),
+        }
+      }
       const res = await fetch(`${API}/api/dags/${dagId}/nodes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -572,10 +696,8 @@ setNodeState(prev => {
           node_id: newId,
           description: addNodeDesc.trim() || 'New step',
           depends_on: deps,
-          config: {
-            base_image: addNodeImage.trim() || 'openclaw',
-            llm_model: dag.llm_model || undefined,
-          },
+          node_type: addNodeType,
+          config,
         }),
       })
       const data = await res.json().catch(() => ({}))
@@ -596,12 +718,45 @@ setNodeState(prev => {
     if (!selectedNode || !dag) return
     setEditConnInputs(selectedNode.depends_on || [])
     setEditConnOutputs((dag.nodes || []).filter(n => (n.depends_on || []).includes(selectedNode.node_id)).map(n => n.node_id))
+    setDagEdges(Array.isArray((dag as any).edges) ? (dag as any).edges : [])
+    setNewEdgeFrom('')
+    setNewEdgeTo('')
+    setNewEdgeCondition('on_success')
+    setNewEdgeType('rework')
     setShowEditConnectionsDialog(true)
     setShowNodeActions(false)
   }
 
-  const openChangeSkillDialog = async () => {
-    if (!selectedNode || !dag) return
+  const openRenameDialog = () => {
+    if (!selectedNode) return
+    setRenameValue(selectedNode.node_id)
+    setShowRenameDialog(true)
+    setShowNodeActions(false)
+  }
+
+  const saveRename = async () => {
+    if (!dag || !selectedNode) return
+    const newId = renameValue.trim()
+    if (!newId || newId === selectedNode.node_id) { setShowRenameDialog(false); return }
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes/${encodeURIComponent(selectedNode.node_id)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: newId }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail ? (typeof (data as any).detail === 'string' ? (data as any).detail : JSON.stringify((data as any).detail)) : `HTTP ${res.status}`)
+      setShowRenameDialog(false)
+      await applyDagMutationResult(data as DAGDetail, false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
+  }
+
+  const openChangeSkillDialog = async () => {    if (!selectedNode || !dag) return
     setShowNodeActions(false)
     setSelectedSkillId(selectedNode.selected_skill_v2_id || '')
     setSkillDialogLoading(true)
@@ -744,10 +899,13 @@ setNodeState(prev => {
     }
   }
 
-  const applyGraphPatch = async (nodeDependencies: Record<string, string[]>): Promise<DAGDetail> => {    const res = await fetch(`${API}/api/dags/${dagId}/graph`, {
+  const applyGraphPatch = async (nodeDependencies: Record<string, string[]>, edges?: any[]): Promise<DAGDetail> => {
+    const body: any = { node_dependencies: nodeDependencies }
+    if (edges) body.edges = edges
+    const res = await fetch(`${API}/api/dags/${dagId}/graph`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ node_dependencies: nodeDependencies }),
+      body: JSON.stringify(body),
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error((data as any).detail ? (typeof (data as any).detail === 'string' ? (data as any).detail : JSON.stringify((data as any).detail)) : `HTTP ${res.status}`)
@@ -770,7 +928,13 @@ setNodeState(prev => {
           nodeDependencies[n.node_id] = deps
         }
       }
-      const updated = await applyGraphPatch(nodeDependencies)
+      let edgesToSave = dagEdges
+      // Forgiving UX: if the add-edge selects are filled, include that draft
+      // edge even if "+ Add edge" was not clicked before Save.
+      if (newEdgeFrom && newEdgeTo) {
+        edgesToSave = [...dagEdges, { from_node: newEdgeFrom, to_node: newEdgeTo, condition: newEdgeCondition, edge_type: newEdgeType }]
+      }
+      const updated = await applyGraphPatch(nodeDependencies, edgesToSave)
       setShowEditConnectionsDialog(false)
       setShowNodeActions(false)
       await applyDagMutationResult(updated, false)
@@ -784,6 +948,27 @@ setNodeState(prev => {
   const handleGraphConnect = async (source: string, target: string) => {
     if (!dag) return
     if (source === target) return
+
+    if (graphMode === 'rework') {
+      // Rework mode: add an explicit loop-back edge (NOT a depends_on — a loop
+      // must not add the source to the target's dependencies).
+      const edges = ((dag as any).edges || []).filter(
+        (e: any) => !((e.from_node || e.from) === source && (e.to_node || e.to) === target)
+      )
+      edges.push({ from_node: source, to_node: target, condition: 'on_success', edge_type: 'loop' })
+      setNodeActionLoading(true)
+      try {
+        const updated = await applyGraphPatch({}, edges)
+        await applyDagMutationResult(updated, false)
+      } catch (err: any) {
+        setError(err.message)
+        await applyDagMutationResult(null, false)
+      } finally {
+        setNodeActionLoading(false)
+      }
+      return
+    }
+
     const targetNode = dag.nodes.find(n => n.node_id === target)
     if (!targetNode || (targetNode.depends_on || []).includes(source)) return
     setNodeActionLoading(true)
@@ -801,10 +986,15 @@ setNodeState(prev => {
   const handleGraphDisconnect = async (source: string, target: string) => {
     if (!dag) return
     const targetNode = dag.nodes.find(n => n.node_id === target)
-    if (!targetNode || !(targetNode.depends_on || []).includes(source)) return
+    const hasDep = targetNode && (targetNode.depends_on || []).includes(source)
+    const edges = (dag as any).edges || []
+    const hadEdge = edges.some((e: any) => (e.from_node || e.from) === source && (e.to_node || e.to) === target)
+    const nodeDeps: Record<string, string[]> = hasDep ? { [target]: (targetNode.depends_on || []).filter(d => d !== source) } : {}
+    const newEdges = hadEdge ? edges.filter((e: any) => !((e.from_node || e.from) === source && (e.to_node || e.to) === target)) : undefined
+    if (!hasDep && !hadEdge) return
     setNodeActionLoading(true)
     try {
-      const updated = await applyGraphPatch({ [target]: (targetNode.depends_on || []).filter(d => d !== source) })
+      const updated = await applyGraphPatch(nodeDeps, newEdges)
       await applyDagMutationResult(updated, false)
     } catch (err: any) {
       setError(err.message)
@@ -837,7 +1027,7 @@ setNodeState(prev => {
 
   const enhanceSelectedNode = async () => {
     if (!dag || !selectedNode) return
-    if (!(dag.status === 'failed' || dag.status === 'ready')) return
+    if (!(dag.status === 'failed' || dag.status === 'ready' || dag.status === 'cancelled')) return
 
     setNodeActionLoading(true)
     try {
@@ -867,7 +1057,7 @@ setNodeState(prev => {
 
   const retryFromSelectedNode = async () => {
     if (!dag || !selectedNode) return
-    if (dag.status !== 'failed') return
+    if (!(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled')) return
 
     setNodeActionLoading(true)
     try {
@@ -1024,16 +1214,32 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
    const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
   // Graph-level editing (drag-to-connect / edge deletion) allowed when the DAG
   // itself is in a pre-run editable state, independent of node selection.
-  const dagEditable = !!(dag?.status === 'failed' || dag?.status === 'ready')
+  const dagEditable = !!(dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'cancelled')
   const selectedReview = deepReviews[selectedNode?.node_id || ''] || null
+  // Compact per-node deep-review summaries (verdict/score/top finding) for the
+  // graph nodes, so completed-but-flagged steps are visible at a glance.
+  const deepReviewSummaries = useMemo(() => {
+    const out: Record<string, { verdict?: string; score?: number; finding?: string }> = {}
+    for (const [nid, r] of Object.entries(deepReviews)) {
+      const rec = r as any
+      const issues = Array.isArray(rec?.issues) ? rec.issues : []
+      const top = (issues[0] as any)?.finding || rec?.summary || ''
+      out[nid] = { verdict: rec?.verdict, score: rec?.score, finding: top }
+    }
+    return out
+  }, [deepReviews])
+  // Deep-review flag severity: red only when the quality score is below 50.
+  const selectedDrFlagged = !!(selectedReview && (selectedReview.verdict === 'issues_found' || selectedReview.verdict === 'needs_attention'))
+  const selectedDrScore = selectedReview?.score
+  const drRed = selectedDrFlagged && selectedDrScore !== undefined && selectedDrScore !== null && selectedDrScore < 50
   // Read actions (download logs, examine logs) allowed on completed/failed/ready DAGs
   const nodeReadActionsAllowed = !!(
     selectedNode &&
-    (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'completed')
+    (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'completed' || dag?.status === 'cancelled')
   )
   // Write actions (delete, enhance, retry) only on failed/ready DAGs
   const nodeWriteActionsAllowed = !!(
-    selectedNode && (dag?.status === 'failed' || dag?.status === 'ready')
+    selectedNode && (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'cancelled')
   )
   // Legacy alias for backward compat (used in some places)
   const nodeActionsAllowed = nodeWriteActionsAllowed
@@ -1219,6 +1425,94 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
         </div>
       </div>
 
+      {/* Pending interactive steps (decision / input) */}
+      {userRequests.length > 0 && (
+        <div className="mb-4 rounded border border-amber-700/50 bg-amber-950/30 p-4">
+          <div className="text-sm font-semibold text-amber-200 mb-3">
+            ⏸ Waiting for your input ({userRequests.length})
+          </div>
+          <div className="space-y-3">
+            {userRequests.map((req) => (
+              <div key={req.id} className="rounded border border-amber-800/40 bg-black/10 p-3">
+                <div className="text-xs font-mono text-amber-300 mb-1">{req.node_id}</div>
+                <div className="text-sm text-amber-100 mb-2">
+                  {req.kind === 'decision' ? '🛑 ' : '📥 '}
+                  {req.prompt}
+                </div>
+                {req.kind === 'decision' ? (
+                  <div>
+                    <div className="flex flex-wrap gap-2">
+                      {(req.payload?.options || []).map((opt: any) => {
+                        const selected = decisionPending[req.id]?.choice === opt.value
+                        return (
+                          <button
+                            key={opt.value}
+                            onClick={() => setDecisionPending((prev) => ({ ...prev, [req.id]: { choice: opt.value, label: opt.label } }))}
+                            className={`px-3 py-1.5 text-xs rounded ${selected ? 'bg-amber-500 text-black' : 'bg-indigo-600 hover:bg-indigo-500 text-white'}`}
+                          >
+                            {opt.label}
+                          </button>
+                        )
+                      })}
+                    </div>
+                    <div className="mt-2 space-y-2">
+                      <textarea
+                        value={decisionJustification[req.id] || ''}
+                        onChange={(e) => setDecisionJustification((prev) => ({ ...prev, [req.id]: e.target.value }))}
+                        rows={2}
+                        placeholder="Justification (optional — e.g. what the rework should focus on)"
+                        className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                      />
+                      <button
+                        onClick={() => {
+                          const choice = decisionPending[req.id]?.choice
+                          if (!choice) { alert('Select a decision option first'); return }
+                          const needsJust = req.payload?.require_justification === true ||
+                            (req.payload?.options || []).find((o: any) => o.value === choice)?.require_justification === true
+                          const j = (decisionJustification[req.id] || '').trim()
+                          if (needsJust && !j) { alert('Justification is required for this option'); return }
+                          answerUserRequest(req.id, { choice, justification: j })
+                          setDecisionPending((prev) => ({ ...prev, [req.id]: null }))
+                          setDecisionJustification((prev) => ({ ...prev, [req.id]: '' }))
+                        }}
+                        disabled={userRequestBusy === req.id}
+                        className="px-3 py-1.5 text-xs rounded bg-amber-500 hover:bg-amber-400 text-black disabled:opacity-50"
+                      >
+                        Submit decision
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {(req.payload?.fields || []).map((f: any) => (
+                      <div key={f.key}>
+                        <label className="block text-xs text-gray-400 mb-1">{f.label || f.key}</label>
+                        <input
+                          type={f.type === 'number' ? 'number' : 'text'}
+                          defaultValue=""
+                          onChange={(e) => setUserRequestAnswers((prev) => ({
+                            ...prev,
+                            [req.id]: { ...(prev[req.id] || {}), fields: { ...((prev[req.id] || {}).fields || {}), [f.key]: e.target.value } },
+                          }))}
+                          className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                        />
+                      </div>
+                    ))}
+                    <button
+                      onClick={() => answerUserRequest(req.id, { fields: userRequestAnswers[req.id]?.fields || {} })}
+                      disabled={userRequestBusy === req.id}
+                      className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
+                    >
+                      Submit
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {failedNodeSummaries.length > 0 && (
         <div className="mb-4 rounded border border-red-700/50 bg-red-950/40 p-4">
           <div className="text-sm font-semibold text-red-200 mb-2">DAG Failure Summary</div>
@@ -1249,6 +1543,26 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
 
       {/* DAG Graph */}
       <div className="mb-4">
+        {dagEditable && (
+          <div className="flex items-center gap-2 mb-2 text-xs">
+            <span className="text-gray-500">Draw mode:</span>
+            <button
+              onClick={() => setGraphMode('relations')}
+              className={`px-2 py-1 rounded border ${graphMode === 'relations' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+            >
+              ⇢ Relations (depends on)
+            </button>
+            <button
+              onClick={() => setGraphMode('rework')}
+              className={`px-2 py-1 rounded border ${graphMode === 'rework' ? 'border-amber-400 text-amber-200 bg-amber-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+            >
+              ↻ Rework loop
+            </button>
+            {graphMode === 'rework' && (
+              <span className="text-amber-300/80">Drag from the rework step back to the decision step to create a loop.</span>
+            )}
+          </div>
+        )}
         <DAGGraph
           nodes={dag.nodes.map(n => ({
             node_id: n.node_id,
@@ -1259,14 +1573,34 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             skill_id: n.skill_id,
             started_at: n.started_at,
             completed_at: n.completed_at,
+            node_type: (n as any).node_type,
+            deliverables_keys: (n as any).deliverables_keys
+              || (n as any).output_data?.deliverables_keys
+              || Object.keys(((n as any).output_data?.deliverables) || {})
+              || [],
+            selected_skill_v2_id: (n as any).selected_skill_v2_id,
+            base_image: (n as any).config?.base_image,
+            error: (n as any).output_data?.error,
+            gate_failure: (n as any).output_data?.gate_failure,
+            output_message: (n as any).output_data?.output || (n as any).output_data?.compact_summary || '',
+            dag_id: dagId,
+            iteration: (n as any).output_data?.iteration,
           }))}
+          edges={(dag as any).edges || []}
           onNodeClick={(nodeId) => {
             setSelectedNodeId(nodeId === selectedNodeId ? null : nodeId)
+            setActiveTab('overview')
+          }}
+          onSelectNode={(nodeId) => {
+            setSelectedNodeId(nodeId)
             setActiveTab('overview')
           }}
           editable={dagEditable}
           onConnect={dagEditable ? handleGraphConnect : undefined}
           onDisconnect={dagEditable ? handleGraphDisconnect : undefined}
+          onOpenDeliverable={(url, filename) => setPreviewFile({ url, filename })}
+          turnCounts={nodeTurnCounts}
+          deepReviews={deepReviewSummaries}
         />
       </div>
 
@@ -1350,6 +1684,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         🔗 Edit Connections
                       </button>
                       <button
+                        onClick={openRenameDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ✏️ Rename
+                      </button>
+                      <button
                         onClick={openChangeSkillDialog}
                         disabled={nodeActionLoading}
                         className="w-full text-left px-3 py-2 text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
@@ -1363,11 +1704,11 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🖼️ Change Image
                       </button>
-                      {(dag.status === 'failed' || dag.status === 'completed') && (
+                      {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
                         <button
                           onClick={retryFromSelectedNode}
                           disabled={nodeActionLoading}
-                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 border-t border-gray-700 disabled:opacity-50"
+                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
                         >
                           ▶ Run From This Step
                         </button>
@@ -1454,6 +1795,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
                       >
                         🔗 Edit Connections
+                      </button>
+                      <button
+                        onClick={openRenameDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ✏️ Rename
                       </button>
                       <button
                         onClick={openChangeSkillDialog}
@@ -1569,6 +1917,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         🔗 Edit Connections
                       </button>
                       <button
+                        onClick={openRenameDialog}
+                        disabled={nodeActionLoading}
+                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
+                      >
+                        ✏️ Rename
+                      </button>
+                      <button
                         onClick={openChangeSkillDialog}
                         disabled={nodeActionLoading}
                         className="w-full text-left px-3 py-2 text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
@@ -1582,11 +1937,11 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🖼️ Change Image
                       </button>
-                      {(dag.status === 'failed' || dag.status === 'completed') && (
+                      {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
                         <button
                           onClick={retryFromSelectedNode}
                           disabled={nodeActionLoading}
-                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 border-t border-gray-700 disabled:opacity-50"
+                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
                         >
                           ▶ Run From This Step
                         </button>
@@ -1611,6 +1966,23 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             <div className="mb-3 p-4 rounded border border-red-700/60 bg-red-950/50">
               <div className="text-[11px] uppercase tracking-wide text-red-300 mb-1">Failure Reason</div>
               <div className="text-base font-medium text-red-100">{selectedFailureReason}</div>
+            </div>
+          )}
+
+          {selectedNode.status === 'completed' && selectedReview && (selectedReview.verdict === 'issues_found' || selectedReview.verdict === 'needs_attention') && (
+            <div className={`mb-3 p-4 rounded border ${drRed ? 'border-red-700/60 bg-red-950/50' : 'border-amber-700/60 bg-amber-950/40'}`}>
+              <div className={`text-[11px] uppercase tracking-wide mb-1 ${drRed ? 'text-red-300' : 'text-amber-300'}`}>
+                ⚠ Deep Review: {selectedReview.verdict === 'issues_found' ? 'Issues Found' : 'Needs Attention'}
+                <span className="ml-2 normal-case opacity-80">score {selectedReview.score ?? '?'}/100</span>
+              </div>
+              {selectedReview.summary && (
+                <div className={`text-sm mb-2 ${drRed ? 'text-red-100/90' : 'text-amber-100/90'}`}>{selectedReview.summary}</div>
+              )}
+              {(Array.isArray(selectedReview.issues) ? selectedReview.issues : []).slice(0, 2).map((issue: any, i: number) => (
+                <div key={i} className={`text-xs mb-1 ${drRed ? 'text-red-200/80' : 'text-amber-200/80'}`}>
+                  <span className="font-semibold uppercase">{issue.severity}:</span> {issue.finding}
+                </div>
+              ))}
             </div>
           )}
 
@@ -1721,7 +2093,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               )}
 
               <div className="mb-2 flex items-center gap-3">
-                <span className={'px-2 py-0.5 rounded font-semibold ' + (selectedReview.verdict === 'clean' ? 'bg-emerald-800/50 text-emerald-200' : selectedReview.verdict === 'issues_found' ? 'bg-red-800/50 text-red-200' : 'bg-amber-800/50 text-amber-200')}>
+                <span className={'px-2 py-0.5 rounded font-semibold ' + (selectedReview.verdict === 'clean' ? 'bg-emerald-800/50 text-emerald-200' : drRed ? 'bg-red-800/50 text-red-200' : 'bg-amber-800/50 text-amber-200')}>
                   verdict: {selectedReview.verdict}
                 </span>
                 <span className="text-gray-300">quality score: <span className="font-semibold text-amber-200">{selectedReview.score}/100</span></span>
@@ -1915,6 +2287,51 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   </div>
                 </div>
               )}
+              <div className="flex gap-2 mb-2">
+                {(['agent', 'decision', 'input'] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setAddNodeType(t)}
+                    className={`text-xs px-2 py-1 rounded border ${addNodeType === t ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+                  >
+                    {t === 'agent' ? '🤖 Agent' : t === 'decision' ? '🛑 Decision' : '📥 Input'}
+                  </button>
+                ))}
+              </div>
+              {addNodeType === 'decision' && (
+                <div className="mb-2 space-y-2">
+                  <input
+                    value={addNodeQuestion}
+                    onChange={(e) => setAddNodeQuestion(e.target.value)}
+                    placeholder="Question (e.g. Proceed with the report?)"
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                  />
+                  <textarea
+                    value={addNodeOptions}
+                    onChange={(e) => setAddNodeOptions(e.target.value)}
+                    rows={3}
+                    placeholder={'Options — one per line: Label,value\nApprove,approve\nRework,rework'}
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                  />
+                </div>
+              )}
+              {addNodeType === 'input' && (
+                <div className="mb-2 space-y-2">
+                  <input
+                    value={addNodePrompt}
+                    onChange={(e) => setAddNodePrompt(e.target.value)}
+                    placeholder="Prompt (e.g. Enter the measured value)"
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                  />
+                  <textarea
+                    value={addNodeFields}
+                    onChange={(e) => setAddNodeFields(e.target.value)}
+                    rows={3}
+                    placeholder={'Fields — one per line: key,label,type (text|number|select)\nmeasurement,Measurement,number'}
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200"
+                  />
+                </div>
+              )}
               <textarea
                 value={addNodeDesc}
                 onChange={(e) => setAddNodeDesc(e.target.value)}
@@ -1990,10 +2407,82 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   </div>
                 </div>
               </div>
+
+              {/* Explicit edges (conditional / loop) */}
+              <div className="mt-3">
+                <p className="text-[11px] text-gray-500 mb-1">
+                  Edges — conditional routes &amp; rework loops (e.g. <code className="font-mono text-amber-300">edge_type: loop</code> back to a decision):
+                </p>
+                <div className="space-y-1 max-h-40 overflow-y-auto border border-gray-700 rounded p-1.5">
+                  {dagEdges.length === 0 && <p className="text-[11px] text-gray-600">No explicit edges.</p>}
+                  {dagEdges.map((e, idx) => (
+                    <div key={idx} className="flex items-center gap-2 text-[11px] text-gray-300">
+                      <span className="font-mono">{e.from_node || e.from}</span>
+                      <span className="text-gray-600">→</span>
+                      <span className="font-mono">{e.to_node || e.to}</span>
+                      <span className="text-gray-500 font-mono">({e.condition || '—'}, {e.edge_type || 'rework'})</span>
+                      <button
+                        onClick={() => setDagEdges(prev => prev.filter((_, i) => i !== idx))}
+                        className="ml-auto text-red-400 hover:text-red-300"
+                        title="Remove edge"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-4 gap-1.5 mt-1.5">
+                  <select value={newEdgeFrom} onChange={(e) => setNewEdgeFrom(e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-1 text-[11px] text-gray-200">
+                    <option value="">from…</option>
+                    {(dag?.nodes || []).map(n => <option key={n.node_id} value={n.node_id}>{n.node_id}</option>)}
+                  </select>
+                  <select value={newEdgeTo} onChange={(e) => setNewEdgeTo(e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-1 text-[11px] text-gray-200">
+                    <option value="">to…</option>
+                    {(dag?.nodes || []).map(n => <option key={n.node_id} value={n.node_id}>{n.node_id}</option>)}
+                  </select>
+                  <select value={newEdgeCondition} onChange={(e) => setNewEdgeCondition(e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-1 text-[11px] text-gray-200">
+                    {['on_success', 'on_failure', 'decision:accept', 'decision:reject', 'decision:cancel', 'loop'].map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <select value={newEdgeType} onChange={(e) => setNewEdgeType(e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-1 text-[11px] text-gray-200">
+                    {['rework', 'loop', 'skip'].map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </div>
+                <button
+                  onClick={() => {
+                    if (!newEdgeFrom || !newEdgeTo) return
+                    setDagEdges(prev => [...prev, { from_node: newEdgeFrom, to_node: newEdgeTo, condition: newEdgeCondition, edge_type: newEdgeType }])
+                    setNewEdgeFrom(''); setNewEdgeTo('')
+                  }}
+                  className="mt-1.5 px-2 py-0.5 text-[11px] rounded bg-amber-600 hover:bg-amber-500 text-black"
+                >
+                  + Add edge
+                </button>
+              </div>
+
               <div className="flex justify-end gap-2 mt-2">
                 <button onClick={() => setShowEditConnectionsDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
                 <button onClick={saveEditConnections} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
                   {nodeActionLoading ? 'Saving...' : 'Save Connections'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showRenameDialog && selectedNode && (
+            <div className="mb-3 rounded border border-teal-700/40 bg-teal-950/20 p-3">
+              <div className="text-xs uppercase tracking-wide text-teal-300 mb-2">
+                Rename step "{selectedNode.node_id}"
+              </div>
+              <input
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                className="input-field w-full text-sm"
+                placeholder="new node id"
+              />
+              <div className="flex justify-end gap-2 mt-2">
+                <button onClick={() => setShowRenameDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
+                <button onClick={saveRename} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-teal-600 hover:bg-teal-500 text-white disabled:opacity-50">
+                  {nodeActionLoading ? 'Saving…' : 'Rename'}
                 </button>
               </div>
             </div>
@@ -2621,6 +3110,12 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <span className="font-mono text-sm font-semibold">{node.node_id}</span>
+                  {(node as any).node_type === 'decision' && (
+                    <span className="text-xs bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded" title="Pauses for a user decision">🛑 Decision</span>
+                  )}
+                  {(node as any).node_type === 'input' && (
+                    <span className="text-xs bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded" title="Pauses for user-provided data">📥 Input</span>
+                  )}
                   <StatusBadge status={node.status} />
                   {node.skill_id && (
                     <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">
@@ -2675,6 +3170,42 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             {JSON.stringify(dag.dag_json, null, 2)}
           </pre>
         </details>
+      )}
+
+      {/* Deliverable preview drawer */}
+      {previewFile && (
+        <div className="fixed inset-0 z-[60] flex justify-end">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setPreviewFile(null)} />
+          <div className="relative w-[640px] max-w-[85vw] h-full bg-[#0e0e18] border-l border-[#1a1a2a] shadow-2xl flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-[#1a1a2a]">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-sm text-gray-300">📄</span>
+                <span className="text-sm font-mono text-white truncate">{previewFile.filename}</span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <a
+                  href={previewFile.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white"
+                  title="Open in new tab"
+                >
+                  ↗ Open
+                </a>
+                <button
+                  onClick={() => setPreviewFile(null)}
+                  className="text-gray-500 hover:text-gray-200 p-1 rounded hover:bg-[#1c1c28]"
+                  title="Close preview"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 bg-[#0d1117] min-h-0 overflow-hidden">
+              <DeliverablePreview url={previewFile.url} filename={previewFile.filename} />
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

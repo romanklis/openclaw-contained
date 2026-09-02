@@ -1,0 +1,10 @@
+name: docling-rag
+description: RAG showcase — ingest a PDF into Docling RAG, search it, and produce an approved report
+infra: docker-compose.yml
+services:
+  - { name: docling-rag, url: http://docling-rag:8080 }
+  - { name: sample-docs, url: http://sample-docs:8080/sample.pdf }
+dags:
+  - config/dags/rag-report.json
+skills:
+  - config/skills/docling-rag.md

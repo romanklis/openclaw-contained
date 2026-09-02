@@ -3,7 +3,8 @@
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
 		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images \
-		docker-clean-dag docker-clean-dag-dry-run
+		docker-clean-dag docker-clean-dag-dry-run \
+		examples example-up example-down
 
 # ─────────────────────────────────────────────────────────
 # Help
@@ -192,6 +193,19 @@ docker-clean-dag: ## Remove old DAG agent images from DinD (default retention 5 
 
 docker-clean-dag-dry-run: ## Dry-run: list old DAG images that would be removed (deletes nothing)
 	@scripts/cleanup-dag-images.sh $(DAG_RETENTION_DAYS) --dry-run
+
+# ─────────────────────────────────────────────────────────
+# Examples (showcase usage of the platform)
+# ─────────────────────────────────────────────────────────
+
+examples: ## List available usage examples
+	@examples/_shared/example.sh list
+
+example-up: ## Bring up an example + import its config: make example-up NAME=banking-architecture
+	@examples/_shared/example.sh up $(NAME)
+
+example-down: ## Tear down an example's infra: make example-down NAME=banking-architecture
+	@examples/_shared/example.sh down $(NAME)
 
 # ─────────────────────────────────────────────────────────
 # Logs & Status

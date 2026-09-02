@@ -89,7 +89,6 @@ class Task(Base):
     current_image = Column(String)
     current_policy_id = Column(Integer, ForeignKey("policies.id"))
     llm_model = Column(String, default="gemma3:4b")
-    agent_profile = Column(String)  # agent profile ID (e.g. 'performance-agent')
     
     # Temporal workflow
     workflow_id = Column(String, unique=True)
@@ -370,6 +369,7 @@ class MasterDAG(Base):
     locked = Column(Boolean, default=False, nullable=False)
     template_params = Column(JSON, default=list)  # [{key,label,type,default,description}]
     template_source_dag_id = Column(String, nullable=True)  # set on instances
+    project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)  # project namespace
 
     # Archiving: hides the DAG from the default list (soft delete), keeps data.
     archived = Column(Boolean, default=False, nullable=False)
@@ -411,6 +411,9 @@ class DAGNode(Base):
     # Runtime
     task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
     container_id = Column(String)
+
+    # Step type: agent | decision | input (decision/input pause for user input)
+    node_type = Column(String, default="agent", nullable=False)
 
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
@@ -731,6 +734,7 @@ class SkillV2(Base):
 
     id = Column(String, primary_key=True)           # skv2-<uuid8>
     image_id = Column(String, ForeignKey("agent_images.id"), nullable=False, index=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)
 
     name = Column(String, nullable=False)
     description = Column(Text, default="")
@@ -822,6 +826,16 @@ class SkillReview(Base):
     skill = relationship("SkillV2", back_populates="reviews")
 
 
+class Project(Base):
+    """A project/namespace that DAGs (and the skills learned from them) belong to."""
+    __tablename__ = "projects"
+
+    id = Column(String, primary_key=True)  # slug, e.g. banking-architecture
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class SkillSelectionEvent(Base):
     """Records that the planner selected a skill for a DAG node.
 
@@ -850,3 +864,28 @@ class SkillSelectionEvent(Base):
     skill = relationship("SkillV2", back_populates="selection_events")
     dag = relationship("MasterDAG", foreign_keys=[dag_id])
     task = relationship("Task", foreign_keys=[task_id])
+
+
+class DagUserRequest(Base):
+    """A pending interactive step in a DAG: a user decision or data input.
+
+    The DAGNodeWorkflow creates one when it reaches a `decision` or `input`
+    node, pauses, and waits for the user's answer via the `user_input` signal.
+    """
+    __tablename__ = "dag_user_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=True)
+
+    kind = Column(String, nullable=False)  # decision | input
+    prompt = Column(Text, default="")
+    payload = Column(JSON, default=dict)   # options (decision) or fields (input)
+
+    status = Column(String, default="pending")  # pending | answered | cancelled
+    answer = Column(JSON, nullable=True)
+    answered_by = Column(String, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    answered_at = Column(DateTime, nullable=True)

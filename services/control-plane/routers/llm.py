@@ -1423,6 +1423,16 @@ async def get_task_interactions(task_id: str, since: int = 0):
     }
 
 
+@router.get("/interactions/{task_id}/count")
+async def get_task_interaction_count(task_id: str):
+    """Lightweight live turn count for a task.
+
+    Returns just ``{task_id, total}`` — cheap to poll from the UI while an
+    agent is running. The full payload lives in ``/interactions/{task_id}``.
+    """
+    return {"task_id": task_id, "total": len(_task_interactions.get(task_id, []))}
+
+
 @router.delete("/interactions/{task_id}")
 async def clear_task_interactions(task_id: str):
     """Clear recorded interactions for a task (called after worker stores them)."""

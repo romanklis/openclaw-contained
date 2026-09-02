@@ -28,7 +28,6 @@ class TaskCreate(BaseModel):
     llm_model: Optional[str] = None
     model: Optional[str] = None  # alias for llm_model (from curl/CLI)
     base_image: Optional[str] = None  # agent base image key (e.g. "zeroclaw")
-    agent_profile: Optional[str] = None  # agent profile ID for display
     # ── DAG context (optional) ──
     workspace_id: Optional[str] = None   # share an existing workspace
     dag_id: Optional[str] = None         # link to parent DAG
@@ -59,7 +58,6 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     workspace_id: str
     workflow_id: Optional[str]
-    agent_profile: Optional[str] = None
     dag_id: Optional[str] = None
     node_id: Optional[str] = None
     created_at: datetime
@@ -435,6 +433,7 @@ class DAGNodeCreate(BaseModel):
     depends_on: List[str] = []
     config: Dict[str, Any] = {}  # base_image, llm_model, env_id, timeout_minutes, deploy_authorized
     input_mapping: Dict[str, Any] = {}  # supports dependency refs and literal constants
+    node_type: str = "agent"  # agent | decision | input
 
 
 class DAGNodePatch(BaseModel):
@@ -454,16 +453,18 @@ class DAGNodePatch(BaseModel):
     depends_on: Optional[List[str]] = None
     config: Optional[Dict[str, Any]] = None
     input_mapping: Optional[Dict[str, Any]] = None
+    node_type: Optional[str] = None  # agent | decision | input
 
 
 class DAGGraphPatch(BaseModel):
-    """Atomic bulk rewire of node dependencies across a DAG.
+    """Atomic bulk rewire of node dependencies + explicit edges across a DAG.
 
     Maps node_id -> new depends_on list. Only the listed nodes are touched;
-    nodes omitted keep their current dependencies. Applied and validated in a
-    single transaction.
+    nodes omitted keep their current dependencies. `edges` (optional) fully
+    replaces dag_json.edges (conditional edges + loop-backs).
     """
     node_dependencies: Dict[str, List[str]] = {}
+    edges: Optional[List[Dict[str, Any]]] = None
 
 
 class DAGNodeResponse(BaseModel):
@@ -485,6 +486,7 @@ class DAGNodeResponse(BaseModel):
     selected_skill_v2_id: Optional[str] = None
     skill_selection_reason: Optional[str] = None
     deliverables_keys: Optional[List[str]] = None  # quick lookup for node deliverables
+    node_type: str = "agent"  # agent | decision | input
 
     class Config:
         from_attributes = True
@@ -507,6 +509,7 @@ class DAGCreate(BaseModel):
     base_image: Optional[str] = None
     auto_start: bool = False
     skill_ids: Optional[List[str]] = None  # selected skills from registry
+    project_id: Optional[str] = None
 
 
 class DAGRevise(BaseModel):
@@ -536,6 +539,7 @@ class DAGManualCreate(BaseModel):
     edges: List[DAGEdge] = []
     default_image: str = "openclaw"
     default_llm: str = "gemma3:4b"
+    project_id: Optional[str] = None
 
 
 class TemplateParam(BaseModel):
@@ -604,6 +608,7 @@ class DAGResponse(BaseModel):
     template_params: Optional[List[Dict[str, Any]]] = None
     template_source_dag_id: Optional[str] = None
     archived: bool = False
+    project_id: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -613,6 +618,7 @@ class DAGDetail(DAGResponse):
     """Full DAG detail including nodes and edges."""
     dag_json: Dict[str, Any]
     nodes: List[DAGNodeResponse] = []
+    edges: List[DAGEdge] = []
 
 
 class DAGNodeStateSnapshotCreate(BaseModel):

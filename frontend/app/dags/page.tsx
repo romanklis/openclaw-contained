@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { StatusBadge } from '../components/StatusComponents'
 import { API, TEMPORAL_UI } from '../lib/api'
+import { useProject } from '../lib/ProjectContext'
 
 interface DAG {
   id: string
@@ -36,10 +37,13 @@ export default function DAGsPage() {
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([])
   const [modelDefaults, setModelDefaults] = useState<{planning_model: string, agent_model: string} | null>(null)
   const [showArchived, setShowArchived] = useState(false)
+  const { activeProject } = useProject()
 
   const fetchDags = async () => {
     try {
-      const res = await fetch(`${API}/api/dags?archived=${showArchived}`)
+      const qs = new URLSearchParams({ archived: String(showArchived) })
+      if (activeProject) qs.set('project_id', activeProject)
+      const res = await fetch(`${API}/api/dags?${qs}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setDags(await res.json())
     } catch (err: any) {
@@ -67,7 +71,7 @@ export default function DAGsPage() {
     }
   }
 
-  useEffect(() => { fetchDags(); fetchSkills(); fetchModelDefaults() }, [showArchived])
+  useEffect(() => { fetchDags(); fetchSkills(); fetchModelDefaults() }, [showArchived, activeProject])
 
   const createDag = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -81,6 +85,7 @@ export default function DAGsPage() {
           objective,
           auto_start: autoStart,
           skill_ids: selectedSkillIds.length > 0 ? selectedSkillIds : null,
+          project_id: activeProject || null,
         }),
       })
       if (!res.ok) {

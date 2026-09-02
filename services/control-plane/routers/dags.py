@@ -1,8 +1,8 @@
 """
 DAGs Router — CRUD and lifecycle for Master DAGs.
 """
-from typing import Any
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Any, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from database import get_db
@@ -47,7 +47,7 @@ from schemas import (
     DAGInstantiateRequest,
 )
 from dag_validator import validate_dag
-from planner import plan_dag
+from planner import plan_dag, _normalize_interactive_nodes
 from routers.openai_dag import MODEL_CONFIGS
 from temporal_client import start_dag_workflow, get_temporal_client
 import uuid
@@ -173,6 +173,7 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
         dag_json={},
         workspace_id=workspace_id,
         llm_model=agent_model,
+        project_id=data.project_id,
     )
     db.add(dag)
     await db.commit()
@@ -187,6 +188,7 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=422, detail=str(e))
 
     # Store DAG JSON and create node records
+    dag_json = _normalize_interactive_nodes(dag_json)
     dag.dag_json = dag_json
     dag.status = DAGStatus.READY
 
@@ -211,6 +213,9 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
             input_mapping=node_def.get("input_mapping", {}),
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
+            node_type=node_def.get("node_type", "agent")
+            if node_def.get("node_type", "agent") in ("agent", "decision", "input")
+            else "agent",
         )
         db.add(node)
         nodes.append(node)
@@ -246,6 +251,8 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
         "default_llm": data.default_llm,
     }
 
+    dag_json = _normalize_interactive_nodes(dag_json)
+
     # Validate
     is_valid, errors = validate_dag(dag_json)
     if not is_valid:
@@ -258,6 +265,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
         dag_json=dag_json,
         workspace_id=workspace_id,
         llm_model=data.default_llm,
+        project_id=data.project_id,
     )
     db.add(dag)
 
@@ -289,6 +297,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
             input_mapping=node_def.input_mapping,
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
+            node_type=node_def.node_type if node_def.node_type in ("agent", "decision", "input") else "agent",
         )
         db.add(node)
         nodes.append(node)
@@ -348,16 +357,16 @@ async def set_model_defaults(body: dict):
 
 
 @router.get("", response_model=list[DAGResponse])
-async def list_dags(skip: int = 0, limit: int = 50, archived: bool = False, db: AsyncSession = Depends(get_db)):
+async def list_dags(skip: int = 0, limit: int = 50, archived: bool = False, project_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
     """List DAGs. By default excludes archived (soft-deleted) DAGs; pass
-    `archived=true` to list archived DAGs instead."""
-    result = await db.execute(
-        select(MasterDAG)
-        .where(MasterDAG.archived.is_(True) if archived else MasterDAG.archived.is_(False))
-        .order_by(MasterDAG.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-    )
+    `archived=true` to list archived DAGs instead. Pass `project_id` to filter
+    to a project namespace."""
+    q = select(MasterDAG).where(MasterDAG.archived.is_(True) if archived else MasterDAG.archived.is_(False))
+    if project_id == "__general__":
+        q = q.where(MasterDAG.project_id.is_(None))
+    elif project_id:
+        q = q.where(MasterDAG.project_id == project_id)
+    result = await db.execute(q.order_by(MasterDAG.created_at.desc()).offset(skip).limit(limit))
     return list(result.scalars().all())
 
 
@@ -924,6 +933,7 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
         llm_model=new_dag_json.get("default_llm") or source.llm_model,
         template_params=list(source.template_params or []),
         template_source_dag_id=source.id,
+        project_id=source.project_id,
     )
     db.add(new_dag)
 
@@ -945,6 +955,9 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
             input_mapping=nd.get("input_mapping"),
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
+            node_type=nd.get("node_type", "agent")
+            if nd.get("node_type", "agent") in ("agent", "decision", "input")
+            else "agent",
         )
         db.add(node)
         created_nodes.append(node)
@@ -1383,6 +1396,10 @@ async def patch_dag(dag_id: str, payload: dict, db: AsyncSession = Depends(get_d
     dag = await _get_dag_or_404(dag_id, db)
     if "status" in payload:
         dag.status = DAGStatus(payload["status"])
+    if "llm_model" in payload and payload["llm_model"]:
+        dag.llm_model = payload["llm_model"]
+        if dag.dag_json:
+            dag.dag_json["default_llm"] = payload["llm_model"]
     if "completed_at" in payload:
         # Handle ISO format with timezone (e.g., "2026-07-16T21:02:20.123456+00:00")
         # Convert to offset-naive UTC for DB storage
@@ -1444,6 +1461,8 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
         node.skill_selection_reason = patch["skill_selection_reason"]
     if "description" in patch:
         node.description = patch["description"]
+    if "node_type" in patch and patch["node_type"] in ("agent", "decision", "input"):
+        node.node_type = patch["node_type"]
     if "depends_on" in patch and patch["depends_on"] is not None:
         node.depends_on = _dedupe_node_ids(patch["depends_on"])
     if "input_mapping" in patch and patch["input_mapping"] is not None:
@@ -1491,6 +1510,81 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
     return {"ok": True}
 
 
+@router.post("/{dag_id}/nodes/{node_id}/rename", response_model=DAGDetail)
+async def rename_node(dag_id: str, node_id: str, body: dict = Body(...), db: AsyncSession = Depends(get_db)):
+    """Rename a DAG node (pre-run only), cascading to depends_on, edges,
+    input_mapping and dag_json so the whole graph stays consistent."""
+    import re as _re4
+    new_id = str(body.get("node_id") or "").strip()
+    if not _re4.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", new_id):
+        raise HTTPException(status_code=422, detail="new node_id must be a valid slug (letters/digits/-/_)")
+
+    dag = await _get_dag_or_404(dag_id, db)
+    if dag.status in (DAGStatus.RUNNING, DAGStatus.COMPLETED):
+        raise HTTPException(status_code=400, detail="Cannot rename a node while the DAG is running or completed")
+    if dag.locked:
+        raise HTTPException(status_code=400, detail="Cannot rename nodes of a locked template")
+
+    if new_id == node_id:
+        all_nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+        return _build_dag_detail(dag, list(all_nodes_result.scalars().all()))
+
+    result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id))
+    node = result.scalar_one_or_none()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+    dup = await db.execute(select(DAGNode.id).where(DAGNode.dag_id == dag_id, DAGNode.node_id == new_id))
+    if dup.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"Node '{new_id}' already exists")
+
+    all_nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(all_nodes_result.scalars().all())
+
+    # Rename the node row + cascade depends_on in other nodes.
+    node.node_id = new_id
+    for n in all_nodes:
+        deps = n.depends_on or []
+        if node_id in deps:
+            n.depends_on = [new_id if d == node_id else d for d in deps]
+
+    # Mirror into dag_json (node_id, depends_on, input_mapping, edges).
+    dag_json = deepcopy(dag.dag_json or {})
+    for nd in dag_json.get("nodes", []):
+        if nd.get("node_id") == node_id:
+            nd["node_id"] = new_id
+        deps = nd.get("depends_on") or []
+        if node_id in deps:
+            nd["depends_on"] = [new_id if d == node_id else d for d in deps]
+        im = nd.get("input_mapping") or {}
+        if isinstance(im, dict):
+            new_im = {}
+            for k, spec in im.items():
+                if isinstance(spec, dict) and spec.get("from") == node_id:
+                    spec = dict(spec)
+                    spec["from"] = new_id
+                elif isinstance(spec, str) and spec.split(".")[0] == node_id:
+                    spec = new_id + spec[len(node_id):]
+                new_im[k] = spec
+            nd["input_mapping"] = new_im
+    for edge in dag_json.get("edges", []):
+        if edge.get("from_node") == node_id:
+            edge["from_node"] = new_id
+        if edge.get("to_node") == node_id:
+            edge["to_node"] = new_id
+
+    is_valid, errors = validate_dag(dag_json)
+    if not is_valid:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    dag.dag_json = dag_json
+    await db.commit()
+    await db.refresh(dag)
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    all_nodes = list(nodes_result.scalars().all())
+    return _build_dag_detail(dag, all_nodes)
+
+
 @router.patch("/{dag_id}/graph", response_model=DAGDetail)
 async def patch_dag_graph(dag_id: str, payload: DAGGraphPatch, db: AsyncSession = Depends(get_db)):
     """Atomically rewire node dependencies across a DAG.
@@ -1513,7 +1607,7 @@ async def patch_dag_graph(dag_id: str, payload: DAGGraphPatch, db: AsyncSession 
         if node_id not in valid_ids:
             raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
 
-    if not node_deps:
+    if not node_deps and payload.edges is None:
         return _build_dag_detail(dag, all_nodes)
 
     # Apply new depends_on to DAGNode rows.
@@ -1529,6 +1623,16 @@ async def patch_dag_graph(dag_id: str, payload: DAGGraphPatch, db: AsyncSession 
             await db.rollback()
             raise HTTPException(status_code=500, detail=f"Node '{node_id}' missing from dag_json")
         dag_node["depends_on"] = _dedupe_node_ids(deps)
+
+    # Apply explicit edges (conditional edges + loop-backs) if provided.
+    if payload.edges is not None:
+        for edge in payload.edges:
+            frm = str(edge.get("from_node") or edge.get("from") or "")
+            to = str(edge.get("to_node") or edge.get("to") or "")
+            if frm not in valid_ids or to not in valid_ids:
+                await db.rollback()
+                raise HTTPException(status_code=422, detail=f"Edge references unknown node: '{frm}' -> '{to}'")
+        dag_json["edges"] = payload.edges
 
     is_valid, errors = validate_dag(dag_json)
     if not is_valid:
@@ -1657,6 +1761,7 @@ async def add_node(dag_id: str, payload: DAGNodeCreate, db: AsyncSession = Depen
         depends_on=depends_on,
         config=config,
         input_mapping=payload.input_mapping or {},
+        node_type=payload.node_type if payload.node_type in ("agent", "decision", "input") else "agent",
     )
     db.add(new_node)
 
@@ -1909,8 +2014,8 @@ async def enhance_node(
 async def retry_dag_from_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_db)):
     """Resume execution from one failed node onward."""
     dag = await _get_dag_or_404(dag_id, db)
-    if dag.status not in (DAGStatus.FAILED, DAGStatus.COMPLETED):
-        raise HTTPException(status_code=400, detail="Run-from-node is only available for failed or completed DAGs")
+    if dag.status not in (DAGStatus.FAILED, DAGStatus.COMPLETED, DAGStatus.CANCELLED):
+        raise HTTPException(status_code=400, detail="Run-from-node is only available for failed, completed or cancelled DAGs")
 
     nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
     all_nodes = list(nodes_result.scalars().all())
@@ -2111,7 +2216,7 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
         if skill_selection_reason:
             node_def.setdefault("config", {})["skill_selection_reason"] = skill_selection_reason
         node = DAGNode(
-            dag_id=new_dag_id,
+            dag_id=dag_id,
             node_id=node_def["node_id"],
             skill_id=skill_id,
             skill_step_index=node_def.get("skill_step_index"),
@@ -2122,6 +2227,9 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
             input_mapping=node_def.get("input_mapping", {}),
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
+            node_type=node_def.get("node_type", "agent")
+            if node_def.get("node_type", "agent") in ("agent", "decision", "input")
+            else "agent",
         )
         db.add(node)
         nodes.append(node)
@@ -2323,7 +2431,9 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
         "locked": bool(getattr(dag, "locked", False)),
         "template_params": list(getattr(dag, "template_params", []) or []),
         "template_source_dag_id": getattr(dag, "template_source_dag_id", None),
+        "project_id": getattr(dag, "project_id", None),
         "dag_json": dag.dag_json,
+        "edges": [dict(e) for e in (dag.dag_json or {}).get("edges", [])],
         "nodes": [
             {
                 "id": n.id,
@@ -2343,7 +2453,9 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
                 "completed_at": n.completed_at,
                 "selected_skill_v2_id": n.selected_skill_v2_id,
                 "skill_selection_reason": n.skill_selection_reason,
-                "deliverables_keys": (n.output_data or {}).get("deliverables_keys"),
+                "deliverables_keys": (n.output_data or {}).get("deliverables_keys")
+                or (list((((n.output_data or {}).get("deliverables") or {}).keys())) if isinstance((n.output_data or {}).get("deliverables"), dict) else []),
+                "node_type": n.node_type or "agent",
             }
             for n in nodes
         ],

@@ -253,6 +253,40 @@ async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: 
         return dag_json
 
 
+def _normalize_interactive_nodes(dag_json: dict) -> dict:
+    """Ensure interactive node types are set.
+
+    Safety net for planner output: any node that is the source of a
+    "decision:<value>" edge is treated as a decision node (with options derived
+    from the edge values if the LLM did not supply a config), and input nodes
+    get their config.type set.
+    """
+    edges = dag_json.get("edges", [])
+    decision_values: dict[str, list[str]] = {}
+    for edge in edges:
+        cond = str(edge.get("condition") or "")
+        if cond.startswith("decision:"):
+            decision_values.setdefault(str(edge.get("from_node")), []).append(cond.split(":", 1)[1].strip())
+
+    for node in dag_json.get("nodes", []):
+        nid = str(node.get("node_id") or "")
+        cfg = node.setdefault("config", {})
+        if nid in decision_values:
+            node["node_type"] = "decision"
+            cfg["type"] = "decision"
+            cfg.setdefault("question", f"Decision required at '{nid}'")
+            payload = cfg.setdefault("payload", {})
+            options = payload.setdefault("options", [])
+            if not options:
+                for v in decision_values[nid]:
+                    if v not in [o.get("value") for o in options]:
+                        options.append({"label": v.replace("_", " ").capitalize(), "value": v})
+        if str(node.get("node_type") or "agent") == "input":
+            cfg["type"] = "input"
+            cfg.setdefault("prompt", f"Please provide the requested input at '{nid}'")
+    return dag_json
+
+
 PLANNER_SYSTEM_PROMPT = """\
 You are a task decomposition planner for TaskForge, a universal task orchestration platform.
 
@@ -274,6 +308,7 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
   "nodes": [
     {{
       "node_id": "unique-descriptive-id",
+      "node_type": "agent",
       "skill_id": "skill-xxx" or null,
       "skill_step_index": 0,
       "description": "What this node does",
@@ -295,11 +330,38 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
     {{
       "from_node": "review-node-id",
       "to_node": "target-node-id",
-      "condition": "review-node-id.verdict == 'FAIL'",
+      "condition": "decision:approve",
       "edge_type": "rework"
     }}
   ]
 }}
+
+Supported edge conditions: "on_success" (follow when the source completed), "on_failure" (follow when the source failed), "decision:<value>" (follow when a decision node's answer equals <value>). Omit "condition" to always follow.
+
+## Interactive Nodes (decision / input)
+Some steps require HUMAN input mid-flow. Use them ONLY when the objective explicitly calls for a review, approval, or user-provided data. They pause the workflow until the user responds.
+
+### decision node (node_type: "decision")
+Pauses the workflow and asks the user to pick one option. The runtime then runs ONLY the branch matching the chosen option; other branches are skipped.
+- config: {{ "type": "decision", "question": "Approve the generated report?", "payload": {{ "require_justification": false, "options": [ {{ "label": "Approve", "value": "approve" }}, {{ "label": "Rework", "value": "rework", "require_justification": true }} ] }} }}
+- "require_justification": true (either on the payload — all options — or on a specific option) makes the UI show a REQUIRED text field where the user explains their choice (e.g. why they reject/rework). Set it on options where an explanation matters (reject/rework/cancel), not on simple accepts.
+- The user may always add an optional justification; the chosen option is stored on the node output as "choice" and "justification".
+- When a rework node follows a rejected decision, its node_objective MUST tell the agent to read the rejection justification from input_data (the decision node's output contains "justification", e.g. input_data.approve-report.justification) and address it specifically.
+- Routing: add one edge per option from the decision node to that option's next node, with condition "decision:<value>" (e.g. "decision:approve", "decision:rework").
+- The chosen option is stored on the node output as "choice" (and "justification" if the user provided one).
+- IMPORTANT: do NOT put a single downstream node that depends on BOTH branch targets (the skipped branch would block it). Keep the branches separate (they may terminate the flow, or each lead to its own next step).
+- For APPROVAL gates, prefer THREE options: "accept", "reject", "cancel" — accept proceeds, reject routes to a rework step, and cancel ends the DAG (no edge for the cancel option, so the remaining steps are skipped).
+- CLOSED LOOP: to re-approve after rework, add a loop-back edge from the rework node back to the decision node with edge_type "loop" (and condition "on_success"). The runtime then re-runs the decision node after rework so the user can re-approve. Example:
+  {{ "from_node": "rework-node", "to_node": "approval-node", "condition": "on_success", "edge_type": "loop" }}
+
+### input node (node_type: "input")
+Pauses the workflow and asks the user to provide data (measurements, parameters, values).
+- config: {{ "type": "input", "prompt": "Enter the target revenue for verification", "payload": {{ "fields": [ {{ "key": "target_revenue", "label": "Target Revenue", "type": "number" }}, {{ "key": "quarter", "label": "Quarter", "type": "text" }} ] }} }}
+- field "type": text | number | select.
+- The user's values are stored on the node output under "fields". Downstream nodes can reference them via input_mapping, e.g. {{ "target_revenue": "collect-kpi.fields.target_revenue" }}.
+
+### agent node (node_type: "agent")
+Default — executes in an isolated container using the selected base_image + skill. No human interaction.
 
 ## Rules
 1. Minimize total nodes — combine trivial steps.
@@ -308,11 +370,12 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
 4. Every node must have a unique node_id.
 5. depends_on lists the node_ids that must complete before this node starts.
 6. Only the final deployment node should have deploy_authorized: true.
-7. Use review/verdict nodes sparingly — only when quality gates are needed.
-8. base_image options: {base_images_section}. Choose using runtime + capabilities + best_for, and avoid images whose avoid_for conflicts with the node's task.
-9. Set each node config.llm_model to the requested execution model and do not use GPT models.
-10. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
-11. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
+7. Use review/verdict (decision) nodes sparingly — only when the objective explicitly calls for a human review/approval gate, not as a default for every step. When used, give 2-3 clear options and wire each branch with a "decision:<value>" edge condition.
+8. Use input nodes only when the user must supply data (measurements/parameters) mid-flow that cannot be derived automatically; wire the fields so downstream nodes can consume them via input_mapping.
+9. base_image options: {base_images_section}. Choose using runtime + capabilities + best_for, and avoid images whose avoid_for conflicts with the node's task.
+10. Set each node config.llm_model to the requested execution model and do not use GPT models.
+11. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
+12. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
 """
 
 

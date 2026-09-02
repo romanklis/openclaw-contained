@@ -387,53 +387,12 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  # =============================================================================
-  # DOCLING RAG — external RAG tool (offline SQLite + Ollama embeddings)
-  # Web UI at http://localhost:8086 (host 8080 is used by api-gateway)
-  # =============================================================================
-  docling-rag:
-    build:
-      context: .
-      dockerfile: Dockerfile.docling-rag
-    container_name: docling-rag
-    restart: unless-stopped
-    ports:
-      - "8086:8080"
-    volumes:
-      - docling_data:/app/data
-    environment:
-      - RAG_HTTP_ADDR=0.0.0.0:8080
-      - RAG_API_KEYS=${RAG_API_KEYS:-my-local-secret-key}
-      - RAG_DB_BACKEND=sqlite
-      - RAG_DATABASE_URL=sqlite:///app/data/rag.db
-      - RAG_CHUNKER=${RAG_CHUNKER:-hierarchical}
-      - RAG_EMBED_PROVIDER=ollama
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - RAG_EMBED_MODEL=${RAG_EMBED_MODEL:-bge-m3}
-      - RAG_EMBED_DIM=1024
-    depends_on:
-      - ollama
-    networks:
-      - openclaw-network
-
-  # -----------------------------------------------------------------------------
-  # Local embeddings provider (internal-only: does NOT publish 11434, so it
-  # never shadows a host-installed Ollama used via host.docker.internal)
-  # -----------------------------------------------------------------------------
-  ollama:
-    image: ollama/ollama:latest
-    container_name: docling-ollama
-    restart: unless-stopped
-    volumes:
-      - ollama_models:/root/.ollama
-    networks:
-      - openclaw-network
-
 # =============================================================================
 # NETWORKS
 # =============================================================================
 networks:
   openclaw-network:
+    name: openclaw-contained_openclaw-network
     driver: bridge
 
 # =============================================================================
@@ -446,5 +405,3 @@ volumes:
   registry-data:
   docker-data:
   open-webui-data:
-  docling_data:
-  ollama_models:

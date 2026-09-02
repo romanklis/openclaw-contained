@@ -1,0 +1,63 @@
+# Docling RAG example — extra infrastructure.
+#
+# Docling RAG (the external RAG tool) + its local Ollama embeddings provider
+# used to live in the CORE docker-compose; they were moved here to keep the
+# main platform compose clean. Bringing up this example starts them on the
+# platform network, plus a tiny static server that serves the sample PDF
+# (http://sample-docs:8080/sample.pdf) as the external document source.
+
+networks:
+  default:
+    name: openclaw-contained_openclaw-network
+    external: true
+
+services:
+  sample-docs:
+    image: nginx:alpine
+    container_name: docling-sample-docs
+    volumes:
+      - ./data:/usr/share/nginx/html:ro
+    networks:
+      - default
+
+  # External RAG tool (offline SQLite + Ollama embeddings).
+  # Web UI at http://localhost:8086 (host 8080 is used by api-gateway).
+  docling-rag:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.docling-rag
+    container_name: docling-rag
+    restart: unless-stopped
+    ports:
+      - "8086:8080"
+    volumes:
+      - docling_data:/app/data
+    environment:
+      - RAG_HTTP_ADDR=0.0.0.0:8080
+      - RAG_API_KEYS=${RAG_API_KEYS:-my-local-secret-key}
+      - RAG_DB_BACKEND=sqlite
+      - RAG_DATABASE_URL=sqlite:///app/data/rag.db
+      - RAG_CHUNKER=${RAG_CHUNKER:-hierarchical}
+      - RAG_EMBED_PROVIDER=ollama
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - RAG_EMBED_MODEL=${RAG_EMBED_MODEL:-bge-m3}
+      - RAG_EMBED_DIM=1024
+    depends_on:
+      - ollama
+    networks:
+      - default
+
+  # Local embeddings provider (internal-only: does NOT publish 11434, so it
+  # never shadows a host-installed Ollama used via host.docker.internal).
+  ollama:
+    image: ollama/ollama:latest
+    container_name: docling-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - default
+
+volumes:
+  docling_data:
+  ollama_models:

@@ -901,24 +901,16 @@ export default function TaskDetailPage() {
           )}
         </div>
 
-        {/* Agent Profile Banner */}
-        {(timeline?.task?.agent_profile || currentState?.agent_profile) && (
+        {/* Agent Image Banner */}
+        {(timeline?.task?.current_image || currentState?.current_image) && (
           <div className="bg-gradient-to-r from-indigo-900/20 to-violet-900/20 border border-indigo-500/20 rounded-lg p-4 mb-4 flex items-center gap-3">
-            <span className="text-lg">🤖</span>
+            <span className="text-lg">📦</span>
             <div>
-              <div className="text-xs text-gray-500 uppercase tracking-wider">Agent Profile</div>
-              <div className="text-sm font-semibold text-indigo-300">
-                {timeline?.task?.agent_profile || currentState?.agent_profile}
+              <div className="text-xs text-gray-500 uppercase tracking-wider">Agent Image</div>
+              <div className="text-sm font-mono text-indigo-300">
+                {(timeline?.task?.current_image || currentState?.current_image || '').split(':').pop() || 'openclaw'}
               </div>
             </div>
-            {timeline?.task?.current_image && (
-              <div className="ml-auto text-right">
-                <div className="text-xs text-gray-500 uppercase tracking-wider">Base Image</div>
-                <div className="text-sm font-mono text-purple-400">
-                  {timeline.task.current_image.split(':').pop() || 'openclaw'}
-                </div>
-              </div>
-            )}
           </div>
         )}
 
@@ -978,9 +970,9 @@ export default function TaskDetailPage() {
                         ))}
                       </div>
                     )}
-                    {st.agent_profile && !st.has_pending_approval && (
+                    {!st.has_pending_approval && (
                       <div className="mt-1 text-[10px] text-gray-600">
-                        Profile: {st.agent_profile}
+                        Image: {String(st.current_image || st.node_id || '').split(':').pop() || 'openclaw'}
                       </div>
                     )}
                   </div>
@@ -1780,7 +1772,7 @@ export default function TaskDetailPage() {
                               <span className="font-semibold">{req.type}: {req.resource}</span>
                               {subtaskInfo && (
                                 <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">
-                                  {subtaskInfo.role || subtaskInfo.agent_profile}
+                                  {subtaskInfo.role || subtaskInfo.node_id || ''}
                                 </span>
                               )}
                             </div>

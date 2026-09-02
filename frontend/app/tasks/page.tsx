@@ -3,7 +3,6 @@
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { StatusDot, StatusBadge } from '../components/StatusComponents'
-import { AgentProfileBadge } from '../components/AgentProfileBadge'
 import { API, API_GATEWAY } from '../lib/api'
 
 interface Task {
@@ -26,16 +25,15 @@ interface Deployment {
   url: string | null
 }
 
-interface AgentProfile {
+interface ModelOption {
   id: string
-  profile_name?: string
-  profile_description?: string
-  base_image?: string
-  llm_model?: string
-  runtime?: string
-  icon?: string
-  tags?: string[]
-  strengths?: string[]
+  owned_by?: string
+}
+
+interface ImageOption {
+  id: string
+  name: string
+  description?: string
 }
 
 export default function TasksPage() {
@@ -49,31 +47,31 @@ export default function TasksPage() {
   // Form state
   const [taskName, setTaskName] = useState('')
   const [taskDescription, setTaskDescription] = useState('')
-  const [selectedProfile, setSelectedProfile] = useState('')
+  const [selectedModel, setSelectedModel] = useState('')
+  const [selectedImage, setSelectedImage] = useState('openclaw')
   const [maxIterations, setMaxIterations] = useState(10)
-  const [availableProfiles, setAvailableProfiles] = useState<AgentProfile[]>([])
-
-  const currentProfile = availableProfiles.find(p => p.id === selectedProfile) || null
+  const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
+  const [availableImages, setAvailableImages] = useState<ImageOption[]>([])
 
   useEffect(() => {
-    fetch(`${API_GATEWAY}/v1/agent-profiles`)
+    fetch(`${API_GATEWAY}/v1/models`)
       .then((r) => r.json())
       .then((data) => {
-        const profiles = data.profiles || []
-        setAvailableProfiles(profiles)
-        if (profiles.length > 0) setSelectedProfile(profiles[0].id)
+        const models = (data.data || []).filter((m: any) => !String(m.id).startsWith('taskforge-'))
+        setAvailableModels(models)
+        if (models.length > 0) setSelectedModel(models[0].id)
       })
-      .catch(() => {
-        // Fallback: try the /v1/models endpoint
-        fetch(`${API_GATEWAY}/v1/models`)
-          .then((r) => r.json())
-          .then((data) => {
-            const models = (data.data || []).filter((m: any) => m.base_image)
-            setAvailableProfiles(models)
-            if (models.length > 0) setSelectedProfile(models[0].id)
-          })
-          .catch(() => {})
+      .catch(() => {})
+    fetch(`${API}/api/agent-images`)
+      .then((r) => r.json())
+      .then((imgs: ImageOption[]) => {
+        const list = Array.isArray(imgs) ? imgs : []
+        setAvailableImages(list)
+        if (list.length > 0 && !list.some((i) => i.id === 'openclaw')) {
+          setSelectedImage(list[0].id)
+        }
       })
+      .catch(() => {})
   }, [])
 
   const fetchTasks = async () => {
@@ -113,9 +111,8 @@ export default function TasksPage() {
         body: JSON.stringify({
           name: taskName,
           description: taskDescription,
-          llm_model: currentProfile?.llm_model || selectedProfile,
-          base_image: currentProfile?.base_image || 'openclaw',
-          agent_profile: selectedProfile,
+          llm_model: selectedModel,
+          base_image: selectedImage,
           agent_config: { max_iterations: maxIterations, timeout: 600 },
         }),
       })
@@ -187,22 +184,37 @@ export default function TasksPage() {
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">Agent Profile</label>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">LLM Model</label>
                 <select
-                  value={selectedProfile}
-                  onChange={(e) => setSelectedProfile(e.target.value)}
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
                   className="input-field"
                 >
-                  {availableProfiles.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.icon || '🤖'} {p.profile_name || p.id}
-                    </option>
+                  {availableModels.map((m) => (
+                    <option key={m.id} value={m.id}>{m.id}</option>
                   ))}
-                  {availableProfiles.length === 0 && (
-                    <option value="general-assistant">🤖 General Assistant</option>
+                  {availableModels.length === 0 && (
+                    <option value="">(using default model)</option>
                   )}
                 </select>
               </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">Agent Image</label>
+                <select
+                  value={selectedImage}
+                  onChange={(e) => setSelectedImage(e.target.value)}
+                  className="input-field"
+                >
+                  {availableImages.map((i) => (
+                    <option key={i.id} value={i.id}>{i.name || i.id}</option>
+                  ))}
+                  {availableImages.length === 0 && (
+                    <option value="openclaw">openclaw</option>
+                  )}
+                </select>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-medium text-gray-400 mb-1.5">Max Iterations</label>
                 <input
@@ -215,11 +227,6 @@ export default function TasksPage() {
                 />
               </div>
             </div>
-
-            {/* Agent Profile Details */}
-            {currentProfile && (
-              <AgentProfileBadge profile={currentProfile} />
-            )}
             {error && (
               <div className="bg-red-500/10 border border-red-500/20 text-red-400 text-sm rounded-lg p-3">
                 {error}
