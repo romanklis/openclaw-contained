@@ -715,6 +715,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "wait",
+            "description": "Block (sleep) until a shell condition is true or a timeout elapses, checking every poll_every_seconds. Use when an EXTERNAL job must finish first (e.g. an async upload/index/search is still processing). Returns when the condition holds; no LLM turns are spent while waiting.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell snippet that exits 0 when the condition is met (e.g. a curl/python status check), non-zero otherwise."},
+                    "timeout_seconds": {"type": "integer", "description": "Overall wait budget (default 600, max 900)."},
+                    "poll_every_seconds": {"type": "integer", "description": "How often to re-check (default 15, min 5)."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
 
 
@@ -794,6 +810,50 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
                 f.write(content)
             return f"✅ Edited {path}"
 
+        elif name == "wait":
+            command = arguments["command"]
+            timeout_s = max(10, min(900, int(arguments.get("timeout_seconds", 600))))
+            poll_s = max(5, min(60, int(arguments.get("poll_every_seconds", 15))))
+            deadline = time.time() + timeout_s
+            last_out = "(no output yet)"
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    proc = subprocess.Popen(
+                        command,
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        cwd="/workspace",
+                        start_new_session=True,
+                    )
+                    try:
+                        out, err = proc.communicate(timeout=min(poll_s, remaining))
+                    except subprocess.TimeoutExpired:
+                        _kill_tree(proc)
+                        out, err = proc.communicate(timeout=5)
+                    out = out or ""
+                    err = err or ""
+                    if out and err:
+                        out = out + "\n" + err
+                    elif err:
+                        out = err
+                    last_out = out.strip() or f"(exit code {proc.returncode})"
+                    if proc.returncode == 0:
+                        elapsed = int(time.time() - (deadline - timeout_s))
+                        return f"✔ condition met after {elapsed}s.\n{last_out[:4000]}"
+                except Exception as e:
+                    last_out = f"error: {e}"
+                time.sleep(max(0.0, min(poll_s, max(0.0, deadline - time.time()))))
+            return (
+                f"⏱ wait timed out after {timeout_s}s — condition not met.\n"
+                f"Last check:\n{last_out[:8000]}\n"
+                "If the external job is still running, call wait AGAIN with the same command."
+            )
+
         else:
             return f"ERROR: Unknown tool '{name}'"
 
@@ -815,11 +875,12 @@ def build_system_prompt() -> str:
         "Write final deliverables to your node's deliverables directory (e.g. /workspace/<node_id>/, given in the task prompt).",
         "Intermediate/raw files (fetched HTML pages, caches, scratch) go to /tmp or /workspace/.cache/ and are NOT collected.",
         "",
-        "You have these tools: write, read, exec, edit.",
+        "You have these tools: write, read, exec, edit, wait.",
         "- write: Create/overwrite a file",
         "- read: Read a file's content",
         "- exec: Run a shell command (use to test your code!)",
         "- edit: Replace a string in a file",
+        "- wait: Block until a shell condition is true (use for long external jobs, e.g. async indexing/search). No LLM turns are spent while waiting.",
         "",
         "IMPORTANT RULES:",
         "1. Always write code to /workspace",
