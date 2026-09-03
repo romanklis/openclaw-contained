@@ -2,10 +2,22 @@
 
 **Auditable Agent Orchestration for [OpenClaw](https://github.com/openclaw/openclaw)**
 
+Built on [OpenClaw](https://github.com/openclaw/openclaw) · orchestrated by **Temporal** · sandboxed with [Docker](https://www.docker.com)/[gVisor](https://gvisor.dev)
+
 > **Disclaimer:** This project is not affiliated with or endorsed by the OpenClaw project.
 > TaskForge is an independent orchestration layer that wraps the OpenClaw agent runtime.
 
 ---
+
+<p align="center">
+  <img src="assets/images/workflow-screenshot.png" alt="TaskForge DAG workflow graph" width="75%">
+  <br><em>The DAG editor — parallel steps, conditional edges and the closed-loop approval gate at a glance.</em>
+</p>
+
+<p align="center">
+  <img src="assets/images/workflow-execution.gif" alt="TaskForge workflow executing live" width="75%">
+  <br><em>Watch a workflow execute: steps run, live LLM-turn counters tick per node, and human approvals pause/resume the flow.</em>
+</p>
 
 ## What It Does
 
@@ -32,6 +44,8 @@ rebuild, and every LLM interaction is logged for audit.
 - **💬 OpenAI-Compatible API Gateway** — `POST /v1/chat/completions` with SSE streaming, so any OpenAI-compatible client (Open WebUI, LibreChat, Chainlit, curl) can drive tasks through a standard chat interface
 - **🔄 Real-time turn-by-turn streaming** — see every tool call (⚡📝📖✏️🌐) as the agent works, plus capability approval lifecycle updates, deployment status, and clickable links to Temporal UI and the dashboard
 - **🌐 Open WebUI integration** — pre-wired chat UI at port 3001; create an account and start chatting
+- **🧩 Reusable skill library** — Skill Studio skills with code-like instructions (RAG Query, Answer Synthesis, Platform LLM Chat, …) that agents follow deterministically instead of rediscovering APIs
+- **🌊 Examples & showcases** — see the [Docling RAG example](examples/docling-rag/README.md) driving an external RAG service end-to-end (PDF ingest → hybrid search → approved report)
 
 ### 💬 From Chat to Deployed App — in One Prompt
 
@@ -98,7 +112,7 @@ data-exchange best practices.
 
 ### Prerequisites
 
-- **Docker 24+** with Docker Compose v1 (`docker-compose`)
+- **Docker 24+** with Docker Compose v1 (`docker-compose`, used by the Makefile) — or Docker Compose v2 with `docker-compose` aliased to `docker compose`.
 - **16GB+ RAM** recommended (base agent image build uses ~1.8GB)
 - At least one LLM provider configured (Ollama local, or a cloud API key)
 
@@ -128,7 +142,10 @@ OPENAI_API_KEY=your-key-here
 make up
 ```
 
-This starts all 13 services. On first boot, the **image-builder** will automatically build
+This starts the full platform — **15 services**: control plane, API gateway, frontend,
+Open WebUI, Temporal (server + UI + worker + its Postgres), app Postgres + Redis,
+image-builder, internal registry, Docker-in-Docker sandbox, and Zep memory. On first
+boot, the **image-builder** will automatically build
 and push the base agent image (`openclaw-agent:openclaw`) to the internal registry. This takes
 several minutes on the first run (~2.3GB image).
 
