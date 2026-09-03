@@ -1063,14 +1063,33 @@ async def download_file(task_id: str, iteration: int, filename: str, inline: int
 
     def _serve(content) -> Response:
         headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
+        # Large deliverables (>500KB, e.g. PDFs) are stored as workspace file
+        # references (dicts). Fetch the RAW bytes from the control-plane's
+        # workspace reader and pass them through verbatim.
+        if isinstance(content, dict):
+            from urllib.parse import quote
+            try:
+                resp = httpx.get(
+                    f"{settings.CONTROL_PLANE_URL}/api/tasks/{task_id}/files/{iteration}/{quote(filename, safe='/')}",
+                    timeout=60,
+                )
+            except Exception:
+                raise HTTPException(status_code=502, detail="Cannot reach control-plane")
+            if resp.status_code != 200:
+                try:
+                    detail = resp.json().get("detail", resp.text[:300])
+                except Exception:
+                    detail = resp.text[:300]
+                raise HTTPException(status_code=resp.status_code, detail=detail)
+            return Response(content=resp.content, media_type=_guess_mime(filename), headers=headers)
         if isinstance(content, str) and content.startswith("base64:"):
             raw = base64.b64decode(content[7:])
             return Response(content=raw, media_type=_guess_mime(filename), headers=headers)
-        return Response(
-            content=content.encode("utf-8") if isinstance(content, str) else content,
-            media_type=_guess_mime(filename),
-            headers=headers,
-        )
+        if isinstance(content, str):
+            return Response(content=content.encode("utf-8"), media_type=_guess_mime(filename), headers=headers)
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            return Response(content=content, media_type=_guess_mime(filename), headers=headers)
+        raise HTTPException(status_code=404, detail=f"Deliverable '{filename}' has an unsupported format")
 
     # 1) Exact iteration first.
     for o in own_outputs:

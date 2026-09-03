@@ -293,6 +293,7 @@ export default function DeliverablePreview({ url, filename }: { url: string; fil
 function TextPreview({ url, filename, lang }: { url: string; filename: string; lang: Lang }) {
   const [content, setContent] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [wrap, setWrap] = useState(true)
 
   useEffect(() => {
     let cancelled = false
@@ -335,19 +336,35 @@ function TextPreview({ url, filename, lang }: { url: string; filename: string; l
   const tokens = lang === 'markdown' ? null : tokenize(content, lang)
 
   return (
-    <pre
-      className="w-full h-full overflow-auto overscroll-contain m-0 p-4 text-[12px] leading-relaxed"
-      style={{ background: '#0d1117', color: COLORS.plain, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
-    >
-      {tokens ? (
-        <code>
-          {tokens.map((t, idx) => (
-            <TokenSpan key={idx} token={t} lang={lang} />
-          ))}
-        </code>
-      ) : (
-        <code>{renderMarkdown(content)}</code>
-      )}
-    </pre>
+    <div className="relative w-full h-full">
+      <div className="absolute top-2 right-2 z-10 flex items-center">
+        <button
+          type="button"
+          onClick={() => setWrap((w) => !w)}
+          className={`px-2 py-0.5 rounded border text-[10px] transition-colors ${
+            wrap
+              ? 'border-indigo-500/60 bg-indigo-900/70 text-indigo-200'
+              : 'border-gray-700 bg-gray-900/80 text-gray-400 hover:text-gray-200'
+          }`}
+          title={wrap ? 'Disable line wrapping' : 'Enable line wrapping'}
+        >
+          Wrap: {wrap ? 'on' : 'off'}
+        </button>
+      </div>
+      <pre
+        className={`w-full h-full overflow-auto overscroll-contain m-0 p-4 text-[12px] leading-relaxed ${wrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
+        style={{ background: '#0d1117', color: COLORS.plain, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+      >
+        {tokens ? (
+          <code>
+            {tokens.map((t, idx) => (
+              <TokenSpan key={idx} token={t} lang={lang} />
+            ))}
+          </code>
+        ) : (
+          <code>{renderMarkdown(content)}</code>
+        )}
+      </pre>
+    </div>
   )
 }

@@ -45,7 +45,7 @@ up: ## Start all services (first run auto-builds base agent image)
 	 fi
 	docker-compose up -d
 	@echo ""
-	@echo "  ✅  TaskForge is starting (10 services)"
+	@echo "  ✅  TaskForge is starting (15 services)"
 	@echo ""
 	@echo "  Frontend:        http://localhost:3000"
 	@echo "  API:             http://localhost:8000"

@@ -14,6 +14,10 @@ For a concrete end-to-end walk-through, see the
 [Docling RAG example](examples/docling-rag/README.md) and its
 [architecture & workflow diagram](examples/docling-rag/taskforge-docling-rag-integration.xml).
 
+For a visual overview, see the
+[live workflow execution](assets/images/workflow-execution.gif) and the
+[DAG graph screenshot](assets/images/workflow-screenshot.png) on the main README.
+
 ## Core Principles
 
 1. **Agent as Requesting Actor** — agents never self-authorize actions

@@ -2,6 +2,8 @@
 Extended task endpoints for execution tracking
 """
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import Response
+import mimetypes
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
@@ -373,6 +375,68 @@ async def get_task_outputs(
             for o in outputs
         ],
     }
+
+
+@router.get("/{task_id}/files/{iteration:int}/{filename:path}")
+async def get_task_ref_file(
+    task_id: str,
+    iteration: int,
+    filename: str,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Serve a large (file-reference) deliverable from the shared workspace.
+
+    The agent workspace collector embeds deliverables inline only up to a size
+    cap; larger files (e.g. big PDFs) are stored as a reference dict
+    ``{"ref": "file", "path": "/workspace/<rel>", ...}``. Those bytes live on
+    the shared ``/workspaces`` volume under the task's workspace, not in the
+    DB. This endpoint resolves the reference and returns the file's RAW bytes
+    verbatim (binary-safe; correct media type from the filename).
+
+    Only references for THIS task are served; path traversal is blocked.
+    """
+    task_result = await db.execute(select(Task).where(Task.id == task_id))
+    task = task_result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+    workspace_id = task.workspace_id or f"workspace-{task_id}"
+
+    result = await db.execute(
+        select(TaskOutput)
+        .where(TaskOutput.task_id == task_id, TaskOutput.iteration == iteration)
+    )
+    output = result.scalars().first()
+    if not output:
+        raise HTTPException(status_code=404, detail=f"Iteration {iteration} not found for task {task_id}")
+
+    deliverables = output.deliverables or {}
+    content = deliverables.get(filename)
+    if not isinstance(content, dict) or content.get("ref") != "file":
+        raise HTTPException(
+            status_code=404,
+            detail=f"Deliverable '{filename}' is inline content — use the gateway file endpoint",
+        )
+
+    rel = str(content.get("path", "")).replace("/workspace/", "", 1)
+    if rel.startswith("/") or ".." in rel.split("/"):
+        raise HTTPException(status_code=400, detail="Invalid deliverable path")
+
+    workspace_root = f"/workspaces/{workspace_id}"
+    abs_path = os.path.realpath(os.path.join(workspace_root, rel))
+    if not abs_path.startswith(os.path.realpath(workspace_root) + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid deliverable path")
+
+    if not os.path.isfile(abs_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"File '{filename}' is stored on the workspace but no longer present at {abs_path}",
+        )
+
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    with open(abs_path, "rb") as f:
+        raw = f.read()
+    return Response(content=raw, media_type=mime)
 
 
 # =========================================================================

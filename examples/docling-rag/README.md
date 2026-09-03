@@ -1,5 +1,13 @@
 # Docling RAG — showcase example
 
+<p align="center">
+  <img src="../../assets/icons/docling.svg" width="26" alt="Docling"> <strong>Docling RAG</strong> — a TaskForge showcase
+  <br>
+  <em>driven by <img src="../../assets/icons/openclaw.svg" width="12" alt="OpenClaw"> OpenClaw ·
+  orchestrated by <img src="../../assets/icons/Temporal_LogoLockup_Horizontal_dark_1.svg" width="72" alt="Temporal"> Temporal ·
+  sandboxed with <img src="../../assets/icons/docker.svg" width="12" alt="Docker"> Docker/gVisor</em>
+</p>
+
 Demonstrates the platform driving an **external tool** end-to-end: the Docling
 RAG service (moved out of the core compose into this example) is used to ingest
 a PDF, search it with hybrid retrieval, and produce an approved report — with a
@@ -38,6 +46,18 @@ two pages:
   branch) → finalize. A callout explains why this is a durable Temporal
   workflow rather than ad-hoc HTTP calls: retries on failure, pause/resume for
   human approval, and full history in Temporal UI.
+
+## Live run
+
+A real execution of this example's DAG — parallel steps, live LLM-turn counters per node, and the approval gate:
+
+<p align="center">
+  <img src="../../assets/images/workflow-screenshot.png" alt="TaskForge Docling RAG DAG graph" width="85%">
+</p>
+
+<p align="center">
+  <img src="../../assets/images/workflow-execution.gif" alt="TaskForge executing the Docling RAG workflow" width="85%">
+</p>
 
 ## Run
 ```bash
