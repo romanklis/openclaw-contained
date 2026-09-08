@@ -115,3 +115,7 @@ agent-images/deployments/*
 
 
 .kilo
+
+# Credential store — keep real secrets out of git (the sample stays)
+config/credentials/*.json
+!config/credentials/example-basic.json

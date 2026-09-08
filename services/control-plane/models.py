@@ -159,6 +159,71 @@ class CapabilityRequest(Base):
     task = relationship("Task", back_populates="capability_requests")
 
 
+class CredentialRequest(Base):
+    """Human approval request for an agent to use a stored credential
+    against a specific origin (scoped grant)."""
+
+    __tablename__ = "credential_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_session = Column(String, nullable=False)  # e.g. task:<task_id>
+    credential_name = Column(String, nullable=False)
+    origin = Column(String, nullable=False)  # scheme://netloc scope
+    method = Column(String, default="GET")
+    reason = Column(Text, default="")
+
+    status = Column(String, default="pending")  # pending|approved|denied|cancelled
+    ttl_minutes = Column(Integer, default=5)
+    allowed_methods = Column(JSON, default=lambda: ["GET", "POST"])
+    requested_at = Column(DateTime, server_default=func.now())
+    reviewed_at = Column(DateTime)
+    reviewed_by = Column(String)
+
+
+class CredentialGrantLog(Base):
+    """Audit trail of approved credential grants."""
+
+    __tablename__ = "credential_grant_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    request_id = Column(Integer, ForeignKey("credential_requests.id"))
+    agent_session = Column(String)
+    credential_name = Column(String)
+    origin = Column(String)
+    method = Column(String)
+    ttl_minutes = Column(Integer)
+    granted_at = Column(DateTime, server_default=func.now())
+    reviewed_by = Column(String)
+
+
+class Block(Base):
+    """A reusable deterministic block (typed I/O + pinned implementation)."""
+
+    __tablename__ = "blocks"
+
+    id = Column(String, primary_key=True)          # unique slug/name
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    runtime = Column(String, default="worker-python")
+    entrypoint = Column(String, default="main")
+    inputs_schema = Column(JSON, default=dict)
+    outputs_schema = Column(JSON, default=dict)
+    code_json = Column(JSON, default=dict)         # {"files": {name: source}}
+    conformance_json = Column(JSON, default=dict)  # {"sample_input": {...}, "expect": ...}
+    status = Column(String, default="draft")       # draft|active|archived
+    version = Column(Integer, default=1)
+    author = Column(String, default="")
+    created_at = Column(DateTime, server_default=func.now())
+
+    @property
+    def code(self) -> dict:
+        return self.code_json or {}
+
+    @property
+    def conformance(self) -> dict:
+        return self.conformance_json or {}
+
+
 class TaskOutput(Base):
     """Stores output from each agent iteration"""
     __tablename__ = "task_outputs"
@@ -739,6 +804,12 @@ class SkillV2(Base):
     name = Column(String, nullable=False)
     description = Column(Text, default="")
     instructions = Column(Text, default="")         # injected verbatim at agent start
+    code_json = Column(JSON, default=dict)          # driver bundle: {"files": {name: source}, "entrypoint": ...}
+
+    @property
+    def code(self) -> dict:
+        """Driver bundle attached to this skill (surfaced to the agent as files)."""
+        return self.code_json or {}
 
     status = Column(SQLEnum(SkillV2Status), default=SkillV2Status.DRAFT, nullable=False)
     source_type = Column(SQLEnum(SkillV2Source), default=SkillV2Source.MANUAL, nullable=False)

@@ -69,6 +69,40 @@ function ApprovalsContent() {
   const [decisionPending, setDecisionPending] = useState<Record<number, { choice: string; label: string } | null>>({})
   const [decisionJustification, setDecisionJustification] = useState<Record<number, string>>({})
 
+  // ── Credential access requests (credential gateway) ──────────────────
+  const [credRequests, setCredRequests] = useState<any[]>([])
+  const [credLoading, setCredLoading] = useState(true)
+  const [credAction, setCredAction] = useState<number | null>(null)
+
+  const fetchCredRequests = async () => {
+    try {
+      const [pending, all] = await Promise.all([
+        fetch(`${API}/api/credential-requests?status_filter=pending`).then((r) => r.json()),
+        fetch(`${API}/api/credential-requests`).then((r) => r.json()).catch(() => []),
+      ])
+      setCredRequests(Array.isArray(pending) ? pending : [])
+      setCredLoading(false)
+    } catch {
+      setCredLoading(false)
+    }
+  }
+
+  const reviewCredRequest = async (requestId: number, decision: string) => {
+    setCredAction(requestId)
+    try {
+      await fetch(`${API}/api/credential-requests/${requestId}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision, reviewed_by: 'admin' }),
+      })
+      fetchCredRequests()
+    } catch (error) {
+      console.error('Credential review failed:', error)
+    } finally {
+      setCredAction(null)
+    }
+  }
+
   const fetchUserRequests = async () => {
     try {
       const res = await fetch(`${API}/api/dags/user-requests?status=pending`)
@@ -137,7 +171,8 @@ function ApprovalsContent() {
 
   useEffect(() => {
     fetchRequests()
-    const interval = setInterval(fetchRequests, 5000)
+    fetchCredRequests()
+    const interval = setInterval(() => { fetchRequests(); fetchCredRequests() }, 5000)
     return () => clearInterval(interval)
   }, [])
 
@@ -345,6 +380,62 @@ function ApprovalsContent() {
         >
           History ({displayedHistory.length})
         </button>
+      </div>
+
+      {/* Credential access requests (credential gateway) */}
+      <div className="mb-6 rounded border border-cyan-800/40 bg-cyan-950/10 p-4">
+        <div className="text-sm font-semibold text-cyan-200 mb-3">
+          🔐 Credential Access Requests ({credRequests.length}) — agents asking to use a stored credential
+        </div>
+        {credLoading ? (
+          <p className="text-xs text-gray-500">Loading credential requests…</p>
+        ) : credRequests.length === 0 ? (
+          <p className="text-xs text-gray-600">No pending credential requests. When a browser_v4 agent uses
+            <code className="text-cyan-300"> web.get(url, credential="…")</code>, the request appears here for approval.
+          </p>
+        ) : (
+          <div className="space-y-3">
+            {credRequests.map((req: any) => (
+              <div key={req.id} className="rounded border border-cyan-800/40 bg-black/10 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap mb-1">
+                      <span className="font-medium text-white text-sm">{req.origin}</span>
+                      <span className="text-xs bg-cyan-900/40 border border-cyan-700/40 text-cyan-300 px-2 py-0.5 rounded font-mono">
+                        {req.credential_name}
+                      </span>
+                      <span className="text-xs bg-[#12121a] border border-[#232333] text-gray-400 px-2 py-0.5 rounded uppercase">
+                        {req.method}
+                      </span>
+                      <span className="text-[10px] text-gray-500">{req.agent_session}</span>
+                    </div>
+                    {req.reason && <p className="text-xs text-gray-400 mb-1">“{req.reason}”</p>}
+                    <p className="text-[10px] text-gray-600">
+                      Requested {req.requested_at ? new Date(req.requested_at).toLocaleString() : ''} ·
+                      default grant {req.ttl_minutes} min
+                    </p>
+                  </div>
+                  <div className="flex gap-2 shrink-0">
+                    <button
+                      onClick={() => reviewCredRequest(req.id, 'approved')}
+                      disabled={credAction === req.id}
+                      className="btn-success text-xs"
+                    >
+                      {credAction === req.id ? '…' : '✓ Approve'}
+                    </button>
+                    <button
+                      onClick={() => reviewCredRequest(req.id, 'denied')}
+                      disabled={credAction === req.id}
+                      className="btn-danger text-xs"
+                    >
+                      ✕ Deny
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Pending */}

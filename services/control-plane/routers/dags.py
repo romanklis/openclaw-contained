@@ -214,7 +214,7 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
             node_type=node_def.get("node_type", "agent")
-            if node_def.get("node_type", "agent") in ("agent", "decision", "input")
+            if node_def.get("node_type", "agent") in ("agent", "decision", "input", "block")
             else "agent",
         )
         db.add(node)
@@ -297,7 +297,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
             input_mapping=node_def.input_mapping,
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
-            node_type=node_def.node_type if node_def.node_type in ("agent", "decision", "input") else "agent",
+            node_type=node_def.node_type if node_def.node_type in ("agent", "decision", "input", "block") else "agent",
         )
         db.add(node)
         nodes.append(node)
@@ -956,7 +956,7 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
             node_type=nd.get("node_type", "agent")
-            if nd.get("node_type", "agent") in ("agent", "decision", "input")
+            if nd.get("node_type", "agent") in ("agent", "decision", "input", "block")
             else "agent",
         )
         db.add(node)
@@ -1461,7 +1461,7 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
         node.skill_selection_reason = patch["skill_selection_reason"]
     if "description" in patch:
         node.description = patch["description"]
-    if "node_type" in patch and patch["node_type"] in ("agent", "decision", "input"):
+    if "node_type" in patch and patch["node_type"] in ("agent", "decision", "input", "block"):
         node.node_type = patch["node_type"]
     if "depends_on" in patch and patch["depends_on"] is not None:
         node.depends_on = _dedupe_node_ids(patch["depends_on"])
@@ -1508,6 +1508,39 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
 
     await db.commit()
     return {"ok": True}
+
+
+@router.get("/{dag_id}/nodes/{node_id}/files/{filename:path}")
+async def get_node_workspace_file(
+    dag_id: str,
+    node_id: str,
+    filename: str,
+    inline: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve a deterministic block node's workspace deliverable (file written
+    under the DAG workspace at <node_id>/<filename>)."""
+    import mimetypes
+    import os
+    from fastapi.responses import Response
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}")
+    abs_path = os.path.realpath(os.path.join(root, node_id, filename))
+    if not abs_path.startswith(root + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not os.path.isfile(abs_path):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not present for node {node_id}")
+    disposition = "inline" if inline else "attachment"
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    with open(abs_path, "rb") as f:
+        raw = f.read()
+    return Response(
+        content=raw,
+        media_type=mime,
+        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+    )
 
 
 @router.post("/{dag_id}/nodes/{node_id}/rename", response_model=DAGDetail)
@@ -1735,15 +1768,25 @@ async def add_node(dag_id: str, payload: DAGNodeCreate, db: AsyncSession = Depen
     _ensure_dag_editable(dag)
 
     node_id = (payload.node_id or "").strip()
+    provided_node_id = bool(node_id)
+    if not node_id and (payload.description or "").strip():
+        import re as _re
+        node_id = _re.sub(r"[^a-z0-9]+", "-", payload.description.lower()).strip("-")[:60]
     if not node_id:
-        raise HTTPException(status_code=422, detail="node_id is required")
+        raise HTTPException(status_code=422, detail="node_id or a description is required")
 
     # Ensure unique node_id
     existing = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
     all_nodes = list(existing.scalars().all())
     existing_ids = {n.node_id for n in all_nodes}
     if node_id in existing_ids:
-        raise HTTPException(status_code=422, detail=f"Node '{node_id}' already exists")
+        if provided_node_id:
+            raise HTTPException(status_code=422, detail=f"Node '{node_id}' already exists")
+        base = node_id
+        i = 2
+        while f"{base}-{i}" in existing_ids:
+            i += 1
+        node_id = f"{base}-{i}"
 
     config = dict(payload.config or {})
     depends_on = _dedupe_node_ids(payload.depends_on or [])
@@ -1761,7 +1804,7 @@ async def add_node(dag_id: str, payload: DAGNodeCreate, db: AsyncSession = Depen
         depends_on=depends_on,
         config=config,
         input_mapping=payload.input_mapping or {},
-        node_type=payload.node_type if payload.node_type in ("agent", "decision", "input") else "agent",
+        node_type=payload.node_type if payload.node_type in ("agent", "decision", "input", "block") else "agent",
     )
     db.add(new_node)
 
@@ -2228,7 +2271,7 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
             selected_skill_v2_id=selected_skill_v2_id,
             skill_selection_reason=skill_selection_reason,
             node_type=node_def.get("node_type", "agent")
-            if node_def.get("node_type", "agent") in ("agent", "decision", "input")
+            if node_def.get("node_type", "agent") in ("agent", "decision", "input", "block")
             else "agent",
         )
         db.add(node)

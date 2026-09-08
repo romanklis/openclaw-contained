@@ -1,0 +1,28 @@
+{
+  "objective": "Log in to Dropbox with the 'dropbox' credential via the agent_web SDK, upload a short text file to your Dropbox account, verify it appears, and report the result.",
+  "default_image": "browser_v4",
+  "default_llm": "deepseek-v4-flash",
+  "nodes": [
+    {
+      "node_id": "upload-to-dropbox",
+      "node_type": "agent",
+      "description": "Upload a short text file to Dropbox using the credentialed web SDK",
+      "depends_on": [],
+      "config": {
+        "base_image": "browser_v4",
+        "llm_model": "deepseek-v4-flash",
+        "timeout_minutes": 20,
+        "deploy_authorized": false,
+        "deliverable_gate": {
+          "require_real_sources": true
+        },
+        "success_criteria": [
+          "A text file was uploaded to the Dropbox account",
+          "The upload was verified (or an explicit blocker such as a bot/CAPTCHA challenge is reported)"
+        ],
+        "node_objective": "Use the agent_web SDK (import: from agent_web import web) with the credential reference 'dropbox' to log in to Dropbox and upload a short text file.\n\nSteps:\n1. Create /workspace/upload-to-dropbox/taskforge-hello.txt with the content 'Hello from TaskForge agent'.\n2. Establish a credentialed session: s = web.session(credential=\"dropbox\", impersonate=\"chrome\"). The FIRST use of the 'dropbox' credential for https://www.dropbox.com triggers a human approval on the Approvals page - the call blocks until approved. If it raises CredentialDenied, stop and report that the credential was denied.\n3. GET https://www.dropbox.com/home to confirm you are logged in (expected HTML status 200 and an authenticated page).\n4. Upload the file using the Dropbox web upload endpoint POST https://www.dropbox.com/upload (multipart form field 'file', header 'Authorization' as the SPA provides; pass headers you observe on the upload request) with the same session. If Dropbox returns a reCAPTCHA/fingerprint challenge or an error page instead of a successful upload, STOP and report the blocker verbatim - do NOT retry in a loop and do NOT claim success.\n5. Verify the upload: list the account root (GET https://www.dropbox.com/home or the upload/listing API) and confirm 'taskforge-hello.txt' is present.\n6. Write /workspace/upload-to-dropbox/upload_result.json with {file: 'taskforge-hello.txt', uploaded: true/false, verified: true/false, notes: '<what actually happened>'}. Only set uploaded/verified true when you have real evidence.\n\nRules: never print or try to read the credential's password; never fabricate an upload; if you hit a bot challenge, 2FA, or denial, report exactly that."
+      },
+      "input_mapping": {}
+    }
+  ]
+}

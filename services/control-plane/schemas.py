@@ -426,7 +426,7 @@ class SkillResponse(BaseModel):
 
 class DAGNodeCreate(BaseModel):
     """A node in the Master DAG."""
-    node_id: str
+    node_id: Optional[str] = None  # derived from description when omitted
     skill_id: Optional[str] = None
     skill_step_index: Optional[int] = None
     description: Optional[str] = None

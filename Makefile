@@ -3,7 +3,7 @@
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
 		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images \
-		docker-clean-dag docker-clean-dag-dry-run \
+		docker-clean-dag docker-clean-dag-dry-run dind-images dind-clean dind-prune \
 		examples example-up example-down
 
 # ─────────────────────────────────────────────────────────
@@ -163,13 +163,35 @@ build-browser-v3: ## Build Browser v3 image (Chromium + agent-browser + Lightpan
 build-browser-v4: ## Build Browser v4 image (Chromium + agent-browser + Lightpanda) and push to registry
 	@echo "Building Browser v4 agent image inside DinD..."
 	@cp agent-images/base/taskforge-adapter.py agent-images/browser_v4/taskforge-adapter.py
+	@rm -rf agent-images/browser_v4/agent_web && cp -r services/credential-gateway/sdk/agent_web agent-images/browser_v4/agent_web
 	@docker exec openclaw-docker-dind docker build \
 		-t registry:5000/openclaw-agent:browser_v4 \
 		-f /agent-images/browser_v4/Dockerfile \
 		/agent-images/browser_v4/
 	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:browser_v4
 	@rm -f agent-images/browser_v4/taskforge-adapter.py
+	@rm -rf agent-images/browser_v4/agent_web
 	@echo "  ✅  openclaw-agent:browser_v4 built & pushed"
+
+
+dind-images: ## List all images (agent + DAG commits) inside the DinD daemon, with sizes
+	@echo "== Images inside DinD =="
+	@docker exec openclaw-docker-dind docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.ID}}' 2>&1 || true
+	@echo ""
+	@echo "== Disk usage inside DinD =="
+	@docker exec openclaw-docker-dind docker system df 2>&1 || true
+
+
+dind-clean: ## Free DinD space: remove exited/leaked agent containers + dangling images
+	@echo "== Cleaning DinD (exited containers + dangling images) =="
+	@docker exec openclaw-docker-dind docker container prune -f 2>&1 || true
+	@docker exec openclaw-docker-dind docker image prune -f 2>&1 || true
+	@echo "  ✅ Done. For a full wipe (stopped images + build cache): make dind-prune"
+
+dind-prune: ## FULL DinD wipe: docker system prune -af (removes all unused images, containers, build cache)
+	@echo "WARNING: removing ALL unused DinD images/containers/cache..."
+	@docker exec openclaw-docker-dind docker system prune -af 2>&1 || true
+	@echo "  ✅ Done"
 
 
 build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 ## Build all 8 agent base images

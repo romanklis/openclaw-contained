@@ -35,6 +35,7 @@ class SkillV2Create(BaseModel):
     parent_id: Optional[str] = None
     tags: List[str] = []
     source_type: str = "manual"
+    code: Optional[dict] = None  # driver bundle {"files": {name: source}, ...}
 
 
 class SkillV2Update(BaseModel):
@@ -43,6 +44,7 @@ class SkillV2Update(BaseModel):
     instructions: Optional[str] = None
     tags: Optional[List[str]] = None
     status: Optional[str] = None
+    code: Optional[dict] = None
 
 
 class SkillV2Response(BaseModel):
@@ -63,6 +65,7 @@ class SkillV2Response(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime]
     created_by: Optional[str]
+    code: Optional[dict] = None
 
     class Config:
         from_attributes = True
@@ -182,6 +185,7 @@ async def create_skill_v2(data: SkillV2Create, db: AsyncSession = Depends(get_db
         tags=data.tags,
         source_type=src,
         status=SkillV2Status.DRAFT,
+        code_json=data.code or {},
     )
     db.add(skill)
     await db.commit()
@@ -315,6 +319,7 @@ async def export_skills_v2(
             "tags": s.tags or [],
             "source_type": s.source_type.value if hasattr(s.source_type, "value") else str(s.source_type),
             "status": s.status.value if hasattr(s.status, "value") else str(s.status),
+            "code": s.code,
         }
         for s in skills
     ]
@@ -353,6 +358,8 @@ async def update_skill_v2(skill_id: str, data: SkillV2Update, db: AsyncSession =
             skill.status = SkillV2Status(data.status)
         except ValueError:
             raise HTTPException(status_code=422, detail=f"Invalid status '{data.status}'")
+    if data.code is not None:
+        skill.code_json = data.code
 
     await db.commit()
     await db.refresh(skill)
@@ -463,6 +470,99 @@ async def get_demo(demo_id: str, db: AsyncSession = Depends(get_db)):
     return demo
 
 
+def _decode_deliverable(value: Any) -> str:
+    """Decode a stored deliverable value (inline text or base64:...) to text."""
+    if isinstance(value, str):
+        if value.startswith("base64:"):
+            import base64
+            try:
+                return base64.b64decode(value[7:]).decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+        return value
+    return str(value)
+
+
+async def _task_driver_bundle(db: AsyncSession, task_id: str) -> dict:
+    """Extract driver code files (.py) from the latest task output deliverables.
+
+    This is the 'learn as code' hook: successful tasks that deliver a reusable
+    .py driver get promoted as CODE, so the agent calls the driver instead of
+    re-improvising from prose.
+    """
+    rows = (await db.execute(
+        select(TaskOutput).where(TaskOutput.task_id == task_id).order_by(TaskOutput.iteration.desc())
+    )).scalars().all()
+    for out in rows:
+        deliverables = out.deliverables or {}
+        files = {}
+        for fname, value in deliverables.items():
+            if not isinstance(fname, str) or not fname.endswith(".py"):
+                continue
+            text = _decode_deliverable(value)
+            if not text or len(text) > 300_000:
+                continue
+            files[fname] = text
+            if len(files) >= 5:
+                break
+        if files:
+            return {"files": files}
+    return {}
+
+
+@router.post("/skills/promote-from-task", response_model=SkillV2Response, status_code=status.HTTP_201_CREATED)
+async def promote_task_to_driver(
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Promote a SUCCESSFUL task into a driver-code skill (draft for review).
+
+    Body: {task_id, image_id, name?, description?, instructions?, parent_id?}
+    Requires the task's deliverables to include a .py driver (recipe convention).
+    """
+    task_id = str(payload.get("task_id") or "")
+    image_id = str(payload.get("image_id") or "")
+    if not task_id or not image_id:
+        raise HTTPException(status_code=400, detail="task_id and image_id are required")
+    task = await db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+    img = await db.get(AgentImage, image_id)
+    if not img:
+        raise HTTPException(status_code=404, detail=f"AgentImage '{image_id}' not found")
+
+    bundle = await _task_driver_bundle(db, task_id)
+    if not bundle.get("files"):
+        raise HTTPException(
+            status_code=400,
+            detail="Task has no .py driver deliverables to promote. Follow the recipe convention: the task must deliver its reusable driver script(s) (.py).",
+        )
+
+    name = str(payload.get("name") or "").strip() or f"Driver from {task_id}"
+    instructions = str(payload.get("instructions") or "").strip() or (
+        "Reuse the bundled driver module(s) (injected on PYTHONPATH under /workspace/.skills). "
+        "Import and call the provided functions with the task's inputs; do NOT rewrite or re-discover the integration. "
+        f"Learned from task {task_id}."
+    )
+
+    skill = SkillV2(
+        id=_skv2_id(),
+        image_id=image_id,
+        name=name,
+        description=str(payload.get("description") or f"Verified driver code learned from task {task_id}.")[:500],
+        instructions=instructions,
+        parent_id=payload.get("parent_id"),
+        source_type=SkillV2Source.DEMO,
+        status=SkillV2Status.DRAFT,
+        evidence_task_ids=[task_id],
+        code_json=bundle,
+    )
+    db.add(skill)
+    await db.commit()
+    await db.refresh(skill)
+    return skill
+
+
 @router.post("/demos/{demo_id}/promote", response_model=SkillV2Response, status_code=status.HTTP_201_CREATED)
 async def promote_demo_to_skill(
     demo_id: str,
@@ -482,6 +582,15 @@ async def promote_demo_to_skill(
     steps = proc.get("steps", [])
     instructions = "\n".join(f"- {s}" for s in steps) if steps else demo.prompt
 
+    # Learn-as-code: if the demo points at a task that delivered .py drivers,
+    # carry that verified code along so future runs reuse it instead of prose.
+    code_json = {}
+    if demo.source_task_id:
+        try:
+            code_json = await _task_driver_bundle(db, demo.source_task_id)
+        except Exception:
+            code_json = {}
+
     skill = SkillV2(
         id=_skv2_id(),
         image_id=demo.image_id,
@@ -493,6 +602,7 @@ async def promote_demo_to_skill(
         status=SkillV2Status.DRAFT,
         evidence_task_ids=[demo.source_task_id] if demo.source_task_id else [],
         created_by=demo.created_by,
+        code_json=code_json or {},
     )
     db.add(skill)
     await db.flush()

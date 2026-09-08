@@ -1,0 +1,28 @@
+{
+  "objective": "Open the public Google Photos shared album https://photos.app.goo.gl/GjN5cVQbmtrdAUHJ7 with a real browser, collect the direct image download URLs, and download all photos via curl_cffi into the deliverables directory. ALBUM_URL = https://photos.app.goo.gl/GjN5cVQbmtrdAUHJ7",
+  "default_image": "browser_v4",
+  "default_llm": "deepseek-v4-flash",
+  "nodes": [
+    {
+      "node_id": "download-album-photos",
+      "node_type": "agent",
+      "description": "Download the photos of the public Google Photos shared album at ALBUM_URL = https://photos.app.goo.gl/GjN5cVQbmtrdAUHJ7. Resolve the album with a browser, extract image URLs, download them with curl_cffi.",
+      "depends_on": [],
+      "config": {
+        "base_image": "browser_v4",
+        "llm_model": "deepseek-v4-flash",
+        "timeout_minutes": 25,
+        "deploy_authorized": false,
+        "deliverable_gate": {
+          "require_real_sources": true
+        },
+        "success_criteria": [
+          "At least one photo was downloaded from the album",
+          "A manifest.json lists the downloaded files with their source URLs"
+        ],
+        "node_objective": "Download the photos of the public Google Photos shared album at ALBUM_URL = https://photos.app.goo.gl/GjN5cVQbmtrdAUHJ7 into /workspace/download-album-photos/ and write a manifest.\n\nIMPORTANT BACKGROUND: this short link is JS-only - plain curl_cffi/requests on the short URL returns a bootstrap page WITHOUT image URLs. You must resolve the album in a real stealth browser first, then download each photo with curl_cffi.\n\nSteps:\n1. Write and run a Python script that opens the album with a stealth browser (the image has camoufox/playwright):\n   - from camoufox.sync_api import Camoufox\n   - with Camoufox(headless=True) as browser: page = browser.new_page()\n   - page.goto('https://photos.app.goo.gl/GjN5cVQbmtrdAUHJ7', timeout=90000) and wait for the resolved photos.google.com/share page (page.wait_for_url('**photos.google.com/share/**', timeout=60000) or wait_for_timeout then read page.url)\n   - Scroll to load all thumbnails (e.g. loop page.mouse.wheel / page.keyboard press End a few times, or page.evaluate window.scrollTo(0, document.body.scrollHeight)) and wait a couple seconds between scrolls.\n   - Extract image URLs from the DOM: collect all <img> src/srcset and <a> href pointing at https://lh3.googleusercontent.com/... (strip size suffixes like =w...-h...-k-no so you keep base URLs; prefer larger sizes, e.g. append =w2560). De-duplicate.\n   - Save the list to /tmp/album_urls.json and print page.url + count.\n2. If the browser hit a consent/captcha wall or no URLs were extracted after scrolling, retry once with a fresh page; if still blocked, STOP and report exactly what blocked you (do not fabricate URLs).\n3. Download each URL with curl_cffi into the deliverables directory /workspace/download-album-photos/: name files photo_001.jpg, photo_002.jpg ... (match by content-type if needed). Use requests.get(url, impersonate='chrome', timeout=60) with allow_redirects.\n4. Verify every downloaded file is non-empty and looks like an image (starts with the right magic bytes / content-type image/*).\n5. Write /workspace/download-album-photos/manifest.json: {album_url, resolved_page, files: [{file, source_url, bytes}] , downloaded: N}.\n\nRules: only report images actually downloaded and verified; if the album is empty or unreachable, say so explicitly; do not guess image URLs."
+      },
+      "input_mapping": {}
+    }
+  ]
+}

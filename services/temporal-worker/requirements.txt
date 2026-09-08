@@ -6,3 +6,4 @@ urllib3>=1.26,<2
 httpx==0.26.0
 sqlalchemy==2.0.25
 asyncpg==0.29.0
+curl_cffi==0.7.4

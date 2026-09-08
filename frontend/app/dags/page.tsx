@@ -37,6 +37,10 @@ export default function DAGsPage() {
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([])
   const [modelDefaults, setModelDefaults] = useState<{planning_model: string, agent_model: string} | null>(null)
   const [showArchived, setShowArchived] = useState(false)
+  const [showImport, setShowImport] = useState(false)
+  const [importJson, setImportJson] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [importMsg, setImportMsg] = useState<string | null>(null)
   const { activeProject } = useProject()
 
   const fetchDags = async () => {
@@ -157,6 +161,31 @@ export default function DAGsPage() {
     return `${TEMPORAL_UI}/namespaces/default/workflows/${encodeURIComponent(workflowId)}`
   }
 
+  const importManualDag = async () => {
+    setImporting(true); setImportMsg(null)
+    try {
+      const doc = JSON.parse(importJson)
+      const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+      if (!nodes.length) throw new Error('JSON must contain a "nodes" array')
+      const res = await fetch(`${API}/api/dags/manual`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          objective: doc.objective || 'manual dag',
+          default_image: doc.default_image || 'openclaw',
+          default_llm: doc.default_llm || 'deepseek-v4-flash',
+          nodes,
+          edges: Array.isArray(doc.edges) ? doc.edges : [],
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { setImportMsg(`❌ ${(data as any).detail || res.status}`); return }
+      setImportMsg(`✅ Created ${data.id}. ${(nodes || []).every((n: any) => n.node_type === 'block') ? 'All nodes are deterministic (block).' : 'Note: only node_type:"block" nodes run deterministically.'}`)
+      setImportJson('')
+      fetchDags()
+    } catch (e: any) { setImportMsg(`❌ ${e.message}`) } finally { setImporting(false) }
+  }
+
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
@@ -168,6 +197,9 @@ export default function DAGsPage() {
           </button>
           <button onClick={() => setShowForm(!showForm)} className="btn-primary text-sm">
             {showForm ? 'Cancel' : '+ New DAG'}
+          </button>
+          <button onClick={() => setShowImport(!showImport)} className="btn-primary text-sm !bg-cyan-700 hover:!bg-cyan-600">
+            {showImport ? 'Cancel' : '⚙ Import Manual (Deterministic) DAG'}
           </button>
         </div>
       </div>
@@ -244,6 +276,33 @@ export default function DAGsPage() {
             {loading ? 'Planning...' : 'Create DAG'}
           </button>
         </form>
+      )}
+
+      {showImport && (
+        <div className="card mb-6 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold text-white">Import a manual DAG (nodes are used verbatim — no LLM planner)</div>
+            <button onClick={() => setShowImport(false)} className="text-gray-500 hover:text-gray-300 text-xs">✕</button>
+          </div>
+          <p className="text-[11px] text-gray-500">
+            Paste dag_json with nodes. Use <code className="text-cyan-300">"node_type": "block"</code> (with <code className="text-cyan-300">config.block</code>)
+            for deterministic steps. Example: register blocks on the Blocks page, then chain <code className="text-cyan-300">echo</code> nodes.
+          </p>
+          <textarea
+            value={importJson}
+            onChange={(e) => setImportJson(e.target.value)}
+            rows={8}
+            spellCheck={false}
+            className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 font-mono"
+            placeholder={'{"objective":"...","nodes":[{"node_id":"b1","node_type":"block","depends_on":[],"config":{"type":"block","block":"echo","inputs":{"stage":1}},"input_mapping":{}}],"edges":[]}'}
+          />
+          <div className="flex items-center gap-3">
+            <button onClick={importManualDag} disabled={importing} className="btn-success text-sm disabled:opacity-50">
+              {importing ? 'Importing...' : 'Import & validate'}
+            </button>
+            {importMsg && <span className="text-xs text-gray-300">{importMsg}</span>}
+          </div>
+        </div>
       )}
 
       <div className="space-y-3">

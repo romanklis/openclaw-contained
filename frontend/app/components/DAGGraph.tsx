@@ -3,7 +3,7 @@
 import { useMemo, useState, useEffect, useCallback, useRef } from 'react'
 import ReactFlow, { Node, Edge, Position, MarkerType, BaseEdge, EdgeProps, EdgeLabelRenderer, Handle, NodeProps, useNodesState, useEdgesState } from 'reactflow'
 import 'reactflow/dist/style.css'
-import { API_GATEWAY, TEMPORAL_UI } from '../lib/api'
+import { API, API_GATEWAY, TEMPORAL_UI } from '../lib/api'
 
 interface DAGNodeData {
   node_id: string
@@ -135,6 +135,7 @@ const edgeTypes = { loop: LoopEdge }
 const TYPE_STYLES: Record<string, { bg: string; border: string; text: string; label: string; radius: string }> = {
   decision: { bg: '#78350f', border: '#f59e0b', text: '#fcd34d', label: '🛑', radius: '2px' },
   input: { bg: '#164e63', border: '#06b6d4', text: '#67e8f9', label: '📥', radius: '50%' },
+  block: { bg: '#0f1f2e', border: '#22d3ee', text: '#a5f3fc', label: '🧩', radius: '8px' },
 }
 
 function DagStepNode({ data }: NodeProps) {
@@ -148,6 +149,7 @@ function DagStepNode({ data }: NodeProps) {
   const expanded = !!d.expanded
   const label = d.label || d.node_id || ''
   const isInput = d.node_type === 'input'
+  const isBlock = d.node_type === 'block'
   const turnCount = d.turnCount as number | undefined
   const isRunning = d.status === 'running'
   const showLiveTurn = isRunning && turnCount !== undefined
@@ -194,7 +196,7 @@ function DagStepNode({ data }: NodeProps) {
           ⚠ {drScore ?? '?'}/100
         </button>
       )}
-      {!expanded && !isInput && (
+      {!expanded && !isInput && !isBlock && (
         <div className="mt-1 border-t border-white/15 pt-1 text-[10px] font-normal flex flex-wrap gap-x-2">
           {showLiveTurn && (
             <span className="text-blue-300 animate-pulse" title="LLM turns in this run">⟳ {turnCount} turns</span>
@@ -210,6 +212,14 @@ function DagStepNode({ data }: NodeProps) {
       {!expanded && isInput && (
         <div className="mt-1 border-t border-white/15 pt-1 text-[10px] font-normal text-cyan-200">ℹ️ user input step</div>
       )}
+      {!expanded && isBlock && (
+        <div className="mt-1 border-t border-white/15 pt-1 text-[10px] font-normal text-cyan-300">🧩 deterministic block — no LLM</div>
+      )}
+      {expanded && isBlock && (
+        <div className="mt-1 border-t border-white/15 pt-1 text-[10px] font-normal text-cyan-300">
+          🧩 Deterministic block — runs a registered block with no LLM loop; deep review skipped. Result is stored in the node output.
+        </div>
+      )}
       {expanded && !isInput && (
         <div className="mt-1 border-t border-white/15 pt-1 text-[10px] font-normal space-y-1">
           {showLiveTurn && (
@@ -224,26 +234,34 @@ function DagStepNode({ data }: NodeProps) {
             <div>
               <div>📦 deliverables:</div>
               <ul className="list-disc pl-4 space-y-0.5">
-                {deliverables.map((dl) => (
-                  <li key={dl} style={{ animation: 'fadeIn 0.4s ease' }}>
-                    {d.task_id && d.iteration ? (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault()
-                          e.stopPropagation()
-                          d.onOpen(`${API_GATEWAY}/v1/files/${d.task_id}/${d.iteration}/${encodeURIComponent(dl)}?inline=1`, dl)
-                        }}
-                        className="underline decoration-dotted hover:text-white text-left"
-                        title="Preview deliverable"
-                      >
-                        {dl}
-                      </button>
-                    ) : (
-                      <span title="No task/iteration link for preview">{dl}</span>
-                    )}
-                  </li>
-                ))}
+                {deliverables.map((dl) => {
+                  const fileUrl =
+                    d.task_id && d.iteration
+                      ? `${API_GATEWAY}/v1/files/${d.task_id}/${d.iteration}/${encodeURIComponent(dl)}?inline=1`
+                      : d.dag_id
+                        ? `${API}/api/dags/${d.dag_id}/nodes/${d.node_id}/files/${encodeURIComponent(dl)}?inline=1`
+                        : null
+                  return (
+                    <li key={dl} style={{ animation: 'fadeIn 0.4s ease' }}>
+                      {fileUrl ? (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            d.onOpen(fileUrl, dl)
+                          }}
+                          className="underline decoration-dotted hover:text-white text-left"
+                          title="Preview deliverable"
+                        >
+                          {dl}
+                        </button>
+                      ) : (
+                        <span title="No file link available">{dl}</span>
+                      )}
+                    </li>
+                  )
+                })}
               </ul>
             </div>
           )}

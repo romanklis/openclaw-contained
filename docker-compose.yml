@@ -18,6 +18,8 @@ services:
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
       - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-gvisor}
       - AGENT_IMAGES_DIR=/agent-images
+      - CREDENTIAL_GATEWAY_URL=${CREDENTIAL_GATEWAY_URL:-http://credential-gateway:8083}
+      - CREDENTIAL_GATEWAY_ADMIN_TOKEN=${CREDENTIAL_GATEWAY_ADMIN_TOKEN:-openclaw-admin}
     depends_on:
       postgres:
         condition: service_healthy
@@ -243,6 +245,52 @@ services:
     restart: unless-stopped
 
   # =============================================================================
+  # CREDENTIAL GATEWAY — credentialed web access for agents (agent_web SDK).
+  # Owns curl_cffi sessions/cookies + the credential store; never exposes
+  # secrets to the agent process. Human approvals go through control-plane
+  # /api/credential-requests and surface on the Approvals page.
+  # =============================================================================
+  credential-gateway:
+    build:
+      context: ./services/credential-gateway
+      dockerfile: Dockerfile
+    container_name: openclaw-credential-gateway
+    environment:
+      - CONTROL_PLANE_URL=http://control-plane:8000
+      - CREDENTIAL_DIR=/data/credentials
+      - OPENBAO_ENABLED=${OPENBAO_ENABLED:-true}
+      - OPENBAO_ADDR=${OPENBAO_ADDR:-http://openbao:8200}
+      - OPENBAO_TOKEN=${OPENBAO_TOKEN:-openclaw-root}
+      - DEFAULT_GRANT_TTL_MIN=5
+      - DEFAULT_GRANT_MAX_REQUESTS=20
+      - APPROVAL_WAIT_MAX=300
+      - CREDENTIAL_GATEWAY_ADMIN_TOKEN=${CREDENTIAL_GATEWAY_ADMIN_TOKEN:-openclaw-admin}
+    volumes:
+      - ./config/credentials:/data/credentials
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # OPENBAO — secrets backend for the credential gateway (primary store)
+  # =============================================================================
+  openbao:
+    image: openbao/openbao:2.2.0
+    container_name: openclaw-openbao
+    environment:
+      - BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+      - BAO_DEV_ROOT_TOKEN_ID=${OPENBAO_TOKEN:-openclaw-root}
+    command: ["server", "-dev"]
+    volumes:
+      - bao-data:/bao/file
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  # =============================================================================
   # API GATEWAY — OpenAI-Compatible Chat Completions Gateway
   # Maps stateless OpenAI requests to stateful Temporal Workflows.
   # POST /v1/chat/completions  →  create / continue TaskForge tasks.
@@ -405,3 +453,4 @@ volumes:
   registry-data:
   docker-data:
   open-webui-data:
+  bao-data:
