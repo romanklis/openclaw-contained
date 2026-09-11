@@ -1,0 +1,196 @@
+{
+  "objective": "Analyze commercial loan application APP-2026-0899 (TechFlow Solutions LLC, USD 3,000,000 term loan) using the bank's governance data and produce a credit recommendation. Retrieve the application and policy from the banking_docs document system (MongoDB), verify IAM authority, customer KYC/AML status, existing credit exposure, collateral, then calculate LTV and DSCR against Commercial Lending Policy POL-COM-2026. Draft a credit memo, and route the decision to a HUMAN_CREDIT_OFFICER because the amount exceeds the AI approval limit. Never self-approve and never post GL or risk updates: those happen only in post-approval steps.",
+  "llm_model": "gemini-flash-lite-latest",
+  "nodes": [
+    {
+      "node_id": "fetch-application",
+      "node_type": "agent",
+      "description": "Read loan application APP-2026-0899 and policy POL-COM-2026 from the banking_docs MongoDB (host env BANKING_MONGO_HOST, db banking_docs, user dms_ai). Produce a structured summary deliverable.",
+      "depends_on": [],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 12,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step",
+        "extra_service_env": {
+          "BANKING_MONGO_HOST": "banking-mongo",
+          "BANKING_MONGO_PORT": "27017"
+        },
+        "node_objective": "HARD RULE: connect ONLY to the injected endpoints below; never scan, probe, or rediscover other hosts; pymongo/psycopg2 are preinstalled in the banking image. System location: MongoDB at ${BANKING_MONGO_HOST:-banking-mongo:27017}, database 'banking_docs', read-only user 'dms_ai' (password provided in the environment as MONGO_DMS_AI_PASSWORD). Step 1: connect and read loan_applications where _id='APP-2026-0899'. Step 2: read policies where _id='POL-COM-2026'. Record: amount 3,000,000 USD TERM_LOAN purpose 'Expansion of data center infrastructure'; financials annual_revenue 15,000,000, ebitda 3,500,000, existing_annual_debt_service 500,000, proposed_annual_debt_service 700,000 (explicit demo assumption, DSCR methodology stated on the application). Step 3: write /workspace/fetch-application/application_summary.json with application_id, amount_usd, financials, policy parameters (max_ltv_ratio 0.75, min_dscr 1.25, max_unsecured_limit 5,000,000, prohibited_industries GAMBLING+UNREGULATED_CRYPTO). Step 4: insert an audit row into the banking Postgres iam.audit_log with action 'APPLICATION_READ' using the DB connection from BANKING_POSTGRES env if granted; otherwise log the audit entry into your deliverable and move on."
+      }
+    },
+    {
+      "node_id": "check-kyc",
+      "node_type": "agent",
+      "description": "Verify customer C-1001 KYC status APPROVED and AML risk LOW via the CRM schema.",
+      "depends_on": ["fetch-application"],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 10,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step",
+        "extra_service_env": {
+          "BANKING_POSTGRES_HOST": "banking-postgres",
+          "BANKING_POSTGRES_PORT": "5432"
+        },
+        "node_objective": "HARD RULE: connect ONLY to the injected endpoints below; never scan, probe, or rediscover other hosts; pymongo/psycopg2 are preinstalled in the banking image. System location: PostgreSQL at ${BANKING_POSTGRES_HOST:-banking-postgres:5432}, database 'banking_enterprise', read-only login 'ai_agent_v1' (password from env DB_AI_AGENT_PASSWORD). Query crm.customers and crm.kyc_records for customer_id='C-1001'. Expected: legal_name TechFlow Solutions LLC, aml_risk_rating LOW, kyc status APPROVED, next_review_date 2027-01-15. Also read C-1002 for context (Global Import Export Inc, HIGH, PENDING_REVIEW) and note it would fail. Write a short KYC_CHECK.json deliverable and insert an audit row action 'KYC_CHECK' into iam.audit_log if DB access is available."
+      }
+    },
+    {
+      "node_id": "check-exposure-collateral",
+      "node_type": "agent",
+      "description": "Read existing exposure, utilized amounts and available collateral for C-1001.",
+      "depends_on": ["check-kyc"],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 10,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step",
+        "extra_service_env": {
+          "BANKING_POSTGRES_HOST": "banking-postgres",
+          "BANKING_POSTGRES_PORT": "5432"
+        },
+        "node_objective": "PostgreSQL at ${BANKING_POSTGRES_HOST}:${BANKING_POSTGRES_PORT} db banking_enterprise as ai_agent_v1. Query core.credit_facilities for C-1001 (expect FAC-TF-01 REVOLVING_CREDIT approved_limit 1,000,000 drawn 250,000 ACTIVE), risk.customer_limits for C-1001 (total_approved_exposure 1,000,000, total_utilized_exposure 250,000), and collateral.assets (COL-TF-991 COMMERCIAL_REAL_ESTATE appraised 5,000,000 USD last_appraisal 2025-10-01). Write exposure_summary.json. Insert audit actions 'EXPOSURE_CHECK' and 'COLLATERAL_CHECK' into iam.audit_log when DB access is available."
+      }
+    },
+    {
+      "node_id": "credit-memo-recommend",
+      "node_type": "agent",
+      "description": "Compute LTV and DSCR and draft a structured credit memo into banking_docs.credit_memos.",
+      "depends_on": ["check-exposure-collateral"],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 12,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step",
+        "extra_service_env": {
+          "BANKING_MONGO_HOST": "banking-mongo",
+          "BANKING_MONGO_PORT": "27017"
+        },
+        "node_objective": "MongoDB banking_docs insert into credit_memos with _id 'APP-2026-0899-memo-v1' (dms_ai may insert there). Content must include application_id APP-2026-0899, customer C-1001, recommendation 'APPROVE', metrics: ltv_ratio = 3,000,000 / 5,000,000 = 0.60 (policy max 0.75 => PASS), dscr = 3,500,000 / (500,000 + 700,000) = 2.92 (policy min 1.25 => PASS). Include credit memo narrative (KYC approved, AML LOW, collateral 5,000,000, unsecured exposure limit respected) and the explicit DSCR methodology note from the application."
+      }
+    },
+    {
+      "node_id": "authority-check",
+      "node_type": "agent",
+      "description": "Compare requested amount against the AI approval authority and issue the governance verdict.",
+      "depends_on": ["credit-memo-recommend"],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 10,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step",
+        "extra_service_env": {
+          "BANKING_POSTGRES_HOST": "banking-postgres",
+          "BANKING_POSTGRES_PORT": "5432"
+        },
+        "node_objective": "Query iam.roles and iam.system_authorizations for AI_CREDIT_AGENT_V1 (APPROVE/CREDIT_FACILITY max 100,000, requires_human_co_signer true) and HUMAN_CREDIT_OFFICER (APPROVE/CREDIT_FACILITY max 10,000,000). Requested amount 3,000,000 exceeds 100,000. Verdict output (exact fields): cannot_self_approve=true, requested_amount_usd=3000000, ai_approval_limit_usd=100000, required_approver='HUMAN_CREDIT_OFFICER', action='RECOMMEND_APPROVE_AND_ROUTE'. Write authority_verdict.json deliverable and insert an audit row action 'AUTHORITY_CHECK' into iam.audit_log when DB access is available. Do NOT publish any event and do NOT write to risk or gl schemas."
+      }
+    },
+    {
+      "node_id": "human-approval",
+      "node_type": "decision",
+      "description": "Human credit officer decision gate for APP-2026-0899.",
+      "depends_on": ["authority-check"],
+      "config": {
+        "type": "decision",
+        "question": "APP-2026-0899 | TechFlow Solutions LLC | USD 3,000,000 TERM LOAN | AI recommends APPROVE | Approve this facility?",
+        "payload": {
+          "require_justification": true,
+          "options": [
+            { "label": "Approve", "value": "approve" },
+            { "label": "Reject", "value": "reject", "require_justification": true }
+          ]
+        }
+      }
+    },
+    {
+      "node_id": "finalize-approval",
+      "node_type": "agent",
+      "description": "Append the APPROVED decision to credit_decision_archive (append-only, v2).",
+      "depends_on": ["human-approval"],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 10,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step - post-approval archive",
+        "extra_service_env": {
+          "BANKING_MONGO_HOST": "banking-mongo",
+          "BANKING_MONGO_PORT": "27017"
+        },
+        "node_objective": "Runs ONLY after the human chose approve. Insert into banking_docs.credit_decision_archive with _id 'APP-2026-0899:v2' (dms_archivist credentials if granted, otherwise use dms_ai and note the limitation). Fields: application_id APP-2026-0899, customer_id C-1001, decision APPROVED, recommendation APPROVE, approved_amount 3000000, credit_memo (reference memo v1), approved_by HUMAN_CREDIT_OFFICER, approved_at <now UTC ISO>, ai_agent_version AI_CREDIT_AGENT_V1, source_data_references [loan_applications APP-2026-0899, policies POL-COM-2026, crm, core, collateral, risk], policy_version 2026.1, version 2, event_id EVT-APP-2026-0899-001. Archive rule: if a final APPROVED/REJECTED document already exists for the application, do not overwrite - append a new version or refuse."
+      }
+    },
+    {
+      "node_id": "update-risk",
+      "node_type": "agent",
+      "description": "Post-approval risk update: total approved exposure 1M -> 4M (idempotent).",
+      "depends_on": ["finalize-approval"],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 10,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step - post-approval risk",
+        "extra_service_env": {
+          "BANKING_POSTGRES_HOST": "banking-postgres",
+          "BANKING_POSTGRES_PORT": "5432"
+        },
+        "node_objective": "Runs ONLY on the approve branch. Connect to PostgreSQL banking_enterprise using the risk_consumer login (env DB_RISK_CONSUMER_PASSWORD). UPDATE risk.customer_limits SET total_approved_exposure = 4000000 WHERE customer_id='C-1001' ONLY if risk.applied_events has no row for event_id 'EVT-APP-2026-0899-001'; then INSERT INTO risk.applied_events(event_id, application_id) VALUES ('EVT-APP-2026-0899-001','APP-2026-0899'). If already present, do nothing (idempotent). Insert audit row action 'RISK_UPDATED' into iam.audit_log if the role permits (otherwise report it in the deliverable)."
+      }
+    },
+    {
+      "node_id": "post-gl",
+      "node_type": "agent",
+      "description": "Post-approval GL entries: debit 120-001, credit 200-001 for 3,000,000 (idempotent).",
+      "depends_on": ["update-risk"],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 10,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step - post-approval GL",
+        "extra_service_env": {
+          "BANKING_POSTGRES_HOST": "banking-postgres",
+          "BANKING_POSTGRES_PORT": "5432"
+        },
+        "node_objective": "Runs ONLY on the approve branch. Connect to PostgreSQL banking_enterprise using the gl_consumer login (env DB_GL_CONSUMER_PASSWORD). Insert the two rows below ONLY if they do not already exist (unique key reference_id+event_id+account_code+side): (reference_id APP-2026-0899, event_id EVT-APP-2026-0899-001, account_code 120-001, side DEBIT, amount_usd 3000000) and (reference_id APP-2026-0899, event_id EVT-APP-2026-0899-001, account_code 200-001, side CREDIT, amount_usd 3000000). Then insert audit row action 'GL_POSTED' into iam.audit_log if permitted."
+      }
+    },
+    {
+      "node_id": "verify-downstream",
+      "node_type": "agent",
+      "description": "Confirm risk exposure = 4,000,000 and two GL journal entries exist.",
+      "depends_on": ["post-gl"],
+      "config": {
+        "base_image": "banking",
+        "llm_model": "gemini-flash-lite-latest",
+        "timeout_minutes": 10,
+        "selected_skill_name": "banking-credit-analysis",
+        "skill_selection_reason": "Curated demo step - verification",
+        "extra_service_env": {
+          "BANKING_POSTGRES_HOST": "banking-postgres",
+          "BANKING_POSTGRES_PORT": "5432"
+        },
+        "node_objective": "Query as ai_agent_v1: risk.customer_limits total_approved_exposure for C-1001 (expect 4,000,000) and gl.journal_entries rows matching reference_id 'APP-2026-0899' (expect exactly 2). If gl is not readable by ai_agent_v1, query via gl_consumer with the env password. Write verify_downstream.json and finish."
+      }
+    }
+  ],
+  "edges": [
+    { "from_node": "fetch-application", "to_node": "check-kyc", "condition": "on_success" },
+    { "from_node": "check-kyc", "to_node": "check-exposure-collateral", "condition": "on_success" },
+    { "from_node": "check-exposure-collateral", "to_node": "credit-memo-recommend", "condition": "on_success" },
+    { "from_node": "credit-memo-recommend", "to_node": "authority-check", "condition": "on_success" },
+    { "from_node": "authority-check", "to_node": "human-approval", "condition": "on_success" },
+    { "from_node": "human-approval", "to_node": "finalize-approval", "condition": "decision:approve" },
+    { "from_node": "finalize-approval", "to_node": "update-risk", "condition": "on_success" },
+    { "from_node": "update-risk", "to_node": "post-gl", "condition": "on_success" },
+    { "from_node": "post-gl", "to_node": "verify-downstream", "condition": "on_success" }
+  ]
+}

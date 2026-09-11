@@ -1,0 +1,8 @@
+{
+  "name": "browser-pdf-download",
+  "image_id": "browser_v4",
+  "description": "Find PDF links on a web page and download them with curl_cffi (TLS-impersonating HTTP), verifying PDF content-type and %PDF magic; saves files + pdf_manifest.json into the node workspace. For JS/login-gated sites, falls back to the credential gateway / agent_web driver.",
+  "tags": ["browser", "pdf", "download", "curl_cffi", "scraping"],
+  "source_type": "manual",
+  "files": ["browser-pdf-download.md"]
+}

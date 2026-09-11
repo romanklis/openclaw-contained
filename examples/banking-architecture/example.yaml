@@ -1,11 +1,13 @@
 name: banking-architecture
-description: Bank landscape — accounts, transactions, approval loop
+description: Banking governance demo — AI credit agent analysis with a human approval gate (MongoDB + PostgreSQL)
 infra: docker-compose.yml
+build:
+  - banking
 services:
-  - { name: bank-mock, url: http://bank-mock:8080 }
+  - { name: banking-postgres, url: postgres://bank_admin:bank_admin_pwd_demo@banking-postgres:5432/banking_enterprise }
+  - { name: banking-mongo, url: mongodb://mongo_admin:mongo_admin_pwd_demo@banking-mongo:27017/banking_docs?authSource=admin }
 dags:
-  - config/dags/bank-onboarding.json
+  - config/dags/banking-credit-governance.json
 skills:
-  - config/skills/bank-query.md
-seed:
-  - data/bank_seed.sql
+  - config/skills/banking-credit-analysis.skill.json
+  - config/skills/banking-data-access.skill.json

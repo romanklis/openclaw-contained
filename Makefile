@@ -173,6 +173,15 @@ build-browser-v4: ## Build Browser v4 image (Chromium + agent-browser + Lightpan
 	@rm -rf agent-images/browser_v4/agent_web
 	@echo "  ✅  openclaw-agent:browser_v4 built & pushed"
 
+build-banking: ## Build the Banking agent image (MongoDB + PostgreSQL drivers) and push to registry
+	@echo "Building Banking agent image inside DinD..."
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:banking \
+		-f /agent-images/banking/Dockerfile \
+		/agent-images/banking/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:banking
+	@echo "  ✅  openclaw-agent:banking built & pushed"
+
 
 dind-images: ## List all images (agent + DAG commits) inside the DinD daemon, with sizes
 	@echo "== Images inside DinD =="
@@ -228,6 +237,9 @@ example-up: ## Bring up an example + import its config: make example-up NAME=ban
 
 example-down: ## Tear down an example's infra: make example-down NAME=banking-architecture
 	@examples/_shared/example.sh down $(NAME)
+
+skills-import: ## Import shared v2 skills into the platform (examples/_shared/skills)
+	@python3 examples/_shared/import_skills.py examples/_shared/skills
 
 # ─────────────────────────────────────────────────────────
 # Logs & Status
