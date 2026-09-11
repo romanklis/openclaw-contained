@@ -1,0 +1,8 @@
+{
+  "name": "banking-credit-analysis",
+  "image_id": "banking",
+  "description": "Banking governance demo: full credit analysis workflow for loan application APP-2026-0899 - KYC/exposure/collateral checks, LTV and DSCR computation, credit memo drafting, AI authority check and routing to a HUMAN_CREDIT_OFFICER.",
+  "tags": ["banking", "credit", "governance", "analysis"],
+  "source_type": "manual",
+  "files": ["banking-credit-analysis.md", "banking-mongo.md", "banking-postgres.md"]
+}

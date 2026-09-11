@@ -27,6 +27,7 @@ interface SkillV2 {
   reviewer_score: number | null
   tags: string[]
   evidence_task_ids: string[]
+  code?: { files?: Record<string, string>; entrypoint?: string }
   created_at: string
 }
 
@@ -494,6 +495,22 @@ async function loadDemos() {
                     </pre>
                   )}
 
+                  {skill.code?.files && Object.keys(skill.code.files).length > 0 && (
+                    <div className="mb-3">
+                      <div className="text-[10px] uppercase tracking-wide text-indigo-300 mb-1">
+                        🧩 Driver code · {Object.keys(skill.code.files).length} file(s)
+                      </div>
+                      {Object.entries(skill.code.files).map(([fname, src]) => (
+                        <div key={fname} className="mb-2">
+                          <div className="text-[11px] text-indigo-200 font-mono mb-1">{fname}</div>
+                          <pre className="bg-black/40 border border-indigo-900/40 rounded p-2 text-[11px] text-gray-300 overflow-x-auto max-h-48 overflow-y-auto">
+                            {src}
+                          </pre>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {reviewingSkill?.id === skill.id ? (
                     <div className="space-y-3">
                       <textarea
@@ -823,6 +840,21 @@ function SkillCard({ skill, onReview, onEdit, onDelete, onExport }: { skill: Ski
         <pre className="mt-2 bg-gray-900 rounded p-3 text-xs text-gray-300 overflow-x-auto max-h-48 overflow-y-auto">
           {skill.instructions}
         </pre>
+      )}
+      {skill.code?.files && Object.keys(skill.code.files).length > 0 && (
+        <div className="mt-2">
+          <div className="text-[10px] uppercase tracking-wide text-indigo-300 mb-1">
+            🧩 Driver code · {Object.keys(skill.code.files).length} file(s)
+          </div>
+          {Object.entries(skill.code.files).map(([fname, src]) => (
+            <div key={fname} className="mb-2">
+              <div className="text-[11px] text-indigo-200 font-mono mb-1">{fname}</div>
+              <pre className="bg-black/40 border border-indigo-900/40 rounded p-2 text-[11px] text-gray-300 overflow-x-auto max-h-40 overflow-y-auto">
+                {src}
+              </pre>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   )

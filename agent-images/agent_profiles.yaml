@@ -171,3 +171,22 @@ base_images:
     - browser testing
     avoid_for:
     - tasks requiring smallest image footprint
+  banking:
+    dockerfile: agent-images/banking/Dockerfile
+    tag: openclaw-agent:banking
+    enabled: true
+    runtime: Python 3.11 (Debian) + MongoDB/PostgreSQL drivers
+    description: OpenClaw image with pymongo (MongoDB) and psycopg2 (PostgreSQL) drivers baked in for the banking governance demo.
+    size_estimate: ~470 MB
+    capabilities:
+    - python
+    - mongodb-client
+    - postgresql-client
+    - database-access
+    best_for:
+    - banking data analysis
+    - document-system reads (MongoDB)
+    - enterprise database reads (PostgreSQL)
+    avoid_for:
+    - browser automation
+

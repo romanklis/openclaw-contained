@@ -1,0 +1,8 @@
+{
+  "name": "banking-data-access",
+  "image_id": "banking",
+  "description": "Banking demo database connectivity: MongoDB (banking_docs) and PostgreSQL (banking_enterprise) access with RBAC logins, endpoint-only/no-scan rules.",
+  "tags": ["banking", "database", "governance"],
+  "source_type": "manual",
+  "files": ["banking-mongo.md", "banking-postgres.md"]
+}

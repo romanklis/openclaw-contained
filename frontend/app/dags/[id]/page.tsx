@@ -29,6 +29,15 @@ interface DAGNode {
   skill_selection_reason: string | null
 }
 
+function slugifyPurpose(text: string): string {
+  return (
+    text.toLowerCase().trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 60)
+  )
+}
+
 interface DAGDetail {
   id: string
   objective: string
@@ -169,7 +178,9 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [addNodeImage, setAddNodeImage] = useState('openclaw')
   const [addNodeMode, setAddNodeMode] = useState<'after' | 'parallel' | 'custom'>('after')
   const [addNodeDeps, setAddNodeDeps] = useState<string[]>([])
-  const [addNodeType, setAddNodeType] = useState<'agent' | 'decision' | 'input'>('agent')
+  const [addNodeType, setAddNodeType] = useState<'agent' | 'decision' | 'input' | 'block'>('agent')
+  const [blockLibrary, setBlockLibrary] = useState<any[]>([])
+  const [addBlockId, setAddBlockId] = useState('')
   const [addNodeQuestion, setAddNodeQuestion] = useState('')
   const [addNodeOptions, setAddNodeOptions] = useState('Approve,approve\nRework,rework')
   const [addNodePrompt, setAddNodePrompt] = useState('')
@@ -205,6 +216,13 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
 
   // Skill extraction state
   const [miningSkill, setMiningSkill] = useState(false)
+  const [driverPromoting, setDriverPromoting] = useState(false)
+  const [blockPromoting, setBlockPromoting] = useState(false)
+  const [blockEditOpen, setBlockEditOpen] = useState(false)
+  const [blockEditId, setBlockEditId] = useState('')
+  const [blockEditInputs, setBlockEditInputs] = useState('{}')
+  const [blockLibrary2, setBlockLibrary2] = useState<any[]>([])
+  const [blockLearnResult, setBlockLearnResult] = useState<any>(null)
   const [mineResult, setMineResult] = useState<string | null>(null)
   const [analysisResult, setAnalysisResult] = useState<any>(null)
   const [deepReviewLoading, setDeepReviewLoading] = useState(false)
@@ -655,7 +673,18 @@ setNodeState(prev => {
     if (!dag || !selectedNode) return
     setNodeActionLoading(true)
     try {
-      const newId = 'step-' + Math.random().toString(36).slice(2, 8)
+      const purpose = addNodeDesc.trim()
+      let purposeSeed = ''
+      if (!purpose) {
+        if (addNodeType === 'block' && addBlockId) purposeSeed = slugifyPurpose(addBlockId) || 'step'
+        else if (addNodeType === 'decision') purposeSeed = slugifyPurpose(addNodeQuestion.trim()) || 'step'
+        else if (addNodeType === 'input') purposeSeed = 'collect-input'
+      }
+      const baseId = slugifyPurpose(purpose || purposeSeed) || 'step'
+      const takenIds = new Set((dag.nodes || []).map((n) => n.node_id))
+      let newId = baseId
+      for (let i = 2; takenIds.has(newId); i++) newId = `${baseId}-${i}`
+      const nodeDesc = purpose || (purposeSeed === 'collect-input' ? 'Collect user input' : purposeSeed && purposeSeed !== 'step' ? purposeSeed.replace(/-/g, ' ') : 'New step')
       // "after" -> depends on selected node; "parallel" -> same deps as selected;
       // "custom" -> explicitly chosen predecessors.
       let deps: string[]
@@ -688,13 +717,17 @@ setNodeState(prev => {
             return { key: key || label, label: label || key, type: type || 'text' }
           }),
         }
+      } else if (addNodeType === 'block') {
+        if (!addBlockId) throw new Error('Select a block from the library')
+        config.type = 'block'
+        config.block = addBlockId
       }
       const res = await fetch(`${API}/api/dags/${dagId}/nodes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           node_id: newId,
-          description: addNodeDesc.trim() || 'New step',
+          description: nodeDesc,
           depends_on: deps,
           node_type: addNodeType,
           config,
@@ -1147,6 +1180,84 @@ setNodeState(prev => {
     } finally {
       setMiningSkill(false)
     }
+  }
+
+  const promoteRunToDriver = async (taskId: string) => {
+    if (!taskId) return
+    setDriverPromoting(true)
+    try {
+      const imageId = selectedNode?.config?.base_image || 'browser_v4'
+      const res = await fetch(`${API}/api/skill-learning/skills/promote-from-task`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_id: taskId,
+          image_id: imageId,
+          name: `${selectedNode?.node_id || 'Driver'} (task-learned)`,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        alert(data.detail || 'Promote failed')
+        return
+      }
+      alert(`Created draft driver skill ${data.id} — review & activate in Skill Studio.`)
+    } catch (e: any) {
+      alert(`Error: ${e.message}`)
+    } finally {
+      setDriverPromoting(false)
+    }
+  }
+
+  const promoteRunToBlock = async (taskId: string) => {
+    if (!taskId) return
+    setBlockPromoting(true)
+    setBlockLearnResult(null)
+    try {
+      const res = await fetch(`${API}/api/blocks/learn-from-run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_id: taskId,
+          dag_id: dag?.id,
+          node_id: selectedNode?.node_id,
+          created_by: 'dag-review',
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { setMineResult(`❌ Learn block failed: ${data.detail || `HTTP ${res.status}`}`); return }
+      setBlockLearnResult(data)
+      setMineResult(null)
+    } catch (e: any) { setMineResult(`❌ Learn block error: ${e.message}`) } finally { setBlockPromoting(false) }
+  }
+
+  const openBlockEditor = async () => {
+    if (!selectedNode) return
+    const cfg = (selectedNode as any).config || {}
+    setBlockEditId(cfg.block || '')
+    setBlockEditInputs(JSON.stringify(cfg.inputs || {}, null, 2))
+    try {
+      const res = await fetch(`${API}/api/blocks?status_filter=active`)
+      if (res.ok) setBlockLibrary2(await res.json())
+    } catch { setBlockLibrary2([]) }
+    setBlockEditOpen(true)
+  }
+
+  const saveBlockEditor = async () => {
+    if (!selectedNode) return
+    let inputs: any = {}
+    try { inputs = JSON.parse(blockEditInputs || '{}') } catch { alert('inputs must be valid JSON'); return }
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes/${selectedNode.node_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: { type: 'block', block: blockEditId, inputs } }),
+      })
+      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || `HTTP ${res.status}`) }
+      setBlockEditOpen(false)
+      await fetchDag()
+    } catch (e: any) { alert(`Error: ${e.message}`) } finally { setNodeActionLoading(false) }
   }
 
   const deepReviewTask = async (taskId: string, nodeId: string) => {
@@ -1640,7 +1751,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               )}
             </div>
             <div className="flex items-center gap-3 text-xs">
-              {nodeActionsAllowed && !selectedNode.task_id && (
+              {(nodeReadActionsAllowed || nodeWriteActionsAllowed) && !selectedNode.task_id && (
                 <div className="relative">
                   <button
                     onClick={() => setShowNodeActions(v => !v)}
@@ -1751,6 +1862,35 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🧠 Examine Logs → Learn Skill
                       </button>
+                      {(selectedNode as any).node_type === 'block' && dagEditable && (
+                        <button
+                          onClick={() => openBlockEditor()}
+                          disabled={nodeActionLoading}
+                          className="w-full text-left px-3 py-2 text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
+                        >
+                          🔧 Change Block / Inputs
+                        </button>
+                      )}
+                      {selectedNode.status === 'completed' && (
+                        <button
+                          onClick={() => promoteRunToBlock(selectedNode.task_id!)}
+                          disabled={nodeActionLoading || blockPromoting}
+                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
+                          title="Promote this successful run's .py driver deliverables into a draft Block"
+                        >
+                          🧩 Learn Block from This Run
+                        </button>
+                      )}
+                      {selectedNode.status === 'completed' && (
+                      <button
+                        onClick={() => promoteRunToDriver(selectedNode.task_id!)}
+                        disabled={nodeActionLoading || driverPromoting}
+                          className="w-full text-left px-3 py-2 text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
+                          title="Promote this successful run's .py driver deliverables into a draft code skill"
+                        >
+                          🧪 Learn Code Driver from This Run
+                        </button>
+                      )}
                       <button
                         onClick={() => deepReviewTask(selectedNode.task_id!, selectedNode.node_id)}
                         disabled={nodeActionLoading || deepReviewLoading}
@@ -1855,6 +1995,35 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                       >
                         🧠 Examine Logs → Learn Skill
                       </button>
+                      {(selectedNode as any).node_type === 'block' && dagEditable && (
+                        <button
+                          onClick={() => openBlockEditor()}
+                          disabled={nodeActionLoading}
+                          className="w-full text-left px-3 py-2 text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
+                        >
+                          🔧 Change Block / Inputs
+                        </button>
+                      )}
+                      {selectedNode.status === 'completed' && (
+                        <button
+                          onClick={() => promoteRunToBlock(selectedNode.task_id!)}
+                          disabled={nodeActionLoading || blockPromoting}
+                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
+                          title="Promote this successful run's .py driver deliverables into a draft Block"
+                        >
+                          🧩 Learn Block from This Run
+                        </button>
+                      )}
+                      {selectedNode.status === 'completed' && (
+                      <button
+                        onClick={() => promoteRunToDriver(selectedNode.task_id!)}
+                        disabled={nodeActionLoading || driverPromoting}
+                          className="w-full text-left px-3 py-2 text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
+                          title="Promote this successful run's .py driver deliverables into a draft code skill"
+                        >
+                          🧪 Learn Code Driver from This Run
+                        </button>
+                      )}
                       <button
                         onClick={() => deepReviewTask(selectedNode.task_id!, selectedNode.node_id)}
                         disabled={nodeActionLoading || deepReviewLoading}
@@ -2077,6 +2246,49 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             </div>
           )}
 
+          {blockLearnResult && (() => {
+            const blk = blockLearnResult.block
+            const files: Record<string, string> = blk?.code?.files || {}
+            const provenanceVals = Object.values(blockLearnResult.provenance || {}) as string[]
+            const sources = provenanceVals.filter((v, i) => provenanceVals.indexOf(v) === i).join('\n')
+            return (
+              <div className="mb-3 rounded border border-emerald-700/40 bg-emerald-950/20 p-3 text-xs">
+                <div className="text-xs uppercase tracking-wide text-emerald-300 mb-2 flex items-center justify-between">
+                  <span>🧩 Learned Block — {blk?.name || blk?.id}</span>
+                  <span className="text-emerald-300">{blk?.status}</span>
+                </div>
+                <div className="mb-2 text-gray-300">
+                  Deterministic block draft derived from this run via LLM introspection.
+                  {blockLearnResult.model && (
+                    <div className="text-[10px] text-gray-400 font-mono mt-1">
+                      model: <span className="text-cyan-300">{blockLearnResult.model}</span>
+                    </div>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <div className="text-gray-500 mb-1">Files</div>
+                    <div className="font-mono text-gray-300">{Object.keys(files).join(', ') || '—'}</div>
+                    <div className="text-gray-500 mt-2 mb-1">inputs_schema</div>
+                    <pre className="whitespace-pre-wrap text-gray-300 bg-gray-950/60 p-2 rounded">{JSON.stringify(blk?.inputs_schema || {}, null, 2)}</pre>
+                  </div>
+                  <div>
+                    <div className="text-gray-500 mb-1">Sources used</div>
+                    <div className="text-gray-300 whitespace-pre-wrap">{sources || '—'}</div>
+                    {blk?.description && <div className="text-gray-400 mt-2 whitespace-pre-wrap">{blk.description}</div>}
+                  </div>
+                </div>
+                <div className="mt-2 flex items-center gap-3">
+                  <Link href="/blocks" className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white">
+                    Test & Activate on Blocks page
+                  </Link>
+                  <button onClick={() => setBlockLearnResult(null)} className="text-gray-400 hover:text-gray-200">Dismiss</button>
+                  <span className="text-gray-500">ID: {blk?.id}</span>
+                </div>
+              </div>
+            )
+          })()}
+
           {selectedReview && (
             <div className="mb-3 rounded border border-amber-700/40 bg-amber-950/20 p-3 text-xs">
               <div className="text-xs uppercase tracking-wide text-amber-300 mb-2 flex items-center justify-between">
@@ -2288,13 +2500,21 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 </div>
               )}
               <div className="flex gap-2 mb-2">
-                {(['agent', 'decision', 'input'] as const).map((t) => (
+                {(['agent', 'decision', 'input', 'block'] as const).map((t) => (
                   <button
                     key={t}
-                    onClick={() => setAddNodeType(t)}
+                    onClick={() => {
+                      setAddNodeType(t)
+                      if (t === 'block') {
+                        fetch(`${API}/api/blocks?status_filter=active`)
+                          .then((r) => r.json())
+                          .then((d) => setBlockLibrary(Array.isArray(d) ? d : []))
+                          .catch(() => setBlockLibrary([]))
+                      }
+                    }}
                     className={`text-xs px-2 py-1 rounded border ${addNodeType === t ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
                   >
-                    {t === 'agent' ? '🤖 Agent' : t === 'decision' ? '🛑 Decision' : '📥 Input'}
+                    {t === 'agent' ? '🤖 Agent' : t === 'decision' ? '🛑 Decision' : t === 'input' ? '📥 Input' : '🧩 Block'}
                   </button>
                 ))}
               </div>
@@ -2332,6 +2552,24 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   />
                 </div>
               )}
+              {addNodeType === 'block' && (
+                <div className="mb-2">
+                  <label className="block text-xs text-gray-400 mb-1">Select a deterministic block</label>
+                  <select
+                    value={addBlockId}
+                    onChange={(e) => setAddBlockId(e.target.value)}
+                    className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2"
+                  >
+                    <option value="">— choose block —</option>
+                    {blockLibrary.map((b: any) => (
+                      <option key={b.id} value={b.id}>{b.id} · {b.entrypoint}</option>
+                    ))}
+                  </select>
+                  {blockLibrary.length === 0 && (
+                    <p className="text-[10px] text-gray-500 mb-2">No active blocks in the library. Register one on the Blocks page first.</p>
+                  )}
+                </div>
+              )}
               <textarea
                 value={addNodeDesc}
                 onChange={(e) => setAddNodeDesc(e.target.value)}
@@ -2339,6 +2577,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2"
                 placeholder="Describe the new step..."
               />
+              {addNodeType !== 'block' && (<>
               <label className="block text-xs text-gray-400 mb-1">Image</label>
               <select
                 value={addNodeImage}
@@ -2349,11 +2588,33 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   <option key={img} value={img}>{img}</option>
                 ))}
               </select>
+              </>)}
               <div className="flex justify-end gap-2">
                 <button onClick={() => setShowAddNodeDialog(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300 hover:text-white">Cancel</button>
                 <button onClick={addNodeAfterSelected} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
                   {nodeActionLoading ? 'Adding...' : 'Add Step'}
                 </button>
+              </div>
+            </div>
+          )}
+
+          {blockEditOpen && selectedNode && (
+            <div className="fixed inset-0 bg-black/60 z-[70] flex items-center justify-center p-4" onClick={() => setBlockEditOpen(false)}>
+              <div className="bg-[#12121a] border border-[#232333] rounded-lg p-4 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+                <div className="text-sm font-semibold text-white mb-3">🔧 Edit block step: {selectedNode.node_id}</div>
+                <label className="block text-xs text-gray-400 mb-1">Block</label>
+                <select value={blockEditId} onChange={(e) => setBlockEditId(e.target.value)}
+                  className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-3">
+                  <option value="">— choose block —</option>
+                  {blockLibrary2.map((b: any) => <option key={b.id} value={b.id}>{b.id}</option>)}
+                </select>
+                <label className="block text-xs text-gray-400 mb-1">Inputs (JSON)</label>
+                <textarea value={blockEditInputs} onChange={(e) => setBlockEditInputs(e.target.value)} rows={5}
+                  className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 font-mono mb-3" />
+                <div className="flex justify-end gap-2">
+                  <button onClick={() => setBlockEditOpen(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300">Cancel</button>
+                  <button onClick={saveBlockEditor} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">Save</button>
+                </div>
               </div>
             </div>
           )}

@@ -194,6 +194,7 @@ class AgentTaskWorkflow:
     def __init__(self):
         self.approval_received = False
         self.capability_approved = False
+        self._handled_credential_ids = set()  # credential requests already waited on
         self.current_image = "localhost:5000/openclaw-agent:openclaw"  # Track current agent image (default)
         self.llm_model = "gemma3:4b"  # Track LLM model
         self.follow_up = ""  # Follow-up instructions for continuation
@@ -507,6 +508,49 @@ class AgentTaskWorkflow:
                     logger.info(f"📦 Deployment created: {deploy_result.get('id')}")
                 break
             
+            # ── Credential approval — Temporal-native pause ────────────────────
+            # If the agent's credentialed call left a pending request behind,
+            # pause the workflow (durable) until a human decides, then resume.
+            _pending_creds = await workflow.execute_activity(
+                list_task_credential_requests,
+                args=[task_id],
+                start_to_close_timeout=timedelta(seconds=20),
+            )
+            _unhandled = [
+                r for r in _pending_creds
+                if r.get("status") == "pending" and r.get("id") not in self._handled_credential_ids
+            ]
+            if _unhandled:
+                _req = _unhandled[0]
+                logger.info(
+                    f"🔐 CREDENTIAL | Task: {task_id} | awaiting human approval for "
+                    f"{_req.get('credential_name')} @ {_req.get('origin')}"
+                )
+                self.approval_received = False
+                self.capability_approved = False
+                await workflow.execute_activity(
+                    update_task_status,
+                    args=[task_id, "waiting_approval"],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+                # Workflow pauses here (durable, visible in Temporal UI).
+                await workflow.wait_condition(
+                    lambda: self.approval_received,
+                    timeout=timedelta(hours=24),
+                )
+                for _r in _unhandled:
+                    self._handled_credential_ids.add(_r.get("id"))
+                if not self.capability_approved:
+                    raise RuntimeError(
+                        f"credential '{_req.get('credential_name')}' was denied for {_req.get('origin')}"
+                    )
+                self.follow_up = (self.follow_up or "") + (
+                    f"\nThe human APPROVED credential '{_req.get('credential_name')}' for "
+                    f"{_req.get('origin')}. Retry the credentialed call that was blocked."
+                )
+                logger.info(f"🔐 CREDENTIAL approved for {_req.get('origin')} — continuing.")
+                continue
+
             # Resolve capability lifecycle before completion. This prevents
             # completed=true from skipping capability handling in fast approval paths.
             capability_state = await self._resolve_capability_state(
@@ -760,21 +804,43 @@ class AgentStepWorkflow:
         workspace_dir = launch_info["workspace_dir"]
         turns_seen = 0
 
-        # 2. Poll loop — keep checking for new LLM turns until container exits
-        container_done = False
-        while not container_done:
-            poll_result = await workflow.execute_activity(
-                poll_agent_turns,
-                args=[task_id, container_id, turns_seen],
-                start_to_close_timeout=timedelta(minutes=31),
-                heartbeat_timeout=timedelta(seconds=60),
+        try:
+            # 2. Poll loop — keep checking for new LLM turns until container exits
+            container_done = False
+            while not container_done:
+                poll_result = await workflow.execute_activity(
+                    poll_agent_turns,
+                    args=[task_id, container_id, turns_seen],
+                    start_to_close_timeout=timedelta(minutes=31),
+                    heartbeat_timeout=timedelta(seconds=60),
+                )
+
+                container_done = poll_result["container_done"]
+                new_turns = poll_result.get("new_turns", [])
+
+                # Record each new turn as its own activity
+                for turn_data in new_turns:
+                    turns_seen += 1
+                    try:
+                        await workflow.execute_activity(
+                            record_agent_turn,
+                            args=[task_id, iteration, turns_seen, turn_data],
+                            start_to_close_timeout=timedelta(seconds=15),
+                        )
+                    except Exception:
+                        pass  # non-critical
+
+            # 3. Collect the final result from the container
+            result = await workflow.execute_activity(
+                collect_agent_result,
+                args=[task_id, iteration, container_id, workspace_dir, agent_image, llm_model, dag_id],
+                start_to_close_timeout=timedelta(minutes=2),
             )
 
-            container_done = poll_result["container_done"]
-            new_turns = poll_result.get("new_turns", [])
-
-            # Record each new turn as its own activity
-            for turn_data in new_turns:
+            # Record any remaining turns that arrived between last poll and container exit.
+            all_turns = result.pop("_remaining_turns", [])
+            remaining_turns = all_turns[turns_seen:]
+            for turn_data in remaining_turns:
                 turns_seen += 1
                 try:
                     await workflow.execute_activity(
@@ -783,29 +849,24 @@ class AgentStepWorkflow:
                         start_to_close_timeout=timedelta(seconds=15),
                     )
                 except Exception:
-                    pass  # non-critical
-
-        # 3. Collect the final result from the container
-        result = await workflow.execute_activity(
-            collect_agent_result,
-            args=[task_id, iteration, container_id, workspace_dir, agent_image, llm_model, dag_id],
-            start_to_close_timeout=timedelta(minutes=2),
-        )
-
-        # Record any remaining turns that arrived between last poll and container exit.
-        # _remaining_turns contains ALL interactions; skip the ones already recorded.
-        all_turns = result.pop("_remaining_turns", [])
-        remaining_turns = all_turns[turns_seen:]
-        for turn_data in remaining_turns:
-            turns_seen += 1
-            try:
-                await workflow.execute_activity(
-                    record_agent_turn,
-                    args=[task_id, iteration, turns_seen, turn_data],
-                    start_to_close_timeout=timedelta(seconds=15),
+                    pass
+        except Exception as _ce:
+            # Cancel-safe cleanup: if the step is cancelled mid-run (external
+            # cancel/timeouts), collect_agent_result never runs, so force-remove
+            # the agent container to avoid leaking it inside DinD.
+            if type(_ce).__name__ == "CancelledError":
+                logger.info(
+                    f"🛑 AgentStepWorkflow cancelled — cleaning up container {container_id[:12]}"
                 )
-            except Exception:
-                pass
+                try:
+                    await workflow.execute_activity(
+                        remove_agent_container,
+                        args=[container_id],
+                        start_to_close_timeout=timedelta(seconds=20),
+                    )
+                except Exception:
+                    pass
+            raise
 
         logger.info(
             f"🔬 AgentStepWorkflow done | Task: {task_id} | Iteration: {iteration} | "
@@ -976,6 +1037,8 @@ async def start_agent_container(
         # If this task is a DAG node with a selected v2 skill, fetch that
         # skill's instructions first. Fall back to legacy skill_id.
         skill_instructions = ""
+        _skill_bundle = None
+        skill_code_dir = ""
         if dag_id and node_id:
             try:
                 import httpx as _httpx_skill
@@ -1003,6 +1066,7 @@ async def start_agent_container(
                                     f"{_cp_skill}/api/skill-learning/skills/{_selected_v2}"
                                 )
                                 if _skill_resp.status_code == 200:
+                                    _skill_bundle = _skill_resp.json().get("code") or {}
                                     skill_instructions = _skill_resp.json().get("instructions", "") or ""
                                     if skill_instructions:
                                         logger.info(
@@ -1024,6 +1088,33 @@ async def start_agent_container(
                                 break
             except Exception as _skill_err:
                 logger.warning(f"⚠️ Could not fetch skill instructions: {_skill_err}")
+
+        # Materialize skill driver code (if any) into the task workspace so the
+        # agent can import verified functions instead of re-discovering APIs.
+        if _skill_bundle and workspace_id:
+            _files = (_skill_bundle.get("files") or {}) if isinstance(_skill_bundle, dict) else {}
+            if isinstance(_files, dict) and _files:
+                _skill_dir = f"{workspaces_root}/{workspace_id}/.skills"
+                try:
+                    os.makedirs(_skill_dir, exist_ok=True)
+                    _written = []
+                    for _fname, _src in _files.items():
+                        _base = os.path.basename(_fname)
+                        if not _base or _base in (".", "..") or "/" in _base or "\\" in _base:
+                            continue
+                        with open(os.path.join(_skill_dir, _base), "w", encoding="utf-8") as _fh:
+                            _fh.write(str(_src))
+                        _written.append(_base)
+                    if _written:
+                        skill_code_dir = _skill_dir
+                        skill_instructions = (skill_instructions or "") + (
+                            "\n\nBundled driver code is in /workspace/.skills (on PYTHONPATH). "
+                            "Import and call the provided functions instead of writing your own client. "
+                            f"Files: {', '.join(_written)}."
+                        )
+                        logger.info(f"🧩 Materialized skill driver files for {task_id}: {_written}")
+                except Exception as _we:
+                    logger.warning(f"⚠️ Could not materialize skill driver files: {_we}")
 
         # --- pre-installed packages discovery ---
         # Query approved capability requests so the agent knows what's
@@ -1107,6 +1198,16 @@ async def start_agent_container(
             else os.getenv("RAG_TOOL_URL", "http://docling-rag:8080")
         )
 
+        # --- Credential gateway discovery ---
+        # Same pattern: pre-resolve the compose service so gVisor agents (which
+        # get an isolated netns) can reach it by IP.
+        cred_gw_ip = os.getenv("CREDENTIAL_GATEWAY_IP", "") or _resolve("credential-gateway", fallback="")
+        cred_gw_url_for_agent = (
+            f"http://{cred_gw_ip}:8083"
+            if cred_gw_ip
+            else os.getenv("CREDENTIAL_GATEWAY_URL", "http://credential-gateway:8083")
+        )
+
         # Session ID: DAG-scoped by node_id so memory persists across
         # retries for the same DAG node.  For standalone tasks we
         # fall back to the task_id.
@@ -1139,6 +1240,8 @@ async def start_agent_container(
             # External RAG tool (docling-rag) so agents can query uploaded docs.
             "RAG_TOOL_URL": rag_url_for_agent,
             "RAG_API_KEY": os.getenv("RAG_API_KEY", "my-local-secret-key"),
+            # Credential gateway for credentialed web access (agent_web SDK).
+            "CREDENTIAL_GATEWAY_URL": cred_gw_url_for_agent,
             "LLM_MODEL": llm_model,
             # Context-management mode for the agent loop (none|linear), from the
             # LLM Providers DAG model defaults; env override wins.
@@ -1147,6 +1250,9 @@ async def start_agent_container(
             "AGENT_IMAGE": agent_image,
             "AGENT_DOCKERFILE": agent_dockerfile[:4000],
             "FOLLOW_UP": follow_up[:2000],
+            # .skills is the AGENT-visible mount path (/workspace/.skills); the
+            # files are written to the worker-side /workspaces/{id}/.skills.
+            "PYTHONPATH": ("/workspace/.skills:/opt/openclaw") if skill_code_dir else "/opt/openclaw",
             "PRE_INSTALLED_PACKAGES": pre_installed_packages[:1000],
             "ZEP_URL": zep_url_for_agent,
             "ZEP_SESSION_ID": zep_session_id,
@@ -1764,6 +1870,650 @@ async def get_last_iteration(task_id: str) -> int:
         logger.warning(f"⚠️ Could not fetch last iteration: {e}")
 
     return 0
+
+
+@activity.defn
+async def remove_agent_container(container_id: str) -> dict:
+    """Force-remove an agent container from DinD (cancel-safe cleanup)."""
+    import docker
+
+    try:
+        docker_client = docker.from_env()
+        container = docker_client.containers.get(container_id)
+        container.remove(force=True)
+        logger.info(f"🧹 Removed agent container {container_id[:12]} (cancel cleanup)")
+        return {"removed": True, "container_id": container_id}
+    except docker.errors.NotFound:
+        return {"removed": True, "container_id": container_id}
+    except Exception as exc:
+        logger.warning(f"⚠️ Could not remove agent container {container_id}: {exc}")
+        return {"removed": False, "container_id": container_id}
+
+
+_BLOCK_RUNNER_SRC = r'''"""Deterministic block runner (subprocess).
+
+Reads the block inputs JSON from argv[1], executes the entry function of the
+entry module (files materialized in BLOCK_TMPDIR) with the given inputs, and
+writes the JSON result to argv[2]. Exceptions print to stderr and exit non-zero.
+"""
+import importlib.util
+import json
+import os
+import sys
+
+
+def _main() -> None:
+    inputs_file, result_file = sys.argv[1], sys.argv[2]
+    tmpdir = os.environ["BLOCK_TMPDIR"]
+    entry_file = os.environ["BLOCK_ENTRY_FILE"]
+    entry_name = os.environ["BLOCK_ENTRY_NAME"]
+    sys.path.insert(0, tmpdir)
+    with open(inputs_file, "r", encoding="utf-8") as fh:
+        inputs = json.load(fh)
+    modname = "block_entry_" + os.path.splitext(entry_file)[0].replace("-", "_")
+    path = os.path.join(tmpdir, os.path.basename(entry_file))
+    spec = importlib.util.spec_from_file_location(modname, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load entry module {entry_file}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[modname] = module
+    spec.loader.exec_module(module)
+    fn = getattr(module, entry_name, None)
+    if fn is None or not callable(fn):
+        raise AttributeError(f"entrypoint function '{entry_name}' not found in {entry_file}")
+    result = fn(inputs)
+    if hasattr(result, "model_dump"):
+        result = result.model_dump()
+    if not isinstance(result, dict):
+        result = {"result": result}
+    with open(result_file, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, default=str)
+
+
+if __name__ == "__main__":
+    try:
+        _main()
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+'''
+
+
+def _resolve_block_entry_file(code_files: dict, entry_file_meta: str = "") -> str:
+    """Pick which .py file holds the entrypoint function."""
+    for candidate in ([entry_file_meta, "block_main.py", "main.py"] if entry_file_meta else ["block_main.py", "main.py"]):
+        if candidate and candidate in code_files:
+            return candidate
+    if len(code_files) == 1:
+        return list(code_files)[0]
+    import re
+    for fname, src in code_files.items():
+        if re.search(r"^def\s+main\s*\(", str(src), re.MULTILINE):
+            return fname
+    raise RuntimeError(f"could not determine block entry file among: {list(code_files)}")
+
+
+def _execute_block_module(code_files: dict, entry_name: str, entry_file: str, inputs: dict,
+                          timeout_seconds: int = 290) -> dict:
+    """Materialize block code files and run the entrypoint in a subprocess.
+
+    Real file/module execution: sibling modules import normally
+    (``from google_photos import download_album``), unlike the old exec-into-
+    one-namespace model. Isolation per run avoids sys.modules/sys.path races
+    between concurrent block activities."""
+    import json as _json
+    import os as _os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="block-run-")
+    try:
+        for fname, src in code_files.items():
+            if not fname.endswith(".py"):
+                continue
+            safe = _os.path.basename(fname)
+            with open(_os.path.join(tmpdir, safe), "w", encoding="utf-8") as fh:
+                fh.write(str(src))
+        runner = _os.path.join(tmpdir, "_block_runner.py")
+        with open(runner, "w", encoding="utf-8") as fh:
+            fh.write(_BLOCK_RUNNER_SRC)
+        inputs_file = _os.path.join(tmpdir, "_inputs.json")
+        result_file = _os.path.join(tmpdir, "_result.json")
+        with open(inputs_file, "w", encoding="utf-8") as fh:
+            _json.dump(inputs, fh, default=str)
+        env = _os.environ.copy()
+        env.update({
+            "BLOCK_TMPDIR": tmpdir,
+            "BLOCK_ENTRY_FILE": _os.path.basename(entry_file),
+            "BLOCK_ENTRY_NAME": entry_name,
+        })
+        proc = subprocess.run(
+            [sys.executable, runner, inputs_file, result_file],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=env,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip() or proc.stdout or "unknown error"
+            raise RuntimeError(f"block execution failed ({err[-1500:]})")
+        if not _os.path.isfile(result_file):
+            raise RuntimeError("block runner produced no result file")
+        if _os.path.getsize(result_file) > 2_000_000:
+            raise RuntimeError("block result exceeded 2 MB limit")
+        with open(result_file, "r", encoding="utf-8") as fh:
+            return _json.load(fh)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"block execution timed out after {timeout_seconds}s: {(exc.stderr or '')[-800:]}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _normalize_block_image(image_ref: str) -> str:
+    """DinD resolves the local registry as ``registry:5000``; a ``localhost:5000``
+    ref is what compose services see and is unreachable from inside DinD."""
+    if not image_ref:
+        return image_ref
+    return image_ref.replace("http://", "").replace("localhost:5000/", "registry:5000/")
+
+
+def _execute_block_image_container(code_files: dict, entry_name: str, entry_file: str, inputs: dict,
+                                   workdir: str, runtime_image: str, timeout_seconds: int = 290) -> dict:
+    """Execute an image-backed deterministic block inside the runtime agent image.
+
+    Mirrors the agent-container launch pattern: the DAG workspace host dir is bind-mounted
+    at /workspace (shared with DinD), block files + inputs + result live in a temp subdir
+    under it, the credential gateway URL is pre-resolved to an IP (isolated netns has no
+    DNS), and the image's own PYTHONPATH (/opt/openclaw) provides libs like ``agent_web``."""
+    import json as _json
+    import os as _os
+    import shutil
+    import socket as _socket
+    import uuid as _uuid
+
+    if not workdir:
+        raise RuntimeError("image-backed block requires a node workspace dir (workdir)")
+    runtime_image = _normalize_block_image(runtime_image)
+    if not runtime_image:
+        raise RuntimeError("image-backed block has an empty runtime_image")
+    base = _os.path.dirname(_os.path.abspath(workdir))
+    if not base or not _os.path.isdir(base):
+        raise RuntimeError(f"image-backed block workspace base not found: {base}")
+
+    tmp_rel = ".block-" + _uuid.uuid4().hex[:10]
+    tmp_host = _os.path.join(base, tmp_rel)
+    _os.makedirs(tmp_host, exist_ok=True)
+    try:
+        _os.chmod(tmp_host, 0o777)
+        if _os.path.isdir(workdir):
+            _os.chmod(workdir, 0o777)
+    except Exception:
+        pass
+
+    node_name = _os.path.basename(_os.path.normpath(workdir))
+    cont_inputs = dict(inputs or {})
+    cont_inputs["__node_dir__"] = f"/workspace/{node_name}"
+    cont_inputs["__workspace_dir__"] = "/workspace"
+
+    try:
+        for fname, src in code_files.items():
+            if not fname.endswith(".py"):
+                continue
+            with open(_os.path.join(tmp_host, _os.path.basename(fname)), "w", encoding="utf-8") as fh:
+                fh.write(str(src))
+        with open(_os.path.join(tmp_host, "_block_runner.py"), "w", encoding="utf-8") as fh:
+            fh.write(_BLOCK_RUNNER_SRC)
+        with open(_os.path.join(tmp_host, "inputs.json"), "w", encoding="utf-8") as fh:
+            _json.dump(cont_inputs, fh, default=str)
+
+        try:
+            gw_ip = _socket.gethostbyname("credential-gateway")
+            gateway_url = f"http://{gw_ip}:8083"
+        except Exception:
+            gateway_url = _os.getenv("CREDENTIAL_GATEWAY_URL", "http://credential-gateway:8083")
+
+        env = {
+            "CREDENTIAL_GATEWAY_URL": gateway_url,
+            "CREDENTIAL_GATEWAY_ADMIN_TOKEN": _os.getenv("CREDENTIAL_GATEWAY_ADMIN_TOKEN", "openclaw-admin"),
+            "BLOCK_TMPDIR": f"/workspace/{tmp_rel}",
+            "BLOCK_ENTRY_FILE": _os.path.basename(entry_file),
+            "BLOCK_ENTRY_NAME": entry_name,
+        }
+        task_id = _os.environ.get("TASK_ID", "")
+        if task_id:
+            env["TASK_ID"] = task_id
+
+        volumes = {base: {"bind": "/workspace", "mode": "rw"}}
+        runner_path = f"/workspace/{tmp_rel}/_block_runner.py"
+        kwargs = dict(
+            image=runtime_image,
+            environment=env,
+            volumes=volumes,
+            tmpfs={"/tmp": "size=100m,mode=1777"},
+            entrypoint=["python3"],
+            command=[runner_path, f"/workspace/{tmp_rel}/inputs.json", f"/workspace/{tmp_rel}/result.json"],
+            detach=True,
+        )
+        if _os.getenv("AGENT_SANDBOX_MODE", "gvisor") == "gvisor":
+            kwargs["runtime"] = "runsc"
+
+        import docker
+        docker_client = get_docker_client()
+        try:
+            container = docker_client.containers.run(**kwargs)
+        except Exception as exc:
+            raise RuntimeError(f"image-backed block container failed to start ({runtime_image}): {str(exc)[-600:]}")
+
+        try:
+            try:
+                wait_result = container.wait(timeout=timeout_seconds)
+                code = wait_result if isinstance(wait_result, int) else (wait_result or {}).get("StatusCode", 0)
+            except Exception:
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+                raise RuntimeError(f"image-backed block timed out after {timeout_seconds}s")
+            try:
+                logs = (container.logs(stdout=True, stderr=True) or b"").decode("utf-8", errors="replace")
+            except Exception:
+                logs = ""
+            if code != 0:
+                raise RuntimeError(f"image-backed block execution failed ({runtime_image}): {(logs or 'no output')[-1500:]}")
+        finally:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+
+        result_file = _os.path.join(tmp_host, "result.json")
+        if not _os.path.isfile(result_file):
+            raise RuntimeError("image-backed block produced no result file")
+        if _os.path.getsize(result_file) > 2_000_000:
+            raise RuntimeError("image-backed block result exceeded 2 MB limit")
+        with open(result_file, "r", encoding="utf-8") as fh:
+            return _json.load(fh)
+    finally:
+        shutil.rmtree(tmp_host, ignore_errors=True)
+
+
+def _field_type_compatible(value: Any, want_type: str) -> bool:
+    """Check a runtime value against a JSON Schema type name (loose typing)."""
+    if not want_type or not isinstance(want_type, str):
+        return True
+    t = want_type.lower()
+    if t == "array":
+        return isinstance(value, (list, tuple))
+    if t == "string":
+        return isinstance(value, str)
+    if t == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if t == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if t == "boolean":
+        return isinstance(value, bool)
+    if t == "object":
+        return isinstance(value, dict)
+    return True
+
+
+def _block_required_input_contract(block: dict) -> tuple:
+    """Return (required_names, any_of_flag) for a block from inputs_schema / handover.
+
+    `handover.requires_any_of: ["urls", "album_url"]` expresses alternative
+    acceptable input sources (at least one required)."""
+    code_obj = block.get("code")
+    handover = code_obj.get("handover") if isinstance(code_obj, dict) else None
+    schema = block.get("inputs_schema")
+    if not isinstance(schema, dict):
+        schema = {}
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+    if isinstance(handover, dict):
+        anyof = handover.get("requires_any_of")
+        if isinstance(anyof, list) and anyof:
+            names = [str(n) for n in anyof if not str(n).startswith("__")]
+            return names, True
+    req = schema.get("required")
+    names = [str(n) for n in req if isinstance(n, str) and not n.startswith("__")] if isinstance(req, list) else []
+    return names, False
+
+
+def _search_handover_leaf(node: Any, name: str, want_type: str, depth: int = 0):
+    """Deterministic depth-first search for a leaf field `name` with compatible type."""
+    if depth > 6:
+        return (False, None)
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(k, str) and k.startswith("__"):
+                continue
+            if k == name and _field_type_compatible(v, want_type):
+                return (True, v)
+        for k, v in node.items():
+            if isinstance(k, str) and k.startswith("__"):
+                continue
+            if isinstance(v, (dict, list)):
+                found, val = _search_handover_leaf(v, name, want_type, depth + 1)
+                if found:
+                    return (True, val)
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, (dict, list)):
+                found, val = _search_handover_leaf(item, name, want_type, depth + 1)
+                if found:
+                    return (True, val)
+    return (False, None)
+
+
+def _collect_leaf_names(node: Any, out: set, cap: int = 60, depth: int = 0) -> None:
+    if depth > 6 or len(out) >= cap:
+        return
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(k, str) and k.startswith("__"):
+                continue
+            if isinstance(v, (dict, list)):
+                _collect_leaf_names(v, out, cap, depth + 1)
+            elif k not in out:
+                out.add(k)
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, (dict, list)):
+                _collect_leaf_names(item, out, cap, depth + 1)
+
+
+def _is_url_field_name(name: Any) -> bool:
+    s = str(name).lower()
+    return any(t in s for t in ("url", "link", "href", "uri"))
+
+
+def _looks_like_http_url_list(value: Any) -> bool:
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    sample = [v for v in value[:8] if isinstance(v, str)]
+    return bool(sample) and all(v.strip().lower().startswith(("http://", "https://")) for v in sample)
+
+
+def _search_url_alias_leaf(node: Any, want_type: str, depth: int = 0):
+    """Semantic alias search: a required URL-ish field may be satisfied by an
+    upstream URL-ish leaf (urls/image_urls/media_urls/… ) of a compatible type.
+
+    Deterministic first-match in input order; only URL-like string/list values."""
+    if depth > 6:
+        return (False, None)
+    if want_type and want_type not in ("array", "string", ""):
+        return (False, None)
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(k, str) and k.startswith("__"):
+                continue
+            if not _is_url_field_name(k):
+                continue
+            if want_type == "array":
+                if _looks_like_http_url_list(v):
+                    return (True, v)
+            elif want_type == "string":
+                if isinstance(v, str) and v.strip().lower().startswith(("http://", "https://")):
+                    return (True, v)
+            else:
+                if _looks_like_http_url_list(v) or (
+                    isinstance(v, str) and v.strip().lower().startswith(("http://", "https://"))
+                ):
+                    return (True, v)
+        for k, v in node.items():
+            if isinstance(k, str) and k.startswith("__"):
+                continue
+            if isinstance(v, (dict, list)):
+                found, val = _search_url_alias_leaf(v, want_type, depth + 1)
+                if found:
+                    return (True, val)
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, (dict, list)):
+                found, val = _search_url_alias_leaf(item, want_type, depth + 1)
+                if found:
+                    return (True, val)
+    return (False, None)
+
+
+def _resolve_dotted(obj: Any, path: str) -> Any:
+    """Resolve ``input_sources`` paths.
+
+    Plain paths are ``producer_node_id.field.path``. A leading ``*.`` is
+    producer-relative: the remainder is resolved against the first direct
+    upstream dict that can satisfy it (portable across DAG node ids)."""
+    if not path or not isinstance(path, str):
+        return None
+    parts = [p for p in path.split(".") if p]
+    if not parts:
+        return None
+
+    def _walk(cur: Any, segs) -> Any:
+        for part in segs:
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return None
+        return cur
+
+    if parts[0] == "*":
+        for k, v in obj.items():
+            if not isinstance(k, str) or k.startswith("__"):
+                continue
+            val = _walk(v, parts[1:])
+            if val is not None:
+                return val
+        return None
+    return _walk(obj, parts)
+
+
+def _inject_required_block_inputs(block: dict, inputs: dict) -> None:
+    """Resolve/validate a block's required inputs against what the flow provides.
+
+    Priority: (a) literal/config top-level value, (b) explicit
+    ``handover.input_sources`` path mapping, (c) auto-injection of the field from
+    an upstream node's output (recursive leaf search by name + type), (d) semantic
+    URL-list/URL alias family, else a clear pre-flight failure instead of a runtime
+    error inside the block code."""
+    names, any_of = _block_required_input_contract(block)
+    if not names:
+        return
+    schema = block.get("inputs_schema")
+    props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
+    types: Dict[str, str] = {}
+    if isinstance(props, dict):
+        for n in names:
+            p = props.get(n)
+            if isinstance(p, dict) and isinstance(p.get("type"), str):
+                types[n] = p["type"]
+
+    present = [n for n in names if inputs.get(n) is not None]
+    if any_of:
+        if present:
+            return
+        missing = list(names)
+    else:
+        missing = [n for n in names if n not in present]
+        if not missing:
+            return
+
+    upstream = {k: v for k, v in inputs.items() if isinstance(k, str) and not k.startswith("__")}
+    code_obj = block.get("code")
+    handover = code_obj.get("handover") if isinstance(code_obj, dict) else None
+    input_sources = handover.get("input_sources") if isinstance(handover, dict) else None
+
+    injected: List[str] = []
+    still: List[str] = []
+    for n in missing:
+        resolved = None
+        if isinstance(input_sources, dict) and isinstance(input_sources.get(n), str):
+            resolved = _resolve_dotted(upstream, input_sources[n])
+        if resolved is None:
+            found, val = _search_handover_leaf(upstream, n, types.get(n, ""))
+            if found:
+                resolved = val
+        if resolved is None:
+            # Alias guard: never satisfy an object-items array field with a
+            # plain-string URL list (semantic item-shape mismatch).
+            p = props.get(n) if isinstance(props, dict) else None
+            items_type = ""
+            if isinstance(p, dict) and isinstance(p.get("items"), dict):
+                items_type = p["items"].get("type") or ""
+            allow_alias = True
+            if types.get(n, "") == "array" and items_type and items_type != "string":
+                allow_alias = False
+            if allow_alias:
+                found, val = _search_url_alias_leaf(upstream, types.get(n, ""))
+                if found:
+                    resolved = val
+        if resolved is not None:
+            inputs[n] = resolved
+            injected.append(n)
+        else:
+            still.append(n)
+
+    if any_of:
+        if any(inputs.get(n) is not None for n in names):
+            return
+        missing_note = f"at least one of {names}"
+    else:
+        if not still:
+            return
+        missing_note = f"{still}"
+
+    leaves: set = set()
+    _collect_leaf_names(inputs, leaves)
+    available_leaves = sorted(leaves - set(names))[:20]
+    provided_keys = sorted(k for k in inputs if isinstance(k, str) and not k.startswith("__"))
+    raise RuntimeError(
+        f"block '{block.get('id') or block.get('name')}' requires input {missing_note}; "
+        f"present: {present or []}, auto-injected: {injected or []}, still missing: {still or []}. "
+        f"Provided top-level keys: {provided_keys}. "
+        f"Upstream leaf fields available: {available_leaves or []}. "
+        "Add a literal config input, set input_mapping, or connect a producer whose output contains the required field."
+    )
+
+
+@activity.defn
+async def run_block(name: str, inputs: dict, agent_token: str = "", workdir: str = "") -> dict:
+    """Deterministic block execution — no LLM loop.
+
+    Fetches the block definition (code.files + entry), executes the entrypoint
+    with the inputs in-process. When ``workdir`` is provided the block may write
+    files there; collected files are returned under ``__deliverables__``.
+    """
+    import base64 as _b64
+    from concurrent.futures import ThreadPoolExecutor
+
+    async def _fetch():
+        import httpx as _h
+        cp = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+        resp = await _h.AsyncClient(timeout=10).get(f"{cp}/api/blocks/{name}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"block '{name}' not found (HTTP {resp.status_code})")
+        return resp.json()
+
+    block = await _fetch()
+    code_obj = block.get("code") or {}
+    code = (code_obj.get("files") or {}) if isinstance(code_obj, dict) else {}
+    if not code:
+        raise RuntimeError(f"block '{name}' has no code files")
+    entry = block.get("entrypoint") or "main"
+    entry_file = _resolve_block_entry_file(
+        code, (code_obj.get("entry_file") or "") if isinstance(code_obj, dict) else ""
+    )
+
+    os.environ.setdefault("CREDENTIAL_GATEWAY_URL", "http://credential-gateway:8083")
+    os.environ.setdefault("CREDENTIAL_GATEWAY_ADMIN_TOKEN", os.getenv("CREDENTIAL_GATEWAY_ADMIN_TOKEN", "openclaw-admin"))
+    if agent_token:
+        os.environ["TASK_ID"] = agent_token[len("task:"):] if agent_token.startswith("task:") else agent_token
+
+    _inputs = dict(inputs or {})
+    if workdir:
+        os.makedirs(workdir, exist_ok=True)
+        _inputs["__node_dir__"] = workdir
+        _inputs["__workspace_dir__"] = os.path.dirname(workdir)
+
+    # Typed handover validation/injection: resolve required inputs from config
+    # literals or upstream outputs before executing the block code.
+    _inject_required_block_inputs(block, _inputs)
+
+    exec_runtime = (code_obj.get("runtime") or "python") if isinstance(code_obj, dict) else "python"
+    runtime_image = (code_obj.get("runtime_image") or "") if isinstance(code_obj, dict) else ""
+    if exec_runtime == "image":
+        if not runtime_image:
+            raise RuntimeError(
+                f"block '{name}' is image-backed but has no runtime_image; "
+                "set it via block update or re-learn the block"
+            )
+        if not workdir:
+            raise RuntimeError(f"image-backed block '{name}' requires a node workspace dir")
+
+    def _exec() -> Any:
+        if exec_runtime == "image":
+            return _execute_block_image_container(
+                code, entry, entry_file, _inputs, workdir, runtime_image, timeout_seconds=290
+            )
+        return _execute_block_module(code, entry, entry_file, _inputs, timeout_seconds=290)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(_exec).result(timeout=300)
+    except Exception as exc:
+        logger.warning(f"⚠️ run_block {name} failed: {exc}")
+        raise
+    if not isinstance(result, dict):
+        result = {"result": result}
+
+    # Collect any files the block wrote into its node directory.
+    deliverables: Dict[str, Any] = {}
+    if workdir and os.path.isdir(workdir):
+        for fname in sorted(os.listdir(workdir)):
+            fpath = os.path.join(workdir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                raw = open(fpath, "rb").read()
+            except Exception:
+                continue
+            if len(raw) <= 400_000:
+                try:
+                    deliverables[fname] = raw.decode("utf-8")
+                except Exception:
+                    deliverables[fname] = "base64:" + _b64.b64encode(raw).decode("ascii")
+            else:
+                deliverables[fname] = {"ref": "file", "path": fpath, "size": len(raw)}
+    if deliverables:
+        result["__deliverables__"] = deliverables
+
+    logger.info(f"🧩 run_block {name} ok (files: {len(deliverables)})")
+    return result
+
+
+@activity.defn
+async def list_task_credential_requests(task_id: str) -> list:
+    """Fetch credential approval requests for a task (any status)."""
+    import httpx
+
+    cp_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{cp_url}/api/credential-requests",
+                params={"agent_session": f"task:{task_id}"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data if isinstance(data, list) else []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"⚠️ Could not list credential requests for {task_id}: {exc}")
+    return []
 
 
 @activity.defn
@@ -3255,6 +4005,18 @@ def _lookup_input_field(source_value: Any, path: str) -> Any:
     return cur
 
 
+def _block_result_text(data: Dict[str, Any]) -> str:
+    """Render a deterministic block's structured result for handoff/review."""
+    res = data.get("result")
+    if res is None:
+        return ""
+    try:
+        txt = json.dumps(res, default=str, ensure_ascii=False)
+    except Exception:
+        txt = str(res)
+    return txt[:2000]
+
+
 def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
     """Build a bounded 'stage handoff' block describing each predecessor node:
     what was done (tool/action trace), what was produced (deliverables + paths),
@@ -3343,6 +4105,9 @@ def _build_stage_handoff(input_data: Dict[str, Any]) -> str:
                 block += f"\n    {fk} = {str(fv)[:300]}"
         if output_preview:
             block += f"\n  OUTPUT: {output_preview}"
+        _block_txt = _block_result_text(data)
+        if _block_txt:
+            block += f"\n  BLOCK RESULT:\n    {_block_txt}"
         blocks.append(block)
 
     return "\n\n".join(blocks)
@@ -3498,6 +4263,9 @@ def _summarize_upstream_state(input_data: Dict[str, Any]) -> List[Dict[str, Any]
             ans = data.get("answer")
             raw_fields = (ans or {}).get("fields") if isinstance(ans, dict) else None
         input_fields = {str(k): str(v)[:500] for k, v in (raw_fields or {}).items()}
+        _block_txt = _block_result_text(data)
+        if not output_text and _block_txt:
+            output_text = _block_txt[:1200]
 
         summary = {
             "node_id": src_node,
@@ -3873,6 +4641,10 @@ class DAGNodeWorkflow:
         # ── Interactive steps: decision / input (pause for the user) ───────
         if node_type in ("decision", "input"):
             return await self._run_interactive(dag_id, node_id, node_type, config)
+
+        # ── Deterministic block: no LLM loop, no container ─────────────────
+        if node_type == "block":
+            return await self._run_block_node(dag_id, node_id, config, input_data, workspace_id)
 
         # Post start message indicating base image and skill consumed
         base_img = config.get("base_image", "openclaw")
@@ -4475,6 +5247,115 @@ class DAGNodeWorkflow:
             start_to_close_timeout=timedelta(seconds=15),
         )
 
+        return {"status": "completed", "output": output, "current_image": ""}
+
+
+    async def _run_block_node(self, dag_id: str, node_id: str, config: dict, input_data: dict, workspace_id: str) -> Dict[str, Any]:
+        """Deterministic block node: run a registered block (no LLM loop)."""
+        import json as _json
+
+        block_id = str(config.get("block") or config.get("block_id") or "").strip()
+        if not block_id:
+            raise RuntimeError(f"block node '{node_id}' is missing config.block")
+        await workflow.execute_activity(
+            post_dag_progress,
+            args=[dag_id, f"🧩 Node '{node_id}' running deterministic block '{block_id}'"],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        inputs: Dict[str, Any] = dict(config.get("inputs") or {})
+        for k, v in (input_data or {}).items():
+            if k in inputs or k == "state_context":
+                continue
+            try:
+                inputs[k] = _json.loads(_json.dumps(v, default=str))
+            except Exception:
+                inputs[k] = str(v)[:4000]
+        workdir = f"/workspaces/{workspace_id}/{node_id}"
+        inputs.setdefault("__node_dir__", workdir)
+
+        try:
+            result = await workflow.execute_activity(
+                run_block,
+                args=[block_id, inputs, "", workdir],
+                start_to_close_timeout=timedelta(minutes=6),
+            )
+        except Exception as _be:
+            _err = str(_be)
+            logger.warning(f"⚠️ Block {block_id} failed for node {node_id}: {_err}")
+            await workflow.execute_activity(
+                update_node_status,
+                args=[dag_id, node_id, "failed", {"error": _err, "node_type": "block", "block": block_id}],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            await workflow.execute_activity(
+                post_node_state_snapshot,
+                args=[
+                    dag_id,
+                    node_id,
+                    {
+                        "phase": "failed",
+                        "status": "failed",
+                        "output_context": {"error": _err, "block": block_id},
+                        "completion_state": {"reason": _err},
+                    },
+                ],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            return {"status": "failed", "error": _err, "current_image": ""}
+        if not isinstance(result, dict):
+            result = {"result": result}
+        deliverables = result.pop("__deliverables__", {}) or {}
+        result = {k: v for k, v in result.items() if not k.startswith("__")}
+        output: Dict[str, Any] = {
+            "status": "completed",
+            "node_type": "block",
+            "block": block_id,
+            "result": result,
+            "deliverables": deliverables,
+            "deliverables_keys": sorted(deliverables.keys()),
+            "workspace_dir": workdir,
+            # Deterministic blocks are not LLM-generated — skip deep review /
+            # acceptance gating entirely and mark it explicitly.
+            "skip_deep_review": True,
+            "acceptance_result": {
+                "valid": True,
+                "reason": "deterministic block — deep review skipped",
+                "deep_review": None,
+            },
+            "acceptance_state": {
+                "verdict": "pass",
+                "score": None,
+                "criteria_results": [],
+                "skipped_reason": "deterministic block",
+            },
+        }
+        await workflow.execute_activity(
+            update_node_status,
+            args=[dag_id, node_id, "completed", output],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        await workflow.execute_activity(
+            post_node_state_snapshot,
+            args=[
+                dag_id,
+                node_id,
+                {
+                    "phase": "completed",
+                    "status": "completed",
+                    "output_context": output,
+                    "acceptance_result": output["acceptance_result"],
+                    "acceptance_state": output["acceptance_state"],
+                    "completion_state": {"description": f"Deterministic block '{block_id}' completed"},
+                },
+            ],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        await workflow.execute_activity(
+            post_dag_progress,
+            args=[dag_id, f"✅ Block '{block_id}' completed."],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
         return {"status": "completed", "output": output, "current_image": ""}
 
 
@@ -5111,6 +5992,9 @@ async def main():
             get_last_iteration,
             create_capability_request,
             list_task_capability_requests,
+            list_task_credential_requests,
+            run_block,
+            remove_agent_container,
             dismiss_pending_capabilities,
             build_agent_image,
             update_task_policy,

@@ -83,9 +83,15 @@ ENV HOME=/home/agent
 ENV XDG_CACHE_HOME=/home/agent/.cache
 ENV OPENCLAW_IMAGE_TYPE=browser_v4
 ENV DBUS_SESSION_BUS_ADDRESS=/dev/null
-ENV OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`curl\`, \`git\`\n- Camoufox (Firefox-based stealth browser) with GeoIP\n- \`curl_cffi\` for TLS fingerprinting\n- Web processing: beautifulsoup4, lxml, html5lib, cssselect, pyquery\n- Content extraction: readability-lxml, trafilatura, newspaper3k, goose3, extruct\n- \`scrapy\`, \`feedparser\`, \`w3lib\`, \`fake-useragent`"
+ENV OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (Debian, standard library)\n- \`httpx\` (HTTP client)\n- \`curl\`, \`git\`\n- \`curl_cffi\` for TLS fingerprinting (HTTP downloads)\n- Web processing: beautifulsoup4, lxml, html5lib, cssselect, pyquery\n- Content extraction: readability-lxml, trafilatura, newspaper3k, goose3, extruct\n- \`scrapy\`, \`feedparser\`, \`w3lib\`, \`fake-useragent\`\n- \`agent_web\` credentialed web SDK (web.get/post/session via the credential gateway)\n- NO browser inside this container. Camoufox/Playwright are NOT available here. Any JS/browser-heavy flow (logins, JS-only pages, shared albums) must call the credential gateway driver endpoints; this container only makes plain HTTP (curl_cffi/httpx) requests."
 
 WORKDIR /workspace
+
+# agent_web SDK — credentialed web access through the credential gateway
+# (the agent references credentials by name; secrets never enter this image).
+# Exposed on PYTHONPATH like the adapter, avoiding a pip build step.
+COPY agent_web /opt/openclaw/agent_web
+ENV PYTHONPATH=/opt/openclaw
 
 # Download browser + GeoIP while running as root
 RUN python3 -m camoufox fetch

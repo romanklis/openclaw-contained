@@ -13,6 +13,9 @@ from routers import agent_images as agent_images_router
 from routers import skill_learning as skill_learning_router
 from routers import dag_user_requests
 from routers import projects as projects_router
+from routers import credentials as credentials_router
+from routers import credential_management as credential_management_router
+from routers import blocks as blocks_router
 from database import engine, Base, async_session
 from config import settings
 
@@ -208,6 +211,9 @@ app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
 app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
 app.include_router(skill_learning_router.router, prefix="/api/skill-learning", tags=["skill-learning"])
 app.include_router(projects_router.router, prefix="/api/projects", tags=["projects"])
+app.include_router(credentials_router.router)
+app.include_router(credential_management_router.router)
+app.include_router(blocks_router.router)
 
 
 @app.get("/health")

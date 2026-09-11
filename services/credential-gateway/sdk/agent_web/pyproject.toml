@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent_web"
+version = "0.1.0"
+description = "Credentialed web access for agents via the credential gateway (no raw secrets reach the agent)"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27"]
+
+[tool.setuptools]
+packages = ["agent_web"]

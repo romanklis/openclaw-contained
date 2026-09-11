@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from models import Skill, AgentImage, SkillV2, SkillV2Status
+from models import Skill, AgentImage, SkillV2, SkillV2Status, Block
 from dag_validator import validate_dag
 
 logger = logging.getLogger(__name__)
@@ -75,8 +75,10 @@ def enforce_gemini_lite_execution_model(dag_json: dict, execution_model: str) ->
 
 
 def set_node_execution_model(dag_json: dict, execution_model: str) -> dict:
-    """Set the LLM model on every DAG node config."""
+    """Set the LLM model on every DAG node config (blocks have no LLM)."""
     for node in dag_json.get("nodes", []):
+        if str(node.get("node_type") or node.get("config", {}).get("type") or "").lower() == "block":
+            continue
         config = node.get("config") or {}
         config["llm_model"] = execution_model
         node["config"] = config
@@ -151,19 +153,47 @@ def _normalize_tokens(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
 
 
+# Words too generic to establish skill relevance — their co-occurrence alone
+# must never cause a skill to be attached to a node.
+_SKILL_MATCH_STOPWORDS = {
+    "browser", "python", "using", "use", "used", "create", "build", "write",
+    "file", "files", "api", "http", "https", "report", "reports", "download",
+    "upload", "verify", "verification", "verified", "login", "log", "session",
+    "web", "request", "requests", "page", "pages", "data", "list", "listing",
+    "search", "query", "result", "results", "step", "task", "agent", "image",
+    "images", "openclaw", "code", "script", "doc", "docs", "tool", "com", "www",
+    "html", "json", "content", "url", "urls", "text", "sample", "account",
+    "service", "call", "need", "must", "work", "new", "via", "into", "from",
+    "with", "the", "and", "a", "an", "in", "it", "its", "to", "of", "for", "on",
+    "your", "this", "that", "appears", "short", "use", "out", "well", "will",
+    "can", "has", "have", "should", "when", "after", "then", "check", "look",
+    "see", "go", "get", "make", "find", "add", "remove", "list", "read",
+    "ensure", "photo", "photos", "album", "media", "gallery", "source",
+    "network", "navigate", "collect", "resolve", "resolved", "direct", "open",
+    "robust", "extractor", "scrape", "scraper", "crawl", "remote", "review",
+}
+
+
+def _meaningful_tokens(text: str) -> set[str]:
+    return {t for t in _normalize_tokens(text) if len(t) >= 6 and t not in _SKILL_MATCH_STOPWORDS}
+
+
 def _pick_matching_v2_skill(node: dict, objective: str, candidates: list[SkillV2]) -> SkillV2 | None:
-    """Pick a best-effort matching v2 skill for a DAG node."""
+    """Pick a best-effort matching v2 skill for a DAG node.
+
+    Conservative: only a genuine overlap of domain terms (>= 2 meaningful
+    tokens) attaches a skill; otherwise the node stays skill-less and the agent
+    follows its inline instructions (custom).
+    """
     if not candidates:
         return None
-    if len(candidates) == 1:
-        return candidates[0]
 
     node_text = " ".join([
         node.get("description", ""),
         objective or "",
         json.dumps(node.get("input_mapping", {}) or {}),
     ])
-    node_tokens = _normalize_tokens(node_text)
+    node_tokens = _meaningful_tokens(node_text)
 
     best: SkillV2 | None = None
     best_score = 0
@@ -173,14 +203,13 @@ def _pick_matching_v2_skill(node: dict, objective: str, candidates: list[SkillV2
             skill.description or "",
             " ".join(skill.tags or []),
         ])
-        skill_tokens = _normalize_tokens(skill_text)
+        skill_tokens = _meaningful_tokens(skill_text)
         overlap = len(node_tokens.intersection(skill_tokens))
-        score = overlap + max(0, (skill.confidence_score or 0) // 20)
-        if score > best_score:
+        if overlap > best_score:
             best = skill
-            best_score = score
+            best_score = overlap
 
-    return best if best_score > 0 else None
+    return best if best_score >= 2 else None
 
 
 async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: str) -> dict:
@@ -201,6 +230,8 @@ async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: 
 
         for node in dag_json.get("nodes", []):
             config = node.setdefault("config", {})
+            if str(node.get("node_type") or config.get("type") or "").lower() == "block" or config.get("block"):
+                continue
             if config.get("selected_skill_v2_id"):
                 continue
 
@@ -234,6 +265,8 @@ async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: 
         ]
         for node in dag_json.get("nodes", []):
             config = node.setdefault("config", {})
+            if str(node.get("node_type") or config.get("type") or "").lower() == "block" or config.get("block"):
+                continue
             gate_cfg = config.setdefault("deliverable_gate", {})
             # Skip nodes that already have an explicit setting
             if "require_real_sources" in gate_cfg:
@@ -300,6 +333,8 @@ Use them when they match the task requirements. For unique tasks, create inline 
 {skills_section}
 
 {skills_v2_section}
+
+{blocks_section}
 
 ## DAG JSON Schema
 You MUST respond with ONLY a valid JSON object (no markdown, no text before/after):
@@ -407,6 +442,101 @@ def _build_skills_section(skills: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_BLOCK_STOPWORDS = frozenset(
+    "the a an and or for to of in on with from this that these those is are be do does did "
+    "block blocks node step steps deterministic fetch fetching data stock value values price "
+    "list page current today latest via using use used".split()
+)
+
+
+def _block_tokens(*texts) -> set:
+    toks: set = set()
+    for t in texts:
+        if not t:
+            continue
+        for w in re.findall(r"[a-z0-9]+", str(t).lower()):
+            if len(w) > 2 and w not in _BLOCK_STOPWORDS:
+                toks.add(w)
+    return toks
+
+
+def _block_purpose(b) -> str:
+    """Semantic one-liner for a block for the planner.
+
+    Prefers the description's first line when it is capability text; falls back
+    to a humanized block id (learned blocks often store only provenance text)."""
+    d = (getattr(b, "description", None) or "").strip()
+    first = (d.split("\n")[0] if d else "").strip()
+    if first and not first.lower().startswith(("learned from", "source:", "model:")):
+        return first[:220]
+    human = re.sub(r"[-_]+", " ", getattr(b, "id", "") or "").strip()
+    return f"Deterministic step: {human}."
+
+
+async def _build_blocks_section(db: AsyncSession, objective: str = "") -> str:
+    """List active deterministic blocks for the planner and instruct its use.
+
+    Ranks objective-overlapping blocks first (deterministic grounding so the
+    planning LLM does not silently skip a learned block that matches the task)."""
+    rows = (await db.execute(
+        select(Block).where(Block.status == "active").order_by(Block.name.asc())
+    )).scalars().all()
+    if not rows:
+        return "## Deterministic Blocks\n\nNo deterministic blocks are registered yet."
+    lines = ["## Deterministic Blocks",
+             "Deterministic blocks run with NO LLM and NO agent container — pure, typed, repeatable operations.",
+             "PREFER THEM: for any step that is a well-defined operation (fetch/convert/search/api/download), emit:",
+             '  {"node_id": "…", "node_type": "block", "depends_on": ["<upstream>"],',
+             '   "config": {"type": "block", "block": "<id>", "inputs": {…}}}',
+             "Upstream outputs are passed to the block automatically as `<upstream-node-id>` input keys when",
+             'input_mapping is empty; set "depends_on" to the upstream nodes whose outputs it needs.',
+             "Only use node_type 'agent' when NO block fits the step — and if you do, note 'CAPABILITY GAP:' in the node description.",
+             "Block nodes have no base_image, no skill, no llm_model, and no deep review.\n"]
+
+    def _format(b):
+        code = getattr(b, "code", None)
+        code_meta = code if isinstance(code, dict) else {}
+        runtime = code_meta.get("runtime") or "python"
+        ins = b.inputs_schema or {}
+        props = ins.get("properties") if isinstance(ins, dict) else {}
+        req = set(ins.get("required") or []) if isinstance(ins, dict) else set()
+        ins_part = ", ".join(
+            f"{name}:{props[name].get('type', 'any')}{'(required)' if name in req else ''}"
+            for name in (list(props.keys())[:6] if isinstance(props, dict) else [])
+        ) or "-"
+        outs = b.outputs_schema or {}
+        out_props = outs.get("properties") if isinstance(outs, dict) else {}
+        out_part = ", ".join(list(out_props.keys())[:6]) if isinstance(out_props, dict) else "-"
+        return (
+            f"- id: {b.id} | runtime: {runtime} | what: {_block_purpose(b)} | "
+            f"inputs: {ins_part} | outputs: {out_part}"
+        )
+
+    objective_tokens = _block_tokens(objective) if objective else set()
+    if objective_tokens:
+        scored = []
+        for b in rows:
+            bt = _block_tokens(getattr(b, "id", ""), getattr(b, "name", ""), _block_purpose(b))
+            overlap = sorted(objective_tokens & bt)
+            if overlap:
+                scored.append((len(overlap), -b.id.count("-"), b))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        strong = scored[:6]
+        if strong:
+            lines.append("### Strong candidates for THIS objective — strongly prefer one of these when a step matches:")
+            lines.append("\n".join(_format(b) for _, _, b in strong))
+            lines.append("")
+
+    lines.append("### All available blocks")
+    shown = 0
+    for b in rows:
+        if shown >= 50:
+            break
+        lines.append(_format(b))
+        shown += 1
+    return "\n".join(lines)
+
+
 async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None, skill_ids: list[str] | None = None, agent_model: str | None = None) -> dict:
     """Generate a DAG plan from a user objective using the LLM router.
 
@@ -451,6 +581,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
     system_prompt = PLANNER_SYSTEM_PROMPT.format(
         skills_section=skills_section,
         skills_v2_section=skills_v2_section,
+        blocks_section=await _build_blocks_section(db, objective=objective),
         base_images_section=await _build_base_images_section(db),
     )
 

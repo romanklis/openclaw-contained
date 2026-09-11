@@ -1,35 +1,63 @@
-# Banking-architecture example — extra infrastructure.
-
-# Joins the platform network so the platform's agents (in dind) can reach
-# these services by name (e.g. http://bank-mock:8080).
-networks:
-  default:
-    name: openclaw-contained_openclaw-network
-    external: true
-
 services:
-  bank-mock:
-    image: nginx:alpine
-    container_name: bank-mock
-    volumes:
-      - ./infra/bank-mock:/usr/share/nginx/html:ro
-    networks:
-      - default
-    # TODO: replace with a real mock bank API (e.g. FastAPI + WireMock) that
-    # the example DAGs query. This nginx stub lets the network wiring work.
-
-  bank-db:
-    image: postgres:16-alpine
-    container_name: bank-db
+  banking-postgres:
+    image: postgres:15
+    container_name: banking-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: bank
-      POSTGRES_USER: bank
-      POSTGRES_PASSWORD: bank
+      POSTGRES_USER: ${POSTGRES_USER:-bank_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bank_admin_pwd_demo}
+      POSTGRES_DB: banking_enterprise
+      # Application/technical role passwords (consumed by init-pg/init.sh)
+      DB_AI_AGENT_PASSWORD: ${DB_AI_AGENT_PASSWORD:-ai_agent_pwd_demo}
+      DB_RISK_CONSUMER_PASSWORD: ${DB_RISK_CONSUMER_PASSWORD:-risk_pwd_demo}
+      DB_GL_CONSUMER_PASSWORD: ${DB_GL_CONSUMER_PASSWORD:-gl_pwd_demo}
+      DB_CREDIT_OFFICER_PASSWORD: ${DB_CREDIT_OFFICER_PASSWORD:-officer_pwd_demo}
+    ports:
+      - "55432:5432"    # developer debugging only; not the security boundary
     volumes:
-      - bank-db-data:/var/lib/postgresql/data
-      - ./data:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+      - ./init-pg:/init-pg:ro
+      - ./init-pg/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
     networks:
-      - default
+      - platform
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bank_admin} -d banking_enterprise"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  banking-mongo:
+    image: mongo:6
+    container_name: banking-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-mongo_admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-mongo_admin_pwd_demo}
+      MONGO_DMS_AI_USER: ${MONGO_DMS_AI_USER:-dms_ai}
+      MONGO_DMS_AI_PASSWORD: ${MONGO_DMS_AI_PASSWORD:-dms_ai_pwd_demo}
+      MONGO_DMS_ARCHIVIST_USER: ${MONGO_DMS_ARCHIVIST_USER:-dms_archivist}
+      MONGO_DMS_ARCHIVIST_PASSWORD: ${MONGO_DMS_ARCHIVIST_PASSWORD:-dms_archivist_pwd_demo}
+    ports:
+      - "27017:27017"   # developer debugging only; not the security boundary
+    volumes:
+      - mongodata:/data/db
+      - ./init-mongo:/init-mongo:ro
+      - ./init-mongo/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    networks:
+      - platform
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ping:1}).ok' mongodb://${MONGO_ROOT_USER:-mongo_admin}:${MONGO_ROOT_PASSWORD:-mongo_admin_pwd_demo}@127.0.0.1:27017/admin?authSource=admin"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
 
 volumes:
-  bank-db-data:
+  pgdata:
+  mongodata:
+
+networks:
+  # Attach to the TaskForge platform network so the platform's worker can resolve
+  # these services and inject their endpoints into authorized agent nodes.
+  platform:
+    external: true
+    name: ${PLATFORM_NETWORK:-openclaw-contained_openclaw-network}
