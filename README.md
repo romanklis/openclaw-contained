@@ -1,4 +1,4 @@
-# TaskForge
+# TaskForge Platform
 
 **Auditable Agent Orchestration for [OpenClaw](https://github.com/openclaw/openclaw)**
 
