@@ -1,0 +1,8 @@
+{
+  "name": "control-benchmark-tests",
+  "image_id": "ann2snn",
+  "description": "pytest suite for the ANN2SNN simulation engine: physics invariants, controller bounds/Dale's law/SNN micro-steps, determinism, convergence and import surface, with a concise TEST_REPORT.",
+  "tags": ["pytest", "testing", "benchmark", "pytorch"],
+  "source_type": "manual",
+  "files": ["control-benchmark-tests.md"]
+}

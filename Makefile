@@ -182,6 +182,15 @@ build-banking: ## Build the Banking agent image (MongoDB + PostgreSQL drivers) a
 	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:banking
 	@echo "  ✅  openclaw-agent:banking built & pushed"
 
+build-ann2snn: ## Build the ANN2SNN agent image (CPU PyTorch + numpy/matplotlib + Flask/Gunicorn) and push to registry
+	@echo "Building ANN2SNN agent image inside DinD..."
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:ann2snn \
+		-f /agent-images/ann2snn/Dockerfile \
+		/agent-images/ann2snn/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:ann2snn
+	@echo "  ✅  openclaw-agent:ann2snn built & pushed"
+
 
 dind-images: ## List all images (agent + DAG commits) inside the DinD daemon, with sizes
 	@echo "== Images inside DinD =="

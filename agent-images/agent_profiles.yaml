@@ -189,4 +189,33 @@ base_images:
     - enterprise database reads (PostgreSQL)
     avoid_for:
     - browser automation
+  ann2snn:
+    dockerfile: agent-images/ann2snn/Dockerfile
+    tag: openclaw-agent:ann2snn
+    enabled: true
+    runtime: Python 3.11 (Debian) + CPU PyTorch + numpy/matplotlib + Flask/Gunicorn
+    description: OpenClaw image with CPU PyTorch, numpy, matplotlib (Agg), pytest, Flask, Gunicorn and ffmpeg for ANN/SNN simulation, control benchmarks, interactive dashboards and demo-video recording.
+    size_estimate: ~1.9 GB
+    capabilities:
+    - python
+    - pytorch-cpu
+    - numpy
+    - plotting
+    - pytest
+    - flask
+    - gunicorn
+    - ffmpeg
+    - video-recording
+    - nodejs
+    - git
+    best_for:
+    - neural-network / SNN simulation
+    - control-system benchmarks
+    - research refactors with tests
+    - interactive simulator dashboards
+    - recording demo videos of simulations
+    avoid_for:
+    - GPU/CUDA training
+    - browser automation
+
 

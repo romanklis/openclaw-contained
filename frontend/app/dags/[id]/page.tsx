@@ -38,6 +38,12 @@ function slugifyPurpose(text: string): string {
   )
 }
 
+// Used until /api/agent-images responds; keeps the picker working offline.
+const FALLBACK_AGENT_IMAGES = [
+  'openclaw', 'browser', 'browser_v2', 'browser_v3', 'browser_v4',
+  'nanobot', 'picoclaw', 'octaveclaw', 'zeroclaw',
+]
+
 interface DAGDetail {
   id: string
   objective: string
@@ -223,6 +229,24 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [blockEditInputs, setBlockEditInputs] = useState('{}')
   const [blockLibrary2, setBlockLibrary2] = useState<any[]>([])
   const [blockLearnResult, setBlockLearnResult] = useState<any>(null)
+  const [agentImageOptions, setAgentImageOptions] = useState<string[]>(FALLBACK_AGENT_IMAGES)
+
+  // Image picker is backed by the registered agent images (banking, ann2snn, ...).
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API}/api/agent-images`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: any[]) => {
+        if (cancelled || !Array.isArray(rows)) return
+        const ids = rows
+          .filter((i) => i && i.enabled !== false && i.id)
+          .map((i) => String(i.id))
+        const merged = ['openclaw', ...ids.filter((x) => x !== 'openclaw')]
+        setAgentImageOptions(Array.from(new Set(merged)))
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
   const [mineResult, setMineResult] = useState<string | null>(null)
   const [analysisResult, setAnalysisResult] = useState<any>(null)
   const [deepReviewLoading, setDeepReviewLoading] = useState(false)
@@ -2584,7 +2608,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 onChange={(e) => setAddNodeImage(e.target.value)}
                 className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2"
               >
-                {['openclaw', 'browser', 'browser_v2', 'browser_v3', 'browser_v4', 'nanobot', 'picoclaw', 'octaveclaw', 'zeroclaw'].map(img => (
+                {agentImageOptions.map(img => (
                   <option key={img} value={img}>{img}</option>
                 ))}
               </select>
@@ -2790,7 +2814,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 onChange={(e) => setNodeImage(e.target.value)}
                 className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2"
               >
-                {['openclaw', 'browser', 'browser_v2', 'browser_v3', 'browser_v4', 'nanobot', 'picoclaw', 'octaveclaw', 'zeroclaw'].map(img => (
+                {agentImageOptions.map(img => (
                   <option key={img} value={img}>{img}</option>
                 ))}
               </select>

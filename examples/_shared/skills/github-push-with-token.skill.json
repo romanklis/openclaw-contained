@@ -1,0 +1,8 @@
+{
+  "name": "github-push-with-token",
+  "image_id": "ann2snn",
+  "description": "Commit and push the generated project to a GitHub repository using a token from the environment: .gitignore first, single authenticated push, remote URL scrubbed afterwards, and a token-redacted GIT_PUSH_REPORT.",
+  "tags": ["git", "github", "delivery"],
+  "source_type": "manual",
+  "files": ["github-push-with-token.md"]
+}

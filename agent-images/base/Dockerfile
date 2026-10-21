@@ -29,6 +29,8 @@ RUN apt-get update && apt-get install -y \
     file \
     # Process management
     supervisor \
+    # OpenMP runtime (required by scipy / scikit-learn wheels)
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (for npm package support in capability requests)
@@ -41,10 +43,17 @@ RUN useradd -m -u 1001 -s /bin/bash agent && \
     mkdir -p /workspace /workspace/output && \
     chown -R agent:agent /workspace
 
+# Headless plotting + writable caches for the agent user (matplotlib Agg)
+RUN mkdir -p /home/agent/.cache/matplotlib && \
+    chown -R agent:agent /home/agent
+
 # Install base Python packages
 COPY requirements.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && \
     rm /tmp/requirements.txt
+
+# Fail the build early if any pre-baked wheel is missing/broken
+RUN python3 -c "import numpy, scipy, matplotlib, pandas, seaborn, sklearn, PIL; print('py libs OK')"
 
 # Copy agent runtime
 COPY agent_runtime.py /opt/openclaw/
@@ -59,15 +68,18 @@ USER agent
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
+    HOME=/home/agent \
+    XDG_CACHE_HOME=/home/agent/.cache \
+    MPLBACKEND=Agg \
     OPENCLAW_WORKSPACE=/workspace \
     OPENCLAW_OUTPUT=/workspace/output \
     OPENCLAW_POLICY_ENFORCER=http://policy-engine:8001 \
     OPENCLAW_IMAGE_TYPE=openclaw \
-    OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (standard library)\n- \`httpx\` (HTTP client)\n- \`curl\`, \`git\`\n- Node.js for npm package support\n- Build tools: gcc, g++, make"
+    OPENCLAW_RUNTIME_DESCRIPTION="- Python 3 (standard library)\n- numerics/data: \`numpy\`, \`scipy\`, \`pandas\`, \`scikit-learn\`\n- plotting: \`matplotlib\` (Agg backend — save PNGs, no display), \`seaborn\`\n- imaging: \`pillow\`\n- \`httpx\` (HTTP client)\n- PDF: \`pypdf\`, \`pymupdf\`\n- \`curl\`, \`git\`\n- Node.js for npm package support\n- Build tools: gcc, g++, make"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
-    CMD python -c "import sys; sys.exit(0)"
+    CMD python -c "import numpy, scipy, matplotlib, pandas, seaborn, sklearn, PIL"
 
 # Default command — use taskforge-adapter for proper LLM agent loop
 ENTRYPOINT ["python", "/opt/openclaw/taskforge-adapter.py"]
