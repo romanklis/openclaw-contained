@@ -136,6 +136,14 @@ ANTHROPIC_API_KEY=your-key-here
 OPENAI_API_KEY=your-key-here
 ```
 
+> **Windows + WSL2:** if TaskForge runs in WSL2 and Ollama runs on Windows,
+> `host.docker.internal` resolves to the WSL VM, not Windows. Run
+> `make test-ollama` to detect the Windows LAN IP, then `make set-ollama-url`
+> to write it to `.env`, and recreate the control-plane:
+> `docker-compose up -d --no-deps --force-recreate control-plane`.
+> Allow TCP 11434 inbound in Windows Firewall (see
+> [Ollama on Windows](#ollama-on-windows-wsl2) below).
+
 ### 2. Start the platform
 
 ```bash
@@ -455,6 +463,29 @@ docker exec openclaw-docker-dind docker ps -a
 | `WEBUI_SECRET_KEY` | `change-me-open-webui-secret` | No | Open WebUI session secret |
 
 At least one LLM provider must be configured for agents to function.
+
+### Ollama on Windows (WSL2)
+
+When TaskForge runs in WSL2 and Ollama runs on the Windows host:
+
+1. In Ollama on Windows, enable **Expose Ollama to the network** and keep it running.
+2. Allow TCP 11434 inbound (admin PowerShell):
+   ```powershell
+   New-NetFirewallRule -DisplayName "Ollama 11434" -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Allow
+   ```
+3. In WSL, detect and save the Windows LAN IP:
+   ```bash
+   make test-ollama       # tests host.docker.internal, the WSL gateway, and Windows LAN IPs
+   make set-ollama-url    # writes .env and updates the running control-plane config
+   # If the control-plane isn't running yet: docker-compose up -d --no-deps control-plane
+   ```
+4. Open the LLM Router dashboard (`http://localhost:3000/llm-providers`) and use
+   **Diagnose**; test chat models in the Playground and decision models in the
+   **Decision Model (System One)** panel (e.g. `kev:0.8b-q8_0`).
+
+`host.docker.internal` points at the WSL VM, not Windows, so it will not reach
+Ollama on the Windows host. Prefer the Windows LAN IP; the WSL gateway IP can
+change when WSL restarts.
 
 ---
 

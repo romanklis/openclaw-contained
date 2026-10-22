@@ -23,6 +23,7 @@ import logging
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -231,6 +232,72 @@ def _gemini_key() -> str: return _config["GEMINI_API_KEY"]
 def _anthropic_key() -> str: return _config["ANTHROPIC_API_KEY"]
 def _openai_key() -> str: return _config["OPENAI_API_KEY"]
 def _deepseek_key() -> str: return _config["DEEPSEEK_API_KEY"]
+
+
+# ---------------------------------------------------------------------------
+# Ollama helpers — model listing, diagnostics, System One
+# ---------------------------------------------------------------------------
+
+async def _fetch_ollama_models(url: str, timeout: float = 5.0) -> tuple[List[str], Optional[str]]:
+    """Return (model_names, error). Never raises."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{url.rstrip('/')}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            models = [
+                m.get("name") or m.get("model")
+                for m in data.get("models", [])
+                if m.get("name") or m.get("model")
+            ]
+            return models, None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _is_wsl() -> bool:
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="ignore") as fh:
+            return "microsoft" in fh.read().lower()
+    except Exception:
+        return False
+
+
+def _ollama_hint(url: str, error: Optional[str] = None) -> str:
+    """Actionable hint for an Ollama connectivity/model error."""
+    base = (url or "").rstrip("/")
+    err = (error or "").lower()
+    if "host.docker.internal" in base and _is_wsl():
+        return (
+            "host.docker.internal points to the WSL VM, not the Windows host. "
+            "Ollama on Windows must be reached via the Windows LAN IP. Run "
+            "`make test-ollama` then `make set-ollama-url` in WSL, and recreate "
+            "the control-plane."
+        )
+    if any(s in err for s in ("connection refused", "connect", "timed out", "timeout", "name or service")):
+        return (
+            f"Ollama is not reachable at {base}. Verify it is running, enable "
+            "'Expose Ollama to the network', and allow TCP 11434 through the "
+            "Windows Firewall. From WSL, use the Windows LAN IP (not "
+            "host.docker.internal)."
+        )
+    if "404" in err or "not found" in err:
+        return (
+            "The endpoint returned 404. /v1/systemone requires Ollama >= 0.35; "
+            "the kev decision models require Ollama >= 0.40.4. Upgrade Ollama."
+        )
+    if "not found" in err and "model" in err:
+        return "The model is not installed. Run `ollama pull <model>` on the Ollama host."
+    return (
+        f"Check that Ollama is running and reachable at {base}. If it runs on "
+        "Windows and TaskForge runs in WSL2, use the Windows LAN IP."
+    )
+
+
+def _extract_noul(data: dict, question: str = "needs_audit") -> Optional[float]:
+    answer = (data.get("answers") or {}).get(question) or {}
+    value = answer.get("noul")
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 # ---------------------------------------------------------------------------
@@ -1444,6 +1511,224 @@ async def clear_task_interactions(task_id: str):
 # Utility endpoints
 # -------------------------------------------------------------------
 
+class SystemOneRequest(BaseModel):
+    model: str
+    state: Any
+    questions: Dict[str, Any]
+    keep_alive: Optional[Union[str, int]] = None
+
+
+@router.get("/diagnose")
+async def diagnose_ollama(model: Optional[str] = None, url: Optional[str] = None):
+    """Step-by-step Ollama connectivity + capability diagnostics.
+
+    Tests the configured (or supplied) URL, the model's presence/capabilities,
+    and the System One decision endpoint. Returns actionable hints on failure.
+    """
+    await _load_config_from_db()
+
+    if not model:
+        try:
+            from routers.dags import _dag_model_defaults
+            model = _dag_model_defaults.get("triage_model") or "kev:0.8b-q8_0"
+        except Exception:
+            model = "kev:0.8b-q8_0"
+
+    base = (url or _ollama_url()).rstrip("/")
+    parsed = urlparse(base)
+    steps: List[dict] = []
+    hints: List[str] = []
+    models: List[str] = []
+    model_info: Optional[dict] = None
+    systemone: Optional[dict] = None
+    version: Optional[str] = None
+
+    def _step(name: str, ok: bool, detail: Any, started: float) -> None:
+        steps.append({
+            "name": name,
+            "ok": ok,
+            "detail": detail,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+        })
+
+    # 1. URL shape
+    parse_ok = parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    _step("url", parse_ok, {
+        "url": base,
+        "scheme": parsed.scheme,
+        "host": parsed.hostname,
+        "port": parsed.port or (443 if parsed.scheme == "https" else 11434),
+        "wsl": _is_wsl(),
+    }, time.monotonic())
+    if not parse_ok:
+        hints.append("OLLAMA_URL must be an http(s) URL, e.g. http://192.168.1.10:11434.")
+        return {
+            "ok": False, "url": base, "version": None, "steps": steps,
+            "models": [], "model_info": None, "systemone": None, "hints": hints,
+        }
+
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        # 2. version (also the reachability probe)
+        started = time.monotonic()
+        try:
+            resp = await client.get(f"{base}/api/version")
+            resp.raise_for_status()
+            version = resp.json().get("version")
+            _step("version", True, {"version": version}, started)
+        except Exception as exc:
+            _step("version", False, str(exc), started)
+            hints.append(_ollama_hint(base, str(exc)))
+            return {
+                "ok": False, "url": base, "version": None, "steps": steps,
+                "models": [], "model_info": None, "systemone": None, "hints": hints,
+            }
+
+        # 3. models
+        started = time.monotonic()
+        try:
+            resp = await client.get(f"{base}/api/tags")
+            resp.raise_for_status()
+            models = [
+                m.get("name") or m.get("model")
+                for m in resp.json().get("models", [])
+                if m.get("name") or m.get("model")
+            ]
+            _step("tags", True, {"count": len(models), "models": models[:50]}, started)
+        except Exception as exc:
+            _step("tags", False, str(exc), started)
+            hints.append(_ollama_hint(base, str(exc)))
+
+        # 4. model presence + capabilities
+        started = time.monotonic()
+        if model and model not in models:
+            _step("model", False, {"model": model, "installed": False}, started)
+            hints.append(
+                f"Model '{model}' is not installed. Run `ollama pull {model}` on the Ollama host."
+            )
+        elif model:
+            try:
+                resp = await client.post(f"{base}/api/show", json={"model": model})
+                resp.raise_for_status()
+                data = resp.json()
+                caps = data.get("capabilities") or []
+                details = data.get("details") or {}
+                model_info = {
+                    "model": model,
+                    "capabilities": caps,
+                    "parameter_size": details.get("parameter_size"),
+                    "quantization_level": details.get("quantization_level"),
+                    "family": details.get("family"),
+                }
+                _step("model", True, model_info, started)
+                if "decision" not in caps:
+                    hints.append(
+                        f"Model '{model}' does not advertise the 'decision' capability; "
+                        "use a decision model (kev/tev1) for triage."
+                    )
+            except Exception as exc:
+                _step("model", False, str(exc), started)
+                hints.append(_ollama_hint(base, str(exc)))
+
+        # 5. System One probe
+        started = time.monotonic()
+        if model_info and "decision" in (model_info.get("capabilities") or []):
+            try:
+                probe = {
+                    "model": model,
+                    "state": "hello world",
+                    "stream": False,
+                    "questions": {
+                        "is_greeting": {
+                            "type": "noul",
+                            "instructions": "Does the state text contain a greeting?",
+                            "criteria": {
+                                "true": "The state contains a greeting.",
+                                "false": "The state does not contain a greeting.",
+                            },
+                        }
+                    },
+                }
+                resp = await client.post(f"{base}/v1/systemone", json=probe)
+                resp.raise_for_status()
+                data = resp.json()
+                p_true = _extract_noul(data, "is_greeting")
+                systemone = {
+                    "p_true": p_true,
+                    "answers": data.get("answers"),
+                    "usage": data.get("usage"),
+                }
+                _step("systemone", p_true is not None, systemone, started)
+                if p_true is None:
+                    hints.append(
+                        "System One responded without a noul probability; check the Ollama version."
+                    )
+            except Exception as exc:
+                _step("systemone", False, str(exc), started)
+                hints.append(_ollama_hint(base, str(exc)))
+        else:
+            _step("systemone", False, "skipped (model lacks decision capability)", started)
+
+    return {
+        "ok": all(s["ok"] for s in steps),
+        "url": base,
+        "version": version,
+        "steps": steps,
+        "models": models,
+        "model_info": model_info,
+        "systemone": systemone,
+        "hints": hints,
+    }
+
+
+@router.post("/systemone")
+async def systemone(req: SystemOneRequest):
+    """Proxy a typed decision request to Ollama's System One endpoint."""
+    await _load_config_from_db()
+    if not req.questions or len(req.questions) > 64:
+        raise HTTPException(status_code=400, detail="questions must contain 1..64 items")
+
+    base = _ollama_url().rstrip("/")
+    payload: Dict[str, Any] = {
+        "model": req.model,
+        "state": req.state,
+        "stream": False,
+        "questions": req.questions,
+    }
+    if req.keep_alive is not None:
+        payload["keep_alive"] = req.keep_alive
+
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{base}/v1/systemone", json=payload)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": str(exc),
+                "hint": _ollama_hint(base, str(exc)),
+                "url": base,
+            },
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": f"Ollama returned HTTP {resp.status_code}: {resp.text[:500]}",
+                "upstream_status": resp.status_code,
+                "hint": _ollama_hint(base, f"{resp.status_code}"),
+                "url": base,
+            },
+        )
+
+    data = resp.json()
+    data["_meta"] = {
+        "url": base,
+        "latency_ms": int((time.monotonic() - started) * 1000),
+    }
+    return data
+
+
 @router.get("/health")
 async def llm_health():
     """Check backend provider connectivity."""
@@ -1452,14 +1737,29 @@ async def llm_health():
     ollama_url = _ollama_url()
 
     # Check Ollama
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{ollama_url}/api/tags")
-            resp.raise_for_status()
-            models = [m["name"] for m in resp.json().get("models", [])]
-            status_map["ollama"] = {"status": "healthy", "url": ollama_url, "models": models}
-    except Exception as e:
-        status_map["ollama"] = {"status": "unhealthy", "error": str(e)}
+    ollama_models, ollama_err = await _fetch_ollama_models(ollama_url)
+    if ollama_err is None:
+        ollama_version = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                vr = await client.get(f"{ollama_url.rstrip('/')}/api/version")
+                if vr.status_code == 200:
+                    ollama_version = vr.json().get("version")
+        except Exception:
+            pass
+        status_map["ollama"] = {
+            "status": "healthy",
+            "url": ollama_url,
+            "models": ollama_models,
+            "version": ollama_version,
+        }
+    else:
+        status_map["ollama"] = {
+            "status": "unhealthy",
+            "url": ollama_url,
+            "error": ollama_err,
+            "hint": _ollama_hint(ollama_url, ollama_err),
+        }
 
     # Gemini — fetch dynamically
     gemini_key = _gemini_key()
@@ -1562,20 +1862,17 @@ async def get_llm_providers():
     await _load_config_from_db()
     providers = []
 
-    # Ollama — always present if reachable
+    # Ollama — always present; report the real error instead of swallowing it
     ollama_url = _ollama_url()
-    ollama_models: list[str] = []
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{ollama_url}/api/tags")
-            if resp.status_code == 200:
-                ollama_models = [m["name"] for m in resp.json().get("models", [])]
-    except Exception:
-        pass
-
+    ollama_models, ollama_err = await _fetch_ollama_models(ollama_url)
     providers.append({
-        "name": "ollama", "type": "ollama", "url": ollama_url,
-        "available": len(ollama_models) > 0, "models": ollama_models,
+        "name": "ollama",
+        "type": "ollama",
+        "url": ollama_url,
+        "available": ollama_err is None,
+        "models": ollama_models,
+        "error": ollama_err,
+        "hint": _ollama_hint(ollama_url, ollama_err) if ollama_err else None,
     })
 
     # Google (Gemini + Gemma) — fetch dynamically
@@ -1689,14 +1986,9 @@ async def list_all_models():
     all_models = []
 
     ollama_url = _ollama_url()
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{ollama_url}/api/tags")
-            if resp.status_code == 200:
-                for m in resp.json().get("models", []):
-                    all_models.append({"id": m["name"], "provider": "ollama"})
-    except Exception:
-        pass
+    ollama_models, _ = await _fetch_ollama_models(ollama_url)
+    for name in ollama_models:
+        all_models.append({"id": name, "provider": "ollama"})
 
     # Google (Gemini + Gemma) — fetch dynamically from the API
     gemini_key = _gemini_key()

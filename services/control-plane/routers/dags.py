@@ -53,6 +53,7 @@ from temporal_client import start_dag_workflow, get_temporal_client
 import uuid
 import logging
 import json
+import os
 import httpx
 from datetime import datetime
 from copy import deepcopy
@@ -61,7 +62,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Default model config — persisted to DB (llm_provider_config) so it survives restarts
-_DAG_MODEL_KEYS = ["planning_model", "agent_model", "deep_review_model", "agent_context_mode"]
+_DAG_MODEL_KEYS = [
+    "planning_model",
+    "agent_model",
+    "deep_review_model",
+    "agent_context_mode",
+    "triage_enabled",
+    "triage_provider",
+    "triage_model",
+    "triage_threshold",
+    "triage_sample_rate",
+]
 _dag_model_defaults: dict[str, str] = {
     "planning_model": "gemini-flash-lite-latest",
     "agent_model": "gemini-flash-lite-latest",
@@ -69,7 +80,30 @@ _dag_model_defaults: dict[str, str] = {
     # none = full history replay each turn (quadratic cost);
     # linear = trim + fold old turns into a summary (bounded growth)
     "agent_context_mode": "none",
+    # Decision-model triage: cheap pre-screen before the expensive deep review.
+    # Triage can only pass or escalate; it never fails a node.
+    "triage_enabled": "true",
+    "triage_provider": "ollama",
+    "triage_model": "kev:0.8b-q8_0",
+    "triage_threshold": "0.20",
+    "triage_sample_rate": "0.05",
 }
+
+# Env overrides (env wins over DB/defaults for the triage settings).
+_TRIAGE_ENV_OVERRIDES = {
+    "triage_enabled": "DECISION_TRIAGE_ENABLED",
+    "triage_provider": "DECISION_TRIAGE_PROVIDER",
+    "triage_model": "DECISION_TRIAGE_MODEL",
+    "triage_threshold": "DECISION_TRIAGE_THRESHOLD",
+    "triage_sample_rate": "DECISION_TRIAGE_SAMPLE_RATE",
+}
+
+
+def _apply_triage_env_overrides() -> None:
+    for key, env_name in _TRIAGE_ENV_OVERRIDES.items():
+        value = os.getenv(env_name)
+        if value is not None and str(value).strip() != "":
+            _dag_model_defaults[key] = str(value).strip()
 
 
 async def _load_dag_model_defaults_from_db():
@@ -77,17 +111,21 @@ async def _load_dag_model_defaults_from_db():
     try:
         from sqlalchemy import text
         from database import async_session
+        params = {f"k{i}": key for i, key in enumerate(_DAG_MODEL_KEYS)}
+        placeholders = ", ".join(f":k{i}" for i in range(len(_DAG_MODEL_KEYS)))
         session = async_session()
         async with session:
             result = await session.execute(
-                text("SELECT key, value FROM llm_provider_config WHERE key IN (:k1, :k2, :k3, :k4)"),
-                {"k1": "planning_model", "k2": "agent_model", "k3": "deep_review_model", "k4": "agent_context_mode"},
+                text(f"SELECT key, value FROM llm_provider_config WHERE key IN ({placeholders})"),
+                params,
             )
             for key, value in result.fetchall():
                 if key in _DAG_MODEL_KEYS and value:
                     _dag_model_defaults[key] = value
     except Exception as e:
         logger.warning(f"Could not load DAG model defaults from DB: {e}")
+    # Env always wins after the DB load.
+    _apply_triage_env_overrides()
 
 
 async def _save_dag_model_default_to_db(key: str, value: str):
@@ -331,7 +369,7 @@ async def get_model_defaults():
 
 @router.post("/model-defaults")
 async def set_model_defaults(body: dict):
-    """Update the default planning and/or agent model."""
+    """Update the default planning / agent / review / triage settings."""
     changed = []
     if "planning_model" in body and body["planning_model"]:
         _dag_model_defaults["planning_model"] = body["planning_model"]
@@ -348,9 +386,36 @@ async def set_model_defaults(body: dict):
             mode = "none"
         _dag_model_defaults["agent_context_mode"] = mode
         changed.append(f"agent_context_mode={mode}")
+
+    # Decision-model triage settings
+    if "triage_enabled" in body:
+        enabled = str(body["triage_enabled"]).strip().lower() in ("1", "true", "yes", "on")
+        _dag_model_defaults["triage_enabled"] = "true" if enabled else "false"
+        changed.append(f"triage_enabled={_dag_model_defaults['triage_enabled']}")
+    if "triage_provider" in body and body["triage_provider"]:
+        _dag_model_defaults["triage_provider"] = str(body["triage_provider"]).strip()
+        changed.append(f"triage_provider={_dag_model_defaults['triage_provider']}")
+    if "triage_model" in body and body["triage_model"]:
+        _dag_model_defaults["triage_model"] = str(body["triage_model"]).strip()
+        changed.append(f"triage_model={_dag_model_defaults['triage_model']}")
+    if "triage_threshold" in body and body["triage_threshold"] not in (None, ""):
+        try:
+            threshold = max(0.0, min(1.0, float(body["triage_threshold"])))
+        except (TypeError, ValueError):
+            threshold = 0.20
+        _dag_model_defaults["triage_threshold"] = f"{threshold:.2f}"
+        changed.append(f"triage_threshold={_dag_model_defaults['triage_threshold']}")
+    if "triage_sample_rate" in body and body["triage_sample_rate"] not in (None, ""):
+        try:
+            sample_rate = max(0.0, min(1.0, float(body["triage_sample_rate"])))
+        except (TypeError, ValueError):
+            sample_rate = 0.05
+        _dag_model_defaults["triage_sample_rate"] = f"{sample_rate:.2f}"
+        changed.append(f"triage_sample_rate={_dag_model_defaults['triage_sample_rate']}")
+
     # Persist changed keys to DB so they survive restarts
-    for key in ("planning_model", "agent_model", "deep_review_model", "agent_context_mode"):
-        if key in _dag_model_defaults and (key in body and body[key]):
+    for key in _DAG_MODEL_KEYS:
+        if key in body and body[key] not in (None, ""):
             await _save_dag_model_default_to_db(key, _dag_model_defaults[key])
     logger.info(f"DAG model defaults updated: {', '.join(changed)}")
     return dict(_dag_model_defaults)

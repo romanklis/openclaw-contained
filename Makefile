@@ -4,7 +4,9 @@
 .PHONY: help up down build restart stop logs logs-service ps health clean \
 		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images \
 		docker-clean-dag docker-clean-dag-dry-run dind-images dind-clean dind-prune \
-		examples example-up example-down
+		examples example-up example-down test-ollama set-ollama-url
+
+MODEL ?= kev:0.8b-q8_0
 
 # ─────────────────────────────────────────────────────────
 # Help
@@ -67,6 +69,12 @@ restart: ## Restart all services
 
 build: ## Build all service Docker images (control-plane, image-builder, worker, frontend)
 	docker-compose build
+
+test-ollama: ## Detect and verify a reachable Ollama (WSL2/Windows-aware)
+	@bash scripts/test-ollama-connection.sh --model $(MODEL)
+
+set-ollama-url: ## Detect Ollama and write OLLAMA_URL to .env
+	@bash scripts/test-ollama-connection.sh --model $(MODEL) --write-env
 
 build-frontend: ## Rebuild only the frontend
 	docker-compose build frontend

@@ -3798,15 +3798,26 @@ async def post_node_structured_output(dag_id: str, node_id: str, task_id: str, o
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
+    gate_result = output.get("gate_result", {}) or {}
+    deep_review = gate_result.get("deep_review") or {}
+    triage = gate_result.get("triage") or {}
+    if deep_review:
+        acceptance_score = deep_review.get("score")
+    elif triage:
+        # Deep review was skipped by triage — no quality score was produced.
+        acceptance_score = None
+    else:
+        acceptance_score = (gate_result.get("external_assessment") or {}).get("score", 0)
+
     # Build structured payload from the collected output
     structured_payload = {
         "task_id": task_id,
         "status": "completed" if output.get("completed") else "failed",
         "objective": output.get("node_objective", ""),
         "success_criteria": output.get("success_criteria", []),
-        "acceptance_verdict": "pass" if output.get("gate_result", {}).get("valid") else "fail",
-        "acceptance_score": output.get("gate_result", {}).get("deep_review", {}).get("score") if output.get("gate_result", {}).get("deep_review") else output.get("gate_result", {}).get("external_assessment", {}).get("score", 0),
-        "criteria_met": {c: True for c in output.get("success_criteria", [])} if output.get("gate_result", {}).get("valid") else {},
+        "acceptance_verdict": "pass" if gate_result.get("valid") else "fail",
+        "acceptance_score": acceptance_score,
+        "criteria_met": {c: True for c in output.get("success_criteria", [])} if gate_result.get("valid") else {},
         "skill_id": output.get("skill_id"),
         "skill_followed": None,  # Will be populated by skill reference extraction
         "deliverables_count": len(output.get("deliverables") or {}),
@@ -3816,6 +3827,7 @@ async def post_node_structured_output(dag_id: str, node_id: str, task_id: str, o
         "output_text": output.get("output", ""),
         "error_text": output.get("error"),
         "workspace_step_path": output.get("workspace_step_path"),
+        "triage": triage or None,
     }
 
     try:
@@ -4333,18 +4345,81 @@ def _build_prior_state_review_prompt(upstream_state_review: List[Dict[str, Any]]
     return "\n".join(lines)
 
 
-async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], assessment: Dict[str, Any]) -> Dict[str, Any]:
-    """Judge the node via the deep review (the control-plane's integrity audit
-    of the task's FINAL iteration).
+async def _gate_triage_precheck(
+    task_id: str,
+    node_id: str,
+    config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Ask the control-plane decision-model triage whether deep review is needed.
 
-    A clean or needs_attention verdict passes the node; issues_found only
-    hard-fails when the score is <= 55 (a convincing LLM failure); if the deep
-    review is unavailable the node passes (a broken reviewer must never sink a
-    well-executed step).
+    Returns the triage payload, or None when the triage service is unreachable
+    (callers then run the deep review). Triage can only pass or escalate; it can
+    never fail a node.
+    """
+    import httpx as _httpx_triage
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    gate_cfg = ((config or {}).get("gate_triage") or {}) if isinstance(config, dict) else {}
+    try:
+        async with _httpx_triage.AsyncClient(timeout=20.0) as _triage_client:
+            resp = await _triage_client.post(
+                f"{control_plane_url}/api/skill-learning/gate-triage",
+                json={
+                    "task_id": task_id,
+                    "node_id": node_id or None,
+                    "force_deep_review": bool(gate_cfg.get("force_deep_review")),
+                    "config": config or {},
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning(
+            f"gate_triage: triage unavailable ({exc}) — falling back to deep review for node {node_id}"
+        )
+        return None
+
+
+async def _deep_review_gate_fallback(
+    task_id: str,
+    output: Dict[str, Any],
+    assessment: Dict[str, Any],
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Judge the node via decision-model triage, then (if needed) the deep review.
+
+    Triage is a cheap pre-screen: a confident "pass" skips the deep review. It
+    can only pass or escalate — never fail a node. The deep review remains the
+    sole failure authority and runs whenever triage escalates, is uncertain, or
+    is unavailable. A clean/needs_attention deep-review verdict passes the node;
+    issues_found only hard-fails when the score is <= 55 (a convincing LLM
+    failure); if the deep review is unavailable the node passes (a broken
+    reviewer must never sink a well-executed step).
     """
     import httpx as _httpx_dr
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
     node_id = (output or {}).get("node_id") or ""
+
+    triage = await _gate_triage_precheck(task_id, node_id, config)
+    if triage and str(triage.get("decision") or "").lower() == "pass":
+        p_escalate = triage.get("p_escalate")
+        reason = (
+            f"ok (triage pass, p_escalate={p_escalate})"
+            if p_escalate is not None
+            else "ok (triage pass)"
+        )
+        logger.info(
+            f"gate_triage: node {node_id} passed triage "
+            f"(model={triage.get('model')}, p={p_escalate}, "
+            f"latency={triage.get('latency_ms')}ms) — deep review skipped"
+        )
+        return {
+            "valid": True,
+            "reason": reason,
+            "external_assessment": assessment,
+            "deep_review": None,
+            "triage": triage,
+        }
+
     try:
         async with _httpx_dr.AsyncClient(timeout=180.0) as _dr_client:
             resp = await _dr_client.post(
@@ -4364,6 +4439,7 @@ async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], asses
             "reason": "deep review unavailable",
             "external_assessment": assessment,
             "deep_review": None,
+            "triage": triage,
         }
 
     verdict = str((review or {}).get("verdict") or "").lower()
@@ -4379,12 +4455,14 @@ async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], asses
             "reason": f"deep_review: issues_found (hard integrity signals, score {score})",
             "external_assessment": assessment,
             "deep_review": review,
+            "triage": triage,
         }
     return {
         "valid": True,
         "reason": f"ok (deep review: {verdict or 'n/a'}" + (f", score {score})" if score is not None else ")"),
         "external_assessment": assessment,
         "deep_review": review,
+        "triage": triage,
     }
 
 
@@ -4462,7 +4540,7 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
     # reviewer. A clean/needs_attention verdict passes; issues_found hard-fails
     # only at score <= 55 (a convincing failure); an unavailable deep review
     # passes (a broken reviewer must never sink a well-executed step).
-    return await _deep_review_gate_fallback(task_id, output, {})
+    return await _deep_review_gate_fallback(task_id, output, {}, config)
 
 
 @activity.defn
@@ -4813,8 +4891,37 @@ class DAGNodeWorkflow:
             gate_result = await workflow.execute_activity(
                 evaluate_node_gate,
                 args=[task_id, output, config],
-                start_to_close_timeout=timedelta(seconds=30),
+                # Triage is fast, but the fallback deep review allows 180s.
+                start_to_close_timeout=timedelta(seconds=300),
             )
+
+            # Record the decision-model triage outcome (even when it escalated)
+            # so the UI/audit trail shows why a deep review ran or was skipped.
+            triage_result = gate_result.get("triage")
+            if triage_result:
+                await workflow.execute_activity(
+                    post_node_audit_event,
+                    args=[
+                        dag_id,
+                        node_id,
+                        {
+                            "task_id": task_id,
+                            "event_type": "gate_triage",
+                            "severity": "info",
+                            "message": (
+                                f"Decision-model triage: {triage_result.get('decision')} "
+                                f"(p_escalate={triage_result.get('p_escalate')}, "
+                                f"model={triage_result.get('model')}, "
+                                f"reason={triage_result.get('reason')})"
+                            ),
+                            "event_data": {
+                                "triage": triage_result,
+                                "deep_review_skipped": not gate_result.get("deep_review"),
+                            },
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
 
             # Soft-fail retry policy: when the deep review reports a hard
             # integrity failure (issues_found, score <= 55), run one corrective
@@ -4900,10 +5007,15 @@ class DAGNodeWorkflow:
                     args=[task_id],
                     start_to_close_timeout=timedelta(seconds=30),
                 )
+                # After a corrective retry, always run the deep review to
+                # confirm the fix — triage must not short-circuit verification.
+                _retry_gate_cfg = dict((config.get("gate_triage") or {}))
+                _retry_gate_cfg["force_deep_review"] = True
+                _retry_config = {**config, "gate_triage": _retry_gate_cfg}
                 gate_result = await workflow.execute_activity(
                     evaluate_node_gate,
-                    args=[task_id, output, config],
-                    start_to_close_timeout=timedelta(seconds=30),
+                    args=[task_id, output, _retry_config],
+                    start_to_close_timeout=timedelta(seconds=300),
                 )
 
                 if retry_result.get("current_image"):
@@ -5034,7 +5146,11 @@ class DAGNodeWorkflow:
                         "acceptance_result": gate_result,
                         "acceptance_state": {
                             "verdict": "pass" if gate_result.get("valid") else "fail",
-                            "score": (gate_result.get("deep_review") or {}).get("score") or gate_result.get("external_assessment", {}).get("score", 0),
+                            "score": (
+                                (gate_result.get("deep_review") or {}).get("score")
+                                if gate_result.get("deep_review")
+                                else (gate_result.get("external_assessment") or {}).get("score")
+                            ),
                             "criteria_results": [],
                             "checked_at": workflow.now().isoformat(),
                         },
