@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 
 type Lang =
   | 'python'
@@ -248,32 +248,234 @@ function TokenSpan({ token, lang }: { token: Token; lang: Lang }) {
   }
 }
 
-function renderMarkdown(content: string) {
-  return content.split('\n').map((line, idx) => {
-    if (/^\s*#{1,6}\s/.test(line)) {
+function safeHref(raw: string): string | null {
+  const href = raw.trim()
+  if (/^(https?:\/\/|mailto:|\/|#)/i.test(href)) return href
+  return null
+}
+
+function renderInline(text: string, keyPrefix: string): ReactNode[] {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g)
+  return parts.map((part, index) => {
+    const key = `${keyPrefix}-${index}`
+    if (!part) return null
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 1) {
       return (
-        <div key={idx} style={{ color: COLORS.heading, fontWeight: 700 }}>
-          {line.replace(/^\s*#{1,6}\s/, '').split('**').map((seg, si) => (
-            <span key={si}>{seg}</span>
-          ))}
-        </div>
+        <code key={key} className="rounded bg-[#161b22] px-1 py-0.5 text-[0.9em] text-[#a5d6ff]">
+          {part.slice(1, -1)}
+        </code>
       )
     }
-    const parts = line.split(/(\*\*[^*]+\*\*|`[^`]+`)/g)
-    return (
-      <div key={idx}>
-        {parts.map((seg, si) => {
-          if (seg.startsWith('**') && seg.endsWith('**')) {
-            return <span key={si} style={{ color: COLORS.fn, fontWeight: 700 }}>{seg.slice(2, -2)}</span>
-          }
-          if (seg.startsWith('`') && seg.endsWith('`')) {
-            return <span key={si} style={{ color: COLORS.string }}>{seg.slice(1, -1)}</span>
-          }
-          return <span key={si}>{seg}</span>
-        })}
-      </div>
-    )
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 3) {
+      return <strong key={key} className="font-semibold text-gray-100">{part.slice(2, -2)}</strong>
+    }
+    if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+      return <em key={key}>{part.slice(1, -1)}</em>
+    }
+    const link = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/)
+    if (link) {
+      const href = safeHref(link[2])
+      if (!href) return <span key={key}>{link[1]}</span>
+      return (
+        <a
+          key={key}
+          href={href}
+          target={href.startsWith('http') ? '_blank' : undefined}
+          rel={href.startsWith('http') ? 'noreferrer' : undefined}
+          className="text-indigo-300 underline decoration-indigo-500/40 hover:text-indigo-200"
+        >
+          {link[1]}
+        </a>
+      )
+    }
+    return <span key={key}>{part}</span>
   })
+}
+
+function splitTableRow(line: string): string[] {
+  let row = line.trim()
+  if (row.startsWith('|')) row = row.slice(1)
+  if (row.endsWith('|')) row = row.slice(0, -1)
+  return row.split('|').map((cell) => cell.trim())
+}
+
+const TABLE_DIVIDER = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/
+
+export function RenderedMarkdown({ content }: { content: string }) {
+  const lines = content.replace(/\r\n/g, '\n').split('\n')
+  const blocks: ReactNode[] = []
+  let i = 0
+
+  while (i < lines.length) {
+    const line = lines[i]
+
+    if (!line.trim()) {
+      i++
+      continue
+    }
+
+    const fence = line.match(/^\s*```(\w*)\s*$/)
+    if (fence) {
+      const code: string[] = []
+      i++
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
+        code.push(lines[i])
+        i++
+      }
+      i++
+      blocks.push(
+        <pre
+          key={`code-${i}`}
+          className="overflow-auto rounded border border-[#1f2937] bg-[#0d1117] p-3 font-mono text-[12px] leading-relaxed text-[#e6edf3]"
+        >
+          <code>{code.join('\n')}</code>
+        </pre>,
+      )
+      continue
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/)
+    if (heading) {
+      const level = heading[1].length
+      const sizes: Record<number, string> = {
+        1: 'text-2xl mt-4',
+        2: 'text-xl mt-4',
+        3: 'text-lg mt-3',
+        4: 'text-base mt-3',
+        5: 'text-sm mt-2 uppercase tracking-wide',
+        6: 'text-xs mt-2 uppercase tracking-wide',
+      }
+      blocks.push(
+        <div
+          key={`h-${i}`}
+          className={`${sizes[level]} font-semibold text-gray-100`}
+        >
+          {renderInline(heading[2], `h-${i}`)}
+        </div>,
+      )
+      i++
+      continue
+    }
+
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      blocks.push(<hr key={`hr-${i}`} className="my-4 border-[#1f2937]" />)
+      i++
+      continue
+    }
+
+    if (line.trimStart().startsWith('>')) {
+      const quote: string[] = []
+      while (i < lines.length && lines[i].trimStart().startsWith('>')) {
+        quote.push(lines[i].replace(/^\s*>\s?/, ''))
+        i++
+      }
+      blocks.push(
+        <blockquote
+          key={`quote-${i}`}
+          className="border-l-2 border-indigo-500/50 bg-indigo-500/5 px-3 py-1.5 text-gray-300 italic"
+        >
+          {renderInline(quote.join(' '), `quote-${i}`)}
+        </blockquote>,
+      )
+      continue
+    }
+
+    if (line.includes('|') && i + 1 < lines.length && TABLE_DIVIDER.test(lines[i + 1])) {
+      const header = splitTableRow(line)
+      i += 2
+      const rows: string[][] = []
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(splitTableRow(lines[i]))
+        i++
+      }
+      blocks.push(
+        <div key={`table-${i}`} className="overflow-auto">
+          <table className="w-full border-collapse text-xs">
+            <thead>
+              <tr className="border-b border-[#2a3441] text-left text-gray-400">
+                {header.map((cell, ci) => (
+                  <th key={ci} className="px-2 py-1.5 font-semibold">{renderInline(cell, `th-${i}-${ci}`)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, ri) => (
+                <tr key={ri} className="border-b border-[#1a2029] align-top">
+                  {row.map((cell, ci) => (
+                    <td key={ci} className="px-2 py-1.5 text-gray-300">{renderInline(cell, `td-${i}-${ri}-${ci}`)}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      )
+      continue
+    }
+
+    const unordered = line.match(/^(\s*)[-*+]\s+(.*)$/)
+    if (unordered) {
+      const items: string[] = []
+      while (i < lines.length) {
+        const match = lines[i].match(/^(\s*)[-*+]\s+(.*)$/)
+        if (!match) break
+        items.push(match[2])
+        i++
+      }
+      blocks.push(
+        <ul key={`ul-${i}`} className="list-disc space-y-1 pl-5">
+          {items.map((item, index) => (
+            <li key={index}>{renderInline(item, `ul-${i}-${index}`)}</li>
+          ))}
+        </ul>,
+      )
+      continue
+    }
+
+    const ordered = line.match(/^(\s*)\d+[.)]\s+(.*)$/)
+    if (ordered) {
+      const items: string[] = []
+      while (i < lines.length) {
+        const match = lines[i].match(/^(\s*)\d+[.)]\s+(.*)$/)
+        if (!match) break
+        items.push(match[2])
+        i++
+      }
+      blocks.push(
+        <ol key={`ol-${i}`} className="list-decimal space-y-1 pl-5">
+          {items.map((item, index) => (
+            <li key={index}>{renderInline(item, `ol-${i}-${index}`)}</li>
+          ))}
+        </ol>,
+      )
+      continue
+    }
+
+    const paragraph: string[] = []
+    while (i < lines.length) {
+      const current = lines[i]
+      if (
+        !current.trim() ||
+        /^\s*```/.test(current) ||
+        /^#{1,6}\s/.test(current) ||
+        /^\s*>/.test(current) ||
+        /^\s*([-*+]|\d+[.)])\s+/.test(current) ||
+        /^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(current) ||
+        (current.includes('|') && i + 1 < lines.length && TABLE_DIVIDER.test(lines[i + 1]))
+      ) {
+        break
+      }
+      paragraph.push(current.trim())
+      i++
+    }
+    blocks.push(
+      <p key={`p-${i}`} className="text-gray-300">
+        {renderInline(paragraph.join(' '), `p-${i}`)}
+      </p>,
+    )
+  }
+
+  return <div className="space-y-2.5">{blocks}</div>
 }
 
 export default function DeliverablePreview({ url, filename }: { url: string; filename: string }) {
@@ -335,6 +537,14 @@ function TextPreview({ url, filename, lang }: { url: string; filename: string; l
 
   const tokens = lang === 'markdown' ? null : tokenize(content, lang)
 
+  if (!tokens) {
+    return (
+      <div className="w-full h-full overflow-auto overscroll-contain bg-[#0d1117] p-4">
+        <RenderedMarkdown content={content} />
+      </div>
+    )
+  }
+
   return (
     <div className="relative w-full h-full">
       <div className="absolute top-2 right-2 z-10 flex items-center">
@@ -355,15 +565,11 @@ function TextPreview({ url, filename, lang }: { url: string; filename: string; l
         className={`w-full h-full overflow-auto overscroll-contain m-0 p-4 text-[12px] leading-relaxed ${wrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
         style={{ background: '#0d1117', color: COLORS.plain, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
       >
-        {tokens ? (
-          <code>
-            {tokens.map((t, idx) => (
-              <TokenSpan key={idx} token={t} lang={lang} />
-            ))}
-          </code>
-        ) : (
-          <code>{renderMarkdown(content)}</code>
-        )}
+        <code>
+          {tokens.map((t, idx) => (
+            <TokenSpan key={idx} token={t} lang={lang} />
+          ))}
+        </code>
       </pre>
     </div>
   )

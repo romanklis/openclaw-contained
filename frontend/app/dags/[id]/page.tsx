@@ -6,7 +6,8 @@ import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import dynamic from 'next/dynamic'
 import { StatusBadge } from '../../components/StatusComponents'
-import DeliverablePreview from '../../components/DeliverablePreview'
+import DeliverablePreview, { RenderedMarkdown } from '../../components/DeliverablePreview'
+import AuditReviewTab from '../../components/AuditReviewTab'
 import DAGTree from '../../components/DAGTree'
 import { API, API_GATEWAY, TEMPORAL_UI } from '../../lib/api'
 
@@ -189,7 +190,11 @@ export default function DAGDetailPage() {
   const [dag, setDag] = useState<DAGDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
-const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'logs' | 'audit' | 'sbom' | 'workspace'>('overview')
+  const [activeTab, setActiveTab] = useState<'deliverables' | 'audit' | 'turns' | 'configuration'>('deliverables')
+  const [previewMode, setPreviewMode] = useState<'rendered' | 'raw'>('rendered')
+  const [previewCopied, setPreviewCopied] = useState(false)
+  const [showDagMore, setShowDagMore] = useState(false)
+  const [showDagSpec, setShowDagSpec] = useState(false)
    const [showRevise, setShowRevise] = useState(false)
   const [reviseComments, setReviseComments] = useState('')
   const [revising, setRevising] = useState(false)
@@ -305,13 +310,12 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'logs' | 'au
   const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(false)
   const [workspacePreview, setWorkspacePreview] = useState<{ path: string; content: string; isImage: boolean } | null>(null)
   const [viewMode, setViewMode] = useState<'graph' | 'tree'>('graph')
-  const [showFullReview, setShowFullReview] = useState(false)
   const [showExecutionState, setShowExecutionState] = useState(false)
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [modelChanging, setModelChanging] = useState(false)
   const [skillInfo, setSkillInfo] = useState<Record<string, any>>({})
   const [logIteration, setLogIteration] = useState<number | null>(null)
-  const [inspectorWidth, setInspectorWidth] = useState(560)
+  const [inspectorWidth, setInspectorWidth] = useState(700)
   const [inspectorMaximized, setInspectorMaximized] = useState(false)
   const [showFullWorkspace, setShowFullWorkspace] = useState(false)
   const [showFullObjective, setShowFullObjective] = useState(false)
@@ -482,10 +486,10 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'logs' | 'au
     fetchNodeTask()
   }, [selectedNodeId, dag?.nodes, nodeTaskData])
 
-  // Load audit turns when audit tab is active
+  // Load audit turns when the Turns & Logs tab is active
   useEffect(() => {
     const node = dag?.nodes.find(n => n.node_id === selectedNodeId)
-    if (!node?.task_id || activeTab !== 'audit') return
+    if (!node?.task_id || activeTab !== 'turns') return
     const taskId = node.task_id
     if (nodeTaskData[taskId]?.auditTurns) return
 
@@ -504,10 +508,10 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'logs' | 'au
     fetchAudit()
   }, [selectedNodeId, activeTab, dag?.nodes, nodeTaskData])
 
-  // Load SBOM when sbom tab is active
+  // Load SBOM when the configuration tab is active
   useEffect(() => {
     const node = dag?.nodes.find(n => n.node_id === selectedNodeId)
-    if (!node?.task_id || activeTab !== 'sbom') return
+    if (!node?.task_id || activeTab !== 'configuration') return
     const taskId = node.task_id
     if (nodeTaskData[taskId]?.sbom !== undefined) return
 
@@ -619,9 +623,9 @@ loadFailedNodeStates()
      fetchAcceptance()
    }, [selectedNodeId, dag?.nodes, dagId, nodeAcceptance])
 
-   // Load workspace manifest when workspace tab is active
+   // Load workspace manifest when deliverables tab is active
    useEffect(() => {
-     if (!dag || activeTab !== 'workspace' || workspaceManifest) return
+     if (!dag || activeTab !== 'deliverables' || workspaceManifest) return
 
      const fetchWorkspaceManifest = async () => {
        try {
@@ -1350,7 +1354,7 @@ setNodeState(prev => {
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
       setDeepReviews(prev => ({ ...prev, [nodeId]: data }))
-      setShowFullReview(true)
+      setActiveTab('audit')
       setMineResult(null)
     } catch (e: any) {
       setMineResult(`❌ Deep review error: ${e.message}`)
@@ -1409,7 +1413,7 @@ setNodeState(prev => {
   }, [selectedNode?.selected_skill_v2_id, skillInfo])
 
   useEffect(() => {
-    if (activeTab !== 'workspace' || !dag) return
+    if ((activeTab !== 'deliverables' && activeTab !== 'audit') || !dag) return
     let cancelled = false
     setWorkspaceTreeLoading(true)
     fetch(`${API}/api/dags/${dagId}/workspace/tree`)
@@ -1462,6 +1466,13 @@ setNodeState(prev => {
     if (!path) return
     const encoded = path.split('/').map((part) => encodeURIComponent(part)).join('/')
     const url = `${API}/api/dags/${dagId}/workspace/files/${encoded}?inline=1`
+    const ext = (path.split('.').pop() || '').toLowerCase()
+    const image = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'].includes(ext)
+    const framed = ['pdf', 'html', 'htm'].includes(ext)
+    if (image || framed) {
+      setWorkspacePreview({ path, content: url, isImage: image })
+      return
+    }
     setWorkspacePreview({ path, content: 'Loading…', isImage: false })
     try {
       const resp = await fetch(url)
@@ -1492,7 +1503,7 @@ setNodeState(prev => {
   const moveInspectorResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!resizeRef.current) return
     const delta = resizeRef.current.startX - event.clientX
-    setInspectorWidth(Math.min(900, Math.max(380, resizeRef.current.startWidth + delta)))
+    setInspectorWidth(Math.min(1000, Math.max(460, resizeRef.current.startWidth + delta)))
   }
 
   const endInspectorResize = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1516,22 +1527,126 @@ setNodeState(prev => {
     (entry) => entry.path.startsWith('attachments/')
   ) || []
 
+  const fileExt = (path: string) => {
+    const base = path.split('/').pop() || path
+    const dot = base.lastIndexOf('.')
+    return dot >= 0 ? base.slice(dot + 1).toLowerCase() : ''
+  }
+  const fileTypeLabel = (path: string) => {
+    const ext = fileExt(path)
+    const base = (path.split('/').pop() || '').toLowerCase()
+    if (!ext) return 'Script'
+    if (['md', 'markdown'].includes(ext)) return 'Markdown'
+    if (ext === 'tex') return 'LaTeX'
+    if (ext === 'py' || ext === 'ipynb') return 'Python'
+    if (ext === 'm') return 'Octave'
+    if (ext === 'sh' || ext === 'bash') return 'Shell'
+    if (ext === 'js' || ext === 'mjs' || ext === 'cjs' || ext === 'jsx') return 'JavaScript'
+    if (ext === 'ts' || ext === 'tsx') return 'TypeScript'
+    if (ext === 'json') return 'JSON'
+    if (ext === 'yaml' || ext === 'yml') return 'YAML'
+    if (ext === 'csv') return 'CSV'
+    if (ext === 'tsv') return 'TSV'
+    if (ext === 'pdf') return 'PDF'
+    if (ext === 'log' || (ext === 'txt' && base.includes('log'))) return 'Log'
+    if (ext === 'txt') return 'Text'
+    if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'].includes(ext)) return 'Image'
+    return ext ? ext.toUpperCase() : 'File'
+  }
+  const isKeyDeliverable = (path: string) => {
+    const ext = fileExt(path)
+    if (['md', 'markdown', 'tex', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'csv'].includes(ext)) return true
+    return /(report|metrics|company_data|summary)/i.test(path) && ['json', 'yaml', 'yml', 'txt'].includes(ext)
+  }
+  const isScriptOrLog = (path: string) => {
+    const ext = fileExt(path)
+    const base = (path.split('/').pop() || '').toLowerCase()
+    if (['py', 'm', 'sh', 'bash', 'js', 'ts', 'log', 'txt', 'ipynb'].includes(ext)) return true
+    return base === 'results.json' || base === 'validate.py' || base.startsWith('run.') || base.startsWith('console')
+  }
+  const groupWorkspaceFiles = (entries: { path: string; size: number }[]) => {
+    const key: { path: string; size: number }[] = []
+    const scripts: { path: string; size: number }[] = []
+    const other: { path: string; size: number }[] = []
+    for (const entry of entries) {
+      if (isKeyDeliverable(entry.path)) key.push(entry)
+      else if (isScriptOrLog(entry.path)) scripts.push(entry)
+      else other.push(entry)
+    }
+    return { key, scripts, other }
+  }
+  const activeGroups = groupWorkspaceFiles(showFullWorkspace ? (workspaceTree || []) : workspaceOwnFiles)
+  const selectedPreviewEntry = workspacePreview
+    ? (workspaceTree || []).find((entry) => entry.path === workspacePreview.path) || null
+    : null
+  const selectedIsMarkdown = workspacePreview ? ['md', 'markdown'].includes(fileExt(workspacePreview.path)) : false
+  const selectedIsImageFile = workspacePreview ? ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'].includes(fileExt(workspacePreview.path)) : false
+  const selectedIsFrame = workspacePreview ? ['pdf', 'html', 'htm'].includes(fileExt(workspacePreview.path)) : false
+  const workspacePreviewUrl = workspacePreview
+    ? `${API}/api/dags/${dagId}/workspace/files/${workspacePreview.path
+        .split('/')
+        .map((part) => encodeURIComponent(part))
+        .join('/')}?inline=1`
+    : ''
+
+  const copyWorkspacePreview = async () => {
+    if (!workspacePreview || workspacePreview.isImage) return
+    const ext = (workspacePreview.path.split('.').pop() || '').toLowerCase()
+    if (['pdf', 'html', 'htm'].includes(ext)) return
+    try {
+      await navigator.clipboard.writeText(workspacePreview.content)
+      setPreviewCopied(true)
+      setTimeout(() => setPreviewCopied(false), 1500)
+    } catch {
+      setError('Could not copy file contents to the clipboard')
+    }
+  }
+
   useEffect(() => {
     setWorkspacePreview(null)
+    setPreviewMode('rendered')
+    setCorrectSkillResult(null)
   }, [selectedNodeId])
 
-  const workspaceFileButton = (entry: { path: string; size: number }) => (
+  const explorerFileIcon = (path: string) => {
+    const ext = fileExt(path)
+    if (['md', 'markdown', 'txt', 'tex'].includes(ext)) return '📄'
+    if (ext === 'pdf') return '📕'
+    if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext)) return '🖼️'
+    if (['csv', 'tsv'].includes(ext)) return '📊'
+    if (ext === 'json' || ext === 'yaml' || ext === 'yml') return '🧾'
+    if (ext === 'py' || ext === 'ipynb') return '🐍'
+    if (ext === 'log') return '📜'
+    if (['sh', 'bash'].includes(ext)) return '⌨️'
+    return '📎'
+  }
+
+  const explorerFileRow = (entry: { path: string; size: number }) => (
     <button
       key={entry.path}
       onClick={() => openWorkspaceFile(entry.path)}
-      className={`block w-full text-left text-[10px] font-mono px-1 py-0.5 rounded truncate ${
+      className={`flex w-full items-start gap-2 rounded px-1.5 py-1 text-left text-[11px] ${
         workspacePreview?.path === entry.path
           ? 'bg-indigo-900/40 text-indigo-200'
           : 'text-gray-400 hover:bg-gray-800'
       }`}
-      title={`${entry.path} · ${formatAttachmentBytes(entry.size)}`}
+      title={entry.path}
     >
-      {entry.path}
+      <span className="mt-0.5 shrink-0">{explorerFileIcon(entry.path)}</span>
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-2">
+          <span className="truncate font-mono text-[11px]">{entry.path.split('/').pop() || entry.path}</span>
+          <span
+            className={`ml-auto h-1.5 w-1.5 shrink-0 rounded-full ${
+              selectedReview ? (selectedDrFlagged ? 'bg-amber-400' : 'bg-emerald-400') : 'bg-gray-600'
+            }`}
+            title={verificationLabel}
+          />
+        </span>
+        <span className="mt-0.5 block text-[9px] text-gray-600">
+          {formatAttachmentBytes(entry.size)} • {fileTypeLabel(entry.path)}
+        </span>
+      </span>
     </button>
   )
 
@@ -1557,6 +1672,48 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
   }, [deepReviews])
   // Deep-review flag severity: red only when the quality score is below 50.
   const selectedDrFlagged = !!(selectedReview && (selectedReview.verdict === 'issues_found' || selectedReview.verdict === 'needs_attention'))
+  const selectedReviewIssues = Array.isArray(selectedReview?.issues) ? selectedReview.issues.length : 0
+  const selectedReviewScore = typeof selectedReview?.score === 'number' ? selectedReview.score : null
+  const reviewPillClass =
+    selectedReviewScore === null
+      ? 'bg-gray-800 text-gray-400'
+      : selectedReviewScore >= 80
+        ? 'bg-emerald-500/15 text-emerald-300'
+        : selectedReviewScore >= 50
+          ? 'bg-amber-500/15 text-amber-300'
+          : 'bg-red-500/15 text-red-300'
+  const nodeDuration = (() => {
+    if (!selectedNode?.started_at) return null
+    const start = new Date(selectedNode.started_at).getTime()
+    if (Number.isNaN(start)) return null
+    const end = selectedNode.completed_at ? new Date(selectedNode.completed_at).getTime() : Date.now()
+    if (Number.isNaN(end)) return null
+    const seconds = Math.max(0, Math.round((end - start) / 1000))
+    if (seconds < 60) return `${seconds}s`
+    const minutes = Math.floor(seconds / 60)
+    const rest = seconds % 60
+    if (minutes < 60) return `${minutes}m ${rest}s`
+    const hours = Math.floor(minutes / 60)
+    return `${hours}h ${minutes % 60}m`
+  })()
+  const deliverableCount = workspaceOwnFiles.length
+  const turnCount = selectedTaskData?.outputs.length || selectedTaskData?.auditTurns?.total_turns || 0
+  const verificationLabel = selectedReview
+    ? selectedDrFlagged
+      ? 'Needs Review ⚠'
+      : 'Verification Passed (Local) ✓'
+    : 'Not audited'
+  const verificationClass = selectedReview
+    ? selectedDrFlagged
+      ? 'text-amber-300'
+      : 'text-emerald-300'
+    : 'text-gray-500'
+  const selectedTopIssue = (Array.isArray(selectedReview?.issues) ? [...selectedReview.issues] : [])
+    .sort((a: any, b: any) => {
+      const rank: Record<string, number> = { high: 0, medium: 1, low: 2 }
+      return (rank[String(a?.severity || '').toLowerCase()] ?? 3) - (rank[String(b?.severity || '').toLowerCase()] ?? 3)
+    })[0]
+  const qualityWarningText = String(selectedTopIssue?.finding || selectedReview?.summary || '').trim() || 'Review flagged issues that need attention.'
   const selectedDrScore = selectedReview?.score
   const drRed = selectedDrFlagged && selectedDrScore !== undefined && selectedDrScore !== null && selectedDrScore < 50
   // Read actions (download logs, examine logs) allowed on completed/failed/ready DAGs
@@ -1574,10 +1731,6 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
   if (error) return <div className="text-red-400 p-8">Error: {error}</div>
   if (!dag) return <div className="text-gray-500 p-8">Loading...</div>
 
-  const completedNodes = dag.nodes.filter(n => n.status === 'completed').length
-  const runningNodes = dag.nodes.filter(n => n.status === 'running').length
-  const failedNodes = dag.nodes.filter(n => n.status === 'failed').length
-  const pendingApproval = dag.nodes.filter(n => n.status === 'pending_approval').length
   const failedNodeSummaries = dag.nodes
     .filter(n => n.status === 'failed')
     .map(n => ({
@@ -1611,32 +1764,94 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             )}
           </div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowDagSpec(true)}
+            className="btn-secondary text-sm"
+            title="View the DAG specification"
+          >
+            View Spec
+          </button>
+          <button
+            onClick={() => {
+              const blob = new Blob([JSON.stringify(dag.dag_json || dag, null, 2)], { type: 'application/json' })
+              const url = URL.createObjectURL(blob)
+              const anchor = document.createElement('a')
+              anchor.href = url
+              anchor.download = `${dag.id}.json`
+              document.body.appendChild(anchor)
+              anchor.click()
+              anchor.remove()
+              URL.revokeObjectURL(url)
+            }}
+            className="btn-secondary text-sm"
+          >
+            Export
+          </button>
           {(dag.status === 'ready' || dag.status === 'failed' || dag.status === 'cancelled' || dag.status === 'completed') && !dag.locked && (
             <button onClick={startDag} className="btn-success text-sm">
-              {dag.status === 'completed' ? '▶ Run (all)' : (dag.status === 'failed' ? '▶ Retry (all)' : '▶ Start')}
+              {dag.status === 'completed' ? '▶ Run (all)' : (dag.status === 'failed' ? '▶ Retry (all)' : '▶ Run')}
             </button>
           )}
-          {dag.status === 'running' && !dag.locked && (
-            <button onClick={cancelDag} className="btn-danger text-sm">&#9209; Cancel</button>
-          )}
-          {(dag.status === 'completed' || dag.status === 'failed' || dag.status === 'cancelled') && !dag.locked && (
+          <div className="relative">
             <button
-              onClick={() => setShowRevise(!showRevise)}
-              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-md transition-colors"
+              onClick={() => setShowDagMore((value) => !value)}
+              className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm rounded-md border border-gray-700"
+              title="More pipeline actions"
             >
-              {showRevise ? 'Cancel' : '♻️ Revise'}
+              More ▾
             </button>
-          )}
-          {dag.locked && (
-            <>
-              <button onClick={openExecuteDialog} className="btn-success text-sm">▶ Execute routine</button>
-              <button onClick={unlockDag} disabled={lockSaving} className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-sm rounded-md transition-colors disabled:opacity-50">🔓 Unlock</button>
-            </>
-          )}
-          {!dag.locked && (dag.status === 'completed' || dag.status === 'failed' || dag.status === 'ready') && (
-            <button onClick={openLockDialog} className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-md transition-colors">🔒 Lock as template</button>
-          )}
+            {showDagMore && (
+              <div className="absolute right-0 z-50 mt-1 w-56 rounded border border-gray-700 bg-gray-900 shadow-xl">
+                {(dag.status === 'completed' || dag.status === 'failed' || dag.status === 'cancelled') && !dag.locked && (
+                  <button
+                    onClick={() => { setShowDagMore(false); setShowRevise((value) => !value) }}
+                    className="w-full px-3 py-2 text-left text-xs text-indigo-300 hover:bg-gray-800"
+                  >
+                    {showRevise ? 'Close revise panel' : '♻️ Revise'}
+                  </button>
+                )}
+                {!dag.locked && (dag.status === 'completed' || dag.status === 'failed' || dag.status === 'ready') && (
+                  <button
+                    onClick={() => { setShowDagMore(false); openLockDialog() }}
+                    className="w-full px-3 py-2 text-left text-xs text-purple-300 hover:bg-gray-800"
+                  >
+                    🔒 Lock as template
+                  </button>
+                )}
+                {dag.status === 'running' && !dag.locked && (
+                  <button
+                    onClick={() => { setShowDagMore(false); cancelDag() }}
+                    className="w-full px-3 py-2 text-left text-xs text-red-300 hover:bg-gray-800"
+                  >
+                    ⏹ Cancel
+                  </button>
+                )}
+                {dag.locked && (
+                  <button
+                    onClick={() => { setShowDagMore(false); openExecuteDialog() }}
+                    className="w-full px-3 py-2 text-left text-xs text-emerald-300 hover:bg-gray-800"
+                  >
+                    ▶ Execute routine
+                  </button>
+                )}
+                {dag.locked && (
+                  <button
+                    onClick={() => { setShowDagMore(false); unlockDag() }}
+                    disabled={lockSaving}
+                    className="w-full px-3 py-2 text-left text-xs text-amber-300 hover:bg-gray-800 disabled:opacity-50"
+                  >
+                    🔓 Unlock
+                  </button>
+                )}
+                {dag.locked && dag.status !== 'running' && (
+                  <div className="border-t border-gray-800 px-3 py-2 text-[10px] text-gray-500">
+                    Routine is locked as a reusable template.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1760,30 +1975,6 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
         </div>
       )}
 
-      {/* Stats bar */}
-      <div className="grid grid-cols-5 gap-3 mb-4">
-        <div className="card py-2 px-3 text-center">
-          <div className="text-[10px] text-gray-500 uppercase">Nodes</div>
-          <div className="text-sm font-bold text-white">{dag.nodes.length}</div>
-        </div>
-        <div className="card py-2 px-3 text-center">
-          <div className="text-[10px] text-gray-500 uppercase">Completed</div>
-          <div className="text-sm font-bold text-emerald-400">{completedNodes}</div>
-        </div>
-        <div className="card py-2 px-3 text-center">
-          <div className="text-[10px] text-gray-500 uppercase">Running</div>
-          <div className="text-sm font-bold text-blue-400">{runningNodes}</div>
-        </div>
-        <div className="card py-2 px-3 text-center">
-          <div className="text-[10px] text-gray-500 uppercase">Failed</div>
-          <div className="text-sm font-bold text-red-400">{failedNodes}</div>
-        </div>
-        <div className="card py-2 px-3 text-center">
-          <div className="text-[10px] text-gray-500 uppercase">Approval</div>
-          <div className={`text-sm font-bold ${pendingApproval > 0 ? 'text-amber-400' : 'text-gray-500'}`}>{pendingApproval}</div>
-        </div>
-      </div>
-
       {/* Pending interactive steps (decision / input) */}
       {userRequests.length > 0 && (
         <div className="mb-4 rounded border border-amber-700/50 bg-amber-950/30 p-4">
@@ -1879,7 +2070,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             {failedNodeSummaries.map(({ nodeId, reason }) => (
               <button
                 key={nodeId}
-                onClick={() => { setSelectedNodeId(nodeId); setActiveTab('overview') }}
+                onClick={() => { setSelectedNodeId(nodeId); setActiveTab('deliverables') }}
                 className="block w-full text-left rounded border border-red-800/40 bg-black/10 px-3 py-2 hover:border-red-500/60 transition-colors"
               >
                 <div className="text-xs font-mono text-red-300 mb-1">{nodeId}</div>
@@ -1972,11 +2163,11 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
           edges={(dag as any).edges || []}
           onNodeClick={(nodeId) => {
             setSelectedNodeId(nodeId)
-            setActiveTab('overview')
+            setActiveTab('deliverables')
           }}
           onSelectNode={(nodeId) => {
             setSelectedNodeId(nodeId)
-            setActiveTab('overview')
+            setActiveTab('deliverables')
           }}
           editable={dagEditable}
           onConnect={dagEditable ? handleGraphConnect : undefined}
@@ -1989,7 +2180,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
           <DAGTree
             nodes={dag.nodes}
             selectedNodeId={selectedNodeId}
-            onSelectNode={(nodeId) => { setSelectedNodeId(nodeId); setActiveTab('overview') }}
+            onSelectNode={(nodeId) => { setSelectedNodeId(nodeId); setActiveTab('deliverables') }}
             deepReviews={deepReviewSummaries}
             turnCounts={nodeTurnCounts}
           />
@@ -2010,478 +2201,266 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
       {selectedNode && (
         <div className={`card border-blue-500/30 mb-4 min-w-0 ${inspectorMaximized ? '' : 'xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto'}`}>
           {/* Node header */}
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-3">
-              <span className="font-mono text-sm font-bold text-white">{selectedNode.node_id}</span>
-              <StatusBadge status={selectedNode.status} />
-              {selectedNode.skill_id && (
-                <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">
-                  skill: {selectedNode.skill_id}
-                </span>
-              )}
-              {selectedNode.selected_skill_v2_id && (
-                <span
-                  className="text-xs bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded cursor-help"
-                  title={
-                    skillInfo[selectedNode.selected_skill_v2_id]?.description ||
-                    selectedNode.skill_selection_reason ||
-                    'v2 skill selected'
-                  }
-                >
-                  v2: {skillInfo[selectedNode.selected_skill_v2_id]?.name || selectedNode.selected_skill_v2_id}
-                </span>
-              )}
-              {selectedNode.config?.base_image && (
-                <span className="text-xs bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded">
-                  image: {selectedNode.config.base_image}
-                </span>
-              )}
-              {selectedNode.config?.dag_image && (
-                <span
-                  className="text-xs bg-indigo-500/20 text-indigo-300 px-2 py-0.5 rounded cursor-help"
-                  title={`Inherited built image: ${selectedNode.config.dag_image}`}
-                >
-                  custom build: {selectedNode.config.dag_image.split(':').pop() || selectedNode.config.dag_image}
-                </span>
-              )}
-            </div>
-            <div className="flex items-center gap-3 text-xs">
-              {(nodeReadActionsAllowed || nodeWriteActionsAllowed) && !selectedNode.task_id && (
-                <div className="relative">
+          <div className="mb-3 border-b border-gray-800 pb-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] uppercase tracking-wide text-gray-500">NODE:</span>
+                  <span className="font-mono text-sm font-bold text-white">{selectedNode.node_id}</span>
+                  <StatusBadge status={selectedNode.status} />
+                  <span className="ml-1 text-[10px] uppercase tracking-wide text-gray-500">Audit:</span>
                   <button
-                    onClick={() => setShowNodeActions(v => !v)}
-                    disabled={nodeActionLoading}
-                    className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
-                    title="Step actions"
+                    onClick={() => {
+                      setActiveTab('audit')
+                      if (selectedNode.task_id && !selectedReview) deepReviewTask(selectedNode.task_id, selectedNode.node_id)
+                    }}
+                    className={`rounded px-1.5 py-0.5 text-[10px] ${reviewPillClass}`}
+                    title={selectedReview?.summary || 'Open Audit & Review'}
                   >
-                    More ▾
+                    {selectedReview
+                      ? `⚠ ${selectedReviewScore ?? '?'}/100 (${selectedReviewIssues} Issue${selectedReviewIssues === 1 ? '' : 's'})`
+                      : 'Not audited'}
                   </button>
-                  {showNodeActions && (
-                    <div className="absolute right-0 mt-1 w-56 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
-                      <button
-                        onClick={() => {
-                          setShowNodeActions(false)
-                          setShowEnhanceDialog(true)
-                        }}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        ✨ Enhance Step
-                      </button>
-                      <button
-                        onClick={deleteSelectedNode}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-red-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🗑 Delete Step
-                      </button>
-                      <button
-                        onClick={() => { setShowNodeActions(false); setShowAddNodeDialog(true) }}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        ➕ Add Step After
-                      </button>
-                      <button
-                        onClick={openEditConnectionsDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🔗 Edit Connections
-                      </button>
-                      <button
-                        onClick={openRenameDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        ✏️ Rename
-                      </button>
-                      <button
-                        onClick={openChangeSkillDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🎯 Change Skill
-                      </button>
-                      <button
-                        onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🖼️ Change Image
-                      </button>
-                      {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
-                        <button
-                          onClick={retryFromSelectedNode}
-                          disabled={nodeActionLoading}
-                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
-                        >
-                          ▶ Run From This Step
-                        </button>
-                      )}
-                    </div>
-                  )}
                 </div>
-              )}
-              {/* Read-only actions available on completed/failed/ready DAGs */}
-              {selectedNode.task_id && nodeReadActionsAllowed && !nodeWriteActionsAllowed && (
-                <div className="relative">
-                  <button
-                    onClick={() => setShowNodeActions(v => !v)}
-                    disabled={nodeActionLoading}
-                    className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
-                    title="Step actions"
-                  >
-                    More ▾
-                  </button>
-                  {showNodeActions && (
-                    <div className="absolute right-0 mt-1 w-64 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
-                      <button
-                        onClick={() => downloadAuditLogs(selectedNode.task_id!)}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        📥 Download Execution Logs
-                      </button>
-                      <button
-                        onClick={() => downloadAuditSummary(selectedNode.task_id!)}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        📋 Download Summary
-                      </button>
-                      <button
-                        onClick={() => examineAndLearnSkill(selectedNode.task_id!, selectedNode.node_id)}
-                        disabled={nodeActionLoading || miningSkill}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🧠 Examine Logs → Learn Skill
-                      </button>
-                      {(selectedNode as any).node_type === 'block' && dagEditable && (
-                        <button
-                          onClick={() => openBlockEditor()}
-                          disabled={nodeActionLoading}
-                          className="w-full text-left px-3 py-2 text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
-                        >
-                          🔧 Change Block / Inputs
-                        </button>
-                      )}
-                      {selectedNode.status === 'completed' && (
-                        <button
-                          onClick={() => promoteRunToBlock(selectedNode.task_id!)}
-                          disabled={nodeActionLoading || blockPromoting}
-                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
-                          title="Promote this successful run's .py driver deliverables into a draft Block"
-                        >
-                          🧩 Learn Block from This Run
-                        </button>
-                      )}
-                      {selectedNode.status === 'completed' && (
-                      <button
-                        onClick={() => promoteRunToDriver(selectedNode.task_id!)}
-                        disabled={nodeActionLoading || driverPromoting}
-                          className="w-full text-left px-3 py-2 text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
-                          title="Promote this successful run's .py driver deliverables into a draft code skill"
-                        >
-                          🧪 Learn Code Driver from This Run
-                        </button>
-                      )}
-                      <button
-                        onClick={() => deepReviewTask(selectedNode.task_id!, selectedNode.node_id)}
-                        disabled={nodeActionLoading || deepReviewLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-amber-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🔍 Deep Review (hallucination / synthetic data)
-                      </button>
-                      <div className="border-t border-gray-700 my-1 px-3 py-2">
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={includeSkillInReview}
-                            onChange={(e) => setIncludeSkillInReview(e.target.checked)}
-                            className="accent-amber-500"
-                          />
-                          <span className="text-xs text-gray-400">Include skill context in review</span>
-                        </label>
-                        <div className="mt-2">
-                          <label className="block text-[10px] text-gray-500 mb-1">Skill format (learn / correct)</label>
-                          <select
-                            value={skillFormat}
-                            onChange={(e) => setSkillFormat(e.target.value)}
-                            className="w-full bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-[11px] text-gray-300"
+                {selectedNode.description && (
+                  <p className="mt-1 line-clamp-2 text-xs italic text-gray-400" title={selectedNode.description}>
+                    &quot;{selectedNode.description}&quot;
+                  </p>
+                )}
+                <div className="mt-1 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] text-gray-500">
+                  <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="text-gray-300">{effectiveNodeModel || '—'}</span>
+                    <span className="text-gray-700">•</span>
+                    <span className="text-gray-300">{selectedNode.config?.dag_image || selectedNode.config?.base_image || 'openclaw'}</span>
+                    <span className="text-gray-700">•</span>
+                    <span className="text-gray-300">⏱ {nodeDuration || '—'}</span>
+                    {selectedNode.depends_on.length > 0 && (
+                      <>
+                        <span className="text-gray-700">•</span>
+                        <span className="text-gray-500">Deps:</span>
+                        {selectedNode.depends_on.map((dep) => (
+                          <button
+                            key={dep}
+                            onClick={() => { setSelectedNodeId(dep); setActiveTab('deliverables') }}
+                            className="rounded border border-gray-700 px-1.5 py-0.5 font-mono text-[10px] text-blue-300 hover:border-blue-500/60 hover:text-blue-200"
+                            title={`Open dependency ${dep}`}
                           >
-                            <option value="pseudo-code">pseudo-code (algorithmic)</option>
-                            <option value="easy">easy (structured steps)</option>
-                            <option value="code">code (ready-to-run script in original language)</option>
-                          </select>
-                        </div>
+                            {dep}
+                          </button>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                  <div className="ml-auto flex shrink-0 items-center gap-3">
+                    {selectedNode.task_id && (
+                      <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400 hover:text-blue-300">
+                        Full task view &#8599;
+                      </Link>
+                    )}
+                    <a
+                      href={getNodeWorkflowLink(selectedNode.node_id)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-blue-400 hover:text-blue-300"
+                    >
+                      Temporal &#8599;
+                    </a>
+                  </div>
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5 text-xs">
+                {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
+                  <button
+                    onClick={retryFromSelectedNode}
+                    disabled={nodeActionLoading}
+                    className="btn-secondary text-[10px] px-2 py-1"
+                    title="Run this step and continue downstream"
+                  >
+                    ▷ Run Step
+                  </button>
+                )}
+                {((selectedNode.task_id && nodeReadActionsAllowed) || nodeWriteActionsAllowed) && (
+                  <div className="relative">
+                    <button
+                      onClick={() => setShowNodeActions(v => !v)}
+                      disabled={nodeActionLoading}
+                      className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:bg-gray-700 disabled:opacity-50"
+                      title="Step actions"
+                    >
+                      More ▾
+                    </button>
+                    {showNodeActions && (
+                      <div className="absolute right-0 z-50 mt-1 max-h-[70vh] w-64 overflow-y-auto rounded border border-gray-700 bg-gray-900 shadow-xl">
+                        {selectedNode.task_id && nodeReadActionsAllowed && (
+                          <>
+                            <button
+                              onClick={() => { setShowNodeActions(false); downloadAuditLogs(selectedNode.task_id!) }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              📥 Download Execution Logs
+                            </button>
+                            <button
+                              onClick={() => { setShowNodeActions(false); downloadAuditSummary(selectedNode.task_id!) }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              📋 Download Summary
+                            </button>
+                            <button
+                              onClick={() => { setShowNodeActions(false); examineAndLearnSkill(selectedNode.task_id!, selectedNode.node_id) }}
+                              disabled={nodeActionLoading || miningSkill}
+                              className="w-full px-3 py-2 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              🧠 Examine Logs → Learn Skill
+                            </button>
+                            {(selectedNode as any).node_type === 'block' && dagEditable && (
+                              <button
+                                onClick={() => { setShowNodeActions(false); openBlockEditor() }}
+                                disabled={nodeActionLoading}
+                                className="w-full px-3 py-2 text-left text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
+                              >
+                                🔧 Change Block / Inputs
+                              </button>
+                            )}
+                            {selectedNode.status === 'completed' && (
+                              <button
+                                onClick={() => { setShowNodeActions(false); promoteRunToBlock(selectedNode.task_id!) }}
+                                disabled={nodeActionLoading || blockPromoting}
+                                className="w-full px-3 py-2 text-left text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
+                                title="Promote this successful run's .py driver deliverables into a draft Block"
+                              >
+                                🧩 Learn Block from This Run
+                              </button>
+                            )}
+                            {selectedNode.status === 'completed' && (
+                              <button
+                                onClick={() => { setShowNodeActions(false); promoteRunToDriver(selectedNode.task_id!) }}
+                                disabled={nodeActionLoading || driverPromoting}
+                                className="w-full px-3 py-2 text-left text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
+                                title="Promote this successful run's .py driver deliverables into a draft code skill"
+                              >
+                                🧪 Learn Code Driver from This Run
+                              </button>
+                            )}
+                            <button
+                              onClick={() => { setShowNodeActions(false); deepReviewTask(selectedNode.task_id!, selectedNode.node_id) }}
+                              disabled={nodeActionLoading || deepReviewLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-amber-200 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              🔍 Deep Review (hallucination / synthetic data)
+                            </button>
+                            <div className="border-t border-gray-700 px-3 py-2">
+                              <label className="flex cursor-pointer items-center gap-2">
+                                <input
+                                  type="checkbox"
+                                  checked={includeSkillInReview}
+                                  onChange={(e) => setIncludeSkillInReview(e.target.checked)}
+                                  className="accent-amber-500"
+                                />
+                                <span className="text-xs text-gray-400">Include skill context in review</span>
+                              </label>
+                              <div className="mt-2">
+                                <label className="mb-1 block text-[10px] text-gray-500">Skill format (learn / correct)</label>
+                                <select
+                                  value={skillFormat}
+                                  onChange={(e) => setSkillFormat(e.target.value)}
+                                  className="w-full rounded border border-gray-700 bg-gray-800 px-1.5 py-1 text-[11px] text-gray-300"
+                                >
+                                  <option value="pseudo-code">pseudo-code (algorithmic)</option>
+                                  <option value="easy">easy (structured steps)</option>
+                                  <option value="code">code (ready-to-run script in original language)</option>
+                                </select>
+                              </div>
+                            </div>
+                          </>
+                        )}
+                        {nodeWriteActionsAllowed && (
+                          <>
+                            <div className="border-t border-gray-700" />
+                            <button
+                              onClick={() => { setShowNodeActions(false); setShowEnhanceDialog(true) }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              ✨ Enhance Step
+                            </button>
+                            <button
+                              onClick={() => { setShowNodeActions(false); deleteSelectedNode() }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-red-300 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              🗑 Delete Step
+                            </button>
+                          </>
+                        )}
+                        {(nodeReadActionsAllowed || nodeWriteActionsAllowed) && (
+                          <>
+                            <div className="border-t border-gray-700" />
+                            <button
+                              onClick={() => { setShowNodeActions(false); setShowAddNodeDialog(true) }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              ➕ Add Step After
+                            </button>
+                            <button
+                              onClick={() => { setShowNodeActions(false); openEditConnectionsDialog() }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              🔗 Edit Connections
+                            </button>
+                            <button
+                              onClick={() => { setShowNodeActions(false); openRenameDialog() }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              ✏️ Rename
+                            </button>
+                            <button
+                              onClick={() => { setShowNodeActions(false); openChangeSkillDialog() }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              🎯 Change Skill
+                            </button>
+                            <button
+                              onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
+                              disabled={nodeActionLoading}
+                              className="w-full px-3 py-2 text-left text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
+                            >
+                              🖼️ Change Image
+                            </button>
+                          </>
+                        )}
+                        {nodeWriteActionsAllowed && (
+                          <>
+                            {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
+                              <button
+                                onClick={() => { setShowNodeActions(false); retryFromSelectedNode() }}
+                                disabled={nodeActionLoading}
+                                className="w-full px-3 py-2 text-left text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
+                              >
+                                ▶ Run From This Step
+                              </button>
+                            )}
+                          </>
+                        )}
                       </div>
-                      <div className="border-t border-gray-700 my-1" />
-                      <button
-                        onClick={() => { setShowNodeActions(false); setShowAddNodeDialog(true) }}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        ➕ Add Step After
-                      </button>
-                      <button
-                        onClick={openEditConnectionsDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🔗 Edit Connections
-                      </button>
-                      <button
-                        onClick={openRenameDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        ✏️ Rename
-                      </button>
-                      <button
-                        onClick={openChangeSkillDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🎯 Change Skill
-                      </button>
-                      <button
-                        onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🖼️ Change Image
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-              {/* Read-write actions on failed/ready DAGs (both read and write) */}
-              {selectedNode.task_id && nodeWriteActionsAllowed && (
-                <div className="relative">
-                  <button
-                    onClick={() => setShowNodeActions(v => !v)}
-                    disabled={nodeActionLoading}
-                    className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
-                    title="Step actions"
-                  >
-                    More ▾
-                  </button>
-                  {showNodeActions && (
-                    <div className="absolute right-0 mt-1 w-64 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
-                      <button
-                        onClick={() => downloadAuditLogs(selectedNode.task_id!)}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        📥 Download Execution Logs
-                      </button>
-                      <button
-                        onClick={() => downloadAuditSummary(selectedNode.task_id!)}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        📋 Download Summary
-                      </button>
-                      <button
-                        onClick={() => examineAndLearnSkill(selectedNode.task_id!, selectedNode.node_id)}
-                        disabled={nodeActionLoading || miningSkill}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🧠 Examine Logs → Learn Skill
-                      </button>
-                      {(selectedNode as any).node_type === 'block' && dagEditable && (
-                        <button
-                          onClick={() => openBlockEditor()}
-                          disabled={nodeActionLoading}
-                          className="w-full text-left px-3 py-2 text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
-                        >
-                          🔧 Change Block / Inputs
-                        </button>
-                      )}
-                      {selectedNode.status === 'completed' && (
-                        <button
-                          onClick={() => promoteRunToBlock(selectedNode.task_id!)}
-                          disabled={nodeActionLoading || blockPromoting}
-                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
-                          title="Promote this successful run's .py driver deliverables into a draft Block"
-                        >
-                          🧩 Learn Block from This Run
-                        </button>
-                      )}
-                      {selectedNode.status === 'completed' && (
-                      <button
-                        onClick={() => promoteRunToDriver(selectedNode.task_id!)}
-                        disabled={nodeActionLoading || driverPromoting}
-                          className="w-full text-left px-3 py-2 text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
-                          title="Promote this successful run's .py driver deliverables into a draft code skill"
-                        >
-                          🧪 Learn Code Driver from This Run
-                        </button>
-                      )}
-                      <button
-                        onClick={() => deepReviewTask(selectedNode.task_id!, selectedNode.node_id)}
-                        disabled={nodeActionLoading || deepReviewLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-amber-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🔍 Deep Review (hallucination / synthetic data)
-                      </button>
-                      <div className="border-t border-gray-700 my-1 px-3 py-2">
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={includeSkillInReview}
-                            onChange={(e) => setIncludeSkillInReview(e.target.checked)}
-                            className="accent-amber-500"
-                          />
-                          <span className="text-xs text-gray-400">Include skill context in review</span>
-                        </label>
-                        <div className="mt-2">
-                          <label className="block text-[10px] text-gray-500 mb-1">Skill format (learn / correct)</label>
-                          <select
-                            value={skillFormat}
-                            onChange={(e) => setSkillFormat(e.target.value)}
-                            className="w-full bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-[11px] text-gray-300"
-                          >
-                            <option value="pseudo-code">pseudo-code (algorithmic)</option>
-                            <option value="easy">easy (structured steps)</option>
-                            <option value="code">code (ready-to-run script in original language)</option>
-                          </select>
-                        </div>
-                      </div>                      <div className="border-t border-gray-700 my-1" />
-                      <button
-                        onClick={() => {
-                          setShowNodeActions(false)
-                          setShowEnhanceDialog(true)
-                        }}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        ✨ Enhance Step
-                      </button>
-                      <button
-                        onClick={deleteSelectedNode}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-red-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🗑 Delete Step
-                      </button>
-                      <button
-                        onClick={() => { setShowNodeActions(false); setShowAddNodeDialog(true) }}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        ➕ Add Step After
-                      </button>
-                      <button
-                        onClick={openEditConnectionsDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🔗 Edit Connections
-                      </button>
-                      <button
-                        onClick={openRenameDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        ✏️ Rename
-                      </button>
-                      <button
-                        onClick={openChangeSkillDialog}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-purple-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🎯 Change Skill
-                      </button>
-                      <button
-                        onClick={() => { setShowNodeActions(false); setNodeImage(selectedNode.config?.base_image || 'openclaw'); setShowImageDialog(true) }}
-                        disabled={nodeActionLoading}
-                        className="w-full text-left px-3 py-2 text-xs text-indigo-300 hover:bg-gray-800 disabled:opacity-50"
-                      >
-                        🖼️ Change Image
-                      </button>
-                      {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
-                        <button
-                          onClick={retryFromSelectedNode}
-                          disabled={nodeActionLoading}
-                          className="w-full text-left px-3 py-2 text-xs text-emerald-300 hover:bg-gray-800 disabled:opacity-50"
-                        >
-                          ▶ Run From This Step
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-              <button
-                onClick={() => setInspectorMaximized((value) => !value)}
-                className="text-[10px] text-gray-400 hover:text-gray-200"
-              >
-                {inspectorMaximized ? 'Restore split' : 'Maximize'}
-              </button>
-              <button onClick={() => setSelectedNodeId(null)} className="text-gray-500 hover:text-gray-300">&times;</button>
+                    )}
+                  </div>
+                )}
+                <button
+                  onClick={() => setInspectorMaximized((value) => !value)}
+                  className="rounded px-2 py-1 text-[10px] text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+                  title={inspectorMaximized ? 'Restore split view' : 'Pop out the node inspector'}
+                >
+                  {inspectorMaximized ? '⤡ Restore' : '⤢ Pop-out'}
+                </button>
+                <button onClick={() => setSelectedNodeId(null)} className="text-gray-500 hover:text-gray-300">&times;</button>
+              </div>
             </div>
-          </div>
-
-          {/* Node meta */}
-          <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-gray-500">
-            <label>Model</label>
-            <select
-              value={effectiveNodeModel}
-              onChange={(event) => changeNodeModel(event.target.value)}
-              disabled={modelChanging}
-              className="max-w-[190px] rounded border border-gray-700 bg-gray-800 px-1.5 py-1 text-[11px] text-gray-300"
-            >
-              {effectiveNodeModel && !modelOptions.includes(effectiveNodeModel) && (
-                <option value={effectiveNodeModel}>{effectiveNodeModel}</option>
-              )}
-              {modelOptions.map((model) => (
-                <option key={model} value={model}>{model}</option>
-              ))}
-            </select>
-            {selectedNode.task_id && (
-              <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400 hover:text-blue-300">
-                Full task view &rarr;
-              </Link>
-            )}
-            <a
-              href={getNodeWorkflowLink(selectedNode.node_id)}
-              target="_blank"
-              rel="noreferrer"
-              className="text-blue-400 hover:text-blue-300"
-            >
-              Temporal &#8599;
-            </a>
-          </div>
-
-          {/* Central node actions */}
-          <div className="mb-3 flex flex-wrap items-center gap-1.5 border-b border-gray-800 pb-2 text-xs">
-            {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
-              <button onClick={retryFromSelectedNode} disabled={nodeActionLoading} className="btn-secondary text-[10px] px-2 py-0.5">
-                ▶ Run from step
-              </button>
-            )}
-            {selectedNode.task_id && (
-              <button
-                onClick={() => {
-                  setShowFullReview(true)
-                  if (!selectedReview) deepReviewTask(selectedNode.task_id!, selectedNode.node_id)
-                }}
-                disabled={deepReviewLoading}
-                className="btn-secondary text-[10px] px-2 py-0.5"
-              >
-                🔍 Review
-              </button>
-            )}
-            {selectedNode.task_id && (
-              <button onClick={() => setActiveTab('logs')} className="btn-secondary text-[10px] px-2 py-0.5">
-                📜 Logs
-              </button>
-            )}
-            <button onClick={() => setActiveTab('workspace')} className="btn-secondary text-[10px] px-2 py-0.5">
-              📁 Workspace
-            </button>
           </div>
 
           {selectedNode.status === 'failed' && selectedFailureReason && (
@@ -2491,64 +2470,24 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             </div>
           )}
 
-          {selectedNode.status === 'completed' && selectedReview && (selectedReview.verdict === 'issues_found' || selectedReview.verdict === 'needs_attention') && (
-            <div className={`mb-3 p-4 rounded border ${drRed ? 'border-red-700/60 bg-red-950/50' : 'border-amber-700/60 bg-amber-950/40'}`}>
-              <div className={`text-[11px] uppercase tracking-wide mb-1 ${drRed ? 'text-red-300' : 'text-amber-300'}`}>
-                ⚠ Deep Review: {selectedReview.verdict === 'issues_found' ? 'Issues Found' : 'Needs Attention'}
-                <span className="ml-2 normal-case opacity-80">score {selectedReview.score ?? '?'}/100</span>
-              </div>
-              {selectedReview.summary && (
-                <div className={`text-sm mb-2 ${drRed ? 'text-red-100/90' : 'text-amber-100/90'}`}>{selectedReview.summary}</div>
-              )}
-              {(Array.isArray(selectedReview.issues) ? selectedReview.issues : []).slice(0, 2).map((issue: any, i: number) => (
-                <div key={i} className={`text-xs mb-1 ${drRed ? 'text-red-200/80' : 'text-amber-200/80'}`}>
-                  <span className="font-semibold uppercase">{issue.severity}:</span> {issue.finding}
-                </div>
-              ))}
+          {selectedNode.status === 'completed' && selectedDrFlagged && (
+            <div className={`mb-3 flex flex-wrap items-center gap-3 rounded border px-3 py-2 text-xs ${drRed ? 'border-red-700/60 bg-red-950/50' : 'border-amber-700/60 bg-amber-950/40'}`}>
+              <span className={`shrink-0 font-semibold ${drRed ? 'text-red-300' : 'text-amber-300'}`}>
+                ⚠ Quality Warning:
+              </span>
+              <span
+                className={`min-w-0 flex-1 truncate ${drRed ? 'text-red-100/90' : 'text-amber-100/90'}`}
+                title={qualityWarningText}
+              >
+                {qualityWarningText}
+              </span>
+              <button
+                onClick={() => setActiveTab('audit')}
+                className={`shrink-0 underline underline-offset-2 ${drRed ? 'text-red-200 hover:text-red-100' : 'text-amber-200 hover:text-amber-100'}`}
+              >
+                View {selectedReviewIssues} Issue{selectedReviewIssues === 1 ? '' : 's'} in Audit ({selectedReviewIssues}) &rarr;
+              </button>
             </div>
-          )}
-
-          {selectedNode.description && (
-            <p className="text-sm text-gray-400 mb-3">{selectedNode.description}</p>
-          )}
-
-          {selectedNode.skill_selection_reason && (
-            <div className="mb-3 p-2 bg-blue-950/40 border border-blue-800/50 rounded text-xs text-blue-300">
-              <span className="font-semibold text-blue-400">Skill rationale: </span>
-              {selectedNode.skill_selection_reason}
-            </div>
-          )}
-
-          {selectedNode.selected_skill_v2_id && skillInfo[selectedNode.selected_skill_v2_id] && (
-            <div className="mb-3 p-2 bg-blue-950/30 border border-blue-800/40 rounded text-xs">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-semibold text-blue-300">
-                  Skill: {skillInfo[selectedNode.selected_skill_v2_id].name || selectedNode.selected_skill_v2_id}
-                </span>
-                {skillInfo[selectedNode.selected_skill_v2_id].status && (
-                  <span className="text-gray-500">{skillInfo[selectedNode.selected_skill_v2_id].status}</span>
-                )}
-                {typeof skillInfo[selectedNode.selected_skill_v2_id].usage_count === 'number' && (
-                  <span className="text-gray-600">used {skillInfo[selectedNode.selected_skill_v2_id].usage_count}</span>
-                )}
-                {typeof skillInfo[selectedNode.selected_skill_v2_id].success_count === 'number' && (
-                  <span className="text-gray-600">success {skillInfo[selectedNode.selected_skill_v2_id].success_count}</span>
-                )}
-                <Link href="/skill-studio" className="ml-auto text-indigo-400 hover:text-indigo-300">
-                  Open Skill Studio →
-                </Link>
-              </div>
-              {skillInfo[selectedNode.selected_skill_v2_id].description && (
-                <p className="mt-1 text-blue-200/80">{skillInfo[selectedNode.selected_skill_v2_id].description}</p>
-              )}
-            </div>
-          )}
-
-          {selectedNode.config?.template_guidance && (
-            <details className="mb-3 p-2 bg-cyan-950/40 border border-cyan-800/50 rounded text-xs text-cyan-200">
-              <summary className="cursor-pointer font-semibold text-cyan-300">📋 Previous run (follow-the-guidance reference)</summary>
-              <pre className="whitespace-pre-wrap mt-1 text-cyan-200/80">{selectedNode.config.template_guidance}</pre>
-            </details>
           )}
 
           {mineResult && (
@@ -2666,111 +2605,6 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               </div>
             )
           })()}
-
-          {selectedReview && showFullReview && (
-            <div className="mb-3 rounded border border-amber-700/40 bg-amber-950/20 p-3 text-xs">
-              <div className="text-xs uppercase tracking-wide text-amber-300 mb-2 flex items-center justify-between">
-                <span>Deep Review — {selectedReview.image_id}{selectedReview.image_tag && <span className="text-gray-500"> ({selectedReview.image_tag})</span>}</span>
-                {selectedReview.skill_used_name && <span className="text-gray-400">skill: {selectedReview.skill_used_name}</span>}
-              </div>
-              {selectedReview.model && (
-                <div className="mb-2 text-[10px] text-gray-400 font-mono">
-                  model: <span className="text-cyan-300">{selectedReview.model}</span>
-                  {selectedReview.created_at && (
-                    <span className="ml-2 text-gray-500">· reviewed {new Date(selectedReview.created_at).toLocaleString()}</span>
-                  )}
-                </div>
-              )}
-
-              <div className="mb-2 flex items-center gap-3">
-                <span className={'px-2 py-0.5 rounded font-semibold ' + (selectedReview.verdict === 'clean' ? 'bg-emerald-800/50 text-emerald-200' : drRed ? 'bg-red-800/50 text-red-200' : 'bg-amber-800/50 text-amber-200')}>
-                  verdict: {selectedReview.verdict}
-                </span>
-                <span className="text-gray-300">quality score: <span className="font-semibold text-amber-200">{selectedReview.score}/100</span></span>
-              </div>
-
-              <div className="mb-3 text-gray-300 whitespace-pre-wrap">{selectedReview.summary}</div>
-
-              {selectedReview.issues?.length > 0 ? (
-                <div className="mb-3">
-                  <div className="text-red-300 font-semibold mb-2">⚠️ Issues found ({selectedReview.issues.length})</div>
-                  <div className="space-y-2">
-                    {selectedReview.issues.map((iss: any, i: number) => (
-                      <div key={i} className="rounded border border-gray-700 bg-gray-900/60 p-2">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className={'px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ' + (iss.severity === 'high' ? 'bg-red-800/60 text-red-100' : iss.severity === 'medium' ? 'bg-amber-800/60 text-amber-100' : 'bg-gray-700 text-gray-300')}>{iss.severity}</span>
-                          <span className={'px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase bg-indigo-900/60 text-indigo-200'}>{iss.category}</span>
-                        </div>
-                        <div className="text-gray-200 font-medium">{iss.finding}</div>
-                        {iss.evidence && <div className="mt-1 text-gray-400 italic whitespace-pre-wrap">Evidence: {iss.evidence}</div>}
-                        {iss.recommendation && <div className="mt-1 text-amber-200">→ {iss.recommendation}</div>}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div className="mb-3 text-emerald-300">No integrity issues detected.</div>
-              )}
-
-              {selectedReview.positives?.length > 0 && (
-                <div className="mb-2">
-                  <div className="text-emerald-300 font-semibold mb-1">✅ Done correctly</div>
-                  <ul className="list-disc list-inside text-emerald-200 space-y-1">
-                    {selectedReview.positives.map((p: string, i: number) => <li key={i}>{p}</li>)}
-                  </ul>
-                </div>
-              )}
-
-              {selectedReview.issues?.length > 0 && (
-                <button
-                  onClick={() => correctSkillFromReview(selectedNode.task_id!, selectedNode.node_id)}
-                  disabled={correctSkillLoading}
-                  className="mt-2 w-full px-3 py-2 rounded bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold disabled:opacity-50"
-                >
-                  {correctSkillLoading ? '🛠️ Generating corrected skill…' : '🛠️ Correct Skill to Prevent Issues'}
-                </button>
-              )}
-
-              {correctSkillResult && (
-                <div className="mt-3 rounded border border-emerald-700/40 bg-emerald-950/20 p-3">
-                  {correctSkillResult.unchanged ? (
-                    <div className="text-emerald-300 text-xs">No issues found — no skill correction needed.</div>
-                  ) : (
-                    <>
-                      <div className="text-xs uppercase tracking-wide text-emerald-300 mb-2">
-                        ✅ Corrected skill created (child of "{correctSkillResult.skill_name}")
-                      </div>
-                      {correctSkillResult.corrected?.map((sk: any, i: number) => (
-                        <div key={i} className="mb-3 rounded border border-gray-700 bg-gray-900/60 p-3">
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="font-semibold text-gray-200">{sk.name}</span>
-                            <span className="text-emerald-300 text-xs">{sk.status}</span>
-                          </div>
-                          {sk.description && <div className="text-gray-400 text-xs mb-2">{sk.description}</div>}
-                          <pre className="whitespace-pre-wrap text-gray-300 text-xs mb-2 bg-gray-950/60 p-2 rounded">{sk.instructions}</pre>
-                          {sk.addressed_issues?.length > 0 && (
-                            <div className="mb-2">
-                              <div className="text-amber-300 font-semibold text-xs mb-1">Addresses:</div>
-                              <ul className="list-disc list-inside text-amber-200 text-xs space-y-1">
-                                {sk.addressed_issues.map((a: string, j: number) => <li key={j}>{a}</li>)}
-                              </ul>
-                            </div>
-                          )}
-                          <a
-                            href="/skill-studio"
-                            className="inline-block mt-2 px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs"
-                          >
-                            Review in Skill Studio
-                          </a>
-                          <span className="ml-3 text-gray-500 text-xs">ID: {sk.skill_id}</span>
-                        </div>
-                      ))}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
 
           {showEnhanceDialog && (
             <div className="mb-3 rounded border border-indigo-700/40 bg-indigo-950/20 p-3">
@@ -3181,33 +3015,121 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             </div>
           )}
 
-          {selectedNode.depends_on.length > 0 && (
-            <div className="text-xs text-gray-500 mb-3">
-              Dependencies:{' '}
-              {selectedNode.depends_on.map(dep => (
-                <button
-                  key={dep}
-                  onClick={() => { setSelectedNodeId(dep); setActiveTab('overview') }}
-                  className="font-mono text-blue-400 hover:text-blue-300 mx-1"
-                >
-                  {dep}
-                </button>
-              ))}
-            </div>
-          )}
+          {/* Node data tabs */}
+          <>
+              <div className="mb-3 flex flex-wrap gap-2">
+                {([
+                  { id: 'deliverables' as const, label: '📄 Deliverables', count: deliverableCount },
+                  { id: 'audit' as const, label: '⚠ Audit & Review', count: selectedReviewIssues },
+                  { id: 'turns' as const, label: '⏱ Turns & Logs', count: turnCount },
+                  { id: 'configuration' as const, label: '⚙ Config & Spec', count: null },
+                ]).map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    className={`rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
+                      activeTab === tab.id
+                        ? 'border-blue-500 bg-gray-700 text-white'
+                        : 'border-gray-700 text-gray-400 hover:border-gray-600 hover:text-gray-200'
+                    }`}
+                  >
+                    {tab.label}
+                    {tab.count !== null ? ` (${tab.count})` : ''}
+                  </button>
+                ))}
+              </div>
 
-          {/* Timing info */}
-          {(selectedNode.started_at || selectedNode.completed_at) && (
-            <div className="flex gap-4 text-xs text-gray-500 mb-3">
-              {selectedNode.started_at && <span>Started: {new Date(selectedNode.started_at).toLocaleString()}</span>}
-              {selectedNode.completed_at && <span>Completed: {new Date(selectedNode.completed_at).toLocaleString()}</span>}
-              {selectedNode.started_at && selectedNode.completed_at && (
-                <span className="text-gray-400">
-                  Duration: {((new Date(selectedNode.completed_at).getTime() - new Date(selectedNode.started_at).getTime()) / 1000).toFixed(0)}s
-                </span>
-              )}
-            </div>
-          )}
+              {activeTab === 'configuration' && (
+                <div className="space-y-3">
+                  <div className="rounded border border-gray-700 bg-gray-900/30 p-3">
+                    <div className="mb-2 text-[10px] uppercase tracking-wide text-gray-500">Model & Runtime</div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="text-xs text-gray-500">Model</label>
+                      <select
+                        value={effectiveNodeModel}
+                        onChange={(event) => changeNodeModel(event.target.value)}
+                        disabled={modelChanging}
+                        className="max-w-[220px] rounded border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-300"
+                      >
+                        {effectiveNodeModel && !modelOptions.includes(effectiveNodeModel) && (
+                          <option value={effectiveNodeModel}>{effectiveNodeModel}</option>
+                        )}
+                        {modelOptions.map((model) => (
+                          <option key={model} value={model}>{model}</option>
+                        ))}
+                      </select>
+                      {modelChanging && <span className="text-[10px] text-gray-500">Saving…</span>}
+                    </div>
+                    <div className="mt-2 grid grid-cols-1 gap-1 text-xs text-gray-400 md:grid-cols-2">
+                      <div>Image: <span className="font-mono text-gray-300">{selectedNode.config?.dag_image || selectedNode.config?.base_image || 'openclaw'}</span></div>
+                      <div>Runtime: <span className="font-mono text-gray-300">{selectedNode.config?.dag_image ? 'custom build' : 'base image'}</span></div>
+                      {selectedNode.container_id && (
+                        <div className="md:col-span-2">Container: <span className="font-mono text-gray-300">{selectedNode.container_id}</span></div>
+                      )}
+                    </div>
+                  </div>
+
+                  {dag.template_params && dag.template_params.length > 0 && (
+                    <div className="rounded border border-cyan-800/40 bg-cyan-950/20 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <div className="text-[10px] uppercase tracking-wide text-cyan-300">Template Parameters</div>
+                        <button onClick={() => setShowDagSpec(true)} className="text-[10px] text-cyan-300 hover:text-cyan-200">View run spec →</button>
+                      </div>
+                      <div className="grid grid-cols-1 gap-1 text-xs text-gray-400 md:grid-cols-2">
+                        {dag.template_params.map((param) => (
+                          <div key={param.key}>
+                            <span className="text-gray-300">{param.label || param.key}</span>
+                            <span className="text-gray-600"> · {param.type} · default {param.default ?? '—'}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedNode.skill_selection_reason && (
+                    <div className="rounded border border-blue-800/50 bg-blue-950/40 p-2 text-xs text-blue-300">
+                      <span className="font-semibold text-blue-400">Skill rationale: </span>
+                      {selectedNode.skill_selection_reason}
+                    </div>
+                  )}
+
+                  {selectedNode.selected_skill_v2_id && skillInfo[selectedNode.selected_skill_v2_id] && (
+                    <div className="rounded border border-blue-800/40 bg-blue-950/30 p-2 text-xs">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-blue-300">
+                          Skill: {skillInfo[selectedNode.selected_skill_v2_id].name || selectedNode.selected_skill_v2_id}
+                        </span>
+                        {skillInfo[selectedNode.selected_skill_v2_id].status && (
+                          <span className="text-gray-500">{skillInfo[selectedNode.selected_skill_v2_id].status}</span>
+                        )}
+                        {typeof skillInfo[selectedNode.selected_skill_v2_id].usage_count === 'number' && (
+                          <span className="text-gray-600">used {skillInfo[selectedNode.selected_skill_v2_id].usage_count}</span>
+                        )}
+                        {typeof skillInfo[selectedNode.selected_skill_v2_id].success_count === 'number' && (
+                          <span className="text-gray-600">success {skillInfo[selectedNode.selected_skill_v2_id].success_count}</span>
+                        )}
+                        <Link href="/skill-studio" className="ml-auto text-indigo-400 hover:text-indigo-300">
+                          Open Skill Studio →
+                        </Link>
+                      </div>
+                      {skillInfo[selectedNode.selected_skill_v2_id].description && (
+                        <p className="mt-1 text-blue-200/80">{skillInfo[selectedNode.selected_skill_v2_id].description}</p>
+                      )}
+                    </div>
+                  )}
+
+                  {selectedNode.skill_id && (
+                    <div className="rounded border border-purple-800/40 bg-purple-950/20 p-2 text-xs text-purple-300">
+                      Legacy skill: <span className="font-mono">{selectedNode.skill_id}</span>
+                    </div>
+                  )}
+
+                  {selectedNode.config?.template_guidance && (
+                    <details className="rounded border border-cyan-800/50 bg-cyan-950/40 p-2 text-xs text-cyan-200">
+                      <summary className="cursor-pointer font-semibold text-cyan-300">📋 Previous run (follow-the-guidance reference)</summary>
+                      <pre className="mt-1 whitespace-pre-wrap text-cyan-200/80">{selectedNode.config.template_guidance}</pre>
+                    </details>
+                  )}
 
           {/* Execution state continuity panel */}
           <div className="mb-3 rounded border border-cyan-700/40 bg-cyan-950/20">
@@ -3233,8 +3155,8 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               <div className="text-xs text-gray-500">
                 No captured state snapshot yet.{' '}
                 {selectedTaskData?.currentState
-                  ? `Task state: ${selectedTaskData.currentState.status} · ${selectedTaskData.outputs.length} iteration${selectedTaskData.outputs.length === 1 ? '' : 's'}. Use the Logs/Outputs tabs for details.`
-                  : 'Use the Logs/Outputs tabs for this run.'}
+                  ? `Task state: ${selectedTaskData.currentState.status} · ${selectedTaskData.outputs.length} iteration${selectedTaskData.outputs.length === 1 ? '' : 's'}. Use the Turns & Logs tab for details.`
+                  : 'Use the Turns & Logs tab for this run.'}
               </div>
             ) : (
               <div className="space-y-2 text-xs">
@@ -3348,39 +3270,55 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             )}
           </div>
 
-          {/* Task data tabs */}
-          {selectedNode.task_id && (
-            <>
-              <div className="flex border-b border-gray-700 mb-3 gap-1">
-{(['overview', 'logs', 'workspace', 'outputs', 'audit', 'sbom'] as const).map(tab => (
-                    <button
-                      key={tab}
-                      onClick={() => setActiveTab(tab)}
-                      className={`px-3 py-1.5 text-xs font-medium capitalize rounded-t transition-colors ${
-                        activeTab === tab
-                          ? 'bg-gray-700 text-white border-b-2 border-blue-500'
-                          : 'text-gray-500 hover:text-gray-300'
-                      }`}
-                    >
-                      {tab === 'overview' ? 'Overview' :
-                       tab === 'outputs' ? `Outputs${selectedTaskData ? ` (${selectedTaskData.outputs.length})` : ''}` :
-                       tab === 'logs' ? 'Logs' :
-                       tab === 'audit' ? 'Audit' :
-                       tab === 'workspace' ? 'Workspace' :
-                       'SBOM'}
-                    </button>
-                  ))}
-              </div>
+                  <details className="rounded border border-gray-700 bg-gray-900/30 p-3 text-xs">
+                    <summary className="cursor-pointer text-gray-400">Raw node output / state</summary>
+                    <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words text-[10px] text-gray-400">
+{JSON.stringify({ config: selectedNode.config, input_mapping: selectedNode.input_mapping, output_data: selectedNode.output_data, latest_state: selectedNodeState?.latest || null }, null, 2)}
+                    </pre>
+                  </details>
+                </div>
+              )}
 
-              {nodeDataLoading && !selectedTaskData && (
+              {/* Audit tab */}
+              {activeTab === 'audit' && (
+                <AuditReviewTab
+                  review={selectedReview}
+                  nodeId={selectedNode.node_id}
+                  taskId={selectedNode.task_id || null}
+                  dagId={dagId}
+                  deepReviewLoading={deepReviewLoading}
+                  correctSkillLoading={correctSkillLoading}
+                  correctSkillResult={correctSkillResult}
+                  workspaceFiles={workspaceTree || []}
+                  onRunReview={() => {
+                    if (selectedNode.task_id) deepReviewTask(selectedNode.task_id, selectedNode.node_id)
+                  }}
+                  onApplyFixes={() => {
+                    if (selectedNode.task_id) correctSkillFromReview(selectedNode.task_id, selectedNode.node_id)
+                  }}
+                  onOpenFile={(path) => {
+                    setActiveTab('deliverables')
+                    void openWorkspaceFile(path)
+                  }}
+                />
+              )}
+
+              {nodeDataLoading && !selectedTaskData && activeTab === 'turns' && (
                 <div className="text-gray-500 text-sm py-4 text-center animate-pulse">Loading task data...</div>
+              )}
+
+              {activeTab === 'turns' && !selectedNode.task_id && (
+                <div className="text-gray-500 text-sm py-3">
+                  This node has not started yet &mdash; no task data available.
+                </div>
               )}
 
               {selectedTaskData && (
                 <>
-                  {/* Overview tab */}
-                  {activeTab === 'overview' && (
-                    <div>
+                  {/* Turns: execution summary */}
+                  {activeTab === 'turns' && (
+                    <div className="mb-4">
+                      <div className="mb-2 text-[10px] uppercase tracking-wide text-gray-500">Execution Summary</div>
                       {selectedTaskData.currentState && (
                         <div className="grid grid-cols-4 gap-2 mb-3">
                           <div className="bg-gray-900/50 rounded p-2 text-center">
@@ -3457,9 +3395,11 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                     </div>
                   )}
 
-                  {/* Outputs tab */}
-                  {activeTab === 'outputs' && (
-                    <div className="space-y-2 max-h-96 overflow-y-auto">
+                  {/* Turns: iteration outputs */}
+                  {activeTab === 'turns' && (
+                    <div className="mb-4">
+                      <div className="mb-2 text-[10px] uppercase tracking-wide text-gray-500">Iteration Outputs</div>
+                      <div className="max-h-96 space-y-2 overflow-y-auto">
                       {selectedTaskData.outputs.length === 0 ? (
                         <div className="text-gray-500 text-sm text-center py-4">No outputs yet</div>
                       ) : (
@@ -3517,11 +3457,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                         })
                       )}
                     </div>
+                    </div>
                   )}
 
-                  {/* Logs tab */}
-                  {activeTab === 'logs' && (
+                  {/* Turns: logs */}
+                  {activeTab === 'turns' && (
                     <div>
+                      <div className="mb-2 text-[10px] uppercase tracking-wide text-gray-500">Agent Logs</div>
                       {selectedTaskData.outputs.length === 0 ? (
                         <div className="text-gray-500 text-sm py-4">No iterations captured.</div>
                       ) : (() => {
@@ -3566,9 +3508,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                     </div>
                   )}
 
-                  {/* Audit tab */}
-                  {activeTab === 'audit' && (
-                    <div className="max-h-96 overflow-y-auto">
+                  {/* Turns: LLM audit trail */}
+                  {activeTab === 'turns' && (
+                    <details className="mt-4 rounded border border-gray-700 bg-gray-900/30">
+                      <summary className="cursor-pointer px-3 py-2 text-xs text-gray-300">
+                        LLM Audit Trail {selectedTaskData.auditTurns ? `(${selectedTaskData.auditTurns.total_turns} calls)` : ''}
+                      </summary>
+                      <div className="border-t border-gray-700 p-3">
                       {!selectedTaskData.auditTurns ? (
                         <div className="text-gray-500 text-sm text-center py-4 animate-pulse">Loading audit data...</div>
                       ) : selectedTaskData.auditTurns.total_iterations === 0 ? (
@@ -3699,196 +3645,253 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                           })}
                         </div>
                       )}
-                    </div>
+                      </div>
+                    </details>
                   )}
 
-                  {/* SBOM tab */}
-                  {activeTab === 'sbom' && (
-                    <div className="max-h-96 overflow-y-auto">
-                      {selectedTaskData.sbom === undefined ? (
-                        <div className="text-gray-500 text-sm text-center py-4 animate-pulse">Loading SBOM...</div>
-                      ) : selectedTaskData.sbom === null ? (
-                        <div className="text-gray-500 text-sm text-center py-4">No SBOM available for this node</div>
-                      ) : (
-                        <div>
-                          <div className="flex items-center gap-3 mb-2 text-xs text-gray-500">
-                            <span>Image v{selectedTaskData.sbom.image_version}</span>
-                            <span>{selectedTaskData.sbom.packages.length} packages</span>
-                            <span>{selectedTaskData.sbom.format}</span>
-                          </div>
-                          <table className="w-full text-xs">
-                            <thead>
-                              <tr className="text-gray-600 text-left">
-                                <th className="pb-1">Package</th>
-                                <th className="pb-1">Version</th>
-                                <th className="pb-1">Type</th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-gray-800">
-                              {selectedTaskData.sbom.packages.slice(0, 50).map((pkg: any, i: number) => (
-                                <tr key={i} className="text-gray-400">
-                                  <td className="py-1 font-mono">{pkg.name}</td>
-                                  <td className="py-1 font-mono text-gray-500">{pkg.version}</td>
-                                  <td className="py-1">
-                                    <span className={`px-1 py-0.5 rounded ${
-                                      pkg.type === 'pip' ? 'bg-blue-900/30 text-blue-400' :
-                                      pkg.type === 'apt' ? 'bg-orange-900/30 text-orange-400' :
-                                      'bg-gray-700 text-gray-400'
-                                    }`}>{pkg.type}</span>
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-{selectedTaskData.sbom.packages.length > 50 && (
-                             <div className="text-xs text-gray-600 mt-2">
-                               Showing 50 of {selectedTaskData.sbom.packages.length}{' '}
-                               {selectedNode.task_id && (
-                                 <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400">view all &rarr;</Link>
+                      {/* Config: SBOM */}
+                      {activeTab === 'configuration' && (
+                        <div className="max-h-96 overflow-y-auto">
+                          {selectedTaskData.sbom === undefined ? (
+                            <div className="text-gray-500 text-sm text-center py-4 animate-pulse">Loading SBOM...</div>
+                          ) : selectedTaskData.sbom === null ? (
+                            <div className="text-gray-500 text-sm text-center py-4">No SBOM available for this node</div>
+                          ) : (
+                            <div>
+                              <div className="flex items-center gap-3 mb-2 text-xs text-gray-500">
+                                <span>Image v{selectedTaskData.sbom.image_version}</span>
+                                <span>{selectedTaskData.sbom.packages.length} packages</span>
+                                <span>{selectedTaskData.sbom.format}</span>
+                              </div>
+                              <table className="w-full text-xs">
+                                <thead>
+                                  <tr className="text-gray-600 text-left">
+                                    <th className="pb-1">Package</th>
+                                    <th className="pb-1">Version</th>
+                                    <th className="pb-1">Type</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-800">
+                                  {selectedTaskData.sbom.packages.slice(0, 50).map((pkg: any, i: number) => (
+                                    <tr key={i} className="text-gray-400">
+                                      <td className="py-1 font-mono">{pkg.name}</td>
+                                      <td className="py-1 font-mono text-gray-500">{pkg.version}</td>
+                                      <td className="py-1">
+                                        <span className={`px-1 py-0.5 rounded ${
+                                          pkg.type === 'pip' ? 'bg-blue-900/30 text-blue-400' :
+                                          pkg.type === 'apt' ? 'bg-orange-900/30 text-orange-400' :
+                                          'bg-gray-700 text-gray-400'
+                                        }`}>{pkg.type}</span>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+    {selectedTaskData.sbom.packages.length > 50 && (
+                                 <div className="text-xs text-gray-600 mt-2">
+                                   Showing 50 of {selectedTaskData.sbom.packages.length}{' '}
+                                   {selectedNode.task_id && (
+                                     <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400">view all &rarr;</Link>
+                                   )}
+                                 </div>
                                )}
                              </div>
                            )}
                          </div>
                        )}
-                     </div>
+                     </>
                    )}
-                 </>
-               )}
 
-               {!selectedNode.task_id && (
-                 <div className="text-gray-500 text-sm py-3">
-                   This node has not started yet &mdash; no task data available.
+          </>
+
+           {/* Deliverables explorer */}
+           {selectedNode && activeTab === 'deliverables' && (
+             <div className="mb-3 rounded border border-blue-500/30 bg-[#12121a] p-3">
+               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                 <div className="text-[10px] uppercase tracking-wide text-cyan-300">
+                   GENERATED FILES
                  </div>
-               )}
-             </>
-           )}
+                 <label className="flex items-center gap-1 text-[10px] text-gray-500">
+                   <input
+                     type="checkbox"
+                     checked={showFullWorkspace}
+                     onChange={(event) => setShowFullWorkspace(event.target.checked)}
+                   />
+                   Show entire DAG workspace
+                 </label>
+               </div>
+               <div className="flex flex-col gap-3 xl:flex-row">
+                 <div className="min-w-[200px] shrink-0 rounded border border-gray-800 bg-gray-950/30 p-1.5 xl:w-[30%]">
+                   {workspaceTreeLoading && <div className="p-2 text-[10px] text-gray-500">Loading workspace…</div>}
+                   {!workspaceTreeLoading && (
+                     <>
+                       <details open className="mb-1">
+                         <summary className="cursor-pointer px-1 py-1 text-[10px] uppercase tracking-wide text-cyan-300">
+                           Key Deliverables ({activeGroups.key.length})
+                         </summary>
+                         <div className="space-y-0.5">
+                           {activeGroups.key.map(explorerFileRow)}
+                           {activeGroups.key.length === 0 && (
+                             <div className="px-1 pb-1 text-[10px] text-gray-600">No key deliverables.</div>
+                           )}
+                         </div>
+                       </details>
 
-           {/* Workspace manifest (outside task_id condition) */}
-           {selectedNode && activeTab === 'workspace' && (
-             <div className="card border-blue-500/30 mb-4">
-               <div className="p-3">
-                   <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                     <div className="text-xs uppercase tracking-wide text-cyan-300">
-                       Workspace · {selectedNode.node_id}
-                     </div>
-                     <label className="flex items-center gap-1 text-[10px] text-gray-500">
-                       <input
-                         type="checkbox"
-                         checked={showFullWorkspace}
-                         onChange={(event) => setShowFullWorkspace(event.target.checked)}
-                       />
-                       Show entire DAG workspace
-                     </label>
-                   </div>
-                   <div className="mb-4 grid grid-cols-1 gap-3">
-                     <div className="max-h-72 overflow-y-auto border border-gray-800 rounded p-1 space-y-1">
-                       {workspaceTreeLoading && <div className="p-2 text-[10px] text-gray-500">Loading…</div>}
-                       {!workspaceTreeLoading && !showFullWorkspace ? (
-                         <>
-                           <div className="px-1 pt-1 text-[10px] uppercase tracking-wide text-cyan-300">
-                             This step ({workspaceOwnFiles.length})
+                       <details open className="mb-1">
+                         <summary className="cursor-pointer px-1 py-1 text-[10px] uppercase tracking-wide text-cyan-300">
+                           Scripts &amp; Execution Logs ({activeGroups.scripts.length})
+                         </summary>
+                         <div className="space-y-0.5">
+                           {activeGroups.scripts.map(explorerFileRow)}
+                           {activeGroups.scripts.length === 0 && (
+                             <div className="px-1 pb-1 text-[10px] text-gray-600">No scripts or logs.</div>
+                           )}
+                         </div>
+                       </details>
+
+                       {activeGroups.other.length > 0 && (
+                         <details className="mb-1">
+                           <summary className="cursor-pointer px-1 py-1 text-[10px] uppercase tracking-wide text-gray-500">
+                             Other Files ({activeGroups.other.length})
+                           </summary>
+                           <div className="space-y-0.5">
+                             {activeGroups.other.map(explorerFileRow)}
                            </div>
-                           {workspaceOwnFiles.map(workspaceFileButton)}
-                           {workspaceOwnFiles.length === 0 && (
-                             <div className="px-1 pb-1 text-[10px] text-gray-500">No files in this step's directory.</div>
-                           )}
-                           {workspaceInputFiles.length > 0 && (
-                             <>
-                               <div className="px-1 pt-1 text-[10px] uppercase tracking-wide text-cyan-300">
-                                 Inputs from upstream ({workspaceInputFiles.length})
-                               </div>
-                               {workspaceInputFiles.map(workspaceFileButton)}
-                             </>
-                           )}
-                           <div className="px-1 pt-1 text-[10px] uppercase tracking-wide text-cyan-300">
-                             Attachments
+                         </details>
+                       )}
+
+                       {!showFullWorkspace && workspaceInputFiles.length > 0 && (
+                         <details className="mb-1">
+                           <summary className="cursor-pointer px-1 py-1 text-[10px] uppercase tracking-wide text-gray-500">
+                             Upstream Inputs ({workspaceInputFiles.length})
+                           </summary>
+                           <div className="space-y-0.5">
+                             {workspaceInputFiles.map(explorerFileRow)}
                            </div>
-                           {(workspaceManifest?.attachments || []).length > 0 ? (
-                             (workspaceManifest?.attachments || []).map((att) => (
-                               <a
-                                 key={att.stored_as}
-                                 href={`${API}/api/dags/${dagId}/attachments/${encodeURIComponent(att.stored_as)}`}
-                                 className="block truncate px-1 py-0.5 font-mono text-[10px] text-cyan-300 hover:bg-gray-800"
-                                 title={`${att.mime} · ${formatAttachmentBytes(att.size)}`}
-                               >
-                                 attachments/{att.name}
-                               </a>
-                             ))
-                           ) : (
-                             workspaceAttachmentFiles.map(workspaceFileButton)
-                           )}
-                           {((workspaceManifest?.attachments || []).length === 0 && workspaceAttachmentFiles.length === 0) && (
-                             <div className="px-1 pb-1 text-[10px] text-gray-500">No attachments.</div>
-                           )}
-                         </>
+                         </details>
+                       )}
+
+                       {!showFullWorkspace && (
+                         <details className="mb-1">
+                           <summary className="cursor-pointer px-1 py-1 text-[10px] uppercase tracking-wide text-gray-500">
+                             Attachments ({(workspaceManifest?.attachments || []).length || workspaceAttachmentFiles.length})
+                           </summary>
+                           <div className="space-y-0.5">
+                             {(workspaceManifest?.attachments || []).length > 0 ? (
+                               (workspaceManifest?.attachments || []).map((att) => (
+                                 <a
+                                   key={att.stored_as}
+                                   href={`${API}/api/dags/${dagId}/attachments/${encodeURIComponent(att.stored_as)}`}
+                                   className="flex items-center gap-2 rounded px-1.5 py-1 text-[11px] text-cyan-300 hover:bg-gray-800"
+                                   title={`${att.mime} · ${formatAttachmentBytes(att.size)}`}
+                                 >
+                                   <span>📎</span>
+                                   <span className="truncate font-mono">{att.name}</span>
+                                   <span className="ml-auto text-[9px] text-gray-600">{formatAttachmentBytes(att.size)}</span>
+                                 </a>
+                               ))
+                             ) : workspaceAttachmentFiles.length > 0 ? (
+                               workspaceAttachmentFiles.map(explorerFileRow)
+                             ) : (
+                               <div className="px-1 pb-1 text-[10px] text-gray-600">No attachments.</div>
+                             )}
+                           </div>
+                         </details>
+                       )}
+
+                       {!showFullWorkspace && workspaceOwnFiles.length === 0 && (
+                         <div className="px-1 py-1 text-[10px] text-gray-500">
+                           No files captured for this step yet. Toggle “Show entire DAG workspace” to browse everything.
+                         </div>
+                       )}
+                       {showFullWorkspace && workspaceTree?.length === 0 && (
+                         <div className="px-1 py-1 text-[10px] text-gray-500">No files in the workspace.</div>
+                       )}
+                     </>
+                   )}
+                 </div>
+
+                 <div className="flex min-w-0 flex-1 flex-col rounded border border-gray-800">
+                   <div className="flex flex-wrap items-center gap-2 border-b border-gray-800 px-3 py-2">
+                     <span className="min-w-0 truncate text-[10px] uppercase tracking-wide text-gray-500">
+                       PREVIEW: <span className="font-mono text-gray-300">{workspacePreview ? (workspacePreview.path.split('/').pop() || workspacePreview.path) : '—'}</span>
+                     </span>
+                      <div className="ml-auto flex items-center gap-1.5">
+                        {selectedIsMarkdown ? (
+                          <>
+                            <span className="text-[10px] text-gray-500">Mode:</span>
+                            <select
+                              value={previewMode}
+                              onChange={(event) => setPreviewMode(event.target.value as 'rendered' | 'raw')}
+                              className="rounded border border-gray-700 bg-gray-800 px-1.5 py-0.5 text-[10px] text-gray-300"
+                            >
+                              <option value="rendered">Rendered</option>
+                              <option value="raw">Raw</option>
+                            </select>
+                          </>
+                        ) : (
+                          workspacePreview && !workspacePreview.isImage && !selectedIsImageFile && !selectedIsFrame ? (
+                            <span className="text-[10px] text-gray-500">Mode: <span className="text-gray-400">Raw</span></span>
+                          ) : null
+                        )}
+                       <button
+                         onClick={copyWorkspacePreview}
+                         disabled={!workspacePreview || workspacePreview.isImage || selectedIsFrame}
+                         className="rounded border border-gray-700 px-1.5 py-0.5 text-[10px] text-gray-300 hover:text-white disabled:opacity-40"
+                         title="Copy file contents"
+                       >
+                         {previewCopied ? '✓ Copied' : '⎘ Copy'}
+                       </button>
+                       {workspacePreview ? (
+                         <a
+                           href={`${API}/api/dags/${dagId}/workspace/files/${workspacePreview.path
+                             .split('/')
+                             .map((part) => encodeURIComponent(part))
+                             .join('/')}?inline=0`}
+                           className="rounded border border-gray-700 px-1.5 py-0.5 text-[10px] text-blue-300 hover:text-blue-200"
+                         >
+                           ⭳ Download
+                         </a>
                        ) : (
-                         <>
-                           {!workspaceTreeLoading && workspaceTree?.length === 0 && (
-                             <div className="p-2 text-[10px] text-gray-500">No files in the workspace.</div>
-                           )}
-                           {workspaceTree?.map(workspaceFileButton)}
-                         </>
+                         <span className="rounded border border-gray-800 px-1.5 py-0.5 text-[10px] text-gray-600">⭳ Download</span>
                        )}
                      </div>
-                    <div>
-                      {workspacePreview ? (
-                        <div>
-                          <div className="mb-1 flex items-center gap-2 text-[10px] text-gray-500">
-                            <span className="font-mono truncate">{workspacePreview.path}</span>
-                            <a
-                              href={`${API}/api/dags/${dagId}/workspace/files/${workspacePreview.path
-                                .split('/')
-                                .map((part) => encodeURIComponent(part))
-                                .join('/')}?inline=0`}
-                              className="ml-auto text-blue-400 hover:text-blue-300"
-                            >
-                              Download
-                            </a>
-                          </div>
-                          {workspacePreview.isImage ? (
-                            <img
-                              src={workspacePreview.content}
-                              alt={workspacePreview.path}
-                              className="max-h-64 max-w-full rounded border border-gray-800"
-                            />
-                          ) : (
-                            <pre className="max-h-64 overflow-auto text-[10px] text-gray-300 bg-[#0d0d14] border border-[#1a1a2a] rounded p-2 whitespace-pre-wrap break-words">
-                              {workspacePreview.content}
-                            </pre>
-                          )}
-                        </div>
-                      ) : (
-                        <div className="text-[10px] text-gray-500 p-2 border border-gray-800 rounded">
-                          Select a workspace file to preview.
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  <div className="text-[11px] uppercase tracking-wide text-cyan-300 mb-2">Step deliverables</div>
-                  {!workspaceManifest ? (
-                    <div className="text-gray-500 text-sm py-4">No workspace data available</div>
-                  ) : (() => {
-                    const stepDeliverables = workspaceManifest.step_manifest[selectedNode.node_id] || []
-                    return (
-                      <div>
-                        <div className="flex items-center gap-3 mb-2 text-xs text-gray-500">
-                          <span className="font-mono">{selectedNode.node_id}</span>
-                          <span>{stepDeliverables.length} file{stepDeliverables.length === 1 ? '' : 's'}</span>
-                        </div>
-                        {stepDeliverables.length === 0 ? (
-                          <div className="text-gray-500 text-sm">No deliverables captured for this step.</div>
-                        ) : (
-                          <div className="flex flex-wrap gap-1">
-                            {stepDeliverables.map((file) => (
-                              <span key={file} className="font-mono text-[10px] bg-emerald-900/30 text-emerald-400 px-1.5 py-0.5 rounded">
-                                {file.split('/').pop() || file}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )
-                  })()}
+                   </div>
+
+                   <div className="min-h-[18rem] max-h-[55vh] flex-1 overflow-auto bg-[#0d1117]">
+                     {!workspacePreview ? (
+                       <div className="flex h-full items-center justify-center p-6 text-xs text-gray-500">
+                         Select a file to preview it here.
+                       </div>
+                     ) : workspacePreview.isImage || selectedIsImageFile ? (
+                       <div className="p-3">
+                         <img
+                           src={workspacePreviewUrl}
+                           alt={workspacePreview.path}
+                           className="max-h-[48vh] max-w-full rounded border border-gray-800"
+                         />
+                       </div>
+                     ) : selectedIsFrame ? (
+                       <iframe src={workspacePreviewUrl} className="h-[50vh] w-full" title={`Preview: ${workspacePreview.path}`} />
+                     ) : selectedIsMarkdown && previewMode === 'rendered' ? (
+                       <div className="p-4">
+                         <RenderedMarkdown content={workspacePreview.content} />
+                       </div>
+                     ) : (
+                       <pre className="m-0 whitespace-pre-wrap break-words p-4 font-mono text-[11px] leading-relaxed text-gray-300">
+                         {workspacePreview.content}
+                       </pre>
+                     )}
+                   </div>
+
+                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-gray-800 px-3 py-1.5 text-[10px] text-gray-500">
+                     <span className="min-w-0 truncate">
+                       Active: <span className="font-mono text-gray-400">{workspacePreview?.path || '—'}</span>
+                       {selectedPreviewEntry ? ` (${formatAttachmentBytes(selectedPreviewEntry.size)})` : ''}
+                     </span>
+                     <span className={`ml-auto ${verificationClass}`}>Deliverable Health: {verificationLabel}</span>
+                   </div>
+                 </div>
                </div>
              </div>
            )}
@@ -3914,6 +3917,80 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             {JSON.stringify(dag.dag_json, null, 2)}
           </pre>
         </details>
+      )}
+
+      {/* DAG specification modal */}
+      {showDagSpec && (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center p-4" onClick={() => setShowDagSpec(false)}>
+          <div className="absolute inset-0 bg-black/60" />
+          <div
+            className="relative flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-[#232333] bg-[#12121a]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-[#232333] px-4 py-3">
+              <div>
+                <div className="text-sm font-semibold text-white">DAG Specification</div>
+                <div className="font-mono text-[10px] text-gray-500">{dag.id}</div>
+              </div>
+              <button onClick={() => setShowDagSpec(false)} className="text-gray-500 hover:text-gray-200">✕</button>
+            </div>
+            <div className="space-y-4 overflow-y-auto p-4 text-xs text-gray-300">
+              <div>
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Objective</div>
+                <p className="whitespace-pre-wrap text-gray-300">{dag.objective}</p>
+              </div>
+              <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+                <div className="rounded bg-gray-900/60 p-2">
+                  <div className="text-[10px] text-gray-500">Status</div>
+                  <div className="font-mono">{dag.status}</div>
+                </div>
+                <div className="rounded bg-gray-900/60 p-2">
+                  <div className="text-[10px] text-gray-500">Model</div>
+                  <div className="font-mono">{dag.llm_model || '—'}</div>
+                </div>
+                <div className="rounded bg-gray-900/60 p-2">
+                  <div className="text-[10px] text-gray-500">Nodes</div>
+                  <div className="font-mono">{dag.nodes.length}</div>
+                </div>
+                <div className="rounded bg-gray-900/60 p-2">
+                  <div className="text-[10px] text-gray-500">Locked</div>
+                  <div className="font-mono">{dag.locked ? 'template' : 'no'}</div>
+                </div>
+              </div>
+              <div>
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Steps</div>
+                <div className="overflow-x-auto rounded border border-gray-800">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="border-b border-gray-800 text-left text-gray-500">
+                        <th className="px-2 py-1">Node</th>
+                        <th className="px-2 py-1">Depends on</th>
+                        <th className="px-2 py-1">Model</th>
+                        <th className="px-2 py-1">Image</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {dag.nodes.map((node) => (
+                        <tr key={node.node_id} className="border-b border-gray-900 align-top">
+                          <td className="px-2 py-1 font-mono text-gray-300">{node.node_id}</td>
+                          <td className="px-2 py-1 font-mono text-gray-500">{node.depends_on.join(', ') || '—'}</td>
+                          <td className="px-2 py-1 font-mono text-gray-400">{node.config?.llm_model || dag.llm_model || 'default'}</td>
+                          <td className="px-2 py-1 font-mono text-gray-400">{node.config?.dag_image || node.config?.base_image || 'openclaw'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <details>
+                <summary className="cursor-pointer text-[10px] uppercase tracking-wide text-gray-500">Raw dag_json</summary>
+                <pre className="mt-2 max-h-72 overflow-auto rounded bg-[#0d1117] p-2 text-[10px] text-gray-400">
+{JSON.stringify(dag.dag_json || {}, null, 2)}
+                </pre>
+              </details>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Deliverable preview drawer */}
