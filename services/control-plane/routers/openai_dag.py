@@ -511,6 +511,13 @@ async def _stream_dag_execution(
         yield _sse_done()
         return
 
+    # Resolve planner-declared capabilities (reuse/pin or queue a build).
+    try:
+        import image_catalog
+        await image_catalog.resolve_planner_capabilities(dag_json, db)
+    except Exception as exc:
+        logger.warning("Capability resolution skipped: %s", exc)
+
     # Store nodes
     dag.dag_json = dag_json
     dag.status = DAGStatus.READY
@@ -802,6 +809,12 @@ async def _blocking_dag_execution(
         dag_json = await plan_dag(objective, planning_model, db, base_image=base_image, skill_ids=skill_ids if skill_ids else None, agent_model=agent_model)
     except ValueError as e:
         return _non_streaming_response(f"Planning failed: {e}")
+
+    try:
+        import image_catalog
+        await image_catalog.resolve_planner_capabilities(dag_json, db)
+    except Exception as exc:
+        logger.warning("Capability resolution skipped: %s", exc)
 
     dag.dag_json = dag_json
     dag.status = DAGStatus.READY

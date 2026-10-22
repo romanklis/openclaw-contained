@@ -1,8 +1,8 @@
 """
 DAGs Router — CRUD and lifecycle for Master DAGs.
 """
-from typing import Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from typing import Any, Optional, List
+from fastapi import APIRouter, Depends, HTTPException, status, Body, File, Form, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from database import get_db
@@ -49,6 +49,13 @@ from schemas import (
 from dag_validator import validate_dag
 from planner import plan_dag, _normalize_interactive_nodes
 from routers.openai_dag import MODEL_CONFIGS
+from attachments import (
+    save_attachments,
+    validate_uploads,
+    attachments_block,
+    copy_attachments,
+    strip_attachments,
+)
 from temporal_client import start_dag_workflow, get_temporal_client
 import uuid
 import logging
@@ -184,49 +191,110 @@ def _normalize_node_skill_fields(node_def: dict, node_config: dict) -> tuple[str
     return skill_id, selected_skill_v2_id, skill_selection_reason
 
 
-@router.post("", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
-async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
-    """Create a new DAG from an objective using the LLM Planner."""
+async def _resolve_node_capabilities(dag_json: dict, db: AsyncSession) -> None:
+    """Resolve base-image aliases and planner capabilities to catalog pins."""
+    try:
+        import image_catalog
+        await image_catalog.resolve_planner_capabilities(dag_json, db)
+    except Exception as exc:
+        logger.warning("Base/capability image resolution failed: %s", exc)
+
+
+async def _create_dag_impl(
+    objective: str,
+    *,
+    llm_model: Optional[str],
+    base_image: Optional[str],
+    auto_start: bool,
+    skill_ids: Optional[List[str]],
+    project_id: Optional[str],
+    files: Optional[List[UploadFile]],
+    db: AsyncSession,
+):
+    """Plan and persist a DAG, optionally saving attached reference files first."""
     dag_id = _gen_dag_id()
     workspace_id = _gen_workspace_id(dag_id)
 
     # Resolve model config: llm_model can be a MODEL_CONFIGS key or a raw model name
-    cfg = MODEL_CONFIGS.get(data.llm_model or "")
+    cfg = MODEL_CONFIGS.get(llm_model or "")
     if cfg:
         planning_model = cfg["planning_model"]
         agent_model = cfg["agent_model"]
-    elif data.llm_model:
-        planning_model = data.llm_model
+    elif llm_model:
+        planning_model = llm_model
         agent_model = planning_model
     else:
         # Use stored defaults
         planning_model = _dag_model_defaults["planning_model"]
         agent_model = _dag_model_defaults["agent_model"]
 
+    # Validate uploads before creating any DAG record so rejected files do not
+    # leave failed DAGs behind.
+    if files:
+        validate_uploads(files)
+
     # Create DAG record in PLANNING state
     dag = MasterDAG(
         id=dag_id,
-        objective=data.objective,
+        objective=objective,
         status=DAGStatus.PLANNING,
         dag_json={},
         workspace_id=workspace_id,
         llm_model=agent_model,
-        project_id=data.project_id,
+        project_id=project_id,
     )
     db.add(dag)
     await db.commit()
 
+    # Save attachments into the shared DAG workspace before planning so the
+    # planner (manifest only) and every node can use them.
+    attachments: List[dict] = []
+    if files:
+        try:
+            attachments = await save_attachments(workspace_id, files)
+        except HTTPException as exc:
+            dag.status = DAGStatus.FAILED
+            dag.dag_json = {"error": f"attachment upload failed: {exc.detail}"}
+            await db.commit()
+            raise
+        except Exception as exc:
+            dag.status = DAGStatus.FAILED
+            dag.dag_json = {"error": f"attachment upload failed: {exc}"}
+            await db.commit()
+            raise HTTPException(status_code=500, detail=f"Attachment upload failed: {exc}")
+
+    planner_objective = objective
+    if attachments:
+        planner_objective = f"{objective}\n\n{attachments_block(attachments)}"
+
     # Run the planner
     try:
-        dag_json = await plan_dag(data.objective, planning_model, db, base_image=data.base_image, skill_ids=data.skill_ids, agent_model=agent_model)
+        dag_json = await plan_dag(
+            planner_objective,
+            planning_model,
+            db,
+            base_image=base_image,
+            skill_ids=skill_ids,
+            agent_model=agent_model,
+        )
     except ValueError as e:
         dag.status = DAGStatus.FAILED
         dag.dag_json = {"error": str(e)}
         await db.commit()
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        dag.status = DAGStatus.FAILED
+        dag.dag_json = {"error": str(e)}
+        await db.commit()
+        raise HTTPException(status_code=500, detail=f"Planning failed: {e}")
 
     # Store DAG JSON and create node records
     dag_json = _normalize_interactive_nodes(dag_json)
+    await _resolve_node_capabilities(dag_json, db)
+    if attachments:
+        dag_json["input_attachments"] = attachments
+        for node_def in dag_json.get("nodes", []):
+            node_def.setdefault("config", {})["input_attachments"] = attachments
     dag.dag_json = dag_json
     dag.status = DAGStatus.READY
 
@@ -270,10 +338,60 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
 
     await db.commit()
     await db.refresh(dag)
-    if data.auto_start:
+    if auto_start:
         return await _start_dag(dag, db)
 
     return _build_dag_detail(dag, nodes)
+
+
+@router.post("", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
+async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
+    """Create a new DAG from an objective using the LLM Planner."""
+    return await _create_dag_impl(
+        data.objective,
+        llm_model=data.llm_model,
+        base_image=data.base_image,
+        auto_start=data.auto_start,
+        skill_ids=data.skill_ids,
+        project_id=data.project_id,
+        files=None,
+        db=db,
+    )
+
+
+@router.post("/with-files", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
+async def create_dag_with_files(
+    objective: str = Form(...),
+    auto_start: bool = Form(False),
+    skill_ids: Optional[str] = Form(None),
+    project_id: Optional[str] = Form(None),
+    llm_model: Optional[str] = Form(None),
+    base_image: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[]),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a DAG with optional attached reference files."""
+    parsed_skill_ids: Optional[List[str]] = None
+    if skill_ids:
+        try:
+            parsed = json.loads(skill_ids)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=422, detail="skill_ids must be a JSON array")
+        if isinstance(parsed, list):
+            parsed_skill_ids = [str(s) for s in parsed]
+        elif parsed is not None:
+            raise HTTPException(status_code=422, detail="skill_ids must be a JSON array")
+
+    return await _create_dag_impl(
+        objective,
+        llm_model=llm_model,
+        base_image=base_image,
+        auto_start=auto_start,
+        skill_ids=parsed_skill_ids,
+        project_id=project_id or None,
+        files=files or [],
+        db=db,
+    )
 
 
 @router.post("/manual", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
@@ -989,12 +1107,13 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
         raise HTTPException(status_code=422, detail={"errors": errors})
 
     new_dag_id = _gen_dag_id()
+    new_workspace_id = _gen_workspace_id(new_dag_id)
     new_dag = MasterDAG(
         id=new_dag_id,
         objective=objective,
         status=DAGStatus.READY,
         dag_json=new_dag_json,
-        workspace_id=_gen_workspace_id(new_dag_id),
+        workspace_id=new_workspace_id,
         llm_model=new_dag_json.get("default_llm") or source.llm_model,
         template_params=list(source.template_params or []),
         template_source_dag_id=source.id,
@@ -1026,6 +1145,19 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
         )
         db.add(node)
         created_nodes.append(node)
+
+    # Attachments live on disk, not in the DB. Copy them into the new
+    # workspace; if that is impossible, drop the references so no phantom
+    # files are advertised to nodes.
+    source_attachments = (source.dag_json or {}).get("input_attachments") or []
+    if source_attachments:
+        if not copy_attachments(source.workspace_id, new_workspace_id):
+            strip_attachments(new_dag_json)
+            new_dag.dag_json = new_dag_json
+            for node in created_nodes:
+                node_config = dict(node.config or {})
+                node_config.pop("input_attachments", None)
+                node.config = node_config
 
     await db.commit()
     await db.refresh(new_dag)
@@ -1224,6 +1356,7 @@ async def create_node_state_snapshot(
         acquisition_log=payload.acquisition_log,
         acceptance_result=payload.acceptance_result,
         pending_items=payload.pending_items,
+        acceptance_state=payload.acceptance_state,
     )
     db.add(snapshot)
     await db.commit()
@@ -1452,6 +1585,7 @@ async def get_dag_workspace_manifest(dag_id: str, db: AsyncSession = Depends(get
         "step_manifest": step_manifest,
         "total_files": sum(len(v) for v in step_manifest.values()),
         "steps_with_deliverables": list(step_manifest.keys()),
+        "attachments": (dag.dag_json or {}).get("input_attachments", []) or [],
     }
 
 
@@ -1575,6 +1709,64 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
     return {"ok": True}
 
 
+@router.patch("/{dag_id}/nodes/{node_id}/model")
+async def patch_node_model(
+    dag_id: str,
+    node_id: str,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a node's execution model without changing graph structure.
+
+    Allowed for editable and completed/failed DAGs; the change applies to the
+    next run/retry of that node.
+    """
+    dag = await _get_dag_or_404(dag_id, db)
+    result = await db.execute(
+        select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id)
+    )
+    node = result.scalar_one_or_none()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    model = str(payload.get("llm_model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=422, detail="llm_model is required")
+
+    node_config = dict(node.config or {})
+    node_config["llm_model"] = model
+    node.config = node_config
+
+    dag_json = deepcopy(dag.dag_json or {})
+    for node_def in dag_json.get("nodes", []):
+        if node_def.get("node_id") == node_id:
+            node_def.setdefault("config", {})["llm_model"] = model
+            break
+    dag.dag_json = dag_json
+
+    await db.commit()
+    return {"ok": True, "llm_model": model}
+
+
+@router.get("/{dag_id}/attachments/{filename:path}")
+async def get_dag_attachment(dag_id: str, filename: str, db: AsyncSession = Depends(get_db)):
+    """Serve a DAG-level attached reference file from <workspace>/attachments/."""
+    import mimetypes
+    import os
+    from fastapi.responses import FileResponse
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}/attachments")
+    abs_path = os.path.realpath(os.path.join(root, filename))
+    if not abs_path.startswith(root + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not os.path.isfile(abs_path):
+        raise HTTPException(status_code=404, detail=f"Attachment '{filename}' not found")
+    mime = mimetypes.guess_type(abs_path)[0] or "application/octet-stream"
+    return FileResponse(abs_path, media_type=mime, filename=os.path.basename(abs_path))
+
+
 @router.get("/{dag_id}/nodes/{node_id}/files/{filename:path}")
 async def get_node_workspace_file(
     dag_id: str,
@@ -1605,6 +1797,76 @@ async def get_node_workspace_file(
         content=raw,
         media_type=mime,
         headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+    )
+
+
+@router.get("/{dag_id}/workspace/tree")
+async def get_dag_workspace_tree(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """List the actual DAG workspace files (paths, sizes) for inspection."""
+    import os
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}")
+    entries: list[dict] = []
+    truncated = False
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".next"}
+
+    if os.path.isdir(root):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if name not in skip_dirs and not name.startswith(".cache")
+            )
+            for name in sorted(filenames):
+                full_path = os.path.join(dirpath, name)
+                relative = os.path.relpath(full_path, root).replace(os.sep, "/")
+                try:
+                    size = os.path.getsize(full_path)
+                except OSError:
+                    size = 0
+                entries.append({"path": relative, "name": name, "size": size})
+                if len(entries) >= 2000:
+                    truncated = True
+                    break
+            if truncated:
+                break
+
+    return {
+        "workspace_id": workspace_id,
+        "entries": entries,
+        "truncated": truncated,
+    }
+
+
+@router.get("/{dag_id}/workspace/files/{file_path:path}")
+async def get_dag_workspace_file(
+    dag_id: str,
+    file_path: str,
+    inline: int = 1,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve an arbitrary DAG workspace file (inline preview or download)."""
+    import mimetypes
+    import os
+    from fastapi.responses import FileResponse
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}")
+    abs_path = os.path.realpath(os.path.join(root, file_path))
+    if not abs_path.startswith(root + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not os.path.isfile(abs_path):
+        raise HTTPException(status_code=404, detail=f"File '{file_path}' not found")
+    mime = mimetypes.guess_type(abs_path)[0] or "application/octet-stream"
+    disposition = "inline" if inline else "attachment"
+    return FileResponse(
+        abs_path,
+        media_type=mime,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{os.path.basename(abs_path)}"'
+        },
     )
 
 
@@ -2541,6 +2803,7 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
         "template_source_dag_id": getattr(dag, "template_source_dag_id", None),
         "project_id": getattr(dag, "project_id", None),
         "dag_json": dag.dag_json,
+        "input_attachments": (dag.dag_json or {}).get("input_attachments", []) or [],
         "edges": [dict(e) for e in (dag.dag_json or {}).get("edges", [])],
         "nodes": [
             {

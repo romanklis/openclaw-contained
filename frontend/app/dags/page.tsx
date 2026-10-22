@@ -6,6 +6,24 @@ import { StatusBadge } from '../components/StatusComponents'
 import { API, TEMPORAL_UI } from '../lib/api'
 import { useProject } from '../lib/ProjectContext'
 
+const MAX_ATTACHMENT_FILES = 20
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+const MAX_ATTACHMENT_TOTAL_BYTES = 100 * 1024 * 1024
+const ATTACHMENT_ACCEPT = [
+  '.pdf', '.txt', '.md', '.rst', '.doc', '.docx', '.odt', '.rtf',
+  '.csv', '.tsv', '.json', '.jsonl', '.yaml', '.yml', '.xlsx', '.xls', '.parquet',
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff', '.svg',
+  '.py', '.js', '.ts', '.tsx', '.jsx', '.html', '.css', '.sql', '.sh',
+  '.ipynb', '.xml', '.toml', '.ini', '.cfg', '.zip', '.tar', '.gz', '.tgz',
+  '.7z', '.ppt', '.pptx',
+].join(',')
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
+}
+
 interface DAG {
   id: string
   objective: string
@@ -41,6 +59,9 @@ export default function DAGsPage() {
   const [importJson, setImportJson] = useState('')
   const [importing, setImporting] = useState(false)
   const [importMsg, setImportMsg] = useState<string | null>(null)
+  const [attachments, setAttachments] = useState<File[]>([])
+  const [attachmentError, setAttachmentError] = useState<string | null>(null)
+  const [dragActive, setDragActive] = useState(false)
   const { activeProject } = useProject()
 
   const fetchDags = async () => {
@@ -77,27 +98,64 @@ export default function DAGsPage() {
 
   useEffect(() => { fetchDags(); fetchSkills(); fetchModelDefaults() }, [showArchived, activeProject])
 
+  const addFiles = (incoming: FileList | null) => {
+    if (!incoming) return
+    setAttachmentError(null)
+    const accepted = ATTACHMENT_ACCEPT.split(',')
+    const next = [...attachments]
+    for (const file of Array.from(incoming)) {
+      if (next.length >= MAX_ATTACHMENT_FILES) {
+        setAttachmentError(`At most ${MAX_ATTACHMENT_FILES} files can be attached.`)
+        break
+      }
+      const dot = file.name.lastIndexOf('.')
+      const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : ''
+      if (!accepted.includes(ext)) {
+        setAttachmentError(`Unsupported file type: ${file.name}`)
+        continue
+      }
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        setAttachmentError(`${file.name} is larger than ${formatBytes(MAX_ATTACHMENT_BYTES)}.`)
+        continue
+      }
+      if (next.some((f) => f.name === file.name && f.size === file.size)) continue
+      next.push(file)
+    }
+    const total = next.reduce((sum, f) => sum + f.size, 0)
+    if (total > MAX_ATTACHMENT_TOTAL_BYTES) {
+      setAttachmentError(`Total attachment size exceeds ${formatBytes(MAX_ATTACHMENT_TOTAL_BYTES)}.`)
+      return
+    }
+    setAttachments(next)
+  }
+
   const createDag = async (e: React.FormEvent) => {
     e.preventDefault()
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`${API}/api/dags`, {
+      const formData = new FormData()
+      formData.append('objective', objective)
+      formData.append('auto_start', String(autoStart))
+      if (selectedSkillIds.length > 0) formData.append('skill_ids', JSON.stringify(selectedSkillIds))
+      if (activeProject) formData.append('project_id', activeProject)
+      attachments.forEach((file) => formData.append('files', file))
+
+      const res = await fetch(`${API}/api/dags/with-files`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          objective,
-          auto_start: autoStart,
-          skill_ids: selectedSkillIds.length > 0 ? selectedSkillIds : null,
-          project_id: activeProject || null,
-        }),
+        body: formData,
       })
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}))
-        throw new Error(detail.detail || `HTTP ${res.status}`)
+        const msg = typeof detail?.detail === 'string'
+          ? detail.detail
+          : JSON.stringify(detail?.detail || detail)
+        throw new Error(msg || `HTTP ${res.status}`)
       }
       setObjective('')
       setSelectedSkillIds([])
+      setAttachments([])
+      setAttachmentError(null)
       setShowForm(false)
       fetchDags()
     } catch (err: any) {
@@ -218,6 +276,63 @@ export default function DAGsPage() {
               placeholder="Describe what you want to accomplish..."
               required
             />
+          </div>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">
+              Attachments <span className="text-gray-600">(optional — saved to the DAG workspace and available to every step)</span>
+            </label>
+            <div
+              onDragOver={(e) => { e.preventDefault(); setDragActive(true) }}
+              onDragLeave={() => setDragActive(false)}
+              onDrop={(e) => {
+                e.preventDefault()
+                setDragActive(false)
+                addFiles(e.dataTransfer.files)
+              }}
+              className={`border-2 border-dashed rounded px-3 py-4 text-sm transition-colors ${
+                dragActive ? 'border-blue-500 bg-blue-500/5' : 'border-gray-700 bg-gray-800/40'
+              }`}
+            >
+              <input
+                id="dag-attachments"
+                type="file"
+                multiple
+                accept={ATTACHMENT_ACCEPT}
+                onChange={(e) => { addFiles(e.target.files); e.target.value = '' }}
+                className="hidden"
+              />
+              <label htmlFor="dag-attachments" className="cursor-pointer text-indigo-400 hover:text-indigo-300">
+                Choose files
+              </label>
+              <span className="text-gray-500">
+                {' '}or drag &amp; drop — up to {MAX_ATTACHMENT_FILES} files, {formatBytes(MAX_ATTACHMENT_BYTES)} each,
+                {' '}{formatBytes(MAX_ATTACHMENT_TOTAL_BYTES)} total.
+              </span>
+            </div>
+            {attachmentError && <p className="text-xs text-red-400 mt-1">{attachmentError}</p>}
+            {attachments.length > 0 && (
+              <ul className="mt-2 space-y-1">
+                {attachments.map((file, index) => (
+                  <li key={`${file.name}-${index}`} className="flex items-center justify-between gap-2 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs">
+                    <span className="font-mono text-gray-300 truncate">{file.name}</span>
+                    <span className="flex items-center gap-2 text-gray-500 shrink-0">
+                      <span>{formatBytes(file.size)}</span>
+                      <button
+                        type="button"
+                        onClick={() => setAttachments(attachments.filter((_, i) => i !== index))}
+                        className="text-red-400 hover:text-red-300"
+                        aria-label={`Remove ${file.name}`}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="text-[11px] text-gray-600 mt-1">
+              Files are read-only reference context at /workspace/attachments/. PDFs, documents, data, images, code, and archives are supported.
+            </p>
           </div>
           <div className="flex gap-4">
             <div className="flex-1">

@@ -15,6 +15,10 @@ import time
 import json
 import subprocess
 import asyncio
+import io
+import tarfile
+import tempfile
+import httpx
 import yaml
 
 logging.basicConfig(level=logging.INFO)
@@ -304,6 +308,8 @@ class BuildResponse(BaseModel):
     log_url: Optional[str] = None
     supply_chain_denied: Optional[List[Dict[str, str]]] = None
     supply_chain_feedback: Optional[str] = None
+    reused: Optional[bool] = None
+    reused_from: Optional[str] = None
 
 
 class BuildStatus(BaseModel):
@@ -314,6 +320,7 @@ class BuildStatus(BaseModel):
     digest: Optional[str] = None
     error: Optional[str] = None
     logs: Optional[str] = None
+    reused: Optional[bool] = None
 
 
 class DeploymentBuildRequest(BaseModel):
@@ -1439,6 +1446,198 @@ async def build_deployment_image_task(
 # API Endpoints
 # =============================================================================
 
+# ---------------------------------------------------------------------------
+# Platform catalog integration
+# ---------------------------------------------------------------------------
+
+def _catalog_manager(cap_type: str) -> str:
+    return {
+        "pip_package": "pip",
+        "python_packages": "pip",
+        "npm_package": "npm",
+        "apt_package": "apt",
+        "apk_package": "apk",
+        "tool": "binary",
+    }.get((cap_type or "").lower(), "pip")
+
+
+def _registry_ref(tag: str) -> str:
+    if not tag:
+        return tag
+    if tag.startswith(f"{REGISTRY_URL}/") or tag.startswith("registry:5000/"):
+        return tag
+    return f"{REGISTRY_URL}/{tag}"
+
+
+async def _resolve_catalog_capabilities(
+    image_type: str,
+    capabilities: List[BuildCapability],
+    base_image: str,
+    task_id: str = "",
+    build_id: str = "",
+) -> Optional[dict]:
+    """Ask the platform catalog to reuse or create an image version.
+
+    Returns None on any failure so the legacy per-task build still works.
+    """
+    payload = {
+        "runtime_family": image_type,
+        "base_image": base_image,
+        "create_if_missing": True,
+        "task_id": task_id or None,
+        "trigger": "capability_request",
+        "build_id": build_id,
+        "track_build": True,
+        "packages": [
+            {
+                "manager": _catalog_manager(cap.type),
+                "name": cap.name,
+                "version": cap.version or "",
+            }
+            for cap in capabilities
+        ],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{CONTROL_PLANE_URL}/api/image-catalog/resolve", json=payload
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning(f"Catalog resolve unavailable — falling back to legacy build: {exc}")
+        return None
+
+
+def _extract_catalog_bundle(tar_bytes: bytes, destination: Path) -> None:
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tar:
+        root = destination.resolve()
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+            name = member.name.replace("\\", "/").lstrip("/")
+            if ".." in Path(name).parts:
+                raise ValueError(f"Unsafe path in catalog bundle: {name}")
+            dest = (destination / name).resolve()
+            if not str(dest).startswith(str(root) + os.sep):
+                raise ValueError(f"Unsafe path in catalog bundle: {name}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            handle = tar.extractfile(member)
+            if handle:
+                dest.write_bytes(handle.read())
+
+
+async def build_catalog_image_task(
+    build_id: str,
+    version_id: str,
+    definition_id: str,
+    version: str,
+    registry_tag: str,
+    task_id: str,
+):
+    """Build a committed catalog bundle and register the result."""
+    builds[build_id].status = "building"
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.get(
+                f"{CONTROL_PLANE_URL}/api/image-catalog/versions/{version_id}/source"
+            )
+            resp.raise_for_status()
+            tar_bytes = resp.content
+
+        with tempfile.TemporaryDirectory(prefix="catalog-build-") as td:
+            build_dir = Path(td)
+            _extract_catalog_bundle(tar_bytes, build_dir)
+            # Build with a local tag; registry-qualified tags are applied after
+            # the build (docker-py rejects them in images.build on some versions).
+            local_tag = f"{definition_id}:{version}"
+            logger.info(f"Building catalog bundle {local_tag} → {registry_tag}")
+            image, build_logs = docker_client.images.build(
+                path=str(build_dir),
+                dockerfile="Dockerfile",
+                tag=local_tag,
+                rm=True,
+                pull=True,
+            )
+            log_output = []
+            for chunk in build_logs:
+                if isinstance(chunk, dict) and "stream" in chunk:
+                    log_output.append(chunk["stream"])
+            builds[build_id].logs = "".join(log_output)
+            image.tag(registry_tag)
+            docker_client.images.push(registry_tag)
+            builds[build_id].status = "success"
+            builds[build_id].image_tag = registry_tag
+            builds[build_id].digest = image.id
+
+        # Register capabilities from an SBOM; failure is non-fatal.
+        sbom = None
+        try:
+            sbom = await asyncio.to_thread(_generate_sbom_trivy, registry_tag, "cyclonedx")
+        except Exception as sbom_err:
+            logger.warning(f"Catalog SBOM generation failed (non-fatal): {sbom_err}")
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{CONTROL_PLANE_URL}/api/image-catalog/versions/{version_id}/build-result",
+                    json={
+                        "image_digest": image.id,
+                        "image_tag": registry_tag,
+                        "sbom": sbom,
+                        "build_id": build_id,
+                        "logs": builds[build_id].logs or "",
+                    },
+                )
+                if resp.status_code >= 400:
+                    logger.warning(f"Catalog build-result failed: {resp.status_code} {resp.text[:300]}")
+        except Exception as reg_err:
+            logger.warning(f"Could not register catalog build result: {reg_err}")
+
+        logger.info(f"Catalog build {build_id} completed: {registry_tag}")
+    except Exception as exc:
+        logger.error(f"Catalog build {build_id} failed: {exc}")
+        builds[build_id].status = "failed"
+        builds[build_id].error = str(exc)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                await client.post(
+                    f"{CONTROL_PLANE_URL}/api/image-catalog/versions/{version_id}/build-result",
+                    json={
+                        "error": str(exc),
+                        "build_id": build_id,
+                        "logs": builds[build_id].logs or "",
+                    },
+                )
+        except Exception as reg_err:
+            logger.warning(f"Could not register catalog build failure: {reg_err}")
+
+
+class CatalogBuildRequest(BaseModel):
+    version_id: str
+    definition_id: str
+    version: str
+    registry_tag: str
+
+
+@app.post("/build-catalog")
+async def build_catalog(req: CatalogBuildRequest, background_tasks: BackgroundTasks):
+    """Build a committed catalog bundle explicitly (manual version rollout)."""
+    build_id = str(uuid.uuid4())[:8]
+    builds[build_id] = BuildStatus(
+        build_id=build_id, status="pending", image_tag=req.registry_tag
+    )
+    background_tasks.add_task(
+        build_catalog_image_task,
+        build_id,
+        req.version_id,
+        req.definition_id,
+        req.version,
+        req.registry_tag,
+        "",
+    )
+    return {"build_id": build_id, "status": "pending", "image_tag": req.registry_tag}
+
+
 @app.post("/build", response_model=BuildResponse)
 async def build_image(
     request: BuildRequest,
@@ -1542,6 +1741,65 @@ async def build_image(
             supply_chain_denied=supply_chain_denied,
             supply_chain_feedback=supply_chain_feedback,
         )
+
+    # Platform catalog: reuse an existing image whose capabilities cover the
+    # request, or build the committed bundle for a new capability set.
+    if approved_capabilities:
+        catalog = await _resolve_catalog_capabilities(
+            image_type, approved_capabilities, request.base_image, request.task_id, build_id
+        )
+        if catalog:
+            if catalog.get("reused"):
+                reused_tag = _registry_ref(catalog.get("image_tag"))
+                logger.info(
+                    f"♻️ Reusing catalog image {reused_tag} for {request.task_id} "
+                    f"(version={catalog.get('version_id')}, reason={catalog.get('reason')})"
+                )
+                builds[build_id] = BuildStatus(
+                    build_id=build_id,
+                    status="success",
+                    image_tag=reused_tag,
+                    digest=catalog.get("image_digest"),
+                    reused=True,
+                )
+                return BuildResponse(
+                    build_id=build_id,
+                    task_id=request.task_id,
+                    image_tag=reused_tag,
+                    status="success",
+                    log_url=f"/builds/{build_id}/logs",
+                    supply_chain_denied=supply_chain_denied,
+                    supply_chain_feedback=supply_chain_feedback if supply_chain_feedback else None,
+                    reused=True,
+                    reused_from=catalog.get("version_id"),
+                )
+            if catalog.get("version_id"):
+                catalog_version = catalog.get("version") or "0"
+                registry_tag = f"{REGISTRY_URL}/{catalog['definition_id']}:{catalog_version}"
+                builds[build_id] = BuildStatus(
+                    build_id=build_id,
+                    status="pending",
+                    image_tag=registry_tag,
+                )
+                background_tasks.add_task(
+                    build_catalog_image_task,
+                    build_id,
+                    catalog["version_id"],
+                    catalog["definition_id"],
+                    catalog_version,
+                    registry_tag,
+                    request.task_id,
+                )
+                return BuildResponse(
+                    build_id=build_id,
+                    task_id=request.task_id,
+                    image_tag=registry_tag,
+                    status="pending",
+                    log_url=f"/builds/{build_id}/logs",
+                    supply_chain_denied=supply_chain_denied,
+                    supply_chain_feedback=supply_chain_feedback if supply_chain_feedback else None,
+                    reused=False,
+                )
 
     # Generate Dockerfile (with approved capabilities only)
     dockerfile = generate_dockerfile(
@@ -1765,6 +2023,20 @@ class ScanRequest(BaseModel):
     """Request to scan an image for vulnerabilities."""
     image_ref: str  # e.g. "registry:5000/openclaw-agent:task-xxx-v1"
     task_id: str
+
+
+class RawScanRequest(BaseModel):
+    """Request a raw SBOM for an image (no task-scoped storage)."""
+    image_ref: str
+
+
+@app.post("/scan/sbom-raw")
+async def scan_sbom_raw(request: RawScanRequest):
+    """Return a CycloneDX SBOM for an image without storing it."""
+    doc = await asyncio.to_thread(_generate_sbom_trivy, request.image_ref, "cyclonedx")
+    if not doc:
+        raise HTTPException(status_code=503, detail="SBOM generation unavailable or failed")
+    return {"sbom": doc}
 
 
 @app.post("/scan/vulnerabilities")

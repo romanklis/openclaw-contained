@@ -1,11 +1,13 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import dynamic from 'next/dynamic'
 import { StatusBadge } from '../../components/StatusComponents'
 import DeliverablePreview from '../../components/DeliverablePreview'
+import DAGTree from '../../components/DAGTree'
 import { API, API_GATEWAY, TEMPORAL_UI } from '../../lib/api'
 
 const DAGGraph = dynamic(() => import('../../components/DAGGraph'), { ssr: false })
@@ -59,6 +61,23 @@ interface DAGDetail {
   locked: boolean
   template_params: { key: string; label: string; type: string; default: string | null; description: string | null }[]
   template_source_dag_id: string | null
+  input_attachments?: DAGAttachment[]
+}
+
+interface DAGAttachment {
+  name: string
+  stored_as: string
+  path: string
+  size: number
+  mime: string
+  uploaded_at?: string
+}
+
+function formatAttachmentBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '—'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
 }
 
 interface TaskOutput {
@@ -137,6 +156,7 @@ interface WorkspaceManifestResponse {
   step_manifest: Record<string, string[]>
   total_files: number
   steps_with_deliverables: string[]
+  attachments?: DAGAttachment[]
 }
 
 function summarizeNodeFailureReason(
@@ -169,7 +189,7 @@ export default function DAGDetailPage() {
   const [dag, setDag] = useState<DAGDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
-const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 'sbom' | 'workspace'>('overview')
+const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'logs' | 'audit' | 'sbom' | 'workspace'>('overview')
    const [showRevise, setShowRevise] = useState(false)
   const [reviseComments, setReviseComments] = useState('')
   const [revising, setRevising] = useState(false)
@@ -247,6 +267,19 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
       .catch(() => {})
     return () => { cancelled = true }
   }, [])
+  useEffect(() => {
+    fetch(`${API}/api/llm/models`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        const ids = (data?.models || [])
+          .map((model: any) => model?.id)
+          .filter(Boolean)
+          .map(String)
+        if (ids.length) setModelOptions(Array.from(new Set(ids)))
+      })
+      .catch(() => {})
+  }, [])
+
   const [mineResult, setMineResult] = useState<string | null>(null)
   const [analysisResult, setAnalysisResult] = useState<any>(null)
   const [deepReviewLoading, setDeepReviewLoading] = useState(false)
@@ -268,6 +301,21 @@ const [activeTab, setActiveTab] = useState<'overview' | 'outputs' | 'audit' | 's
   const [nodeState, setNodeState] = useState<Record<string, { latest: NodeStateSnapshot | null; events: NodeAuditEvent[] }>>({})
   const [nodeAcceptance, setNodeAcceptance] = useState<Record<string, NodeAcceptanceResponse | null>>({})
   const [workspaceManifest, setWorkspaceManifest] = useState<WorkspaceManifestResponse | null>(null)
+  const [workspaceTree, setWorkspaceTree] = useState<{ path: string; name: string; size: number }[] | null>(null)
+  const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(false)
+  const [workspacePreview, setWorkspacePreview] = useState<{ path: string; content: string; isImage: boolean } | null>(null)
+  const [viewMode, setViewMode] = useState<'graph' | 'tree'>('graph')
+  const [showFullReview, setShowFullReview] = useState(false)
+  const [showExecutionState, setShowExecutionState] = useState(false)
+  const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [modelChanging, setModelChanging] = useState(false)
+  const [skillInfo, setSkillInfo] = useState<Record<string, any>>({})
+  const [logIteration, setLogIteration] = useState<number | null>(null)
+  const [inspectorWidth, setInspectorWidth] = useState(560)
+  const [inspectorMaximized, setInspectorMaximized] = useState(false)
+  const [showFullWorkspace, setShowFullWorkspace] = useState(false)
+  const [showFullObjective, setShowFullObjective] = useState(false)
+  const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null)
 
   const fetchDag = useCallback(async () => {
     try {
@@ -1302,6 +1350,7 @@ setNodeState(prev => {
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
       setDeepReviews(prev => ({ ...prev, [nodeId]: data }))
+      setShowFullReview(true)
       setMineResult(null)
     } catch (e: any) {
       setMineResult(`❌ Deep review error: ${e.message}`)
@@ -1343,6 +1392,149 @@ setNodeState(prev => {
     getWorkflowLink(`dag-node-${dagId}-${nodeId}`)
 
   const selectedNode = dag?.nodes.find(n => n.node_id === selectedNodeId) || null
+
+  useEffect(() => {
+    const skillId = selectedNode?.selected_skill_v2_id
+    if (!skillId || skillInfo[skillId]) return
+    let cancelled = false
+    fetch(`${API}/api/skill-learning/skills/${skillId}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!cancelled && data) {
+          setSkillInfo((prev) => ({ ...prev, [skillId]: data }))
+        }
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [selectedNode?.selected_skill_v2_id, skillInfo])
+
+  useEffect(() => {
+    if (activeTab !== 'workspace' || !dag) return
+    let cancelled = false
+    setWorkspaceTreeLoading(true)
+    fetch(`${API}/api/dags/${dagId}/workspace/tree`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!cancelled) setWorkspaceTree(data?.entries || [])
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspaceTree([])
+      })
+      .finally(() => {
+        if (!cancelled) setWorkspaceTreeLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [activeTab, dagId, dag])
+
+  const effectiveNodeModel = selectedNode?.config?.llm_model || dag?.llm_model || ''
+
+  const changeNodeModel = async (model: string) => {
+    if (!selectedNode || !model || model === effectiveNodeModel) return
+    setModelChanging(true)
+    setError(null)
+    try {
+      const resp = await fetch(`${API}/api/dags/${dagId}/nodes/${selectedNode.node_id}/model`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ llm_model: model }),
+      })
+      if (!resp.ok) throw new Error(await resp.text())
+      setDag((prev) => {
+        if (!prev) return prev
+        return {
+          ...prev,
+          nodes: prev.nodes.map((node) =>
+            node.node_id === selectedNode.node_id
+              ? { ...node, config: { ...(node.config || {}), llm_model: model } }
+              : node
+          ),
+        }
+      })
+      await fetchDag()
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setModelChanging(false)
+    }
+  }
+
+  const openWorkspaceFile = async (path: string) => {
+    if (!path) return
+    const encoded = path.split('/').map((part) => encodeURIComponent(part)).join('/')
+    const url = `${API}/api/dags/${dagId}/workspace/files/${encoded}?inline=1`
+    setWorkspacePreview({ path, content: 'Loading…', isImage: false })
+    try {
+      const resp = await fetch(url)
+      if (!resp.ok) throw new Error(await resp.text())
+      const mime = resp.headers.get('content-type') || ''
+      if (mime.startsWith('image/')) {
+        setWorkspacePreview({ path, content: url, isImage: true })
+        return
+      }
+      const text = await resp.text()
+      setWorkspacePreview({
+        path,
+        content: text.length > 200_000 ? `${text.slice(0, 200_000)}\n\n… truncated (${text.length} chars)` : text,
+        isImage: false,
+      })
+    } catch (err: any) {
+      setWorkspacePreview({ path, content: `Failed to load ${path}: ${err.message}`, isImage: false })
+    }
+  }
+
+  const startInspectorResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (typeof window === 'undefined' || window.innerWidth < 1280 || inspectorMaximized) return
+    event.preventDefault()
+    resizeRef.current = { startX: event.clientX, startWidth: inspectorWidth }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  const moveInspectorResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!resizeRef.current) return
+    const delta = resizeRef.current.startX - event.clientX
+    setInspectorWidth(Math.min(900, Math.max(380, resizeRef.current.startWidth + delta)))
+  }
+
+  const endInspectorResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    resizeRef.current = null
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    } catch {
+      // pointer capture may already be released
+    }
+  }
+
+  const workspaceOwnFiles = workspaceTree?.filter(
+    (entry) => selectedNode && entry.path.startsWith(`${selectedNode.node_id}/`)
+  ) || []
+  const workspaceInputFiles = workspaceTree?.filter(
+    (entry) =>
+      selectedNode &&
+      (selectedNode.depends_on || []).some((dep) => entry.path.startsWith(`${dep}/`))
+  ) || []
+  const workspaceAttachmentFiles = workspaceTree?.filter(
+    (entry) => entry.path.startsWith('attachments/')
+  ) || []
+
+  useEffect(() => {
+    setWorkspacePreview(null)
+  }, [selectedNodeId])
+
+  const workspaceFileButton = (entry: { path: string; size: number }) => (
+    <button
+      key={entry.path}
+      onClick={() => openWorkspaceFile(entry.path)}
+      className={`block w-full text-left text-[10px] font-mono px-1 py-0.5 rounded truncate ${
+        workspacePreview?.path === entry.path
+          ? 'bg-indigo-900/40 text-indigo-200'
+          : 'text-gray-400 hover:bg-gray-800'
+      }`}
+      title={`${entry.path} · ${formatAttachmentBytes(entry.size)}`}
+    >
+      {entry.path}
+    </button>
+  )
+
   const selectedTaskData = selectedNode?.task_id ? nodeTaskData[selectedNode.task_id] : null
 const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
    const selectedNodeAcceptance = selectedNode ? nodeAcceptance[selectedNode.node_id] : null
@@ -1407,7 +1599,17 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             {dag.locked && <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">🔒 template</span>}
             {dag.template_source_dag_id && <span className="text-xs bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded">follow-the-guidance</span>}
           </div>
-          <p className="text-gray-400 text-sm mt-1 max-w-3xl">{dag.objective}</p>
+          <div className="mt-1 max-w-3xl">
+            <p className={`text-gray-400 text-sm ${showFullObjective ? '' : 'line-clamp-3'}`}>{dag.objective}</p>
+            {dag.objective.length > 320 && (
+              <button
+                onClick={() => setShowFullObjective((value) => !value)}
+                className="mt-1 text-[11px] text-indigo-400 hover:text-indigo-300"
+              >
+                {showFullObjective ? 'Show less' : 'Show full objective'}
+              </button>
+            )}
+          </div>
         </div>
         <div className="flex gap-2">
           {(dag.status === 'ready' || dag.status === 'failed' || dag.status === 'cancelled' || dag.status === 'completed') && !dag.locked && (
@@ -1437,6 +1639,32 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
           )}
         </div>
       </div>
+
+      {/* Attached reference files */}
+      {dag.input_attachments && dag.input_attachments.length > 0 && (
+        <div className="card p-4 mb-4 border border-cyan-500/20">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs uppercase tracking-wide text-cyan-300">
+              Attachments ({dag.input_attachments.length})
+            </div>
+            <span className="text-[11px] text-gray-500">read-only · /workspace/attachments/</span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {dag.input_attachments.map((att) => (
+              <a
+                key={att.stored_as}
+                href={`${API}/api/dags/${dagId}/attachments/${encodeURIComponent(att.stored_as)}`}
+                className="flex items-center gap-2 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs hover:border-cyan-500/50"
+                title={`${att.mime} · ${formatAttachmentBytes(att.size)}`}
+              >
+                <span className="font-mono text-gray-300">{att.name}</span>
+                <span className="text-gray-500">{formatAttachmentBytes(att.size)}</span>
+                <span className="text-cyan-400">↓</span>
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Lock as template dialog */}
       {showLockDialog && (
@@ -1533,11 +1761,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
       )}
 
       {/* Stats bar */}
-      <div className="grid grid-cols-6 gap-3 mb-4">
-        <div className="card py-2 px-3 text-center">
-          <div className="text-[10px] text-gray-500 uppercase">Model</div>
-          <div className="text-xs font-mono text-gray-300 truncate">{dag.llm_model}</div>
-        </div>
+      <div className="grid grid-cols-5 gap-3 mb-4">
         <div className="card py-2 px-3 text-center">
           <div className="text-[10px] text-gray-500 uppercase">Nodes</div>
           <div className="text-sm font-bold text-white">{dag.nodes.length}</div>
@@ -1676,9 +1900,32 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
         </div>
       )}
 
-      {/* DAG Graph */}
-      <div className="mb-4">
-        {dagEditable && (
+      {/* Central canvas: graph for design, tree for large DAGs */}
+      <div
+        className={`grid grid-cols-1 gap-4 items-start ${
+          selectedNode && !inspectorMaximized
+            ? 'xl:grid-cols-[minmax(0,1fr)_var(--inspector-width)]'
+            : ''
+        }`}
+        style={{ '--inspector-width': `${inspectorWidth}px` } as any}
+      >
+      <div className={`mb-4 min-w-0 relative ${inspectorMaximized ? 'hidden' : ''}`}>
+        <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+          <button
+            onClick={() => setViewMode('graph')}
+            className={`px-2 py-1 rounded border ${viewMode === 'graph' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+          >
+            ◉ Graph
+          </button>
+          <button
+            onClick={() => setViewMode('tree')}
+            className={`px-2 py-1 rounded border ${viewMode === 'tree' ? 'border-indigo-400 text-indigo-200 bg-indigo-900/40' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+          >
+            ☰ Tree
+          </button>
+          <span className="text-gray-500">{dag.nodes.length} nodes</span>
+        </div>
+        {dagEditable && viewMode === 'graph' && (
           <div className="flex items-center gap-2 mb-2 text-xs">
             <span className="text-gray-500">Draw mode:</span>
             <button
@@ -1698,6 +1945,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             )}
           </div>
         )}
+        {viewMode === 'graph' ? (
         <DAGGraph
           nodes={dag.nodes.map(n => ({
             node_id: n.node_id,
@@ -1723,7 +1971,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
           }))}
           edges={(dag as any).edges || []}
           onNodeClick={(nodeId) => {
-            setSelectedNodeId(nodeId === selectedNodeId ? null : nodeId)
+            setSelectedNodeId(nodeId)
             setActiveTab('overview')
           }}
           onSelectNode={(nodeId) => {
@@ -1737,11 +1985,30 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
           turnCounts={nodeTurnCounts}
           deepReviews={deepReviewSummaries}
         />
+        ) : (
+          <DAGTree
+            nodes={dag.nodes}
+            selectedNodeId={selectedNodeId}
+            onSelectNode={(nodeId) => { setSelectedNodeId(nodeId); setActiveTab('overview') }}
+            deepReviews={deepReviewSummaries}
+            turnCounts={nodeTurnCounts}
+          />
+        )}
+        {selectedNode && !inspectorMaximized && (
+          <div
+            onPointerDown={startInspectorResize}
+            onPointerMove={moveInspectorResize}
+            onPointerUp={endInspectorResize}
+            onPointerCancel={endInspectorResize}
+            className="hidden xl:block absolute -right-3 top-0 z-20 h-full w-2 cursor-col-resize rounded bg-transparent hover:bg-indigo-500/40"
+            title="Drag to resize the inspector"
+          />
+        )}
       </div>
 
       {/* Selected Node Detail Panel */}
       {selectedNode && (
-        <div className="card border-blue-500/30 mb-4">
+        <div className={`card border-blue-500/30 mb-4 min-w-0 ${inspectorMaximized ? '' : 'xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto'}`}>
           {/* Node header */}
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-3">
@@ -1755,9 +2022,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               {selectedNode.selected_skill_v2_id && (
                 <span
                   className="text-xs bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded cursor-help"
-                  title={selectedNode.skill_selection_reason ?? 'v2 skill selected'}
+                  title={
+                    skillInfo[selectedNode.selected_skill_v2_id]?.description ||
+                    selectedNode.skill_selection_reason ||
+                    'v2 skill selected'
+                  }
                 >
-                  v2: {selectedNode.selected_skill_v2_id}
+                  v2: {skillInfo[selectedNode.selected_skill_v2_id]?.name || selectedNode.selected_skill_v2_id}
                 </span>
               )}
               {selectedNode.config?.base_image && (
@@ -1783,7 +2054,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                     className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
                     title="Step actions"
                   >
-                    Actions ▾
+                    More ▾
                   </button>
                   {showNodeActions && (
                     <div className="absolute right-0 mt-1 w-56 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
@@ -1861,7 +2132,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                     className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
                     title="Step actions"
                   >
-                    Actions ▾
+                    More ▾
                   </button>
                   {showNodeActions && (
                     <div className="absolute right-0 mt-1 w-64 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
@@ -1994,7 +2265,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                     className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50"
                     title="Step actions"
                   >
-                    Actions ▾
+                    More ▾
                   </button>
                   {showNodeActions && (
                     <div className="absolute right-0 mt-1 w-64 rounded border border-gray-700 bg-gray-900 shadow-xl z-50">
@@ -2143,16 +2414,74 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                   )}
                 </div>
               )}
-              {selectedNode.task_id && (
-                <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400 hover:text-blue-300">
-                  Full task view &rarr;
-                </Link>
-              )}
-              <a href={getNodeWorkflowLink(selectedNode.node_id)} target="_blank" rel="noreferrer" className="text-blue-400 hover:text-blue-300">
-                Temporal &#8599;
-              </a>
+              <button
+                onClick={() => setInspectorMaximized((value) => !value)}
+                className="text-[10px] text-gray-400 hover:text-gray-200"
+              >
+                {inspectorMaximized ? 'Restore split' : 'Maximize'}
+              </button>
               <button onClick={() => setSelectedNodeId(null)} className="text-gray-500 hover:text-gray-300">&times;</button>
             </div>
+          </div>
+
+          {/* Node meta */}
+          <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-gray-500">
+            <label>Model</label>
+            <select
+              value={effectiveNodeModel}
+              onChange={(event) => changeNodeModel(event.target.value)}
+              disabled={modelChanging}
+              className="max-w-[190px] rounded border border-gray-700 bg-gray-800 px-1.5 py-1 text-[11px] text-gray-300"
+            >
+              {effectiveNodeModel && !modelOptions.includes(effectiveNodeModel) && (
+                <option value={effectiveNodeModel}>{effectiveNodeModel}</option>
+              )}
+              {modelOptions.map((model) => (
+                <option key={model} value={model}>{model}</option>
+              ))}
+            </select>
+            {selectedNode.task_id && (
+              <Link href={`/tasks/${selectedNode.task_id}`} className="text-blue-400 hover:text-blue-300">
+                Full task view &rarr;
+              </Link>
+            )}
+            <a
+              href={getNodeWorkflowLink(selectedNode.node_id)}
+              target="_blank"
+              rel="noreferrer"
+              className="text-blue-400 hover:text-blue-300"
+            >
+              Temporal &#8599;
+            </a>
+          </div>
+
+          {/* Central node actions */}
+          <div className="mb-3 flex flex-wrap items-center gap-1.5 border-b border-gray-800 pb-2 text-xs">
+            {(dag.status === 'failed' || dag.status === 'completed' || dag.status === 'cancelled') && (
+              <button onClick={retryFromSelectedNode} disabled={nodeActionLoading} className="btn-secondary text-[10px] px-2 py-0.5">
+                ▶ Run from step
+              </button>
+            )}
+            {selectedNode.task_id && (
+              <button
+                onClick={() => {
+                  setShowFullReview(true)
+                  if (!selectedReview) deepReviewTask(selectedNode.task_id!, selectedNode.node_id)
+                }}
+                disabled={deepReviewLoading}
+                className="btn-secondary text-[10px] px-2 py-0.5"
+              >
+                🔍 Review
+              </button>
+            )}
+            {selectedNode.task_id && (
+              <button onClick={() => setActiveTab('logs')} className="btn-secondary text-[10px] px-2 py-0.5">
+                📜 Logs
+              </button>
+            )}
+            <button onClick={() => setActiveTab('workspace')} className="btn-secondary text-[10px] px-2 py-0.5">
+              📁 Workspace
+            </button>
           </div>
 
           {selectedNode.status === 'failed' && selectedFailureReason && (
@@ -2187,6 +2516,31 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             <div className="mb-3 p-2 bg-blue-950/40 border border-blue-800/50 rounded text-xs text-blue-300">
               <span className="font-semibold text-blue-400">Skill rationale: </span>
               {selectedNode.skill_selection_reason}
+            </div>
+          )}
+
+          {selectedNode.selected_skill_v2_id && skillInfo[selectedNode.selected_skill_v2_id] && (
+            <div className="mb-3 p-2 bg-blue-950/30 border border-blue-800/40 rounded text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-semibold text-blue-300">
+                  Skill: {skillInfo[selectedNode.selected_skill_v2_id].name || selectedNode.selected_skill_v2_id}
+                </span>
+                {skillInfo[selectedNode.selected_skill_v2_id].status && (
+                  <span className="text-gray-500">{skillInfo[selectedNode.selected_skill_v2_id].status}</span>
+                )}
+                {typeof skillInfo[selectedNode.selected_skill_v2_id].usage_count === 'number' && (
+                  <span className="text-gray-600">used {skillInfo[selectedNode.selected_skill_v2_id].usage_count}</span>
+                )}
+                {typeof skillInfo[selectedNode.selected_skill_v2_id].success_count === 'number' && (
+                  <span className="text-gray-600">success {skillInfo[selectedNode.selected_skill_v2_id].success_count}</span>
+                )}
+                <Link href="/skill-studio" className="ml-auto text-indigo-400 hover:text-indigo-300">
+                  Open Skill Studio →
+                </Link>
+              </div>
+              {skillInfo[selectedNode.selected_skill_v2_id].description && (
+                <p className="mt-1 text-blue-200/80">{skillInfo[selectedNode.selected_skill_v2_id].description}</p>
+              )}
             </div>
           )}
 
@@ -2313,7 +2667,7 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             )
           })()}
 
-          {selectedReview && (
+          {selectedReview && showFullReview && (
             <div className="mb-3 rounded border border-amber-700/40 bg-amber-950/20 p-3 text-xs">
               <div className="text-xs uppercase tracking-wide text-amber-300 mb-2 flex items-center justify-between">
                 <span>Deep Review — {selectedReview.image_id}{selectedReview.image_tag && <span className="text-gray-500"> ({selectedReview.image_tag})</span>}</span>
@@ -2856,12 +3210,32 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
           )}
 
           {/* Execution state continuity panel */}
-          <div className="mb-3 rounded border border-cyan-700/40 bg-cyan-950/20 p-3">
-            <div className="text-xs uppercase tracking-wide text-cyan-300 mb-2">Execution State</div>
+          <div className="mb-3 rounded border border-cyan-700/40 bg-cyan-950/20">
+            <button
+              onClick={() => setShowExecutionState((value) => !value)}
+              className="flex w-full items-center justify-between p-3 text-left"
+            >
+              <span className="text-xs uppercase tracking-wide text-cyan-300">Execution State</span>
+              <span className="text-[10px] text-gray-500">
+                {selectedNodeState?.latest
+                  ? `${selectedNodeState.latest.phase} · ${selectedNodeState.latest.status}`
+                  : selectedNodeState
+                    ? 'No snapshot'
+                    : 'Loading…'}{' '}
+                {showExecutionState ? '▾' : '▸'}
+              </span>
+            </button>
+            {showExecutionState && (
+            <div className="px-3 pb-3">
             {!selectedNodeState ? (
               <div className="text-xs text-gray-500">Loading node state...</div>
             ) : !selectedNodeState.latest ? (
-              <div className="text-xs text-gray-500">No captured state snapshot yet.</div>
+              <div className="text-xs text-gray-500">
+                No captured state snapshot yet.{' '}
+                {selectedTaskData?.currentState
+                  ? `Task state: ${selectedTaskData.currentState.status} · ${selectedTaskData.outputs.length} iteration${selectedTaskData.outputs.length === 1 ? '' : 's'}. Use the Logs/Outputs tabs for details.`
+                  : 'Use the Logs/Outputs tabs for this run.'}
+              </div>
             ) : (
               <div className="space-y-2 text-xs">
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
@@ -2970,13 +3344,15 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 )}
               </div>
             )}
+            </div>
+            )}
           </div>
 
           {/* Task data tabs */}
           {selectedNode.task_id && (
             <>
               <div className="flex border-b border-gray-700 mb-3 gap-1">
-{(['overview', 'outputs', 'audit', 'sbom'] as const).map(tab => (
+{(['overview', 'logs', 'workspace', 'outputs', 'audit', 'sbom'] as const).map(tab => (
                     <button
                       key={tab}
                       onClick={() => setActiveTab(tab)}
@@ -2988,7 +3364,9 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                     >
                       {tab === 'overview' ? 'Overview' :
                        tab === 'outputs' ? `Outputs${selectedTaskData ? ` (${selectedTaskData.outputs.length})` : ''}` :
+                       tab === 'logs' ? 'Logs' :
                        tab === 'audit' ? 'Audit' :
+                       tab === 'workspace' ? 'Workspace' :
                        'SBOM'}
                     </button>
                   ))}
@@ -3138,6 +3516,53 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                           )
                         })
                       )}
+                    </div>
+                  )}
+
+                  {/* Logs tab */}
+                  {activeTab === 'logs' && (
+                    <div>
+                      {selectedTaskData.outputs.length === 0 ? (
+                        <div className="text-gray-500 text-sm py-4">No iterations captured.</div>
+                      ) : (() => {
+                        const outputs = selectedTaskData.outputs
+                        const index = Math.max(0, Math.min(logIteration ?? outputs.length - 1, outputs.length - 1))
+                        const output = outputs[index]
+                        return (
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
+                              <select
+                                value={index}
+                                onChange={(event) => setLogIteration(Number(event.target.value))}
+                                className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300"
+                              >
+                                {outputs.map((item, i) => (
+                                  <option key={`${item.id}-${i}`} value={i}>
+                                    Iteration {item.iteration} · {item.model_used || 'model?'}
+                                  </option>
+                                ))}
+                              </select>
+                              <span className="text-gray-500">
+                                {output.model_used || ''} · {output.duration_ms != null ? `${output.duration_ms}ms` : ''} · {output.completed === 'true' ? 'completed' : output.completed}
+                              </span>
+                              <a
+                                href={`${API}/api/tasks/${selectedNode.task_id}/audit-logs/export`}
+                                className="ml-auto text-blue-400 hover:text-blue-300"
+                              >
+                                Download logs
+                              </a>
+                            </div>
+                            {output.error && (
+                              <div className="mb-2 rounded border border-red-800/40 bg-red-950/30 p-2 text-xs text-red-300 whitespace-pre-wrap">
+                                {output.error}
+                              </div>
+                            )}
+                            <pre className="max-h-[55vh] overflow-auto text-[10px] text-gray-300 bg-[#0d0d14] border border-[#1a1a2a] rounded p-2 whitespace-pre-wrap break-words">
+                              {output.agent_logs || 'No agent logs captured for this iteration.'}
+                            </pre>
+                          </div>
+                        )
+                      })()}
                     </div>
                   )}
 
@@ -3342,100 +3767,134 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
            {selectedNode && activeTab === 'workspace' && (
              <div className="card border-blue-500/30 mb-4">
                <div className="p-3">
-                 <div className="text-xs uppercase tracking-wide text-cyan-300 mb-2">Workspace Manifest</div>
-                 {!workspaceManifest ? (
-                   <div className="text-gray-500 text-sm py-4">No workspace data available</div>
-                 ) : (
-                   <div>
-                     <div className="flex items-center gap-3 mb-3 text-xs text-gray-500">
-                       <span className="font-mono">{workspaceManifest.workspace_id}</span>
-                       <span>{workspaceManifest.total_files} files</span>
-                       <span>{workspaceManifest.steps_with_deliverables.length} steps</span>
+                   <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                     <div className="text-xs uppercase tracking-wide text-cyan-300">
+                       Workspace · {selectedNode.node_id}
                      </div>
-                     {workspaceManifest.steps_with_deliverables.length === 0 ? (
-                       <div className="text-gray-500 text-sm">No deliverables captured</div>
-                     ) : (
-                       <div className="space-y-2 max-h-64 overflow-y-auto">
-                         {workspaceManifest.steps_with_deliverables.map(nodeId => (
-                           <div key={nodeId} className="border border-gray-700 rounded bg-gray-900/30 p-2">
-                             <div className="font-mono text-xs text-blue-300 mb-1">{nodeId}</div>
-                             <div className="flex flex-wrap gap-1">
-                               {(workspaceManifest.step_manifest[nodeId] || []).map(f => (
-                                 <span key={f} className="font-mono text-[10px] bg-emerald-900/30 text-emerald-400 px-1.5 py-0.5 rounded">
-                                   {f.split('/').pop() || f}
-                                 </span>
-                               ))}
-                             </div>
-                           </div>
-                         ))}
-                       </div>
-                     )}
+                     <label className="flex items-center gap-1 text-[10px] text-gray-500">
+                       <input
+                         type="checkbox"
+                         checked={showFullWorkspace}
+                         onChange={(event) => setShowFullWorkspace(event.target.checked)}
+                       />
+                       Show entire DAG workspace
+                     </label>
                    </div>
-                 )}
+                   <div className="mb-4 grid grid-cols-1 gap-3">
+                     <div className="max-h-72 overflow-y-auto border border-gray-800 rounded p-1 space-y-1">
+                       {workspaceTreeLoading && <div className="p-2 text-[10px] text-gray-500">Loading…</div>}
+                       {!workspaceTreeLoading && !showFullWorkspace ? (
+                         <>
+                           <div className="px-1 pt-1 text-[10px] uppercase tracking-wide text-cyan-300">
+                             This step ({workspaceOwnFiles.length})
+                           </div>
+                           {workspaceOwnFiles.map(workspaceFileButton)}
+                           {workspaceOwnFiles.length === 0 && (
+                             <div className="px-1 pb-1 text-[10px] text-gray-500">No files in this step's directory.</div>
+                           )}
+                           {workspaceInputFiles.length > 0 && (
+                             <>
+                               <div className="px-1 pt-1 text-[10px] uppercase tracking-wide text-cyan-300">
+                                 Inputs from upstream ({workspaceInputFiles.length})
+                               </div>
+                               {workspaceInputFiles.map(workspaceFileButton)}
+                             </>
+                           )}
+                           <div className="px-1 pt-1 text-[10px] uppercase tracking-wide text-cyan-300">
+                             Attachments
+                           </div>
+                           {(workspaceManifest?.attachments || []).length > 0 ? (
+                             (workspaceManifest?.attachments || []).map((att) => (
+                               <a
+                                 key={att.stored_as}
+                                 href={`${API}/api/dags/${dagId}/attachments/${encodeURIComponent(att.stored_as)}`}
+                                 className="block truncate px-1 py-0.5 font-mono text-[10px] text-cyan-300 hover:bg-gray-800"
+                                 title={`${att.mime} · ${formatAttachmentBytes(att.size)}`}
+                               >
+                                 attachments/{att.name}
+                               </a>
+                             ))
+                           ) : (
+                             workspaceAttachmentFiles.map(workspaceFileButton)
+                           )}
+                           {((workspaceManifest?.attachments || []).length === 0 && workspaceAttachmentFiles.length === 0) && (
+                             <div className="px-1 pb-1 text-[10px] text-gray-500">No attachments.</div>
+                           )}
+                         </>
+                       ) : (
+                         <>
+                           {!workspaceTreeLoading && workspaceTree?.length === 0 && (
+                             <div className="p-2 text-[10px] text-gray-500">No files in the workspace.</div>
+                           )}
+                           {workspaceTree?.map(workspaceFileButton)}
+                         </>
+                       )}
+                     </div>
+                    <div>
+                      {workspacePreview ? (
+                        <div>
+                          <div className="mb-1 flex items-center gap-2 text-[10px] text-gray-500">
+                            <span className="font-mono truncate">{workspacePreview.path}</span>
+                            <a
+                              href={`${API}/api/dags/${dagId}/workspace/files/${workspacePreview.path
+                                .split('/')
+                                .map((part) => encodeURIComponent(part))
+                                .join('/')}?inline=0`}
+                              className="ml-auto text-blue-400 hover:text-blue-300"
+                            >
+                              Download
+                            </a>
+                          </div>
+                          {workspacePreview.isImage ? (
+                            <img
+                              src={workspacePreview.content}
+                              alt={workspacePreview.path}
+                              className="max-h-64 max-w-full rounded border border-gray-800"
+                            />
+                          ) : (
+                            <pre className="max-h-64 overflow-auto text-[10px] text-gray-300 bg-[#0d0d14] border border-[#1a1a2a] rounded p-2 whitespace-pre-wrap break-words">
+                              {workspacePreview.content}
+                            </pre>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="text-[10px] text-gray-500 p-2 border border-gray-800 rounded">
+                          Select a workspace file to preview.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="text-[11px] uppercase tracking-wide text-cyan-300 mb-2">Step deliverables</div>
+                  {!workspaceManifest ? (
+                    <div className="text-gray-500 text-sm py-4">No workspace data available</div>
+                  ) : (() => {
+                    const stepDeliverables = workspaceManifest.step_manifest[selectedNode.node_id] || []
+                    return (
+                      <div>
+                        <div className="flex items-center gap-3 mb-2 text-xs text-gray-500">
+                          <span className="font-mono">{selectedNode.node_id}</span>
+                          <span>{stepDeliverables.length} file{stepDeliverables.length === 1 ? '' : 's'}</span>
+                        </div>
+                        {stepDeliverables.length === 0 ? (
+                          <div className="text-gray-500 text-sm">No deliverables captured for this step.</div>
+                        ) : (
+                          <div className="flex flex-wrap gap-1">
+                            {stepDeliverables.map((file) => (
+                              <span key={file} className="font-mono text-[10px] bg-emerald-900/30 text-emerald-400 px-1.5 py-0.5 rounded">
+                                {file.split('/').pop() || file}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })()}
                </div>
              </div>
            )}
-         </div>
-       )}
-
-       {/* Node list (compact, when no node selected) */}
-      {!selectedNodeId && (
-        <div className="space-y-2">
-          <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">All Nodes ({dag.nodes.length})</h2>
-          {dag.nodes.map((node) => (
-            <button
-              key={node.node_id}
-              onClick={() => { setSelectedNodeId(node.node_id); setActiveTab('overview') }}
-              className="card w-full text-left hover:border-blue-500/50 transition-colors"
-            >
-              {(() => {
-                const nodeFailureReason = summarizeNodeFailureReason(node, nodeState[node.node_id])
-                return (
-                  <>
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <span className="font-mono text-sm font-semibold">{node.node_id}</span>
-                  {(node as any).node_type === 'decision' && (
-                    <span className="text-xs bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded" title="Pauses for a user decision">🛑 Decision</span>
-                  )}
-                  {(node as any).node_type === 'input' && (
-                    <span className="text-xs bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded" title="Pauses for user-provided data">📥 Input</span>
-                  )}
-                  <StatusBadge status={node.status} />
-                  {node.skill_id && (
-                    <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">
-                      {node.skill_id}
-                    </span>
-                  )}
-                  {node.selected_skill_v2_id && (
-                    <span
-                      className="text-xs bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded cursor-help"
-                      title={node.skill_selection_reason ?? 'v2 skill selected'}
-                    >
-                      v2✓
-                    </span>
-                  )}
-                </div>
-                <div className="text-xs text-gray-500">
-                  {node.task_id && <span className="font-mono">task: {node.task_id}</span>}
-                </div>
-              </div>
-              {node.description && <p className="text-sm text-gray-400 mt-1">{node.description}</p>}
-              {node.status === 'failed' && nodeFailureReason && (
-                <p className="text-xs text-red-300 mt-1">
-                  Failure: {nodeFailureReason}
-                </p>
-              )}
-              {node.depends_on.length > 0 && (
-                <div className="text-xs text-gray-500 mt-1">Depends on: {node.depends_on.join(', ')}</div>
-              )}
-                  </>
-                )
-              })()}
-            </button>
-          ))}
-        </div>
-      )}
+          </div>
+        )}
+      </div>
 
       {/* Output data (collapsed) */}
       {selectedNode?.output_data && (

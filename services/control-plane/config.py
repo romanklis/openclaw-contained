@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     
     # Workspaces
     WORKSPACE_ROOT: str = "/workspaces"
+
+    # Platform image catalog
+    IMAGE_CATALOG_DIR: str = "/data/image-repos"
+    AGENT_IMAGES_DIR: str = "/agent-images"
+    REGISTRY_URL: str = "registry:5000"
+    SHARED_COMPONENTS_DIR: str = "/agent-executor"
     
     class Config:
         env_file = ".env"

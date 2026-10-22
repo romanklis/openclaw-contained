@@ -354,7 +354,15 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
         "timeout_minutes": 15,
         "deploy_authorized": false,
         "selected_skill_v2_id": null,
-        "skill_selection_reason": null
+        "skill_selection_reason": null,
+        "required_capabilities": {{
+          "runtime_family": "openclaw",
+          "categories": ["data", "pdf"],
+          "packages": [{{"manager": "pip", "name": "pandas"}}],
+          "binaries": [],
+          "modalities": ["document"],
+          "rationale": "Why these capabilities are required"
+        }}
       }},
       "input_mapping": {{
         "input_name": "dependency-node-id.output_key"
@@ -408,9 +416,10 @@ Default — executes in an isolated container using the selected base_image + sk
 7. Use review/verdict (decision) nodes sparingly — only when the objective explicitly calls for a human review/approval gate, not as a default for every step. When used, give 2-3 clear options and wire each branch with a "decision:<value>" edge condition.
 8. Use input nodes only when the user must supply data (measurements/parameters) mid-flow that cannot be derived automatically; wire the fields so downstream nodes can consume them via input_mapping.
 9. base_image options: {base_images_section}. Choose using runtime + capabilities + best_for, and avoid images whose avoid_for conflicts with the node's task.
-10. Set each node config.llm_model to the requested execution model and do not use GPT models.
-11. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
-12. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
+10. Declare config.required_capabilities for every agent node: runtime_family, categories (web/pdf/office/data/browser/gpu/…), concrete packages (manager+name; only what the step actually needs), binaries, modalities, and a one-sentence rationale. The platform resolves/reuses a compatible image version before execution. Do not invent packages or request runtime-specific tools that the chosen base_image already provides.
+11. Set each node config.llm_model to the requested execution model and do not use GPT models.
+12. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
+13. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
 """
 
 

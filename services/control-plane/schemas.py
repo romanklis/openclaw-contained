@@ -117,7 +117,11 @@ class CapabilityRequestResponse(BaseModel):
     decision_notes: Optional[str]
     details: Optional[Dict[str, Any]] = None
     alternative_suggestion: Optional[str] = None
-    
+    image_build_id: Optional[int] = None
+    image_version_id: Optional[str] = None
+    image_build_status: Optional[str] = None
+    image_tag: Optional[str] = None
+
     class Config:
         from_attributes = True
 
@@ -619,6 +623,7 @@ class DAGDetail(DAGResponse):
     dag_json: Dict[str, Any]
     nodes: List[DAGNodeResponse] = []
     edges: List[DAGEdge] = []
+    input_attachments: List[Dict[str, Any]] = []
 
 
 class DAGNodeStateSnapshotCreate(BaseModel):
@@ -743,6 +748,7 @@ class WorkspaceManifestResponse(BaseModel):
     step_manifest: Dict[str, List[str]]  # {node_id: [deliverable_filepaths]}
     total_files: int
     steps_with_deliverables: List[str]
+    attachments: List[Dict[str, Any]] = []
 
 
 # ── Node Environments ──────────────────────────────────

@@ -15,7 +15,7 @@ from temporalio.client import Client
 logger = logging.getLogger(__name__)
 
 from database import get_db
-from models import CapabilityRequest, Task, RequestStatus
+from models import CapabilityRequest, ImageBuild, Task, RequestStatus
 from schemas import (
     CapabilityRequestCreate,
     CapabilityRequestResponse,
@@ -34,6 +34,24 @@ async def get_temporal_client():
     except Exception as e:
         logger.error(f"Failed to connect to Temporal: {e}")
         return None
+
+
+async def _to_response(capability_request: CapabilityRequest, db: AsyncSession) -> CapabilityRequestResponse:
+    """Add the linked image build/version to a capability request response."""
+    result = await db.execute(
+        select(ImageBuild)
+        .where(ImageBuild.capability_request_id == capability_request.id)
+        .order_by(ImageBuild.created_at.desc())
+        .limit(1)
+    )
+    build = result.scalars().first()
+    data = CapabilityRequestResponse.model_validate(capability_request)
+    if build:
+        data.image_build_id = build.id
+        data.image_version_id = build.version_id
+        data.image_build_status = build.status
+        data.image_tag = build.image_tag
+    return data
 
 
 @router.get("/requests", response_model=List[CapabilityRequestResponse])
@@ -74,7 +92,7 @@ async def list_capability_requests(
     result = await db.execute(query)
     requests = result.scalars().all()
     
-    return requests
+    return [await _to_response(request, db) for request in requests]
 
 
 @router.post("/requests", response_model=CapabilityRequestResponse)
@@ -112,7 +130,7 @@ async def create_capability_request(
     
     # TODO: Trigger approval workflow notifications
     
-    return capability_request
+    return await _to_response(capability_request, db)
 
 
 @router.post("/requests/{request_id}/review", response_model=CapabilityRequestResponse)
@@ -237,7 +255,7 @@ async def review_capability_request(
                 )
         await db.commit()
 
-    return capability_request
+    return await _to_response(capability_request, db)
 
 
 @router.post("/approve", response_model=CapabilityRequestResponse)
@@ -279,7 +297,7 @@ async def approve_capability(
         # Signal Temporal workflow to resume with new capability
         pass
     
-    return capability_request
+    return await _to_response(capability_request, db)
 
 
 @router.post("/requests/dismiss-pending")
@@ -329,4 +347,4 @@ async def get_capability_request(
             detail=f"Request {request_id} not found"
         )
     
-    return capability_request
+    return await _to_response(capability_request, db)

@@ -3850,6 +3850,7 @@ async def create_node_task(
     agent_image: str = "localhost:5000/openclaw-agent:openclaw",
     llm_model: str = "gemma3:4b",
     workspace_id: str = "",
+    base_image_override: str = "",
 ) -> str:
     """Create a Task record for a DAG node and return the task_id."""
     import httpx
@@ -3858,9 +3859,12 @@ async def create_node_task(
     task_id = f"task-{uuid.uuid4().hex[:8]}"
 
     # Control-plane /api/tasks expects a base_image key (e.g. "browser", "openclaw"), not a full image URL.
-    base_image = (agent_image or "openclaw").strip()
-    if "/" in base_image and ":" in base_image:
-        base_image = base_image.rsplit(":", 1)[-1]
+    if base_image_override:
+        base_image = base_image_override.strip()
+    else:
+        base_image = (agent_image or "openclaw").strip()
+        if "/" in base_image and ":" in base_image:
+            base_image = base_image.rsplit(":", 1)[-1]
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"{control_plane_url}/api/tasks",
@@ -4680,7 +4684,11 @@ class DAGNodeWorkflow:
         # Prefer the DAG-inherited enriched image over the static base_image
         # from the node config.  dag_image is injected by DAGWorkflow when a
         # previous wave already built capabilities.
-        agent_image = config.get("dag_image") or config.get("base_image", "openclaw")
+        agent_image = (
+            config.get("dag_image")
+            or config.get("resolved_image")
+            or config.get("base_image", "openclaw")
+        )
         if "/" not in agent_image:
             agent_image = f"localhost:5000/openclaw-agent:{agent_image}"
         if config.get("dag_image"):
@@ -4759,6 +4767,24 @@ class DAGNodeWorkflow:
             f"in `/tmp` or `/workspace/.cache/` — they are NOT collected. If the task fetches web data, save the "
             f"raw pages outside the deliverables directory and place only the parsed/structured data inside it."
         )
+        input_attachments = config.get("input_attachments") or []
+        if isinstance(input_attachments, list) and input_attachments:
+            follow_up_parts.append("--- Attached Reference Files (read-only) ---")
+            for att in input_attachments[:50]:
+                if not isinstance(att, dict):
+                    continue
+                stored = att.get("stored_as") or att.get("name")
+                mime = att.get("mime") or "application/octet-stream"
+                size = att.get("size")
+                size_str = f"{size} bytes" if isinstance(size, int) else "unknown size"
+                follow_up_parts.append(
+                    f"- /workspace/attachments/{stored} ({mime}, {size_str})"
+                )
+            follow_up_parts.append(
+                "The user attached these files to this DAG. They are in the shared workspace "
+                "and visible to all steps. Read them as needed; do not modify them. Files "
+                "produced by earlier steps appear in the input data below."
+            )
         if node_objective:
             follow_up_parts.append("--- Step Objective ---")
             follow_up_parts.append(node_objective)
@@ -4802,7 +4828,15 @@ class DAGNodeWorkflow:
             # Create a task for tracking
             task_id = await workflow.execute_activity(
                 create_node_task,
-                args=[dag_id, node_id, description, agent_image, llm_model, workspace_id],
+                args=[
+                    dag_id,
+                    node_id,
+                    description,
+                    agent_image,
+                    llm_model,
+                    workspace_id,
+                    config.get("resolved_runtime") or "",
+                ],
                 start_to_close_timeout=timedelta(seconds=30),
             )
 

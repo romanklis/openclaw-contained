@@ -5,6 +5,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
+import os
 from sqlalchemy import text
 
 from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom, supply_chain, skills, environments, dags
@@ -16,6 +17,7 @@ from routers import projects as projects_router
 from routers import credentials as credentials_router
 from routers import credential_management as credential_management_router
 from routers import blocks as blocks_router
+from routers import image_catalog as image_catalog_router
 from database import engine, Base, async_session
 from config import settings
 
@@ -68,6 +70,8 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE skills_v2 ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
         # Interactive steps: decision / input node type on DAG nodes
         await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS node_type VARCHAR DEFAULT 'agent'"))
+        # Image catalog: commit message for build/version history
+        await conn.execute(text("ALTER TABLE image_versions ADD COLUMN IF NOT EXISTS commit_message TEXT"))
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS dag_user_requests (
                 id SERIAL PRIMARY KEY,
@@ -169,6 +173,17 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Agent images sync skipped: {exc}")
 
+    # Bootstrap the git-backed platform image catalog from the project sources.
+    # Idempotent: existing definitions/versions are left untouched.
+    if os.getenv("IMAGE_CATALOG_AUTO_IMPORT", "true").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            import image_catalog
+            async with async_session() as session:
+                result = await image_catalog.import_from_agent_images(session)
+            logger.info("Image catalog bootstrap: %s", result)
+        except Exception as exc:
+            logger.warning(f"Image catalog bootstrap skipped: {exc}")
+
     yield
     
     # Shutdown
@@ -209,6 +224,7 @@ app.include_router(dag_user_requests.router, prefix="/api/dags", tags=["dag-user
 app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
 app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
 app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
+app.include_router(image_catalog_router.router, prefix="/api/image-catalog", tags=["image-catalog"])
 app.include_router(skill_learning_router.router, prefix="/api/skill-learning", tags=["skill-learning"])
 app.include_router(projects_router.router, prefix="/api/projects", tags=["projects"])
 app.include_router(credentials_router.router)

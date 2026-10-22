@@ -3,6 +3,15 @@
 This directory contains version-controlled agent images and the **Agent Profiles
 Registry** for the TaskForge platform.
 
+> **Reference / seed source.** The platform's runtime source of truth is the
+> Image Catalog (`/image-catalog`, git-backed repos under `/data/image-repos`).
+> This directory is retained as the reference/seed source. Use **Seed predefined
+> images** in the catalog (`POST /api/image-catalog/seed`) to import each
+> directory as a **full bundle** (Dockerfile, Python scripts, adapters/runners,
+> requirements, tests) and sync `agent_profiles.yaml` metadata. Seeding does not
+> build Docker images; build them via the catalog or the `make build-*` targets.
+> The legacy `/agent-images` page redirects to `/image-catalog`.
+
 ## Architecture
 
 TaskForge supports multiple **Base Images** (the "body") that are paired with

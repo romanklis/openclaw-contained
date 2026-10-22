@@ -17,7 +17,9 @@ COPY . .
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
+    chown -R appuser:appuser /app && \
+    mkdir -p /data/image-repos && \
+    chown -R appuser:appuser /data/image-repos
 
 USER appuser
 
