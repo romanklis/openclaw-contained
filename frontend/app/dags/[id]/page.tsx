@@ -62,6 +62,9 @@ interface DAGDetail {
   locked: boolean
   template_params: { key: string; label: string; type: string; default: string | null; description: string | null }[]
   template_source_dag_id: string | null
+  workflow_group_id?: string | null
+  exploration_session_id?: string | null
+  exploration_cycle?: number | null
   input_attachments?: DAGAttachment[]
 }
 
@@ -189,6 +192,7 @@ export default function DAGDetailPage() {
   const router = useRouter()
   const [dag, setDag] = useState<DAGDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const deepLinkApplied = useRef(false)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'deliverables' | 'audit' | 'turns' | 'configuration'>('deliverables')
   const [previewMode, setPreviewMode] = useState<'rendered' | 'raw'>('rendered')
@@ -320,6 +324,24 @@ export default function DAGDetailPage() {
   const [showFullWorkspace, setShowFullWorkspace] = useState(false)
   const [showFullObjective, setShowFullObjective] = useState(false)
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null)
+
+  useEffect(() => {
+    deepLinkApplied.current = false
+  }, [dagId])
+
+  useEffect(() => {
+    if (!dag || dag.id !== dagId || deepLinkApplied.current) return
+    deepLinkApplied.current = true
+    const query = new URLSearchParams(window.location.search)
+    const nodeId = query.get('node')
+    if (nodeId && dag.nodes.some((node) => node.node_id === nodeId)) {
+      setSelectedNodeId(nodeId)
+    }
+    const tab = query.get('tab')
+    if (tab === 'deliverables' || tab === 'audit' || tab === 'turns' || tab === 'configuration') {
+      setActiveTab(tab)
+    }
+  }, [dag, dagId])
 
   const fetchDag = useCallback(async () => {
     try {
@@ -1751,6 +1773,11 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             <StatusBadge status={dag.status} />
             {dag.locked && <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">🔒 template</span>}
             {dag.template_source_dag_id && <span className="text-xs bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded">follow-the-guidance</span>}
+            {dag.exploration_session_id && (
+              <Link href={`/explorations/${dag.exploration_session_id}`} className="text-xs bg-cyan-500/15 text-cyan-300 px-2 py-0.5 rounded hover:bg-cyan-500/25">
+                🧭 Exploration cycle {dag.exploration_cycle ?? '?'} &rarr;
+              </Link>
+            )}
           </div>
           <div className="mt-1 max-w-3xl">
             <p className={`text-gray-400 text-sm ${showFullObjective ? '' : 'line-clamp-3'}`}>{dag.objective}</p>

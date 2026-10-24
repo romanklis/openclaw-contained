@@ -6,8 +6,10 @@ from fastapi import APIRouter, Depends, HTTPException, status, Body, File, Form,
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from database import get_db
+from workflow_groups import ensure_workflow_group, cleanup_empty_group
 from models import (
     MasterDAG,
+    WorkflowGroup,
     DAGNode,
     Task,
     DAGStatus,
@@ -233,6 +235,10 @@ async def _create_dag_impl(
     if files:
         validate_uploads(files)
 
+    workflow_group = await ensure_workflow_group(
+        objective, project_id, db, llm_model=agent_model
+    )
+
     # Create DAG record in PLANNING state
     dag = MasterDAG(
         id=dag_id,
@@ -242,6 +248,7 @@ async def _create_dag_impl(
         workspace_id=workspace_id,
         llm_model=agent_model,
         project_id=project_id,
+        workflow_group_id=workflow_group.id,
     )
     db.add(dag)
     await db.commit()
@@ -414,6 +421,9 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
     if not is_valid:
         raise HTTPException(status_code=422, detail={"errors": errors})
 
+    workflow_group = await ensure_workflow_group(
+        data.objective, data.project_id, db, llm_model=data.default_llm
+    )
     dag = MasterDAG(
         id=dag_id,
         objective=data.objective,
@@ -422,6 +432,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
         workspace_id=workspace_id,
         llm_model=data.default_llm,
         project_id=data.project_id,
+        workflow_group_id=workflow_group.id,
     )
     db.add(dag)
 
@@ -691,6 +702,8 @@ async def delete_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Cannot delete a running DAG")
     if dag.locked:
         raise HTTPException(status_code=400, detail="Cannot delete a locked template DAG")
+    if getattr(dag, "exploration_session_id", None):
+        raise HTTPException(status_code=400, detail="Cannot delete an exploration cycle DAG; finish or replan the exploration")
 
     workspace_path = f"/workspaces/{dag.workspace_id}"
 
@@ -711,7 +724,10 @@ async def delete_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     if task_ids:
         await db.execute(delete(Task).where(Task.dag_id == dag_id))
     await db.execute(delete(DAGNode).where(DAGNode.dag_id == dag_id))
+    workflow_group_id = dag.workflow_group_id
     await db.delete(dag)
+    await db.commit()
+    await cleanup_empty_group(workflow_group_id, db)
     await db.commit()
 
     # Best-effort workspace cleanup.
@@ -730,6 +746,11 @@ async def lock_dag(dag_id: str, body: DAGLockRequest, db: AsyncSession = Depends
     params = [p.model_dump() for p in body.parameters]
     dag.locked = True
     dag.template_params = params
+    if dag.workflow_group_id:
+        group_result = await db.execute(select(WorkflowGroup).where(WorkflowGroup.id == dag.workflow_group_id))
+        group = group_result.scalar_one_or_none()
+        if group and getattr(group, "mode", "experiment") != "exploration":
+            group.mode = "template"
 
     # Parameterize the DAG text: replace each param's concrete default with its
     # {key} placeholder so a future instantiation substitutes new inputs.
@@ -823,6 +844,11 @@ async def unlock_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     """Unlock a DAG template so it can be modified again."""
     dag = await _get_dag_or_404(dag_id, db)
     dag.locked = False
+    if dag.workflow_group_id:
+        group_result = await db.execute(select(WorkflowGroup).where(WorkflowGroup.id == dag.workflow_group_id))
+        group = group_result.scalar_one_or_none()
+        if group and getattr(group, "mode", "experiment") == "template":
+            group.mode = "experiment"
     await db.commit()
     await db.refresh(dag)
     nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
@@ -1097,6 +1123,16 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
             "input_mapping": input_mapping,
             "config": cfg,
         })
+    if body.llm_model:
+        overridden_model = str(body.llm_model).strip()
+        if overridden_model:
+            for nd in new_nodes:
+                if str(nd.get("node_type") or "agent") == "agent":
+                    cfg = dict(nd.get("config") or {})
+                    cfg["llm_model"] = overridden_model
+                    nd["config"] = cfg
+            src_dag_json["default_llm"] = overridden_model
+
     new_dag_json = {
         **{k: v for k, v in src_dag_json.items() if k != "nodes"},
         "nodes": new_nodes,
@@ -1108,6 +1144,16 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
 
     new_dag_id = _gen_dag_id()
     new_workspace_id = _gen_workspace_id(new_dag_id)
+    workflow_group = await ensure_workflow_group(
+        source.objective,
+        source.project_id,
+        db,
+        llm_model=source.llm_model,
+        existing_group_id=source.workflow_group_id,
+        use_llm_title=False,
+    )
+    if not source.workflow_group_id:
+        source.workflow_group_id = workflow_group.id
     new_dag = MasterDAG(
         id=new_dag_id,
         objective=objective,
@@ -1117,6 +1163,7 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
         llm_model=new_dag_json.get("default_llm") or source.llm_model,
         template_params=list(source.template_params or []),
         template_source_dag_id=source.id,
+        workflow_group_id=workflow_group.id,
         project_id=source.project_id,
     )
     db.add(new_dag)
@@ -2550,6 +2597,17 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
     new_dag_id = _gen_dag_id()
     workspace_id = old_dag.workspace_id
 
+    workflow_group = await ensure_workflow_group(
+        old_dag.objective,
+        old_dag.project_id,
+        db,
+        llm_model=llm_model,
+        existing_group_id=old_dag.workflow_group_id,
+        use_llm_title=False,
+    )
+    if not old_dag.workflow_group_id:
+        old_dag.workflow_group_id = workflow_group.id
+
     new_dag = MasterDAG(
         id=new_dag_id,
         objective=revision_objective,
@@ -2557,6 +2615,7 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
         dag_json={},
         workspace_id=workspace_id,
         llm_model=llm_model,
+        workflow_group_id=workflow_group.id,
     )
     db.add(new_dag)
     await db.commit()
@@ -2801,6 +2860,10 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
         "locked": bool(getattr(dag, "locked", False)),
         "template_params": list(getattr(dag, "template_params", []) or []),
         "template_source_dag_id": getattr(dag, "template_source_dag_id", None),
+        "workflow_group_id": getattr(dag, "workflow_group_id", None),
+        "exploration_session_id": getattr(dag, "exploration_session_id", None),
+        "exploration_cycle": getattr(dag, "exploration_cycle", None),
+        "archived": bool(getattr(dag, "archived", False)),
         "project_id": getattr(dag, "project_id", None),
         "dag_json": dag.dag_json,
         "input_attachments": (dag.dag_json or {}).get("input_attachments", []) or [],

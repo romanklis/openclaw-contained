@@ -176,6 +176,34 @@ def _record_interaction(
                 f"finish={finish_reason} | tool_calls={len(response_tool_calls or [])}")
 
 
+def get_task_interaction_summary(task_id: str) -> Dict[str, Any]:
+    """Cheap summary of the in-memory LLM turns for a running task."""
+    interactions = _task_interactions.get(task_id, [])
+    if not interactions:
+        return {"count": 0, "latest_turn": None, "latest_activity": None}
+    latest = interactions[-1]
+    response = latest.get("response") or {}
+    tool_calls = response.get("tool_calls") or []
+    activity = None
+    if tool_calls:
+        first = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
+        name = first.get("name") or "tool"
+        args = first.get("arguments") or {}
+        detail = ""
+        if isinstance(args, dict):
+            detail = args.get("file_path") or args.get("path") or args.get("command") or ""
+        activity = f"{name} {str(detail)[:100]}".strip()
+    elif response.get("content"):
+        activity = str(response.get("content"))[:120]
+    elif response.get("finish_reason"):
+        activity = f"finish: {response.get('finish_reason')}"
+    return {
+        "count": len(interactions),
+        "latest_turn": latest.get("turn"),
+        "latest_activity": activity[:120] if activity else None,
+    }
+
+
 async def _get_db_session() -> AsyncSession:
     """Get a DB session for config persistence."""
     from database import async_session

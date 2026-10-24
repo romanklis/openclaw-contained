@@ -565,6 +565,7 @@ class DAGInstantiateRequest(BaseModel):
     objective: Optional[str] = None
     parameters: Dict[str, Any] = {}
     auto_start: bool = False
+    llm_model: Optional[str] = None
 
 
 class TemplateSkillResponse(BaseModel):
@@ -611,6 +612,9 @@ class DAGResponse(BaseModel):
     locked: bool = False
     template_params: Optional[List[Dict[str, Any]]] = None
     template_source_dag_id: Optional[str] = None
+    workflow_group_id: Optional[str] = None
+    exploration_session_id: Optional[str] = None
+    exploration_cycle: Optional[int] = None
     archived: bool = False
     project_id: Optional[str] = None
 
@@ -624,6 +628,95 @@ class DAGDetail(DAGResponse):
     nodes: List[DAGNodeResponse] = []
     edges: List[DAGEdge] = []
     input_attachments: List[Dict[str, Any]] = []
+
+
+class WorkflowRunSummary(BaseModel):
+    id: str
+    status: str
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    duration_seconds: Optional[int] = None
+    run_number: int = 1
+    locked: bool = False
+    archived: bool = False
+    score: Optional[int] = None
+    flagged: bool = False
+    key_output: Optional[str] = None
+    blocker: Optional[str] = None
+    total_tokens: Optional[int] = None
+
+
+class WorkflowNodeChip(BaseModel):
+    node_id: str
+    node_type: str = "agent"
+    label: str = ""
+    status: str = "pending"
+
+
+class WorkflowNodeCounts(BaseModel):
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+    flagged: int = 0
+
+
+class WorkflowSummary(BaseModel):
+    id: str
+    title: str
+    objective: str
+    project_id: Optional[str] = None
+    mode: str = "experiment"
+    exploration_session_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    stage: Literal["experimenting", "locked", "hardened"] = "experimenting"
+    locked: bool = False
+    determinism_pct: int = 0
+    block_count: int = 0
+    step_count: int = 0
+    run_count: int = 0
+    completed_count: int = 0
+    failed_count: int = 0
+    running_count: int = 0
+    latest_run: Optional[WorkflowRunSummary] = None
+    recent_runs: List[WorkflowRunSummary] = []
+    latest_score: Optional[int] = None
+    reliability_pct: Optional[int] = None
+    avg_runtime_seconds: Optional[int] = None
+    latest_nodes: List[WorkflowNodeChip] = []
+    latest_node_counts: WorkflowNodeCounts = WorkflowNodeCounts()
+    blocker: Optional[str] = None
+    key_output: Optional[str] = None
+    latest_active_node_id: Optional[str] = None
+
+
+class WorkflowDetail(WorkflowSummary):
+    runs: List[WorkflowRunSummary] = []
+
+
+class WorkflowMergeRequest(BaseModel):
+    source_id: str
+    allow_cross_project: bool = False
+
+
+class ExplorationCreateRequest(BaseModel):
+    objective: str
+    model: Optional[str] = None
+    project_id: Optional[str] = None
+    skill_ids: List[str] = []
+
+
+class ExplorationChatRequest(BaseModel):
+    message: str
+    mode: Literal["chat", "feedback"] = "chat"
+
+
+class ExplorationFeedbackRequest(BaseModel):
+    feedback: str
+
+
+class ExplorationFinishRequest(BaseModel):
+    pass
 
 
 class DAGNodeStateSnapshotCreate(BaseModel):

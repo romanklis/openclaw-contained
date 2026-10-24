@@ -398,6 +398,22 @@ class Skill(Base):
     updated_at = Column(DateTime, onupdate=func.now())
 
 
+class WorkflowGroup(Base):
+    """A logical workflow objective that groups multiple DAG runs/iterations."""
+    __tablename__ = "workflow_groups"
+
+    id = Column(String, primary_key=True)  # wf-<uuid8>
+    title = Column(Text, nullable=False)
+    title_source = Column(String, default="derived", nullable=False)
+    mode = Column(String, default="experiment", nullable=False)  # experiment|template|exploration
+    objective = Column(Text, nullable=False)
+    objective_key = Column(Text, nullable=False, index=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)
+    created_by = Column(String)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
 class MasterDAG(Base):
     """A Master DAG representing a decomposed user objective.
 
@@ -434,6 +450,9 @@ class MasterDAG(Base):
     locked = Column(Boolean, default=False, nullable=False)
     template_params = Column(JSON, default=list)  # [{key,label,type,default,description}]
     template_source_dag_id = Column(String, nullable=True)  # set on instances
+    workflow_group_id = Column(String, ForeignKey("workflow_groups.id"), nullable=True, index=True)
+    exploration_session_id = Column(String, nullable=True, index=True)
+    exploration_cycle = Column(Integer, nullable=True)
     project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)  # project namespace
 
     # Archiving: hides the DAG from the default list (soft delete), keeps data.
@@ -960,6 +979,53 @@ class DagUserRequest(Base):
 
     created_at = Column(DateTime, server_default=func.now())
     answered_at = Column(DateTime, nullable=True)
+
+
+class ExplorationSession(Base):
+    """A chat-driven, continuous exploration workflow."""
+    __tablename__ = "exploration_sessions"
+
+    id = Column(String, primary_key=True)  # exp-<uuid8>
+    workflow_group_id = Column(String, ForeignKey("workflow_groups.id"), nullable=False, unique=True, index=True)
+    title = Column(Text, nullable=False)
+    objective = Column(Text, nullable=False)
+    status = Column(String, default="planning", nullable=False, index=True)
+    model = Column(String, nullable=True)
+    project_id = Column(String, nullable=True, index=True)
+    workspace_id = Column(String, nullable=True)
+    current_cycle = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    last_activity_at = Column(DateTime, server_default=func.now())
+
+
+class ExplorationCycle(Base):
+    """One DAG run in an exploration session."""
+    __tablename__ = "exploration_cycles"
+
+    id = Column(String, primary_key=True)  # cyc-<uuid8>
+    session_id = Column(String, ForeignKey("exploration_sessions.id"), nullable=False, index=True)
+    cycle_number = Column(Integer, nullable=False)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    status = Column(String, default="proposed", nullable=False)
+    feedback = Column(Text, nullable=True)
+    finalized_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class ExplorationMessage(Base):
+    """Persisted chat/card message in an exploration session."""
+    __tablename__ = "exploration_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String, ForeignKey("exploration_sessions.id"), nullable=False, index=True)
+    cycle_id = Column(String, ForeignKey("exploration_cycles.id"), nullable=True, index=True)
+    role = Column(String, nullable=False)  # user|assistant|system
+    kind = Column(String, default="text", nullable=False)  # text|cycle_proposal|cycle_result|cycle_input|status|error
+    content = Column(Text, default="")
+    metadata_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, server_default=func.now(), index=True)
 
 
 # =========================================================================

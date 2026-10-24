@@ -16,6 +16,15 @@ const navigation = [
     ),
   },
   {
+    name: 'Explorations',
+    href: '/explorations',
+    icon: (
+      <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 3v3m0 12v3M3 12h3m12 0h3M5.636 5.636l2.121 2.121m8.486 8.486 2.121 2.121m0-12.728-2.121 2.121M7.757 16.243l-2.121 2.121" />
+      </svg>
+    ),
+  },
+  {
     name: 'Deployments',
     href: '/deployments',
     icon: (

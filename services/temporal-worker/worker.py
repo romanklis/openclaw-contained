@@ -384,11 +384,32 @@ class AgentTaskWorkflow:
                 )
                 self._capability_feedback = ""  # one-shot — don't repeat
 
-            result = await workflow.execute_child_workflow(
-                AgentStepWorkflow.run,
-                args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns],
-                id=f"agent-step-{task_id}-iter-{iteration}",
-            )
+            try:
+                result = await workflow.execute_child_workflow(
+                    AgentStepWorkflow.run,
+                    args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns],
+                    id=f"agent-step-{task_id}-iter-{iteration}",
+                )
+            except Exception as child_exc:
+                logger.error(
+                    f"❌ AgentStepWorkflow failed | Task: {task_id} | "
+                    f"Iteration: {iteration} | {child_exc}"
+                )
+                try:
+                    await workflow.execute_activity(
+                        finalize_task,
+                        args=[task_id, "failed"],
+                        start_to_close_timeout=timedelta(minutes=2),
+                    )
+                except Exception as finalize_exc:
+                    logger.error(
+                        f"❌ Failed to finalize failed task {task_id}: {finalize_exc}"
+                    )
+                return {
+                    "status": "failed",
+                    "error": str(child_exc)[:1000],
+                    "iteration": iteration,
+                }
 
             # If a DAG container was committed, update current_image so
             # subsequent iterations (and eventually the parent DAGNodeWorkflow)
@@ -1445,6 +1466,131 @@ async def poll_agent_turns(
     }
 
 
+def _compact_agent_result_for_temporal(
+    result: Dict[str, Any],
+    workspace_dir: str,
+    inline_limit_bytes: int = 32 * 1024,
+    safe_payload_bytes: int = 1_500_000,
+) -> Dict[str, Any]:
+    """Replace large inline deliverables with workspace file references.
+
+    Temporal activity results are capped at ~2 MB. Agent steps can legitimately
+    produce multi-megabyte DOCX/PDF/PNG deliverables; returning those as
+    ``base64:`` strings makes the whole workflow result exceed the limit. The
+    files already live in the shared workspace, so return refs that the
+    control-plane file endpoint can serve instead.
+    """
+    import base64 as _b64
+    import json as _json
+
+    deliverables = result.get("deliverables")
+    if not isinstance(deliverables, dict) or not deliverables:
+        return result
+
+    file_index: list[tuple[str, str, int]] = []
+    try:
+        for root, _dirs, names in os.walk(workspace_dir):
+            for name in names:
+                abs_path = os.path.join(root, name)
+                try:
+                    rel = os.path.relpath(abs_path, workspace_dir).replace(os.sep, "/")
+                    if rel.startswith(".."):
+                        continue
+                    file_index.append((rel, os.path.realpath(abs_path), os.path.getsize(abs_path)))
+                except Exception:
+                    continue
+    except Exception as exc:
+        logger.warning(f"⚠️ Could not index workspace for deliverable refs: {exc}")
+
+    # Prefer the node directory that owns the largest share of this result's
+    # deliverables. Several nodes can contain a file with the same basename
+    # (e.g. figures/fig2_results.png copied from an upstream step).
+    deliverable_keys = [str(key).replace("\\", "/").lstrip("/") for key in deliverables.keys()]
+    dir_scores: Dict[str, int] = {}
+    for key in deliverable_keys:
+        for rel, _abs, _size in file_index:
+            if rel == key or rel.endswith("/" + key):
+                prefix = rel.split("/", 1)[0] if "/" in rel else ""
+                if prefix:
+                    dir_scores[prefix] = dir_scores.get(prefix, 0) + 1
+    preferred_prefix = max(dir_scores, key=dir_scores.get) if dir_scores else ""
+
+    def resolve(key: str) -> tuple[str, str, int] | None:
+        normalized = key.replace("\\", "/").lstrip("/")
+        direct = os.path.realpath(os.path.join(workspace_dir, normalized))
+        workspace_real = os.path.realpath(workspace_dir)
+        if direct.startswith(workspace_real + os.sep) and os.path.isfile(direct):
+            rel = os.path.relpath(direct, workspace_dir).replace(os.sep, "/")
+            return rel, direct, os.path.getsize(direct)
+        matches = [
+            entry for entry in file_index
+            if entry[0] == normalized or entry[0].endswith("/" + normalized)
+        ]
+        if preferred_prefix:
+            preferred = [
+                entry for entry in matches
+                if entry[0].startswith(preferred_prefix + "/")
+            ]
+            if preferred:
+                matches = preferred
+        if matches:
+            return min(matches, key=lambda entry: len(entry[0]))
+        return None
+
+    def decoded_size(value: str) -> int:
+        if value.startswith("base64:"):
+            try:
+                return len(_b64.b64decode(value[7:], validate=False))
+            except Exception:
+                return max(0, (len(value) - 7) * 3 // 4)
+        return len(value)
+
+    def to_ref(key: str, value: str) -> Dict[str, Any]:
+        size = decoded_size(value)
+        resolved = resolve(key)
+        if resolved:
+            rel, _abs, actual_size = resolved
+            return {"ref": "file", "path": f"/workspace/{rel}", "size": actual_size}
+        return {"ref": "file", "path": f"/workspace/{key.lstrip('/')}", "size": size, "missing": True}
+
+    compacted = {}
+    for key, value in deliverables.items():
+        if isinstance(value, dict) and value.get("ref") == "file":
+            compacted[key] = value
+            continue
+        if isinstance(value, str) and value.startswith("base64:") and decoded_size(value) > inline_limit_bytes:
+            compacted[key] = to_ref(str(key), value)
+        else:
+            compacted[key] = value
+    result["deliverables"] = compacted
+
+    def payload_size(payload: Dict[str, Any]) -> int:
+        try:
+            return len(_json.dumps(payload, default=str).encode("utf-8"))
+        except Exception:
+            return 0
+
+    # Second pass if the payload is still too large: ref large text artifacts too.
+    if payload_size(result) > safe_payload_bytes:
+        for key, value in list(compacted.items()):
+            if isinstance(value, str) and len(value) > inline_limit_bytes * 2:
+                compacted[key] = to_ref(str(key), value)
+        if isinstance(result.get("agent_logs"), str):
+            result["agent_logs"] = result["agent_logs"][:20_000]
+        if isinstance(result.get("output"), str):
+            result["output"] = result["output"][:20_000]
+        turns = result.get("_remaining_turns")
+        if isinstance(turns, list) and len(turns) > 100:
+            result["_remaining_turns"] = turns[-100:]
+
+    logger.info(
+        "📦 Compacted agent result for Temporal: %s bytes (deliverables=%s)",
+        payload_size(result),
+        len(compacted),
+    )
+    return result
+
+
 @activity.defn
 async def collect_agent_result(
     task_id: str,
@@ -1654,7 +1800,7 @@ async def collect_agent_result(
         result["_remaining_turns"] = slim_turns
         if committed_image:
             result["committed_image"] = committed_image
-        return result
+        return _compact_agent_result_for_temporal(result, workspace_dir)
 
     # Fallback: no structured result — check control plane for pending
     # capability requests that the agent may have posted directly.

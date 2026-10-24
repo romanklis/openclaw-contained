@@ -1,163 +1,88 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
-import { StatusBadge } from '../components/StatusComponents'
-import { API, TEMPORAL_UI } from '../lib/api'
+import { useRouter } from 'next/navigation'
+import { API } from '../lib/api'
 import { useProject } from '../lib/ProjectContext'
+import WorkflowTableRow from '../components/WorkflowTableRow'
+import MergeWorkflowDialog from '../components/MergeWorkflowDialog'
+import TemplateRunDialog, { type TemplateDag } from '../components/TemplateRunDialog'
+import {
+  type WorkflowStage,
+  type WorkflowSummary,
+} from '../lib/workflows'
 
-const MAX_ATTACHMENT_FILES = 20
-const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
-const MAX_ATTACHMENT_TOTAL_BYTES = 100 * 1024 * 1024
-const ATTACHMENT_ACCEPT = [
-  '.pdf', '.txt', '.md', '.rst', '.doc', '.docx', '.odt', '.rtf',
-  '.csv', '.tsv', '.json', '.jsonl', '.yaml', '.yml', '.xlsx', '.xls', '.parquet',
-  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff', '.svg',
-  '.py', '.js', '.ts', '.tsx', '.jsx', '.html', '.css', '.sql', '.sh',
-  '.ipynb', '.xml', '.toml', '.ini', '.cfg', '.zip', '.tar', '.gz', '.tgz',
-  '.7z', '.ppt', '.pptx',
-].join(',')
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`
-}
-
-interface DAG {
-  id: string
-  objective: string
-  status: string
-  workspace_id: string
-  llm_model: string
-  workflow_id: string | null
-  created_at: string
-  started_at: string | null
-  completed_at: string | null
+interface DAGRecord extends TemplateDag {
   locked: boolean
   archived: boolean
+  status: string
 }
 
-interface Skill {
-  id: string
-  name: string
-  description: string | null
-}
+const STAGE_ORDER: WorkflowStage[] = ['hardened', 'locked', 'experimenting']
+type SortMode = 'active' | 'name' | 'stage' | 'score'
 
-export default function DAGsPage() {
-  const [dags, setDags] = useState<DAG[]>([])
-  const [loading, setLoading] = useState(false)
+export default function WorkflowStudioPage() {
+  const router = useRouter()
+  const { activeProject, projects } = useProject()
+  const [workflows, setWorkflows] = useState<WorkflowSummary[]>([])
+  const [dags, setDags] = useState<DAGRecord[]>([])
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [showForm, setShowForm] = useState(false)
-  const [objective, setObjective] = useState('')
-  const [autoStart, setAutoStart] = useState(false)
-  const [skills, setSkills] = useState<Skill[]>([])
-  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([])
-  const [modelDefaults, setModelDefaults] = useState<{planning_model: string, agent_model: string} | null>(null)
+  const [stage, setStage] = useState<'all' | WorkflowStage>('all')
+  const [search, setSearch] = useState('')
   const [showArchived, setShowArchived] = useState(false)
+  const [showMore, setShowMore] = useState(false)
   const [showImport, setShowImport] = useState(false)
   const [importJson, setImportJson] = useState('')
   const [importing, setImporting] = useState(false)
   const [importMsg, setImportMsg] = useState<string | null>(null)
-  const [attachments, setAttachments] = useState<File[]>([])
-  const [attachmentError, setAttachmentError] = useState<string | null>(null)
-  const [dragActive, setDragActive] = useState(false)
-  const { activeProject } = useProject()
+  const [template, setTemplate] = useState<DAGRecord | null>(null)
+  const [mergeTarget, setMergeTarget] = useState<WorkflowSummary | null>(null)
+  const [focusWorkflow, setFocusWorkflow] = useState<string | null>(null)
+  const [sortBy, setSortBy] = useState<SortMode>('active')
+  const [expandedWorkflowId, setExpandedWorkflowId] = useState<string | null>(null)
+  const searchRef = useRef<HTMLInputElement | null>(null)
 
-  const fetchDags = async () => {
-    try {
-      const qs = new URLSearchParams({ archived: String(showArchived) })
-      if (activeProject) qs.set('project_id', activeProject)
-      const res = await fetch(`${API}/api/dags?${qs}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setDags(await res.json())
-    } catch (err: any) {
-      setError(err.message)
-    }
-  }
-
-  const fetchSkills = async () => {
-    try {
-      const res = await fetch(`${API}/api/skills`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setSkills(await res.json())
-    } catch (err: any) {
-      console.error('Failed to fetch skills:', err)
-    }
-  }
-
-  const fetchModelDefaults = async () => {
-    try {
-      const res = await fetch(`${API}/api/dags/model-defaults`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setModelDefaults(await res.json())
-    } catch (err: any) {
-      console.error('Failed to fetch model defaults:', err)
-    }
-  }
-
-  useEffect(() => { fetchDags(); fetchSkills(); fetchModelDefaults() }, [showArchived, activeProject])
-
-  const addFiles = (incoming: FileList | null) => {
-    if (!incoming) return
-    setAttachmentError(null)
-    const accepted = ATTACHMENT_ACCEPT.split(',')
-    const next = [...attachments]
-    for (const file of Array.from(incoming)) {
-      if (next.length >= MAX_ATTACHMENT_FILES) {
-        setAttachmentError(`At most ${MAX_ATTACHMENT_FILES} files can be attached.`)
-        break
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        searchRef.current?.focus()
       }
-      const dot = file.name.lastIndexOf('.')
-      const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : ''
-      if (!accepted.includes(ext)) {
-        setAttachmentError(`Unsupported file type: ${file.name}`)
-        continue
-      }
-      if (file.size > MAX_ATTACHMENT_BYTES) {
-        setAttachmentError(`${file.name} is larger than ${formatBytes(MAX_ATTACHMENT_BYTES)}.`)
-        continue
-      }
-      if (next.some((f) => f.name === file.name && f.size === file.size)) continue
-      next.push(file)
     }
-    const total = next.reduce((sum, f) => sum + f.size, 0)
-    if (total > MAX_ATTACHMENT_TOTAL_BYTES) {
-      setAttachmentError(`Total attachment size exceeds ${formatBytes(MAX_ATTACHMENT_TOTAL_BYTES)}.`)
-      return
-    }
-    setAttachments(next)
-  }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
 
-  const createDag = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const projectNameById = useMemo(
+    () => new Map(projects.map((project) => [project.id, project.name])),
+    [projects],
+  )
+
+  const fetchWorkflows = async () => {
     setLoading(true)
     setError(null)
     try {
-      const formData = new FormData()
-      formData.append('objective', objective)
-      formData.append('auto_start', String(autoStart))
-      if (selectedSkillIds.length > 0) formData.append('skill_ids', JSON.stringify(selectedSkillIds))
-      if (activeProject) formData.append('project_id', activeProject)
-      attachments.forEach((file) => formData.append('files', file))
-
-      const res = await fetch(`${API}/api/dags/with-files`, {
-        method: 'POST',
-        body: formData,
+      const qs = new URLSearchParams({
+        archived: String(showArchived),
+        limit: '200',
       })
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}))
-        const msg = typeof detail?.detail === 'string'
-          ? detail.detail
-          : JSON.stringify(detail?.detail || detail)
-        throw new Error(msg || `HTTP ${res.status}`)
-      }
-      setObjective('')
-      setSelectedSkillIds([])
-      setAttachments([])
-      setAttachmentError(null)
-      setShowForm(false)
-      fetchDags()
+      if (activeProject) qs.set('project_id', activeProject)
+      const dagQs = new URLSearchParams({
+        archived: String(showArchived),
+        limit: '200',
+      })
+      if (activeProject) dagQs.set('project_id', activeProject)
+      const [workflowRes, dagRes] = await Promise.all([
+        fetch(`${API}/api/workflows?${qs}`),
+        fetch(`${API}/api/dags?${dagQs}`),
+      ])
+      const workflowData = await workflowRes.json().catch(() => [])
+      const dagData = await dagRes.json().catch(() => [])
+      if (!workflowRes.ok) throw new Error(`HTTP ${workflowRes.status}`)
+      setWorkflows(Array.isArray(workflowData) ? workflowData : [])
+      setDags(Array.isArray(dagData) ? dagData : [])
     } catch (err: any) {
       setError(err.message)
     } finally {
@@ -165,62 +90,143 @@ export default function DAGsPage() {
     }
   }
 
-  const startDag = async (dagId: string) => {
-    try {
-      await fetch(`${API}/api/dags/${dagId}/start`, { method: 'POST' })
-      fetchDags()
-    } catch (err: any) {
-      setError(err.message)
+  useEffect(() => {
+    fetchWorkflows()
+  }, [showArchived, activeProject])
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const stageParam = params.get('stage')
+    if (stageParam === 'experimenting' || stageParam === 'locked' || stageParam === 'hardened') {
+      setStage(stageParam)
     }
+    const workflowParam = params.get('workflow')
+    if (workflowParam) {
+      setStage('all')
+      setSearch('')
+      setFocusWorkflow(workflowParam)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!focusWorkflow || loading) return
+    const target = document.getElementById(`workflow-${focusWorkflow}`)
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      setFocusWorkflow(null)
+    }
+  }, [focusWorkflow, loading, workflows])
+
+  const counts = useMemo(() => ({
+    all: workflows.length,
+    experimenting: workflows.filter((group) => group.stage === 'experimenting').length,
+    locked: workflows.filter((group) => group.stage === 'locked').length,
+    hardened: workflows.filter((group) => group.stage === 'hardened').length,
+  }), [workflows])
+
+  const determinism = counts.hardened > 0
+    ? Math.round(
+        workflows
+          .filter((group) => group.stage === 'hardened')
+          .reduce((sum, group) => sum + group.determinism_pct, 0) / counts.hardened,
+      )
+    : 0
+
+  const filtered = useMemo(() => {
+    const term = search.trim().toLowerCase()
+    return workflows.filter((group) => {
+      if (stage !== 'all' && group.stage !== stage) return false
+      if (!term) return true
+      return (
+        group.title.toLowerCase().includes(term) ||
+        group.objective.toLowerCase().includes(term) ||
+        (group.latest_run?.id || '').toLowerCase().includes(term)
+      )
+    })
+  }, [workflows, stage, search])
+
+  const sorted = useMemo(() => {
+    const list = [...filtered]
+    if (sortBy === 'name') {
+      list.sort((a, b) => a.title.localeCompare(b.title))
+    } else if (sortBy === 'stage') {
+      list.sort((a, b) => STAGE_ORDER.indexOf(a.stage) - STAGE_ORDER.indexOf(b.stage))
+    } else if (sortBy === 'score') {
+      list.sort((a, b) => (b.latest_score ?? -1) - (a.latest_score ?? -1))
+    } else {
+      list.sort(
+        (a, b) =>
+          new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime(),
+      )
+    }
+    return list
+  }, [filtered, sortBy])
+
+  const openLatest = (group: WorkflowSummary) => {
+    if (group.latest_run?.id) router.push(`/dags/${group.latest_run.id}`)
   }
 
-  const archiveDag = async (dagId: string) => {
-    if (!window.confirm(`Archive DAG ${dagId}? It will be hidden from the list.`)) return
+  const openTemplate = (group: WorkflowSummary) => {
+    const lockedTemplate = dags.find(
+      (dag) => dag.locked && dag.workflow_group_id === group.id,
+    )
+    if (lockedTemplate) router.push(`/dags/${lockedTemplate.id}`)
+    else openLatest(group)
+  }
+
+  const runWorkflow = (group: WorkflowSummary) => {
+    if (!group.latest_run?.id) return
+    if (group.locked) {
+      const lockedTemplate = dags.find(
+        (dag) => dag.locked && dag.workflow_group_id === group.id,
+      )
+      if (lockedTemplate) {
+        setTemplate(lockedTemplate)
+        return
+      }
+    }
+    router.push(`/dags/${group.latest_run.id}`)
+  }
+
+  const convertStep = (group: WorkflowSummary) => {
+    if (!group.latest_run?.id) return
+    const agent = group.latest_nodes.find((node) => node.node_type === 'agent')
+    router.push(`/dags/${group.latest_run.id}${agent ? `?node=${encodeURIComponent(agent.node_id)}` : ''}`)
+  }
+
+  const rerunFailed = (group: WorkflowSummary) => {
+    if (!group.latest_run?.id) return
+    router.push(`/dags/${group.latest_run.id}${group.latest_active_node_id ? `?node=${encodeURIComponent(group.latest_active_node_id)}` : ''}`)
+  }
+
+  const archiveRun = async (dagId: string) => {
+    if (!window.confirm(`Archive run ${dagId}? It will be hidden from the active workflow list.`)) return
     try {
       const res = await fetch(`${API}/api/dags/${dagId}/archive`, { method: 'POST' })
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}))
-        throw new Error(detail.detail || `HTTP ${res.status}`)
-      }
-      fetchDags()
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      fetchWorkflows()
     } catch (err: any) {
       setError(err.message)
     }
   }
 
-  const unarchiveDag = async (dagId: string) => {
-    try {
-      const res = await fetch(`${API}/api/dags/${dagId}/unarchive`, { method: 'POST' })
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}))
-        throw new Error(detail.detail || `HTTP ${res.status}`)
-      }
-      fetchDags()
-    } catch (err: any) {
-      setError(err.message)
-    }
-  }
-
-  const deleteDag = async (dagId: string) => {
-    if (!window.confirm(`Permanently delete DAG ${dagId} and ALL its data (tasks, outputs, reviews, workspace)? This cannot be undone.`)) return
+  const deleteRun = async (dagId: string) => {
+    if (!window.confirm(`Permanently delete run ${dagId} and all its data? This cannot be undone.`)) return
     try {
       const res = await fetch(`${API}/api/dags/${dagId}`, { method: 'DELETE' })
       if (!res.ok) {
-        const detail = await res.json().catch(() => ({}))
-        throw new Error(detail.detail || `HTTP ${res.status}`)
+        const data = await res.json().catch(() => ({}))
+        throw new Error((data as any).detail || `HTTP ${res.status}`)
       }
-      fetchDags()
+      fetchWorkflows()
     } catch (err: any) {
       setError(err.message)
     }
   }
 
-  const getWorkflowLink = (workflowId: string) => {
-    return `${TEMPORAL_UI}/namespaces/default/workflows/${encodeURIComponent(workflowId)}`
-  }
-
   const importManualDag = async () => {
-    setImporting(true); setImportMsg(null)
+    setImporting(true)
+    setImportMsg(null)
     try {
       const doc = JSON.parse(importJson)
       const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
@@ -234,181 +240,142 @@ export default function DAGsPage() {
           default_llm: doc.default_llm || 'deepseek-v4-flash',
           nodes,
           edges: Array.isArray(doc.edges) ? doc.edges : [],
+          project_id: activeProject || undefined,
         }),
       })
       const data = await res.json().catch(() => ({}))
-      if (!res.ok) { setImportMsg(`❌ ${(data as any).detail || res.status}`); return }
-      setImportMsg(`✅ Created ${data.id}. ${(nodes || []).every((n: any) => n.node_type === 'block') ? 'All nodes are deterministic (block).' : 'Note: only node_type:"block" nodes run deterministically.'}`)
+      if (!res.ok) {
+        setImportMsg(`❌ ${(data as any).detail || res.status}`)
+        return
+      }
+      setImportMsg(`✅ Created ${(data as any).id}.`)
       setImportJson('')
-      fetchDags()
-    } catch (e: any) { setImportMsg(`❌ ${e.message}`) } finally { setImporting(false) }
+      fetchWorkflows()
+    } catch (err: any) {
+      setImportMsg(`❌ ${err.message}`)
+    } finally {
+      setImporting(false)
+    }
   }
+
+  const filterButtons: { id: 'all' | WorkflowStage; label: string; count: number }[] = [
+    { id: 'all', label: 'All Workflows', count: counts.all },
+    { id: 'experimenting', label: '🧪 Experiments', count: counts.experimenting },
+    { id: 'locked', label: '🔒 Templates', count: counts.locked },
+    { id: 'hardened', label: '⚡ Hardened', count: counts.hardened },
+  ]
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">DAGs</h1>
-        <div className="flex gap-2 items-center">
-          <Link href="/template-skills" className="btn-primary text-sm !bg-purple-700 hover:!bg-purple-600">🧩 Template Skills</Link>
-          <button onClick={() => setShowArchived(!showArchived)} className="btn-primary text-sm">
-            {showArchived ? 'Show active' : '📁 Show archived'}
-          </button>
-          <button onClick={() => setShowForm(!showForm)} className="btn-primary text-sm">
-            {showForm ? 'Cancel' : '+ New DAG'}
-          </button>
-          <button onClick={() => setShowImport(!showImport)} className="btn-primary text-sm !bg-cyan-700 hover:!bg-cyan-600">
-            {showImport ? 'Cancel' : '⚙ Import Manual (Deterministic) DAG'}
-          </button>
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Workflows &amp; Pipelines</h1>
+          <p className="mt-1 max-w-3xl text-xs text-gray-500">
+            Manage workflow reliability: iterate with AI → lock into templates → convert steps to deterministic blocks.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            ref={searchRef}
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search workflows... (⌘K)"
+            className="w-64 rounded border border-gray-700 bg-gray-900 px-2.5 py-1.5 text-xs text-gray-300 placeholder:text-gray-600"
+          />
+          <Link href="/?new=1" className="btn-primary text-sm">
+            + New Workflow
+          </Link>
+          <div className="relative">
+            <button
+              onClick={() => setShowMore((value) => !value)}
+              className="rounded border border-gray-700 px-3 py-1.5 text-sm text-gray-300 hover:border-gray-500"
+            >
+              More ▾
+            </button>
+            {showMore && (
+              <div className="absolute right-0 z-40 mt-1 w-56 rounded border border-gray-700 bg-gray-900 shadow-xl">
+                <Link href="/template-skills" className="block px-3 py-2 text-left text-xs text-purple-300 hover:bg-gray-800">
+                  🧩 Template Skills
+                </Link>
+                <Link href="/blocks" className="block px-3 py-2 text-left text-xs text-cyan-300 hover:bg-gray-800">
+                  ⚡ Blocks Library
+                </Link>
+                <div className="border-t border-gray-800" />
+                <button
+                  onClick={() => { setShowMore(false); setShowArchived((value) => !value) }}
+                  className="block w-full px-3 py-2 text-left text-xs text-gray-300 hover:bg-gray-800"
+                >
+                  {showArchived ? '📁 Show active workflows' : '📁 Show archived workflows'}
+                </button>
+                <button
+                  onClick={() => { setShowMore(false); setShowImport((value) => !value) }}
+                  className="block w-full px-3 py-2 text-left text-xs text-cyan-300 hover:bg-gray-800"
+                >
+                  ⚙ Import Manual (Deterministic) DAG
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {error && <div className="bg-red-900/20 border border-red-500/30 rounded p-3 mb-4 text-red-300 text-sm">{error}</div>}
+      <div className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-gray-500">
+        <span className="font-medium text-gray-300">{counts.all} Total</span>
+        <span className="text-gray-700">•</span>
+        <span><span className="text-amber-300">{counts.experimenting}</span> 🧪 Experiments</span>
+        <span className="text-gray-700">•</span>
+        <span><span className="text-purple-300">{counts.locked}</span> 🔒 Templates</span>
+        <span className="text-gray-700">•</span>
+        <span><span className="text-emerald-300">{counts.hardened}</span> ⚡ Hardened ({determinism}% deterministic)</span>
+      </div>
 
-      {showForm && (
-        <form onSubmit={createDag} className="card mb-6 space-y-4">
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Objective</label>
-            <textarea
-              value={objective}
-              onChange={(e) => setObjective(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm"
-              rows={3}
-              placeholder="Describe what you want to accomplish..."
-              required
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">
-              Attachments <span className="text-gray-600">(optional — saved to the DAG workspace and available to every step)</span>
-            </label>
-            <div
-              onDragOver={(e) => { e.preventDefault(); setDragActive(true) }}
-              onDragLeave={() => setDragActive(false)}
-              onDrop={(e) => {
-                e.preventDefault()
-                setDragActive(false)
-                addFiles(e.dataTransfer.files)
-              }}
-              className={`border-2 border-dashed rounded px-3 py-4 text-sm transition-colors ${
-                dragActive ? 'border-blue-500 bg-blue-500/5' : 'border-gray-700 bg-gray-800/40'
-              }`}
-            >
-              <input
-                id="dag-attachments"
-                type="file"
-                multiple
-                accept={ATTACHMENT_ACCEPT}
-                onChange={(e) => { addFiles(e.target.files); e.target.value = '' }}
-                className="hidden"
-              />
-              <label htmlFor="dag-attachments" className="cursor-pointer text-indigo-400 hover:text-indigo-300">
-                Choose files
-              </label>
-              <span className="text-gray-500">
-                {' '}or drag &amp; drop — up to {MAX_ATTACHMENT_FILES} files, {formatBytes(MAX_ATTACHMENT_BYTES)} each,
-                {' '}{formatBytes(MAX_ATTACHMENT_TOTAL_BYTES)} total.
-              </span>
-            </div>
-            {attachmentError && <p className="text-xs text-red-400 mt-1">{attachmentError}</p>}
-            {attachments.length > 0 && (
-              <ul className="mt-2 space-y-1">
-                {attachments.map((file, index) => (
-                  <li key={`${file.name}-${index}`} className="flex items-center justify-between gap-2 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs">
-                    <span className="font-mono text-gray-300 truncate">{file.name}</span>
-                    <span className="flex items-center gap-2 text-gray-500 shrink-0">
-                      <span>{formatBytes(file.size)}</span>
-                      <button
-                        type="button"
-                        onClick={() => setAttachments(attachments.filter((_, i) => i !== index))}
-                        className="text-red-400 hover:text-red-300"
-                        aria-label={`Remove ${file.name}`}
-                      >
-                        ✕
-                      </button>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <p className="text-[11px] text-gray-600 mt-1">
-              Files are read-only reference context at /workspace/attachments/. PDFs, documents, data, images, code, and archives are supported.
-            </p>
-          </div>
-          <div className="flex gap-4">
-            <div className="flex-1">
-              <label className="block text-sm text-gray-400 mb-1">LLM Models</label>
-              {modelDefaults ? (
-                <div className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300">
-                  <span className="text-gray-500">Planning:</span> <span className="font-mono">{modelDefaults.planning_model}</span>
-                  <span className="mx-2 text-gray-600">|</span>
-                  <span className="text-gray-500">Agents:</span> <span className="font-mono">{modelDefaults.agent_model}</span>
-                  <span className="ml-2 text-xs text-gray-600">(change in <a href="/llm-providers" className="text-indigo-400 hover:text-indigo-300">LLM Router</a>)</span>
-                </div>
-              ) : (
-                <div className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-500">Loading defaults…</div>
-              )}
-            </div>
-            <div className="flex items-end">
-              <label className="flex items-center gap-2 text-sm text-gray-400">
-                <input type="checkbox" checked={autoStart} onChange={(e) => setAutoStart(e.target.checked)} />
-                Auto-start
-              </label>
-            </div>
-          </div>
-          {skills.length > 0 && (
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">
-                Skills <span className="text-gray-600">(optional — select which skills the planner can use)</span>
-              </label>
-              <div className="grid grid-cols-2 md:grid-cols-3 gap-2 max-h-48 overflow-y-auto bg-gray-800/50 border border-gray-700 rounded p-2">
-                {skills.map((skill) => (
-                  <label key={skill.id} className={`flex items-start gap-2 p-2 rounded cursor-pointer hover:bg-gray-700/50 text-sm ${selectedSkillIds.includes(skill.id) ? 'bg-blue-500/10 border border-blue-500/30' : 'border border-transparent'}`}>
-                    <input
-                      type="checkbox"
-                      className="mt-0.5"
-                      checked={selectedSkillIds.includes(skill.id)}
-                      onChange={(e) => {
-                        if (e.target.checked) {
-                          setSelectedSkillIds([...selectedSkillIds, skill.id])
-                        } else {
-                          setSelectedSkillIds(selectedSkillIds.filter(id => id !== skill.id))
-                        }
-                      }}
-                    />
-                    <div>
-                      <div className="font-medium text-gray-200">{skill.name}</div>
-                      {skill.description && <div className="text-xs text-gray-500 line-clamp-1">{skill.description}</div>}
-                    </div>
-                  </label>
-                ))}
-              </div>
-              {selectedSkillIds.length > 0 && (
-                <div className="text-xs text-blue-400 mt-1">{selectedSkillIds.length} skill(s) selected</div>
-              )}
-            </div>
-          )}
-          <button type="submit" disabled={loading} className="btn-success text-sm">
-            {loading ? 'Planning...' : 'Create DAG'}
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {filterButtons.map((button) => (
+          <button
+            key={button.id}
+            onClick={() => setStage(button.id)}
+            className={`rounded border px-2.5 py-1 text-[10px] ${
+              stage === button.id
+                ? 'border-blue-500 bg-gray-700 text-white'
+                : 'border-gray-700 text-gray-400 hover:border-gray-600 hover:text-gray-200'
+            }`}
+          >
+            {button.label} ({button.count})
           </button>
-        </form>
-      )}
+        ))}
+        <div className="ml-auto flex items-center gap-2 text-[10px] text-gray-500">
+          <span>Sort:</span>
+          <select
+            value={sortBy}
+            onChange={(event) => setSortBy(event.target.value as SortMode)}
+            className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-300"
+          >
+            <option value="active">Last Active</option>
+            <option value="name">Name</option>
+            <option value="stage">Stage</option>
+            <option value="score">Latest Score</option>
+          </select>
+        </div>
+      </div>
+
+      {error && <div className="mb-3 rounded border border-red-500/30 bg-red-900/20 p-3 text-xs text-red-300">{error}</div>}
 
       {showImport && (
-        <div className="card mb-6 space-y-3">
+        <div className="card mb-5 space-y-3">
           <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold text-white">Import a manual DAG (nodes are used verbatim — no LLM planner)</div>
-            <button onClick={() => setShowImport(false)} className="text-gray-500 hover:text-gray-300 text-xs">✕</button>
+            <div className="text-sm font-semibold text-white">Import a manual DAG (no LLM planner)</div>
+            <button onClick={() => setShowImport(false)} className="text-xs text-gray-500 hover:text-gray-300">✕</button>
           </div>
           <p className="text-[11px] text-gray-500">
-            Paste dag_json with nodes. Use <code className="text-cyan-300">"node_type": "block"</code> (with <code className="text-cyan-300">config.block</code>)
-            for deterministic steps. Example: register blocks on the Blocks page, then chain <code className="text-cyan-300">echo</code> nodes.
+            Use <code className="text-cyan-300">&quot;node_type&quot;: &quot;block&quot;</code> with{' '}
+            <code className="text-cyan-300">config.block</code> for deterministic steps.
           </p>
           <textarea
             value={importJson}
-            onChange={(e) => setImportJson(e.target.value)}
+            onChange={(event) => setImportJson(event.target.value)}
             rows={8}
             spellCheck={false}
-            className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 font-mono"
+            className="w-full rounded border border-gray-700 bg-gray-900 p-2 font-mono text-xs text-gray-200"
             placeholder={'{"objective":"...","nodes":[{"node_id":"b1","node_type":"block","depends_on":[],"config":{"type":"block","block":"echo","inputs":{"stage":1}},"input_mapping":{}}],"edges":[]}'}
           />
           <div className="flex items-center gap-3">
@@ -420,78 +387,77 @@ export default function DAGsPage() {
         </div>
       )}
 
-      <div className="space-y-3">
-        {dags.map((dag) => (
-          <Link key={dag.id} href={`/dags/${dag.id}`} className="card block hover:border-blue-500/50 transition-colors">
-            <div className="flex items-center justify-between">
-              <div className="flex-1">
-                <div className="flex items-center gap-3 mb-1">
-                  <span className="font-mono text-sm text-gray-400">{dag.id}</span>
-                  <StatusBadge status={dag.status} />
-                  {dag.locked && <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">🔒 template</span>}
-                </div>
-                <p className="text-sm text-gray-300 line-clamp-2">{dag.objective}</p>
-              </div>
-              <div className="text-right text-xs text-gray-500">
-                <div>{dag.llm_model}</div>
-                <div>{new Date(dag.created_at).toLocaleString()}</div>
-                {dag.workflow_id && (
-                  <a
-                    href={getWorkflowLink(dag.workflow_id)}
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                    className="mt-1 inline-block text-blue-400 hover:text-blue-300"
-                  >
-                    Temporal workflow
-                  </a>
-                )}
-                {dag.status === 'ready' && (
-                  <button
-                    onClick={(e) => { e.preventDefault(); startDag(dag.id) }}
-                    className="mt-1 btn-success text-xs"
-                  >
-                    ▶ Start
-                  </button>
-                )}
-                {!dag.locked && dag.status !== 'running' && (
-                  <div className="mt-1 flex justify-end gap-1">
-                    {showArchived ? (
-                      <button
-                        onClick={(e) => { e.preventDefault(); e.stopPropagation(); unarchiveDag(dag.id) }}
-                        className="btn-primary text-xs"
-                        title="Restore to active list"
-                      >
-                        ↩ Restore
-                      </button>
-                    ) : (
-                      <button
-                        onClick={(e) => { e.preventDefault(); e.stopPropagation(); archiveDag(dag.id) }}
-                        className="btn-warning text-xs"
-                        title="Hide from the list (can be restored)"
-                      >
-                        📁 Archive
-                      </button>
-                    )}
-                    <button
-                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteDag(dag.id) }}
-                      className="btn-danger text-xs"
-                      title="Permanently delete DAG and all its data"
-                    >
-                      🗑 Delete
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-          </Link>
-        ))}
-        {dags.length === 0 && (
-          <div className="text-center text-gray-500 py-12">
-            {showArchived ? 'No archived DAGs.' : 'No DAGs yet. Create one to get started.'}
-          </div>
-        )}
-      </div>
+      {loading ? (
+        <div className="overflow-hidden rounded-lg border border-gray-800">
+          {Array.from({ length: 8 }).map((_, index) => (
+            <div key={index} className="h-12 animate-pulse border-b border-gray-800 bg-gray-900/40" />
+          ))}
+        </div>
+      ) : sorted.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-gray-700 p-12 text-center text-sm text-gray-500">
+          {showArchived
+            ? 'No archived workflows.'
+            : workflows.length === 0
+              ? 'No workflows yet. Start with a new workflow.'
+              : 'No workflows match this filter.'}
+        </div>
+      ) : (
+        <div className="overflow-x-auto rounded-lg border border-gray-800">
+          <table className="w-full min-w-[980px] border-collapse">
+            <thead className="bg-[#15151f] text-left text-[9px] uppercase tracking-wide text-gray-600">
+              <tr>
+                <th className="px-3 py-2 font-medium">Workflow name &amp; objective</th>
+                <th className="px-3 py-2 font-medium">Maturity stage</th>
+                <th className="px-3 py-2 font-medium">Latest run</th>
+                <th className="px-3 py-2 font-medium">History (last 5)</th>
+                <th className="px-3 py-2 font-medium">Executions</th>
+                <th className="px-3 py-2 font-medium">Last active</th>
+                <th className="px-3 py-2 text-right font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((group) => (
+                <WorkflowTableRow
+                  key={group.id}
+                  group={group}
+                  projectName={group.project_id ? projectNameById.get(group.project_id) : undefined}
+                  expanded={expandedWorkflowId === group.id}
+                  onToggleExpand={() => setExpandedWorkflowId((current) => current === group.id ? null : group.id)}
+                  onRun={runWorkflow}
+                  onResume={rerunFailed}
+                  onOpenLatest={openLatest}
+                  onOpenTemplate={openTemplate}
+                  onRerunProblem={rerunFailed}
+                  onConvert={convertStep}
+                  onMerge={setMergeTarget}
+                  onArchiveRun={archiveRun}
+                  onDeleteRun={deleteRun}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {template && (
+        <TemplateRunDialog
+          template={template}
+          onClose={() => setTemplate(null)}
+          onCreated={(dagId) => router.push(`/dags/${dagId}`)}
+        />
+      )}
+
+      {mergeTarget && (
+        <MergeWorkflowDialog
+          target={mergeTarget}
+          groups={workflows}
+          onClose={() => setMergeTarget(null)}
+          onMerged={() => {
+            setMergeTarget(null)
+            fetchWorkflows()
+          }}
+        />
+      )}
     </div>
   )
 }

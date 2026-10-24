@@ -18,7 +18,10 @@ from routers import credentials as credentials_router
 from routers import credential_management as credential_management_router
 from routers import blocks as blocks_router
 from routers import image_catalog as image_catalog_router
+from routers import workflows as workflows_router
+from routers import explorations as explorations_router
 from database import engine, Base, async_session
+from workflow_groups import backfill_workflow_groups
 from config import settings
 
 # Configure logging
@@ -67,6 +70,21 @@ async def lifespan(app: FastAPI):
             )
         """))
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
+        # Workflow groups (logical objectives containing multiple DAG runs)
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS workflow_group_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS exploration_session_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS exploration_cycle INTEGER"))
+        await conn.execute(text("ALTER TABLE workflow_groups ADD COLUMN IF NOT EXISTS title_source VARCHAR DEFAULT 'derived'"))
+        await conn.execute(text("ALTER TABLE workflow_groups ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'experiment'"))
+        await conn.execute(text("""
+            UPDATE workflow_groups SET mode = 'template'
+            WHERE mode = 'experiment' AND EXISTS (
+                SELECT 1 FROM master_dags d
+                WHERE d.workflow_group_id = workflow_groups.id AND d.locked = true
+            )
+        """))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_master_dags_workflow_group_id ON master_dags (workflow_group_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_groups_project_objective ON workflow_groups (project_id, objective_key)"))
         await conn.execute(text("ALTER TABLE skills_v2 ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
         # Interactive steps: decision / input node type on DAG nodes
         await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS node_type VARCHAR DEFAULT 'agent'"))
@@ -93,6 +111,12 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'BUILDING_IMAGE'"))
 
     logger.info("Database initialized")
+
+    try:
+        async with async_session() as session:
+            await backfill_workflow_groups(session)
+    except Exception as e:
+        logger.warning(f"Workflow group backfill skipped: {e}")
 
     # Load persisted DAG model defaults (planning/agent/deep-review models) from
     # the DB at startup so a saved deep-review model selection is honored even
@@ -222,6 +246,8 @@ app.include_router(skills.router, prefix="/api/skills", tags=["skills"])
 app.include_router(environments.router, prefix="/api/environments", tags=["environments"])
 app.include_router(dag_user_requests.router, prefix="/api/dags", tags=["dag-user-requests"])
 app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
+app.include_router(workflows_router.router, prefix="/api/workflows", tags=["workflows"])
+app.include_router(explorations_router.router, prefix="/api/explorations", tags=["explorations"])
 app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
 app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
 app.include_router(image_catalog_router.router, prefix="/api/image-catalog", tags=["image-catalog"])
