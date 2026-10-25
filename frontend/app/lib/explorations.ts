@@ -56,6 +56,7 @@ export interface ExplorationDetail {
   messages: ExplorationMessage[]
   pending_requests: ExplorationRequest[]
   requests: ExplorationRequest[]
+  approvals: any[]
 }
 
 export const EXPLORATION_STATUS_META: Record<string, { label: string; className: string }> = {
@@ -63,6 +64,7 @@ export const EXPLORATION_STATUS_META: Record<string, { label: string; className:
   awaiting_run: { label: 'Awaiting Run', className: 'text-purple-300 border-purple-500/40 bg-purple-500/10' },
   running: { label: 'Running', className: 'text-blue-300 border-blue-500/40 bg-blue-500/10' },
   awaiting_input: { label: 'Needs Input', className: 'text-amber-300 border-amber-500/40 bg-amber-500/10' },
+  awaiting_approval: { label: 'Needs Approval', className: 'text-amber-300 border-amber-500/40 bg-amber-500/10' },
   awaiting_feedback: { label: 'Awaiting Feedback', className: 'text-amber-300 border-amber-500/40 bg-amber-500/10' },
   finished: { label: 'Finished', className: 'text-gray-400 border-gray-600 bg-gray-800/60' },
   error: { label: 'Error', className: 'text-red-300 border-red-500/40 bg-red-500/10' },
@@ -73,4 +75,34 @@ export function explorationStatus(status: string) {
     label: status.replace(/_/g, ' '),
     className: 'text-gray-400 border-gray-600 bg-gray-800/60',
   }
+}
+
+export interface DeployableApp {
+  cycle_number: number
+  dag_id: string
+  task_id: string
+  app_path: string
+  framework: string
+  entrypoint: string
+  port: number
+  name: string
+  source_node?: string | null
+  agent_image?: string | null
+  existing_deployment?: {
+    id: string
+    status: string
+    url: string | null
+    host_port: number | null
+    error: string | null
+  } | null
+}
+
+export const DEPLOYMENT_STATUS_LABEL: Record<string, string> = {
+  pending_approval: 'Waiting approval',
+  approved: 'Approved',
+  building: 'Building',
+  built: 'Built',
+  running: 'Running',
+  stopped: 'Stopped',
+  failed: 'Failed',
 }

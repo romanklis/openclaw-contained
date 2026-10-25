@@ -258,6 +258,7 @@ class DeploymentRequestCreate(BaseModel):
     port: int = 5000
     files: Optional[Dict[str, str]] = None  # workspace files snapshot
     agent_image: Optional[str] = None  # agent's committed image to use as deploy base
+    trial_required: bool = True  # run trial_deploy before building/starting
 
 
 class DeploymentResponse(BaseModel):
@@ -268,6 +269,7 @@ class DeploymentResponse(BaseModel):
     agent_image: Optional[str]
     entrypoint: Optional[str]
     port: Optional[int]
+    trial_required: bool
     status: DeploymentStatus
     container_id: Optional[str]
     host_port: Optional[int]

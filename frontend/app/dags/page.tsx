@@ -29,7 +29,7 @@ export default function WorkflowStudioPage() {
   const [dags, setDags] = useState<DAGRecord[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [stage, setStage] = useState<'all' | WorkflowStage>('all')
+  const [stage, setStage] = useState<'all' | 'exploration' | WorkflowStage>('all')
   const [search, setSearch] = useState('')
   const [showArchived, setShowArchived] = useState(false)
   const [showMore, setShowMore] = useState(false)
@@ -97,7 +97,7 @@ export default function WorkflowStudioPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const stageParam = params.get('stage')
-    if (stageParam === 'experimenting' || stageParam === 'locked' || stageParam === 'hardened') {
+    if (stageParam === 'exploration' || stageParam === 'experimenting' || stageParam === 'locked' || stageParam === 'hardened') {
       setStage(stageParam)
     }
     const workflowParam = params.get('workflow')
@@ -117,17 +117,21 @@ export default function WorkflowStudioPage() {
     }
   }, [focusWorkflow, loading, workflows])
 
-  const counts = useMemo(() => ({
-    all: workflows.length,
-    experimenting: workflows.filter((group) => group.stage === 'experimenting').length,
-    locked: workflows.filter((group) => group.stage === 'locked').length,
-    hardened: workflows.filter((group) => group.stage === 'hardened').length,
-  }), [workflows])
+  const counts = useMemo(() => {
+    const nonExploration = workflows.filter((group) => group.mode !== 'exploration')
+    return {
+      all: workflows.length,
+      explorations: workflows.filter((group) => group.mode === 'exploration').length,
+      experimenting: nonExploration.filter((group) => group.stage === 'experimenting').length,
+      locked: nonExploration.filter((group) => group.stage === 'locked').length,
+      hardened: nonExploration.filter((group) => group.stage === 'hardened').length,
+    }
+  }, [workflows])
 
   const determinism = counts.hardened > 0
     ? Math.round(
         workflows
-          .filter((group) => group.stage === 'hardened')
+          .filter((group) => group.mode !== 'exploration' && group.stage === 'hardened')
           .reduce((sum, group) => sum + group.determinism_pct, 0) / counts.hardened,
       )
     : 0
@@ -135,7 +139,11 @@ export default function WorkflowStudioPage() {
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase()
     return workflows.filter((group) => {
-      if (stage !== 'all' && group.stage !== stage) return false
+      if (stage === 'exploration') {
+        if (group.mode !== 'exploration') return false
+      } else if (stage !== 'all') {
+        if (group.mode === 'exploration' || group.stage !== stage) return false
+      }
       if (!term) return true
       return (
         group.title.toLowerCase().includes(term) ||
@@ -258,8 +266,9 @@ export default function WorkflowStudioPage() {
     }
   }
 
-  const filterButtons: { id: 'all' | WorkflowStage; label: string; count: number }[] = [
+  const filterButtons: { id: 'all' | 'exploration' | WorkflowStage; label: string; count: number }[] = [
     { id: 'all', label: 'All Workflows', count: counts.all },
+    { id: 'exploration', label: '🧭 Explorations', count: counts.explorations },
     { id: 'experimenting', label: '🧪 Experiments', count: counts.experimenting },
     { id: 'locked', label: '🔒 Templates', count: counts.locked },
     { id: 'hardened', label: '⚡ Hardened', count: counts.hardened },
@@ -321,6 +330,8 @@ export default function WorkflowStudioPage() {
 
       <div className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-gray-500">
         <span className="font-medium text-gray-300">{counts.all} Total</span>
+        <span className="text-gray-700">•</span>
+        <span><span className="text-cyan-300">{counts.explorations}</span> 🧭 Explorations</span>
         <span className="text-gray-700">•</span>
         <span><span className="text-amber-300">{counts.experimenting}</span> 🧪 Experiments</span>
         <span className="text-gray-700">•</span>

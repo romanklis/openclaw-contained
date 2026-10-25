@@ -22,21 +22,21 @@ function statusIcon(status: string) {
 }
 
 export default function CycleProgressCard({ sessionStatus, progress }: CycleProgressCardProps) {
-  if (!progress || !['running', 'awaiting_input'].includes(sessionStatus)) return null
+  if (!progress || !['running', 'awaiting_input', 'awaiting_approval'].includes(sessionStatus)) return null
   const done = progress.completed_nodes || 0
   const total = progress.total_nodes || 0
   const pct = total > 0 ? Math.round((done / total) * 100) : 0
   const running = progress.nodes?.find((node: any) => node.status === 'running')
 
   return (
-    <div className="my-2 rounded-lg border border-gray-800 bg-[#0f1015]">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
+    <div className="my-2 border-t border-gray-800/80 pt-2">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 py-1">
         <span className="relative flex h-2 w-2">
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-indigo-400 opacity-60" />
           <span className="relative inline-flex h-2 w-2 rounded-full bg-indigo-400" />
         </span>
         <span className="text-xs font-semibold text-gray-200">
-          Cycle {progress.cycle_number} · {sessionStatus === 'awaiting_input' ? 'Needs input' : 'Running'}
+          Cycle {progress.cycle_number} · {sessionStatus === 'awaiting_input' ? 'Needs input' : sessionStatus === 'awaiting_approval' ? 'Needs approval' : 'Running'}
         </span>
         <span className="text-[10px] text-gray-500">{done}/{total} steps</span>
         <span className="text-[10px] text-gray-500">{formatElapsed(progress.elapsed_seconds)}</span>
@@ -44,7 +44,7 @@ export default function CycleProgressCard({ sessionStatus, progress }: CycleProg
           <span className="ml-auto text-[10px] text-indigo-300">Turn {running.turns}</span>
         )}
       </div>
-      <div className="mx-3 h-1 overflow-hidden rounded bg-gray-800">
+      <div className="h-1 overflow-hidden rounded bg-gray-800">
         <div className="h-full bg-indigo-500 transition-all duration-500" style={{ width: `${pct}%` }} />
       </div>
       <div className="mt-2 divide-y divide-gray-800/60 border-t border-gray-800/60">
@@ -53,7 +53,7 @@ export default function CycleProgressCard({ sessionStatus, progress }: CycleProg
           return (
             <div
               key={node.node_id}
-              className={`flex items-start gap-2 px-3 py-1.5 text-[10px] ${isRunning ? 'border-l-2 border-indigo-500 bg-indigo-500/5' : ''}`}
+              className={`flex items-start gap-2 py-1.5 text-[10px] ${isRunning ? 'border-l-2 border-indigo-500 pl-2' : 'pl-2'}`}
             >
               <span className={`w-4 shrink-0 ${node.status === 'completed' ? 'text-emerald-400' : node.status === 'failed' ? 'text-red-400' : isRunning ? 'text-indigo-400' : 'text-gray-600'}`}>
                 {statusIcon(node.status)}

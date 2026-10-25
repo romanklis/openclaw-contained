@@ -90,6 +90,8 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS node_type VARCHAR DEFAULT 'agent'"))
         # Image catalog: commit message for build/version history
         await conn.execute(text("ALTER TABLE image_versions ADD COLUMN IF NOT EXISTS commit_message TEXT"))
+        # Deployments: trial preflight required before building/starting
+        await conn.execute(text("ALTER TABLE deployments ADD COLUMN IF NOT EXISTS trial_required BOOLEAN NOT NULL DEFAULT TRUE"))
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS dag_user_requests (
                 id SERIAL PRIMARY KEY,

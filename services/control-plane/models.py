@@ -293,6 +293,7 @@ class Deployment(Base):
     agent_image = Column(String)  # agent's committed image (used as deploy base)
     entrypoint = Column(String)  # e.g. "python app.py"
     port = Column(Integer)  # primary exposed port
+    trial_required = Column(Boolean, nullable=False, default=True, server_default="true")
 
     # Runtime
     status = Column(SQLEnum(DeploymentStatus), default=DeploymentStatus.PENDING_APPROVAL)

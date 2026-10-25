@@ -212,7 +212,8 @@ export default function DeploymentsPage() {
                             {dep.entrypoint}
                           </span>
                         )}
-                        {dep.port && <span>Port: {dep.port}</span>}
+                        {dep.port && <span>Container port: {dep.port}</span>}
+                        {dep.host_port && <span>Host port: {dep.host_port}</span>}
                         {dep.image_tag && (
                           <span className="text-gray-700">Image: {dep.image_tag}</span>
                         )}

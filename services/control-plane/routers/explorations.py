@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Optional
 
@@ -17,9 +18,11 @@ from explorations import (
     build_chat_context,
     create_exploration_session,
     finish_session,
+    pending_capability_requests,
     plan_next_cycle,
     reconcile_session,
 )
+from explorations_deploy import detect_cycle_deployables
 from models import (
     DAGNode,
     DagUserRequest,
@@ -120,6 +123,22 @@ async def _session_or_404(session_id: str, db: AsyncSession) -> ExplorationSessi
     if not session:
         raise HTTPException(status_code=404, detail="Exploration session not found")
     return session
+
+
+def _approval_dict(request) -> dict[str, Any]:
+    return {
+        "id": request.id,
+        "task_id": request.task_id,
+        "capability_type": getattr(request.capability_type, "value", request.capability_type),
+        "resource_name": request.resource_name,
+        "justification": request.justification,
+        "status": getattr(request.status, "value", request.status),
+        "requested_at": request.requested_at.isoformat() if request.requested_at else None,
+        "decided_at": request.decided_at.isoformat() if request.decided_at else None,
+        "decision_notes": request.decision_notes,
+        "details": request.details or {},
+        "alternative_suggestion": request.alternative_suggestion,
+    }
 
 
 @router.post("")
@@ -242,11 +261,13 @@ async def _build_progress(session: ExplorationSession, db: AsyncSession) -> dict
         except Exception:
             elapsed = None
 
+    approvals = [_approval_dict(request) for request in await pending_capability_requests(dag.id, db)]
     return {
         "session_status": session.status,
         "cycle_number": cycle.cycle_number,
         "dag_id": dag.id,
         "dag_status": str(getattr(dag.status, "value", dag.status) or "unknown"),
+        "pending_approvals": approvals,
         "elapsed_seconds": elapsed,
         "total_nodes": len(ordered),
         "completed_nodes": counts["completed"],
@@ -258,6 +279,13 @@ async def _build_progress(session: ExplorationSession, db: AsyncSession) -> dict
         ],
         "nodes": progress_nodes,
     }
+
+
+@router.get("/{session_id}/deployables")
+async def get_deployables(session_id: str, db: AsyncSession = Depends(get_db)):
+    session = await _session_or_404(session_id, db)
+    deployables = await detect_cycle_deployables(session, db)
+    return {"deployables": [asdict(item) for item in deployables]}
 
 
 @router.get("/{session_id}/progress")
@@ -288,6 +316,7 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
 
     active_dag_id = cycles[-1].dag_id if cycles else None
     requests: list[DagUserRequest] = []
+    approvals: list[dict[str, Any]] = []
     if active_dag_id:
         req_result = await db.execute(
             select(DagUserRequest)
@@ -295,6 +324,7 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
             .order_by(DagUserRequest.created_at.desc())
         )
         requests = list(req_result.scalars().all())
+        approvals = [_approval_dict(request) for request in await pending_capability_requests(active_dag_id, db)]
 
     return {
         "session": _session_dict(session),
@@ -302,6 +332,7 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
         "messages": [_message_dict(m) for m in messages],
         "pending_requests": [_request_dict(r) for r in requests if r.status == "pending"],
         "requests": [_request_dict(r) for r in requests],
+        "approvals": approvals,
     }
 
 
@@ -418,8 +449,9 @@ async def _chat_stream(
     async with async_session() as db:
         session = await _session_or_404(session_id, db)
         await reconcile_session(session, db)
+        can_plan = session.status in ("awaiting_feedback", "error")
 
-        if mode == "feedback" and session.status not in ("awaiting_feedback", "error"):
+        if mode == "feedback" and not can_plan:
             yield _sse({"type": "error", "message": "Exploration is not waiting for feedback."})
             return
 
@@ -444,7 +476,7 @@ async def _chat_stream(
             "stream": True,
             "temperature": 0.6,
         }
-        if mode == "feedback":
+        if can_plan:
             payload["tools"] = [PROPOSE_TOOL]
             payload["tool_choice"] = "auto"
 
@@ -473,7 +505,7 @@ async def _chat_stream(
                             continue
                         delta = choices[0].get("delta") or {}
                         text = delta.get("content")
-                        if isinstance(text, str) and text:
+                        if isinstance(text, str) and text and mode != "feedback":
                             content_parts.append(text)
                             yield _sse({"type": "text_delta", "text": text})
                         for tc in delta.get("tool_calls") or []:
@@ -490,8 +522,32 @@ async def _chat_stream(
             yield _sse({"type": "error", "message": error_text[:500]})
 
         assistant_text = "".join(content_parts).strip()
+        tool_called = any(
+            call.get("name") == "propose_exploration_cycle"
+            for call in tool_calls.values()
+        )
+        suppress_text = mode == "chat" and can_plan and tool_called
 
-        if mode == "feedback" and not error_text:
+        # Persist the chat answer before the proposal so the transcript reads
+        # user -> assistant -> proposal, and so the legacy narration filter does
+        # not hide a legitimate chat answer stored after a proposal. When the
+        # model is only narrating a planning tool call, do not persist that
+        # internal reasoning; the proposal card is the answer.
+        if assistant_text and not suppress_text:
+            db.add(ExplorationMessage(
+                session_id=session.id,
+                role="assistant",
+                kind="text",
+                content=assistant_text,
+            ))
+            session.last_activity_at = datetime.utcnow()
+            await db.commit()
+
+        should_plan = not error_text and (
+            mode == "feedback" or (mode == "chat" and can_plan and tool_called)
+        )
+
+        if should_plan:
             yield _sse({"type": "status", "message": "Planning the next cycle…"})
             focus = message
             for call in tool_calls.values():
@@ -501,6 +557,15 @@ async def _chat_stream(
                         focus = str(args.get("focus") or focus)
                     except Exception:
                         pass
+            if mode == "chat":
+                recent = [
+                    f"{item.get('role')}: {str(item.get('content') or '')[:600]}"
+                    for item in context[1:]
+                    if item.get("role") in ("user", "assistant")
+                ][-6:]
+                if recent:
+                    focus = f"{focus}\n\nRecent conversation:\n" + "\n".join(recent)
+                focus = focus[-6000:]
             try:
                 await db.refresh(session)
                 dag, cycle = await plan_next_cycle(session, focus, db)
@@ -525,16 +590,6 @@ async def _chat_stream(
                 session.status = "error"
                 await db.commit()
                 yield _sse({"type": "error", "message": f"Planning failed: {exc}"})
-
-        if assistant_text:
-            db.add(ExplorationMessage(
-                session_id=session.id,
-                role="assistant",
-                kind="text",
-                content=assistant_text,
-            ))
-            session.last_activity_at = datetime.utcnow()
-            await db.commit()
 
         yield _sse({"type": "done"})
 

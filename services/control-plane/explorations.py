@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from attachments import save_attachments
 from models import (
+    CapabilityRequest,
     DAGNode,
     DagUserRequest,
     DeepReview,
@@ -18,6 +19,7 @@ from models import (
     ExplorationSession,
     MasterDAG,
     NodeStatus,
+    RequestStatus,
     TaskOutput,
     WorkflowGroup,
 )
@@ -279,6 +281,28 @@ async def _cycle_result(db: AsyncSession, cycle: ExplorationCycle, dag: MasterDA
     }
 
 
+async def pending_capability_requests(dag_id: str, db: AsyncSession) -> list[CapabilityRequest]:
+    """Pending capability approvals for tasks in one DAG."""
+    nodes_result = await db.execute(
+        select(DAGNode.task_id).where(
+            DAGNode.dag_id == dag_id,
+            DAGNode.task_id.is_not(None),
+        )
+    )
+    task_ids = [row[0] for row in nodes_result.all() if row[0]]
+    if not task_ids:
+        return []
+    result = await db.execute(
+        select(CapabilityRequest)
+        .where(
+            CapabilityRequest.task_id.in_(task_ids),
+            CapabilityRequest.status == RequestStatus.PENDING,
+        )
+        .order_by(CapabilityRequest.requested_at.asc())
+    )
+    return list(result.scalars().all())
+
+
 async def reconcile_session(session: ExplorationSession, db: AsyncSession) -> ExplorationSession:
     if session.status == "finished":
         return session
@@ -299,6 +323,7 @@ async def reconcile_session(session: ExplorationSession, db: AsyncSession) -> Ex
         await db.commit()
         return session
 
+    pending_caps = await pending_capability_requests(dag.id, db)
     pending_result = await db.execute(
         select(DagUserRequest).where(
             DagUserRequest.dag_id == dag.id,
@@ -306,7 +331,10 @@ async def reconcile_session(session: ExplorationSession, db: AsyncSession) -> Ex
         )
     )
     pending = list(pending_result.scalars().all())
-    if pending:
+    if pending_caps:
+        session.status = "awaiting_approval"
+        cycle.status = "running"
+    elif pending:
         session.status = "awaiting_input"
         cycle.status = "running"
     else:
@@ -475,10 +503,13 @@ async def build_chat_context(session: ExplorationSession, db: AsyncSession) -> l
     system = (
         "You are the TaskForge exploration copilot. You help the user reason about "
         "exploration outcomes, deliverables, blockers, and next steps. You never "
-        "execute workflows or claim to have run a cycle. In chat mode you can only "
-        "converse. In feedback mode the backend may use your "
-        "propose_exploration_cycle tool to prepare the next ready DAG; the user "
-        "must review and press Run. Be concise, reference deliverables by name, "
+        "execute workflows or claim to have run a cycle. You may discuss freely. "
+        "When the session is awaiting feedback (or in error), you may call "
+        "propose_exploration_cycle after the user explicitly asks to prepare or "
+        "plan the next cycle. The tool creates a ready DAG; the user must review "
+        "and press Run. Never claim that a proposal exists until the tool call "
+        "succeeds. If planning is unavailable, say so and ask the user to review "
+        "or run the current proposal. Be concise, reference deliverables by name, "
         "and ask for clarification when the next step is ambiguous. Do not reveal "
         "internal reasoning or planning narration; speak directly to the user.\n\n"
         f"Exploration objective: {session.objective}\n"
@@ -486,6 +517,13 @@ async def build_chat_context(session: ExplorationSession, db: AsyncSession) -> l
         f"Current cycle: {session.current_cycle}\n"
         f"Cycle history:\n" + ("\n".join(cycle_lines) if cycle_lines else "No cycles yet.")
     )
+    if cycles:
+        pending_caps = await pending_capability_requests(cycles[-1].dag_id, db)
+        if pending_caps:
+            system += "\nPending approvals: " + ", ".join(
+                f"{getattr(cap.capability_type, 'value', cap.capability_type)} {cap.resource_name}"
+                for cap in pending_caps
+            )
     messages_result = await db.execute(
         select(ExplorationMessage)
         .where(

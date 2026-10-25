@@ -5,7 +5,8 @@
 
 .exploration-chat .cs-main-container {
   background-color: #0d1117;
-  border-color: #1f2937;
+  border: 0;
+  border-radius: 0;
   color: #e5e7eb;
 }
 

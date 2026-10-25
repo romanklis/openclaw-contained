@@ -173,3 +173,13 @@ export function sanitizeObjectiveText(value: string, maxLen = 4000): string {
   text = text.replace(/\s+/g, ' ').trim()
   return (text || 'Untitled workflow').slice(0, maxLen)
 }
+
+export const MODE_ORDER: Record<string, number> = {
+  exploration: 0,
+  experiment: 1,
+  template: 2,
+}
+
+export function modeRank(mode?: string | null): number {
+  return MODE_ORDER[mode || 'experiment'] ?? MODE_ORDER.experiment
+}

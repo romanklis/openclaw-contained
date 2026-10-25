@@ -8,6 +8,7 @@ import { useProject } from './lib/ProjectContext'
 import {
   STAGE_META,
   formatRelativeTime,
+  modeRank,
   workflowNodeCountsLabel,
   type WorkflowSummary,
 } from './lib/workflows'
@@ -134,13 +135,21 @@ export default function LaunchpadPage() {
   )
   const selectedTemplate = templates.find((template) => template.id === templateId) || null
 
-  const jumpBackIn = workflows.slice(0, 4)
-  const experiments = workflows.filter((group) => group.stage === 'experimenting').length
-  const locked = workflows.filter((group) => group.stage === 'locked').length
-  const hardened = workflows.filter((group) => group.stage === 'hardened').length
+  const jumpBackIn = [...workflows]
+    .sort((a, b) => {
+      const byMode = modeRank(a.mode) - modeRank(b.mode)
+      if (byMode !== 0) return byMode
+      return new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime()
+    })
+    .slice(0, 4)
+  const explorations = workflows.filter((group) => group.mode === 'exploration').length
+  const nonExploration = workflows.filter((group) => group.mode !== 'exploration')
+  const experiments = nonExploration.filter((group) => group.stage === 'experimenting').length
+  const locked = nonExploration.filter((group) => group.stage === 'locked').length
+  const hardened = nonExploration.filter((group) => group.stage === 'hardened').length
   const determinism = hardened > 0
     ? Math.round(
-        workflows
+        nonExploration
           .filter((group) => group.stage === 'hardened')
           .reduce((sum, group) => sum + group.determinism_pct, 0) / hardened,
       )
@@ -233,7 +242,7 @@ export default function LaunchpadPage() {
           <div className="text-[10px] uppercase tracking-[0.25em] text-indigo-400">TaskForge Studio</div>
           <h1 className="mt-2 text-3xl font-bold text-white">What are you working on today?</h1>
           <p className="mt-1 max-w-2xl text-sm text-gray-500">
-            Start a new experiment, run a locked template, or explore continuously with chat-driven cycles. Iterate, lock the winner, then harden into deterministic blocks.
+            Explore continuously with chat-driven cycles, run a single experiment, or start from a locked template. Iterate, lock the winner, then harden into deterministic blocks.
           </p>
         </div>
         <Link href="/dags" className="btn-secondary text-sm">
@@ -247,21 +256,6 @@ export default function LaunchpadPage() {
 
       <div className="rounded-xl border border-gray-700/70 bg-[#12121a] p-4 shadow-xl">
         <div className="mb-4 grid gap-2 md:grid-cols-3">
-          <button
-            onClick={() => { setComposerMode('experiment'); setError(null) }}
-            className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
-              composerMode === 'experiment'
-                ? 'border-indigo-500 bg-indigo-950/40'
-                : 'border-gray-700 bg-gray-900/30 hover:border-gray-600'
-            }`}
-          >
-            <div className={`text-sm font-semibold ${composerMode === 'experiment' ? 'text-white' : 'text-gray-300'}`}>
-              🧪 New Experiment
-            </div>
-            <div className="mt-0.5 text-[10px] text-gray-500">
-              Describe an objective and let the planner build a fresh workflow.
-            </div>
-          </button>
           <button
             onClick={() => { setComposerMode('exploration'); setError(null) }}
             className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
@@ -278,6 +272,21 @@ export default function LaunchpadPage() {
             </div>
           </button>
           <button
+            onClick={() => { setComposerMode('experiment'); setError(null) }}
+            className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
+              composerMode === 'experiment'
+                ? 'border-indigo-500 bg-indigo-950/40'
+                : 'border-gray-700 bg-gray-900/30 hover:border-gray-600'
+            }`}
+          >
+            <div className={`text-sm font-semibold ${composerMode === 'experiment' ? 'text-white' : 'text-gray-300'}`}>
+              🧪 Experiment
+            </div>
+            <div className="mt-0.5 text-[10px] text-gray-500">
+              Describe an objective and let the planner build a fresh workflow.
+            </div>
+          </button>
+          <button
             onClick={() => { setComposerMode('template'); setError(null) }}
             className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
               composerMode === 'template'
@@ -286,7 +295,7 @@ export default function LaunchpadPage() {
             }`}
           >
             <div className={`flex items-center gap-2 text-sm font-semibold ${composerMode === 'template' ? 'text-white' : 'text-gray-300'}`}>
-              <span>🔒 Run a Template</span>
+              <span>🔒 Template</span>
               {templates.length > 0 && (
                 <span className="rounded border border-purple-700/40 px-1.5 py-0.5 text-[9px] font-normal text-purple-300">
                   {templates.length}
@@ -444,7 +453,7 @@ export default function LaunchpadPage() {
 
                 <div className="flex flex-wrap items-center gap-3 border-t border-gray-800 pt-3">
                   <p className="max-w-md text-[10px] text-gray-500">
-                    Templates run with their frozen attachments. Upload files in New Experiment when you need new inputs.
+                    Templates run with their frozen attachments. Upload files in Experiment when you need new inputs.
                   </p>
                   <button
                     onClick={() => {
@@ -505,14 +514,20 @@ export default function LaunchpadPage() {
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
             {jumpBackIn.map((group) => {
               const stage = STAGE_META[group.stage]
+              const isExploration = group.mode === 'exploration'
               return (
-                <div key={group.id} className={`flex flex-col rounded-lg border bg-[#12121a] p-4 ${stage.border}`}>
+                <div key={group.id} className={`flex flex-col rounded-lg border bg-[#12121a] p-4 ${isExploration ? 'border-cyan-800/40' : stage.border}`}>
                   <div className="mb-1 flex items-center justify-between gap-2">
-                    <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${stage.badge}`}>
-                      {stage.icon} {stage.short}
+                    <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${isExploration ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300' : stage.badge}`}>
+                      {isExploration ? '🧭 Exploration' : `${stage.icon} ${stage.short}`}
                     </span>
                     {group.locked && <span className="text-[9px] text-purple-300">🔒</span>}
                   </div>
+                  {isExploration && (
+                    <div className="mb-1 text-[9px] text-gray-600">
+                      Maturity: {stage.short} · {group.determinism_pct}%
+                    </div>
+                  )}
                   {group.project_id && projectNameById.get(group.project_id) && (
                     <div className="mb-1 text-[9px] uppercase tracking-wide text-gray-600">
                       Group: {projectNameById.get(group.project_id)}
@@ -555,7 +570,11 @@ export default function LaunchpadPage() {
         )}
       </div>
 
-      <div className="mt-10 grid gap-3 md:grid-cols-3">
+      <div className="mt-10 grid gap-3 md:grid-cols-4">
+        <Link href="/dags?stage=exploration" className="rounded-lg border border-cyan-800/40 bg-cyan-950/10 p-4 hover:border-cyan-600/60">
+          <div className="text-2xl font-bold text-cyan-300">{explorations}</div>
+          <div className="text-xs text-cyan-200/80">🧭 Explorations in flight</div>
+        </Link>
         <Link href="/dags?stage=experimenting" className="rounded-lg border border-amber-800/40 bg-amber-950/10 p-4 hover:border-amber-600/60">
           <div className="text-2xl font-bold text-amber-300">{experiments}</div>
           <div className="text-xs text-amber-200/80">🧪 Experiments in flight</div>

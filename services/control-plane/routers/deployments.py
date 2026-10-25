@@ -46,6 +46,7 @@ async def create_deployment(
         entrypoint=data.entrypoint,
         port=data.port,
         agent_image=data.agent_image,
+        trial_required=data.trial_required,
         status=DeploymentStatus.PENDING_APPROVAL,
     )
     db.add(deployment)
@@ -160,11 +161,19 @@ async def approve_deployment(
         from temporalio.client import Client
 
         temporal_client = await Client.connect(TEMPORAL_HOST)
-        # Start a one-shot workflow for building the deployment image
+        # Start a one-shot workflow for trial validation and/or building the image
         workflow_id = f"deploy-build-{deployment_id}"
+        deployment_payload = {
+            "task_id": deployment.task_id,
+            "name": deployment.name,
+            "entrypoint": deployment.entrypoint,
+            "port": deployment.port,
+            "agent_image": deployment.agent_image,
+            "trial_required": bool(deployment.trial_required),
+        }
         await temporal_client.start_workflow(
             "DeploymentBuildWorkflow",
-            deployment_id,
+            args=[deployment_id, deployment_payload],
             id=workflow_id,
             task_queue="openclaw-tasks",
         )

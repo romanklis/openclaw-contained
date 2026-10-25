@@ -988,6 +988,8 @@ RUN find /app -type f \\( -name '*.py' -o -name '*.sh' -o -name '*.yaml' -o -nam
 RUN find /app -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
 
 ENV PORT={{ port }}
+ENV HOST=0.0.0.0
+ENV FLASK_RUN_HOST=0.0.0.0
 EXPOSE {{ port }}
 
 CMD {{ entrypoint_cmd }}

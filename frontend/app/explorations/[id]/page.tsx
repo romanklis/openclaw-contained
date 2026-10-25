@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
 import {
@@ -14,10 +14,15 @@ import { API } from '../../lib/api'
 import { useProject } from '../../lib/ProjectContext'
 import { RenderedMarkdown } from '../../components/DeliverablePreview'
 import DeliverablePreview from '../../components/DeliverablePreview'
-import CycleResultCard from '../../components/exploration/CycleResultCard'
+import CycleCard from '../../components/exploration/CycleCard'
+import CycleGroupCard from '../../components/exploration/CycleGroupCard'
+import FilesDrawer from '../../components/exploration/FilesDrawer'
+import ApprovalCard from '../../components/exploration/ApprovalCard'
+import DeployDialog from '../../components/exploration/DeployDialog'
 import CycleProgressCard from '../../components/exploration/CycleProgressCard'
 import {
   explorationStatus,
+  type DeployableApp,
   type ExplorationDetail,
   type ExplorationMessage,
   type ExplorationRequest,
@@ -33,9 +38,6 @@ function basename(path: string) {
 }
 
 
-function cycleLabel(cycle: any) {
-  return `Cycle ${cycle?.cycle_number ?? '?'}`
-}
 
 export default function ExplorationChatPage() {
   const params = useParams<{ id: string }>()
@@ -52,9 +54,17 @@ export default function ExplorationChatPage() {
   const [streamingText, setStreamingText] = useState('')
   const [preview, setPreview] = useState<{ dagId: string; path: string } | null>(null)
   const [answering, setAnswering] = useState<number | null>(null)
+  const [reviewingApproval, setReviewingApproval] = useState<number | null>(null)
+  const [approvalNotice, setApprovalNotice] = useState<string | null>(null)
   const [progress, setProgress] = useState<any>(null)
+  const [expandedCycles, setExpandedCycles] = useState<Set<number>>(new Set())
+  const [filesOpen, setFilesOpen] = useState(false)
+  const [fileEntries, setFileEntries] = useState<{ path: string; size: number }[]>([])
+  const [deployables, setDeployables] = useState<DeployableApp[]>([])
+  const [deployCandidate, setDeployCandidate] = useState<DeployableApp | null>(null)
   const treeCache = useRef<Map<string, any[]>>(new Map())
   const dagOrderCache = useRef<Map<string, string[]>>(new Map())
+  const autoExpandedCycle = useRef<number | null>(null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
 
   const load = async (showLoading = false) => {
@@ -97,7 +107,7 @@ export default function ExplorationChatPage() {
   useEffect(() => {
     if (!detail) return
     const status = detail.session.status
-    if (!['running', 'awaiting_input', 'awaiting_run'].includes(status)) {
+    if (!['running', 'awaiting_input', 'awaiting_run', 'awaiting_approval'].includes(status)) {
       setProgress(null)
       return
     }
@@ -127,6 +137,51 @@ export default function ExplorationChatPage() {
   const status = session ? explorationStatus(session.status) : null
   const latestCycle = detail?.cycles?.[detail.cycles.length - 1]
   const feedbackAvailable = session?.status === 'awaiting_feedback' || session?.status === 'error'
+
+  const fetchTree = async (dagId: string) => {
+    const cached = treeCache.current.get(dagId)
+    if (cached) return cached
+    const res = await fetch(`${API}/api/dags/${dagId}/workspace/tree`)
+    const data = await res.json().catch(() => ({}))
+    const entries = Array.isArray(data) ? data : (data?.entries || [])
+    treeCache.current.set(dagId, entries)
+    return entries
+  }
+
+  useEffect(() => {
+    if (!latestCycle?.dag_id) {
+      setFileEntries([])
+      return
+    }
+    let cancelled = false
+    treeCache.current.delete(latestCycle.dag_id)
+    fetchTree(latestCycle.dag_id)
+      .then((entries: any[]) => {
+        if (cancelled) return
+        const files = entries
+          .filter((entry: any) => entry?.path && !['AGENTS.md', 'SOUL.md'].includes(entry.path))
+          .map((entry: any) => ({ path: entry.path, size: Number(entry.size) || 0 }))
+        setFileEntries(files)
+      })
+      .catch(() => { if (!cancelled) setFileEntries([]) })
+    return () => { cancelled = true }
+  }, [latestCycle?.dag_id, detail?.session.status, detail?.cycles.length])
+
+  const fetchDeployables = async () => {
+    try {
+      const res = await fetch(`${API}/api/explorations/${sessionId}/deployables`)
+      if (!res.ok) return
+      const data = await res.json().catch(() => ({}))
+      setDeployables(Array.isArray(data?.deployables) ? data.deployables : [])
+    } catch {
+      setDeployables([])
+    }
+  }
+
+  useEffect(() => {
+    if (!detail) return
+    fetchDeployables()
+  }, [detail?.session.id, detail?.session.status, detail?.cycles.length])
 
   const send = async (text: string) => {
     if (!text.trim() || !session || sending) return
@@ -235,6 +290,30 @@ export default function ExplorationChatPage() {
     }
   }
 
+  const reviewApproval = async (request: any, decision: 'approved' | 'denied') => {
+    setReviewingApproval(request.id)
+    setError(null)
+    try {
+      const res = await fetch(`${API}/api/capabilities/requests/${request.id}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          decision,
+          comment: decision === 'approved' ? 'Approved from exploration chat' : 'Denied from exploration chat',
+          reviewed_by: 'chat',
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any)?.detail || `HTTP ${res.status}`)
+      setApprovalNotice(`${decision === 'approved' ? 'Approved' : 'Denied'} ${request.resource_name}`)
+      await load(false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setReviewingApproval(null)
+    }
+  }
+
   const cancelCycle = async () => {
     if (!session || !latestCycle) return
     if (!window.confirm('Cancel the running cycle? The exploration will wait for your feedback.')) return
@@ -244,18 +323,6 @@ export default function ExplorationChatPage() {
         const data = await res.json().catch(() => ({}))
         throw new Error((data as any)?.detail || `HTTP ${res.status}`)
       }
-      await load(false)
-    } catch (err: any) {
-      setError(err.message)
-    }
-  }
-
-  const finish = async () => {
-    if (!session) return
-    if (!window.confirm('Finish this exploration? No further cycles will be planned.')) return
-    try {
-      const res = await fetch(`${API}/api/explorations/${session.id}/finish`, { method: 'POST' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       await load(false)
     } catch (err: any) {
       setError(err.message)
@@ -280,13 +347,7 @@ export default function ExplorationChatPage() {
   const openPreview = async (dagId: string, path: string) => {
     let normalized = String(path || '').replace(/^\/workspace\//, '').replace(/^\/+/, '')
     try {
-      let tree = treeCache.current.get(dagId)
-      if (!tree) {
-        const res = await fetch(`${API}/api/dags/${dagId}/workspace/tree`)
-        const data = await res.json().catch(() => ({}))
-        tree = Array.isArray(data) ? data : (data?.entries || [])
-        treeCache.current.set(dagId, tree)
-      }
+      const tree = await fetchTree(dagId)
       const exact = tree.find((entry: any) => entry.path === normalized)
       if (exact) {
         setPreview({ dagId, path: exact.path })
@@ -319,39 +380,152 @@ export default function ExplorationChatPage() {
     }
   }
 
+  const cycleResults = useMemo(
+    () => (detail?.messages || [])
+      .filter((message) => message.kind === 'cycle_result')
+      .sort((a, b) => (a.metadata?.cycle_number || 0) - (b.metadata?.cycle_number || 0)),
+    [detail?.messages],
+  )
+
+  const latestResultNumber = cycleResults.length > 0
+    ? cycleResults[cycleResults.length - 1].metadata?.cycle_number
+    : null
+
+  useEffect(() => {
+    if (latestResultNumber === null || latestResultNumber === undefined) return
+    const previousAuto = autoExpandedCycle.current
+    if (previousAuto === latestResultNumber) return
+    autoExpandedCycle.current = latestResultNumber
+    setExpandedCycles((prev) => {
+      const next = new Set(prev)
+      if (previousAuto !== null) next.delete(previousAuto)
+      next.add(latestResultNumber)
+      return next
+    })
+  }, [latestResultNumber])
+
+  const versionMap = useMemo(() => {
+    const versions = new Map<number, Map<string, number>>()
+    const counters = new Map<string, number>()
+    for (const message of cycleResults) {
+      const number = message.metadata?.cycle_number
+      if (number === undefined || number === null) continue
+      const cycleVersions = new Map<string, number>()
+      const seen = new Set<string>()
+      for (const path of (message.metadata?.deliverables || [])) {
+        const name = String(path).split('/').pop() || String(path)
+        if (seen.has(name)) continue
+        seen.add(name)
+        const next = (counters.get(name) || 0) + 1
+        counters.set(name, next)
+        cycleVersions.set(name, next)
+      }
+      versions.set(number, cycleVersions)
+    }
+    return versions
+  }, [cycleResults])
+
+  const filteredMessages = useMemo(() => {
+    const messages = detail?.messages || []
+    const resultNumbers = new Set(
+      messages
+        .filter((message) => message.kind === 'cycle_result')
+        .map((message) => message.metadata?.cycle_number),
+    )
+    const proposedNumbers = new Set(
+      (detail?.cycles || [])
+        .filter((cycle) => cycle.status === 'proposed')
+        .map((cycle) => cycle.cycle_number),
+    )
+    const result: ExplorationMessage[] = []
+    let lastNonStatus: ExplorationMessage | null = null
+    for (const message of messages) {
+      if (message.kind === 'status') continue
+      if (
+        message.role === 'assistant' &&
+        message.kind === 'text' &&
+        lastNonStatus?.kind === 'cycle_proposal'
+      ) {
+        continue
+      }
+      const superseded = message.kind === 'cycle_proposal' && (
+        resultNumbers.has(message.metadata?.cycle_number) ||
+        !proposedNumbers.has(message.metadata?.cycle_number)
+      )
+      if (!superseded) result.push(message)
+      lastNonStatus = message
+    }
+    return result
+  }, [detail?.messages, detail?.cycles])
+
+  const conversationItems = useMemo(() => {
+    type CycleItem = { type: 'cycle'; number: number; message: ExplorationMessage }
+    type MessageItem = { type: 'message'; message: ExplorationMessage }
+    type GroupItem = { type: 'cycleGroup'; items: CycleItem[] }
+    const items: (CycleItem | MessageItem | GroupItem)[] = []
+    let group: CycleItem[] = []
+    const flush = () => {
+      if (group.length === 1) items.push(group[0])
+      else if (group.length > 1) items.push({ type: 'cycleGroup', items: [...group] })
+      group = []
+    }
+    for (const message of filteredMessages) {
+      if (message.kind === 'cycle_result') {
+        const number = Number(message.metadata?.cycle_number || 0)
+        const item: CycleItem = { type: 'cycle', number, message }
+        if (expandedCycles.has(number)) {
+          flush()
+          items.push(item)
+        } else {
+          group.push(item)
+        }
+      } else {
+        flush()
+        items.push({ type: 'message', message })
+      }
+    }
+    flush()
+    return items
+  }, [filteredMessages, expandedCycles])
+
+  const fileSizes = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const file of fileEntries) {
+      map.set(file.path, file.size)
+      const name = file.path.split('/').pop() || file.path
+      if (!map.has(name)) map.set(name, file.size)
+    }
+    return map
+  }, [fileEntries])
+
+  const toggleCycle = (number: number) => {
+    setExpandedCycles((prev) => {
+      const next = new Set(prev)
+      if (next.has(number)) next.delete(number)
+      else next.add(number)
+      return next
+    })
+  }
+
   const renderMessage = (message: ExplorationMessage) => {
     if (message.kind === 'cycle_proposal') {
       const meta = message.metadata || {}
       return (
-        <div key={message.id} className="my-2 border-l-2 border-purple-500/60 py-1 pl-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-[10px] uppercase tracking-wide text-purple-300">🛠 Planned cycle {meta.cycle_number}</span>
-            <span className="text-[10px] text-gray-500">{meta.node_count} nodes</span>
-            {meta.model && <span className="font-mono text-[10px] text-gray-500">{meta.model}</span>}
-          </div>
-          <p className="mt-1 line-clamp-3 text-xs text-gray-400">{meta.objective}</p>
-          <div className="mt-2 flex flex-wrap gap-2">
-            <Link href={`/dags/${meta.dag_id}`} className="rounded border border-gray-700 px-2.5 py-1 text-[10px] text-gray-300 hover:border-gray-500">
-              Review DAG
-            </Link>
-            {session.status === 'awaiting_run' && latestCycle?.dag_id === meta.dag_id && (
-              <button onClick={() => runCycle(meta.dag_id)} className="rounded bg-emerald-600 px-2.5 py-1 text-[10px] font-semibold text-white hover:bg-emerald-500">
-                ▷ Run cycle
-              </button>
-            )}
-          </div>
+        <div key={message.id} className="my-3 border-l-2 border-purple-500/50 py-0.5 pl-3 text-xs text-gray-300">
+          <span>Planned cycle {meta.cycle_number}</span>
+          <span className="ml-1 text-gray-600">· {meta.node_count} steps</span>
+          <Link href={`/dags/${meta.dag_id}`} className="ml-2 text-cyan-400 hover:text-cyan-300">
+            Review DAG →
+          </Link>
+          {session.status === 'awaiting_run' && latestCycle?.dag_id === meta.dag_id && (
+            <button
+              onClick={() => runCycle(meta.dag_id)}
+              className="ml-2 text-emerald-400 hover:text-emerald-300"
+            >
+              ▷ Run cycle
+            </button>
+          )}
         </div>
-      )
-    }
-
-    if (message.kind === 'cycle_result') {
-      return (
-        <CycleResultCard
-          key={message.id}
-          meta={message.metadata || {}}
-          onPreview={openPreview}
-          onRetry={retryCycle}
-        />
       )
     }
 
@@ -360,8 +534,9 @@ export default function ExplorationChatPage() {
       const request = detail?.requests?.find((item) => item.id === meta.request_id)
       const answered = request?.status === 'answered'
       return (
-        <div key={message.id} className="my-2 border-l-2 border-amber-500/60 py-1 pl-3">
-          <div className="text-[10px] uppercase tracking-wide text-amber-300">Needs input • {meta.node_id}</div>
+        <div key={message.id} className="my-3 border-l-2 border-amber-500/60 py-1 pl-3">
+          <div className="text-[9px] uppercase tracking-wide text-gray-600">🤖 TaskForge Agent</div>
+          <div className="mt-1 text-[10px] uppercase tracking-wide text-amber-300">Needs input • {meta.node_id}</div>
           <p className="mt-1 text-xs text-gray-200">{meta.prompt}</p>
           {answered ? (
             <div className="mt-2 text-[10px] text-emerald-300">Answered</div>
@@ -373,18 +548,26 @@ export default function ExplorationChatPage() {
     }
 
     if (message.kind === 'error') {
-      return <div key={message.id} className="my-2 rounded border border-red-700/40 bg-red-950/30 p-2 text-xs text-red-300">{message.content}</div>
+      return <div key={message.id} className="my-3 border-l-2 border-red-700/50 py-1 pl-3 text-xs text-red-300">{message.content}</div>
     }
 
-    if (message.kind === 'status') {
-      return <div key={message.id} className="my-1 text-center text-[10px] text-gray-600">{message.content}</div>
-    }
+    if (message.kind === 'status') return null
 
     const isUser = message.role === 'user'
+    if (isUser) {
+      return (
+        <div key={message.id} className="my-3 flex justify-end">
+          <div className="max-w-[78%] rounded-lg bg-indigo-600 px-3 py-2 text-xs text-white">
+            {message.content}
+          </div>
+        </div>
+      )
+    }
     return (
-      <div key={message.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-        <div className={`max-w-[80%] rounded-lg px-3 py-2 text-xs ${isUser ? 'bg-indigo-600 text-white' : 'border border-gray-800 bg-[#161b22] text-gray-200'}`}>
-          {isUser ? message.content : <RenderedMarkdown content={message.content} />}
+      <div key={message.id} className="my-3">
+        <div className="mb-1 text-[9px] uppercase tracking-wide text-gray-600">🤖 TaskForge Agent</div>
+        <div className="border-l-2 border-indigo-500/30 py-0.5 pl-3 text-xs text-gray-200">
+          <RenderedMarkdown content={message.content} />
         </div>
       </div>
     )
@@ -399,7 +582,7 @@ export default function ExplorationChatPage() {
 
   return (
     <div className="exploration-chat flex h-[calc(100vh-4rem)] gap-3">
-      <aside className="hidden w-64 shrink-0 flex-col rounded-lg border border-gray-800 bg-[#12121a] p-2 md:flex">
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-gray-800/60 pr-2 md:flex">
         <div className="mb-2 flex items-center justify-between px-1">
           <span className="text-[10px] uppercase tracking-wide text-gray-500">Sessions</span>
           <Link href="/explorations?new=1" className="rounded border border-gray-700 px-1.5 py-0.5 text-[10px] text-indigo-300 hover:border-indigo-500">+ New</Link>
@@ -419,7 +602,7 @@ export default function ExplorationChatPage() {
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border border-gray-800 bg-[#12121a] px-3 py-2">
+        <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-gray-800/60 pb-2">
           <Link href="/explorations" className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-400 md:hidden">← Sessions</Link>
           <div className="min-w-0 flex-1">
             <div className="truncate text-sm font-semibold text-white">{session.title}</div>
@@ -429,59 +612,74 @@ export default function ExplorationChatPage() {
               {session.model && <span className="font-mono">{session.model}</span>}
             </div>
           </div>
-          <select
-            value={session.model || ''}
-            onChange={(event) => changeModel(event.target.value)}
-            className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-300"
+          <button
+            onClick={() => setFilesOpen(true)}
+            disabled={!latestCycle}
+            className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:border-gray-500 disabled:opacity-40"
           >
-            <option value="">Default model</option>
-            {session.model && !models.some((item) => item.id === session.model) && (
-              <option value={session.model}>{session.model}</option>
-            )}
-            {models.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
-          </select>
-          <div className="flex items-center gap-1 rounded border border-gray-700 p-0.5">
-            <button
-              onClick={() => setMode('chat')}
-              className={`rounded px-2 py-1 text-[10px] ${mode === 'chat' ? 'bg-gray-700 text-white' : 'text-gray-500 hover:text-gray-300'}`}
-            >
-              💬 Chat
-            </button>
-            <button
-              onClick={() => feedbackAvailable && setMode('feedback')}
-              disabled={!feedbackAvailable}
-              className={`rounded px-2 py-1 text-[10px] disabled:opacity-40 ${mode === 'feedback' ? 'bg-amber-700 text-white' : 'text-gray-500 hover:text-gray-300'}`}
-              title={feedbackAvailable ? 'Finalize this cycle and plan the next one' : 'Available after a cycle finishes'}
-            >
-              ↩ Feedback
-            </button>
-          </div>
+            📁 Files ({fileEntries.length})
+          </button>
           {latestCycle && (
-            <Link href={`/dags/${latestCycle.dag_id}`} className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:border-gray-500">Open latest DAG</Link>
+            <Link href={`/dags/${latestCycle.dag_id}`} className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:border-gray-500">👁 DAG</Link>
           )}
           {(session.status === 'running' || session.status === 'awaiting_input') && latestCycle && (
             <button onClick={cancelCycle} className="rounded border border-red-700/50 px-2 py-1 text-[10px] text-red-300 hover:border-red-500">Cancel cycle</button>
           )}
-          <button
-            onClick={finish}
-            disabled={session.status === 'running' || session.status === 'awaiting_input'}
-            className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-400 hover:border-red-500 hover:text-red-300 disabled:opacity-40"
-          >
-            Finish
-          </button>
         </div>
 
         {error && <div className="mb-2 rounded border border-red-700/40 bg-red-950/30 p-2 text-xs text-red-300">{error}</div>}
 
         <div className="relative min-h-0 flex-1">
-          <MainContainer className="h-full rounded-lg border border-gray-800">
+          <MainContainer className="h-full">
             <ChatContainer>
               <MessageList>
-                {detail.messages.map(renderMessage)}
-                <CycleProgressCard sessionStatus={session.status} progress={progress} />
+                {conversationItems.map((item) => {
+                  if (item.type === 'message') return renderMessage(item.message)
+                  if (item.type === 'cycle') {
+                    const meta = item.message.metadata || {}
+                    return (
+                      <CycleCard
+                        key={item.message.id}
+                        meta={meta}
+                        expanded={expandedCycles.has(item.number)}
+                        onToggle={() => toggleCycle(item.number)}
+                        versionMap={versionMap.get(item.number)}
+                        fileSizes={fileSizes}
+                        onPreview={openPreview}
+                        onRetry={retryCycle}
+                        deployable={deployables.find((candidate) => candidate.cycle_number === item.number) || null}
+                        onDeploy={(candidate) => setDeployCandidate(candidate)}
+                      />
+                    )
+                  }
+                  return (
+                    <CycleGroupCard
+                      key={`group-${item.items[0].message.id}`}
+                      cycles={item.items.map((cycle) => ({ message: cycle.message, meta: cycle.message.metadata || {} }))}
+                      onExpand={toggleCycle}
+                    />
+                  )
+                })}
+                {progress && ['running', 'awaiting_input', 'awaiting_approval'].includes(session.status) && (
+                  <CycleProgressCard sessionStatus={session.status} progress={progress} />
+                )}
+                {(detail.approvals || [])
+                  .filter((approval: any) => approval.status === 'pending')
+                  .map((approval: any) => (
+                    <ApprovalCard
+                      key={approval.id}
+                      request={approval}
+                      reviewing={reviewingApproval === approval.id}
+                      onReview={(decision) => reviewApproval(approval, decision)}
+                    />
+                  ))}
+                {approvalNotice && (
+                  <div className="my-2 text-center text-[10px] text-emerald-300">{approvalNotice}</div>
+                )}
                 {streamingText && (
-                  <div className="flex justify-start">
-                    <div className="max-w-[80%] rounded-lg border border-gray-800 bg-[#161b22] px-3 py-2 text-xs text-gray-200">
+                  <div className="my-3">
+                    <div className="mb-1 text-[9px] uppercase tracking-wide text-gray-600">🤖 TaskForge Agent</div>
+                    <div className="border-l-2 border-indigo-500/30 py-0.5 pl-3 text-xs text-gray-200">
                       <RenderedMarkdown content={streamingText} />
                     </div>
                   </div>
@@ -489,8 +687,38 @@ export default function ExplorationChatPage() {
                 {sending && !streamingText && <TypingIndicator content="Thinking…" />}
                 <div ref={bottomRef} />
               </MessageList>
+              <div className="flex flex-wrap items-center gap-2 border-t border-gray-800/60 px-2 py-1">
+                <select
+                  value={session.model || ''}
+                  onChange={(event) => changeModel(event.target.value)}
+                  className="rounded border border-gray-800 bg-gray-900 px-1.5 py-0.5 text-[10px] text-gray-400"
+                >
+                  <option value="">Default model</option>
+                  {session.model && !models.some((item) => item.id === session.model) && (
+                    <option value={session.model}>{session.model}</option>
+                  )}
+                  {models.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
+                </select>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => setMode('chat')}
+                    className={`rounded px-2 py-0.5 text-[10px] ${mode === 'chat' ? 'text-gray-200' : 'text-gray-600 hover:text-gray-400'}`}
+                  >
+                    💬 Chat
+                  </button>
+                  <button
+                    onClick={() => feedbackAvailable && setMode('feedback')}
+                    disabled={!feedbackAvailable}
+                    className={`rounded px-2 py-0.5 text-[10px] disabled:opacity-40 ${mode === 'feedback' ? 'text-amber-300' : 'text-gray-600 hover:text-gray-400'}`}
+                    title={feedbackAvailable ? 'Finalize this cycle and plan the next one' : 'Available after a cycle finishes'}
+                  >
+                    ↩ Feedback
+                  </button>
+                </div>
+                {mode === 'feedback' && <span className="text-[9px] text-amber-300/80">Finalizes the current cycle</span>}
+              </div>
               <MessageInput
-                placeholder={mode === 'feedback' ? 'Describe the feedback and what the next cycle should do…' : 'Ask about the results or discuss the exploration…'}
+                placeholder={mode === 'feedback' ? 'Describe the feedback and what the next cycle should do…' : 'Ask about results or give steering feedback…'}
                 onSend={(_html, text) => send(text)}
                 attachButton={false}
                 sendButton
@@ -500,6 +728,26 @@ export default function ExplorationChatPage() {
           </MainContainer>
         </div>
       </div>
+
+      {deployCandidate && (
+        <DeployDialog
+          candidate={deployCandidate}
+          sessionTitle={session?.title || 'Exploration'}
+          onClose={() => { setDeployCandidate(null); void fetchDeployables() }}
+          onDeployed={() => { void fetchDeployables() }}
+        />
+      )}
+
+      {filesOpen && (
+        <FilesDrawer
+          files={fileEntries}
+          onClose={() => setFilesOpen(false)}
+          onPreview={(path) => {
+            setFilesOpen(false)
+            if (latestCycle) void openPreview(latestCycle.dag_id, path)
+          }}
+        />
+      )}
 
       {preview && (
         <div className="fixed inset-0 z-[70] flex justify-end bg-black/50" onClick={() => setPreview(null)}>

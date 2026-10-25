@@ -140,14 +140,11 @@ export default function WorkflowTableRow({
         <td className="px-3 py-2.5">
           <div className="flex min-w-0 items-center gap-2">
             <span className="shrink-0 text-[9px] text-gray-600">{expanded ? '▼' : '▶'}</span>
-            <span className="shrink-0 text-sm">{stage.icon}</span>
+            <span className="shrink-0 text-sm">{group.mode === 'exploration' ? '🧭' : stage.icon}</span>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <span className="truncate font-medium text-gray-100" title={group.title}>{group.title}</span>
                 {group.locked && <span className="shrink-0 text-[9px] text-purple-300">🔒</span>}
-                {group.mode === 'exploration' && (
-                  <span className="shrink-0 rounded border border-cyan-700/40 bg-cyan-950/30 px-1.5 py-0.5 text-[9px] text-cyan-300">🧭 Exploration</span>
-                )}
                 {projectName && <span className="shrink-0 text-[9px] uppercase tracking-wide text-gray-600">{projectName}</span>}
               </div>
               <div className="mt-0.5 max-w-[46vw] truncate text-[10px] text-gray-500" title={objective}>
@@ -158,14 +155,25 @@ export default function WorkflowTableRow({
         </td>
 
         <td className="px-3 py-2.5">
-          <div className={`text-[10px] font-medium ${group.stage === 'hardened' ? 'text-emerald-300' : group.stage === 'locked' ? 'text-purple-300' : 'text-amber-300'}`}>
-            {stage.icon} {stage.short}
-          </div>
-          <div className="mt-0.5 text-[9px] text-gray-600">
-            {group.step_count > 0
-              ? `${group.block_count}/${group.step_count} blocks (${group.determinism_pct}%)`
-              : 'No executable steps'}
-          </div>
+          {group.mode === 'exploration' ? (
+            <>
+              <div className="text-[10px] font-medium text-cyan-300">🧭 Exploration</div>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                Maturity: {stage.short} · {group.determinism_pct}%
+              </div>
+            </>
+          ) : (
+            <>
+              <div className={`text-[10px] font-medium ${group.stage === 'hardened' ? 'text-emerald-300' : group.stage === 'locked' ? 'text-purple-300' : 'text-amber-300'}`}>
+                {stage.icon} {stage.short}
+              </div>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                {group.step_count > 0
+                  ? `${group.block_count}/${group.step_count} blocks (${group.determinism_pct}%)`
+                  : 'No executable steps'}
+              </div>
+            </>
+          )}
         </td>
 
         <td className="px-3 py-2.5">

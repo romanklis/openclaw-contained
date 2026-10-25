@@ -3212,6 +3212,7 @@ async def create_deployment(task_id: str, deployment: Dict[str, Any]) -> Dict[st
         "port": deployment.get("port", 5000),
         "files": deployment.get("files"),
         "agent_image": deployment.get("agent_image"),
+        "trial_required": False,
     }
     
     logger.info(f"📦 CREATE_DEPLOYMENT | Task: {task_id} | Name: {payload['name']} | Port: {payload['port']}")
@@ -3228,6 +3229,26 @@ async def create_deployment(task_id: str, deployment: Dict[str, Any]) -> Dict[st
             return result
     except Exception as e:
         logger.error(f"❌ Failed to create deployment: {e}")
+        return {"error": str(e)}
+
+
+@activity.defn
+async def patch_deployment(deployment_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Update a deployment record via the control-plane API."""
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(
+                f"{control_plane_url}/api/deployments/{deployment_id}",
+                json=updates,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error(f"❌ Failed to patch deployment {deployment_id}: {e}")
         return {"error": str(e)}
 
 
@@ -3359,6 +3380,7 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
     import httpx
     
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    container = None
     
     logger.info(f"▶️  START_DEPLOYMENT | {deployment_id}")
     
@@ -3413,6 +3435,11 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
             detach=True,
             name=f"deploy-{deployment_id}",
             ports={f"{port}/tcp": host_port},
+            environment={
+                "HOST": "0.0.0.0",
+                "FLASK_RUN_HOST": "0.0.0.0",
+                "PORT": str(port),
+            },
             restart_policy={"Name": "unless-stopped"},
             labels={
                 "openclaw.deployment": deployment_id,
@@ -3422,9 +3449,52 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
         
         url = f"http://localhost:{host_port}" if host_port else None
         
+        logger.info(f"▶️  DEPLOYMENT_CONTAINER_STARTED | {deployment_id} | Container: {container.short_id} | Port: {host_port}")
+
+        healthy = False
+        probe_error = ""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for attempt in range(12):
+                for probe_path in ("/health", "/"):
+                    try:
+                        probe = await client.get(f"http://docker-dind:{host_port}{probe_path}")
+                        if probe.status_code < 500:
+                            healthy = True
+                            break
+                        probe_error = f"HTTP {probe.status_code} on {probe_path}"
+                    except Exception as exc:
+                        probe_error = f"{type(exc).__name__}: {exc}"
+                if healthy:
+                    break
+                try:
+                    container.reload()
+                except Exception:
+                    pass
+                else:
+                    if container.status != "running":
+                        logs = container.logs(tail=30).decode("utf-8", errors="replace")
+                        raise Exception(
+                            f"Container exited during startup (status: {container.status}). "
+                            f"Logs: {logs[:600]}"
+                        )
+                if attempt < 11:
+                    await asyncio.sleep(5)
+
+        if not healthy:
+            logs = ""
+            try:
+                logs = container.logs(tail=30).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise Exception(
+                f"Container started but published port {host_port} did not respond "
+                f"({probe_error}). Check that the app binds HOST=0.0.0.0. "
+                f"Logs: {logs[:600]}"
+            )
+
         logger.info(f"✅ DEPLOYMENT_STARTED | {deployment_id} | Container: {container.short_id} | Port: {host_port}")
         
-        # Update deployment record
+        # Update deployment record only after the published port responds
         async with httpx.AsyncClient(timeout=15.0) as client:
             await client.patch(
                 f"{control_plane_url}/api/deployments/{deployment_id}",
@@ -3440,6 +3510,11 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
     
     except Exception as e:
         logger.error(f"❌ DEPLOYMENT_START_FAILED | {deployment_id} | {e}")
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.patch(
@@ -3467,7 +3542,7 @@ async def trial_deploy(
 
     image_builder_url = os.getenv("IMAGE_BUILDER_URL", "http://openclaw-image-builder:8002")
 
-    trial_id = f"trial-{task_id[-8:]}"
+    trial_id = deployment.get("trial_id") or f"trial-{task_id[-8:]}"
     entrypoint = deployment.get("entrypoint", "python app.py")
     port = deployment.get("port", 5000)
     container = None
@@ -3559,6 +3634,11 @@ async def trial_deploy(
             detach=True,
             name=container_name,
             ports={f"{port}/tcp": host_port},
+            environment={
+                "HOST": "0.0.0.0",
+                "FLASK_RUN_HOST": "0.0.0.0",
+                "PORT": str(port),
+            },
             labels={"openclaw.trial": "true", "openclaw.task": task_id},
         )
         logger.info(f"🧪 Trial container started: {container.short_id} on port {host_port}")
@@ -6220,11 +6300,102 @@ class DAGWorkflow:
 
 @workflow.defn
 class DeploymentBuildWorkflow:
-    """Workflow to build a deployment image after approval."""
+    """Validate and/or build a deployment image after approval."""
 
     @workflow.run
-    async def run(self, deployment_id: str) -> Dict[str, Any]:
+    async def run(
+        self,
+        deployment_id: str,
+        deployment: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         logger.info(f"DeploymentBuildWorkflow started for {deployment_id}")
+
+        if deployment and deployment.get("trial_required"):
+            normalized_entrypoint = _normalize_deployment_entrypoint(
+                deployment.get("entrypoint", "python app.py"),
+                deployment.get("port", 5000),
+            )
+            trial_payload = {
+                **deployment,
+                "entrypoint": normalized_entrypoint,
+                "trial_id": deployment_id,
+            }
+            await workflow.execute_activity(
+                patch_deployment,
+                args=[
+                    deployment_id,
+                    {
+                        "status": "building",
+                        "entrypoint": normalized_entrypoint,
+                    },
+                ],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+
+            trial = await workflow.execute_activity(
+                trial_deploy,
+                args=[deployment.get("task_id"), trial_payload],
+                start_to_close_timeout=timedelta(minutes=10),
+            )
+            if not trial.get("passed"):
+                error = trial.get("error", "Trial deployment failed")
+                phase = trial.get("phase") or "unknown"
+                logs = (trial.get("logs") or "")[:1000]
+                detail = f"Trial preflight failed ({phase}): {error}"
+                if logs:
+                    detail = f"{detail}\n{logs}"
+                await workflow.execute_activity(
+                    patch_deployment,
+                    args=[
+                        deployment_id,
+                        {
+                            "status": "failed",
+                            "error": detail,
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                return {
+                    "status": "failed",
+                    "phase": phase,
+                    "error": error,
+                    "logs": logs,
+                }
+
+            image_tag = trial.get("image_tag")
+            if not image_tag:
+                await workflow.execute_activity(
+                    patch_deployment,
+                    args=[
+                        deployment_id,
+                        {
+                            "status": "failed",
+                            "error": "Trial passed without an image tag",
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                return {"status": "failed", "error": "Trial passed without an image tag"}
+
+            result = await workflow.execute_activity(
+                patch_deployment,
+                args=[
+                    deployment_id,
+                    {
+                        "status": "built",
+                        "image_tag": image_tag,
+                        "entrypoint": normalized_entrypoint,
+                    },
+                ],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            logger.info(f"✅ Trial image reused for deployment {deployment_id}: {image_tag}")
+            return {
+                "status": "built",
+                "image_tag": image_tag,
+                "trial_passed": True,
+                "deployment": result,
+            }
 
         result = await workflow.execute_activity(
             build_deployment_image,
@@ -6299,6 +6470,7 @@ async def main():
             check_verdict_guard,
             finalize_task,
             create_deployment,
+            patch_deployment,
             build_deployment_image,
             start_deployment_container,
             stop_deployment_container,
