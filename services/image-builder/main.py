@@ -2202,8 +2202,29 @@ async def _ensure_base_image():
 
     logger.info(f"Base image {BASE_IMAGE} not found — building...")
 
-    build_ctx = Path("/agent-executor")
-    dockerfile_path = build_ctx / "Dockerfile.openclaw"
+    # Prefer the platform catalog after the initial bootstrap. If the platform
+    # has already been seeded and its base image is missing, do not silently
+    # rebuild from the legacy bootstrap directory.
+    try:
+        import httpx
+        control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            status_resp = await client.get(f"{control_plane_url}/api/image-catalog/bootstrap-status")
+            if status_resp.status_code == 200 and status_resp.json().get("bootstrapped"):
+                logger.error(
+                    "Base image %s is missing but the platform image catalog is already "
+                    "bootstrapped. Rebuild it from the Image Catalog, not agent-images/.",
+                    BASE_IMAGE,
+                )
+                return
+    except Exception:
+        pass
+
+    # Initial bootstrap: use the local Python TaskForge base. The legacy
+    # Dockerfile.openclaw needed a global npm `openclaw` package that is not
+    # required by the TaskForge adapter.
+    build_ctx = Path("/agent-images/base")
+    dockerfile_path = build_ctx / "Dockerfile"
     if not dockerfile_path.exists():
         logger.error(f"Cannot bootstrap base image: {dockerfile_path} not found")
         return
@@ -2212,7 +2233,7 @@ async def _ensure_base_image():
         local_tag = "openclaw-agent:openclaw"
         image, build_logs = docker_client.images.build(
             path=str(build_ctx),
-            dockerfile="Dockerfile.openclaw",
+            dockerfile="Dockerfile",
             tag=local_tag,
             rm=True,
         )
@@ -2232,6 +2253,13 @@ async def _ensure_base_image():
                 logger.error(f"  Push error: {line['error']}")
 
         logger.info(f"Base image {BASE_IMAGE} built and pushed successfully")
+        try:
+            import httpx
+            control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.post(f"{control_plane_url}/api/image-catalog/sync-agent-images")
+        except Exception as sync_exc:
+            logger.warning(f"Base image built but catalog sync failed: {sync_exc}")
     except Exception as e:
         logger.error(f"Failed to build base image: {e}")
 

@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { API } from '../lib/api'
 import { useProject } from '../lib/ProjectContext'
+import { QUALITY_BUDGET_OPTIONS, THINKING_BUDGET_OPTIONS } from '../lib/explorations'
 
 const MAX_FILES = 20
 const MAX_FILE_BYTES = 25 * 1024 * 1024
@@ -31,6 +32,8 @@ export default function NewExplorationForm({ onCreated, compact }: NewExploratio
   const { activeProject } = useProject()
   const [objective, setObjective] = useState('')
   const [model, setModel] = useState('')
+  const [thinkingBudget, setThinkingBudget] = useState('standard')
+  const [qualityBudget, setQualityBudget] = useState('standard')
   const [models, setModels] = useState<{ id: string }[]>([])
   const [skills, setSkills] = useState<{ id: string; name: string; description: string | null }[]>([])
   const [skillIds, setSkillIds] = useState<string[]>([])
@@ -93,6 +96,8 @@ export default function NewExplorationForm({ onCreated, compact }: NewExploratio
       const form = new FormData()
       form.append('objective', objective.trim())
       if (model) form.append('model', model)
+      form.append('thinking_budget', thinkingBudget)
+      form.append('quality_budget', qualityBudget)
       if (skillIds.length) form.append('skill_ids', JSON.stringify(skillIds))
       if (activeProject) form.append('project_id', activeProject)
       files.forEach((file) => form.append('files', file))
@@ -158,7 +163,33 @@ export default function NewExplorationForm({ onCreated, compact }: NewExploratio
 
       {advanced && (
         <div className="mt-3 border-t border-gray-800 pt-3">
-          <div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Skills</div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="text-[10px] text-gray-500">
+              <span className="mb-1 block uppercase tracking-wide">Thinking budget</span>
+              <select
+                value={thinkingBudget}
+                onChange={(event) => setThinkingBudget(event.target.value)}
+                className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-xs text-gray-300"
+              >
+                {THINKING_BUDGET_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label} — {option.detail}</option>
+                ))}
+              </select>
+            </label>
+            <label className="text-[10px] text-gray-500">
+              <span className="mb-1 block uppercase tracking-wide">Quality cross-check</span>
+              <select
+                value={qualityBudget}
+                onChange={(event) => setQualityBudget(event.target.value)}
+                className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-xs text-gray-300"
+              >
+                {QUALITY_BUDGET_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label} — {option.detail}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="mb-1 mt-3 text-[10px] uppercase tracking-wide text-gray-500">Skills</div>
           <div className="max-h-36 overflow-y-auto rounded border border-gray-800 p-2">
             {skills.length === 0 ? (
               <span className="text-[10px] text-gray-600">No skills available.</span>

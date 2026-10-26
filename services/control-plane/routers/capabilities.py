@@ -15,7 +15,7 @@ from temporalio.client import Client
 logger = logging.getLogger(__name__)
 
 from database import get_db
-from models import CapabilityRequest, ImageBuild, Task, RequestStatus
+from models import CapabilityRequest, ImageBuild, Task, RequestStatus, TaskStatus
 from schemas import (
     CapabilityRequestCreate,
     CapabilityRequestResponse,
@@ -133,6 +133,66 @@ async def create_capability_request(
     return await _to_response(capability_request, db)
 
 
+async def _ensure_orphan_capability_build(
+    capability_request: CapabilityRequest,
+    task: Task | None,
+    db: AsyncSession,
+) -> None:
+    """Start a build when approval arrives after the agent workflow is gone."""
+    import httpx
+    import os
+
+    if not task:
+        return
+    if task.status in (
+        TaskStatus.CREATED,
+        TaskStatus.RUNNING,
+        TaskStatus.WAITING_APPROVAL,
+        TaskStatus.BUILDING_IMAGE,
+    ):
+        return
+    existing = await db.execute(
+        select(ImageBuild)
+        .where(ImageBuild.capability_request_id == capability_request.id)
+        .order_by(ImageBuild.created_at.desc())
+        .limit(1)
+    )
+    if existing.scalars().first():
+        return
+
+    details = capability_request.details if isinstance(capability_request.details, dict) else {}
+    packages = details.get("packages") if isinstance(details.get("packages"), list) else []
+    if not packages:
+        default_type = details.get("original_type") or "pip_package"
+        packages = [
+            {"name": name.strip(), "type": default_type}
+            for name in (capability_request.resource_name or "").split(",")
+            if name.strip()
+        ]
+    if not packages:
+        return
+
+    capabilities = [
+        {"type": pkg.get("type") or "pip_package", "name": pkg.get("name"), "version": None}
+        for pkg in packages
+        if isinstance(pkg, dict) and pkg.get("name")
+    ]
+    if not capabilities:
+        return
+    base_image = task.current_image or "localhost:5000/openclaw-agent:openclaw"
+    image_builder_url = os.getenv("IMAGE_BUILDER_URL", "http://openclaw-image-builder:8002")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{image_builder_url}/build",
+                json={"task_id": task.id, "base_image": base_image, "capabilities": capabilities},
+            )
+            resp.raise_for_status()
+            logger.info("Started orphan capability build for %s: %s", task.id, resp.json().get("build_id"))
+    except Exception as exc:
+        logger.warning("Could not start orphan capability build for %s: %s", task.id, exc)
+
+
 @router.post("/requests/{request_id}/review", response_model=CapabilityRequestResponse)
 async def review_capability_request(
     request_id: int,
@@ -170,7 +230,9 @@ async def review_capability_request(
     
     capability_request.decision_notes = decision.comment
     capability_request.reviewed_at = datetime.utcnow()
+    capability_request.decided_at = capability_request.reviewed_at
     capability_request.reviewed_by = decision.reviewed_by or "system"
+    capability_request.decided_by = capability_request.reviewed_by
     
     await db.commit()
     await db.refresh(capability_request)
@@ -222,6 +284,12 @@ async def review_capability_request(
             select(Task).where(
                 Task.dag_id == task.dag_id,
                 Task.id != task.id,
+                Task.status.in_([
+                    TaskStatus.CREATED,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_APPROVAL,
+                    TaskStatus.BUILDING_IMAGE,
+                ]),
             )
         )
         siblings = siblings_result.scalars().all()
@@ -237,6 +305,7 @@ async def review_capability_request(
                     details=capability_request.details,
                     status=RequestStatus.APPROVED,
                     reviewed_at=datetime.utcnow(),
+                    decided_at=datetime.utcnow(),
                     reviewed_by="system (task-force-propagation)",
                     decision_notes=f"Auto-approved: same Task Force as {task.id}",
                 )
@@ -254,6 +323,9 @@ async def review_capability_request(
                     f"Could not propagate to sibling {sibling.id}: {sib_err}"
                 )
         await db.commit()
+
+    if approved:
+        await _ensure_orphan_capability_build(capability_request, task, db)
 
     return await _to_response(capability_request, db)
 
@@ -287,6 +359,7 @@ async def approve_capability(
     capability_request.status = RequestStatus.APPROVED if decision.approved else RequestStatus.DENIED
     capability_request.decision_notes = decision.notes
     capability_request.reviewed_at = datetime.utcnow()
+    capability_request.decided_at = capability_request.reviewed_at
     capability_request.reviewed_by = "system"  # TODO: Get from auth
     
     await db.commit()
@@ -323,6 +396,7 @@ async def dismiss_pending_capabilities(
         cap.status = RequestStatus.APPROVED
         cap.decision_notes = "auto-dismissed after processing"
         cap.reviewed_at = datetime.utcnow()
+        cap.decided_at = cap.reviewed_at
         cap.reviewed_by = "system"
         count += 1
     await db.commit()

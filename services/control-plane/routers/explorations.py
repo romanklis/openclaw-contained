@@ -9,12 +9,14 @@ from typing import Any, Optional
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import async_session, get_db
 from explorations import (
     MAX_EXPLORATION_CYCLES,
+    THINKING_BUDGET_LEVELS,
+    QUALITY_BUDGET_LEVELS,
     build_chat_context,
     create_exploration_session,
     finish_session,
@@ -30,6 +32,10 @@ from models import (
     ExplorationMessage,
     ExplorationSession,
     MasterDAG,
+    DAGStatus,
+    NodeStatus,
+    TaskOutput,
+    AgentTurn,
 )
 from schemas import ExplorationChatRequest, ExplorationCreateRequest, ExplorationFeedbackRequest
 
@@ -43,8 +49,10 @@ PROPOSE_TOOL = {
     "function": {
         "name": "propose_exploration_cycle",
         "description": (
-            "Prepare the next ready DAG cycle for this exploration. This only "
-            "plans a workflow; it never starts it. Use only in feedback mode."
+            "Prepare the next ready DAG cycle for this exploration. Use this only "
+            "when the user gives an actionable change or next-cycle instruction, "
+            "not for questions, explanations, status, or finalization. This only "
+            "plans a workflow; it never starts it."
         ),
         "parameters": {
             "type": "object",
@@ -60,6 +68,29 @@ PROPOSE_TOOL = {
 }
 
 
+QUEUE_FEEDBACK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "queue_exploration_feedback",
+        "description": (
+            "Queue an actionable feedback/change request for the next cycle while "
+            "the current cycle is running or a cycle is planned. Do not use for "
+            "questions, status, explanations, or finalization."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "Concise feedback for the next cycle.",
+                }
+            },
+            "required": ["focus"],
+        },
+    },
+}
+
+
 def _session_dict(session: ExplorationSession) -> dict[str, Any]:
     return {
         "id": session.id,
@@ -68,6 +99,8 @@ def _session_dict(session: ExplorationSession) -> dict[str, Any]:
         "objective": session.objective,
         "status": session.status,
         "model": session.model,
+        "thinking_budget": session.thinking_budget or "standard",
+        "quality_budget": session.quality_budget or "standard",
         "project_id": session.project_id,
         "current_cycle": session.current_cycle,
         "created_at": session.created_at.isoformat() if session.created_at else None,
@@ -146,6 +179,8 @@ async def create_session(
     objective: str = Form(...),
     model: Optional[str] = Form(None),
     project_id: Optional[str] = Form(None),
+    thinking_budget: Optional[str] = Form("standard"),
+    quality_budget: Optional[str] = Form("standard"),
     skill_ids: Optional[str] = Form(None),
     files: list[UploadFile] = File(default=[]),
     db: AsyncSession = Depends(get_db),
@@ -163,6 +198,8 @@ async def create_session(
         db,
         files=files,
         skill_ids=parsed_skills if isinstance(parsed_skills, list) else [],
+        thinking_budget=thinking_budget or "standard",
+        quality_budget=quality_budget or "standard",
     )
     await reconcile_session(session, db)
     return {
@@ -244,13 +281,36 @@ async def _build_progress(session: ExplorationSession, db: AsyncSession) -> dict
         summary = {"count": 0, "latest_turn": None, "latest_activity": None}
         if node.task_id and status in ("running", "waiting_input"):
             summary = get_task_interaction_summary(node.task_id)
+        iteration_count = 0
+        durable_turns = 0
+        approval_wait_ms = 0
+        if node.task_id:
+            output_stats = await db.execute(
+                select(
+                    func.count(TaskOutput.id),
+                    func.coalesce(func.sum(TaskOutput.turn_count), 0),
+                    func.coalesce(func.sum(TaskOutput.approval_wait_ms), 0),
+                ).where(TaskOutput.task_id == node.task_id)
+            )
+            iteration_count, durable_turns, approval_wait_ms = output_stats.one()
+            turn_stats = await db.execute(
+                select(func.count(AgentTurn.id)).where(AgentTurn.task_id == node.task_id)
+            )
+            durable_turns = max(int(durable_turns or 0), int(turn_stats.scalar() or 0))
+        cfg = node.config or {}
         progress_nodes.append({
             "node_id": node.node_id,
             "description": (node.description or node.node_id)[:160],
             "status": status,
             "task_id": node.task_id,
-            "turns": summary.get("count") if status == "running" else None,
+            "turns": max(int(summary.get("count") or 0), durable_turns),
             "latest_activity": summary.get("latest_activity") if status == "running" else None,
+            "iteration_count": int(iteration_count or 0),
+            "turn_count": durable_turns,
+            "turn_budget": cfg.get("max_turns"),
+            "max_iterations": cfg.get("max_iterations"),
+            "approval_wait_ms": int(approval_wait_ms or 0),
+            "verification_mode": cfg.get("verification_mode"),
         })
 
     elapsed = None
@@ -266,6 +326,7 @@ async def _build_progress(session: ExplorationSession, db: AsyncSession) -> dict
         "session_status": session.status,
         "cycle_number": cycle.cycle_number,
         "dag_id": dag.id,
+        "workflow_id": dag.workflow_id,
         "dag_status": str(getattr(dag.status, "value", dag.status) or "unknown"),
         "pending_approvals": approvals,
         "elapsed_seconds": elapsed,
@@ -341,8 +402,19 @@ async def update_session(session_id: str, body: dict, db: AsyncSession = Depends
     session = await _session_or_404(session_id, db)
     if "model" in body:
         session.model = str(body["model"]) if body["model"] else None
+    if "thinking_budget" in body:
+        value = str(body["thinking_budget"] or "standard")
+        if value not in THINKING_BUDGET_LEVELS:
+            raise HTTPException(status_code=400, detail="Invalid thinking_budget")
+        session.thinking_budget = value
+    if "quality_budget" in body:
+        value = str(body["quality_budget"] or "standard")
+        if value not in QUALITY_BUDGET_LEVELS:
+            raise HTTPException(status_code=400, detail="Invalid quality_budget")
+        session.quality_budget = value
     session.last_activity_at = datetime.utcnow()
     await db.commit()
+    await db.refresh(session)
     return _session_dict(session)
 
 
@@ -352,6 +424,7 @@ async def finish(session_id: str, db: AsyncSession = Depends(get_db)):
     if session.status in ("running", "awaiting_input"):
         raise HTTPException(status_code=400, detail="Cancel the running cycle before finishing")
     await finish_session(session, db)
+    await db.refresh(session)
     return _session_dict(session)
 
 
@@ -360,7 +433,7 @@ async def feedback(session_id: str, body: ExplorationFeedbackRequest, db: AsyncS
     session = await _session_or_404(session_id, db)
     await reconcile_session(session, db)
     try:
-        dag, cycle = await plan_next_cycle(session, body.feedback, db)
+        dag, cycle = await plan_next_cycle(session, body.feedback, db, source_feedback=body.feedback)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -380,10 +453,83 @@ async def plan_next(session_id: str, body: Optional[dict] = None, db: AsyncSessi
     await reconcile_session(session, db)
     feedback_text = str((body or {}).get("feedback") or "Continue the exploration with the next useful step.")
     try:
-        dag, cycle = await plan_next_cycle(session, feedback_text, db)
+        dag, cycle = await plan_next_cycle(session, feedback_text, db, source_feedback=feedback_text)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"session": _session_dict(session), "cycle": _cycle_dict(cycle), "dag_id": dag.id}
+
+
+@router.post("/{session_id}/cycles/{dag_id}/retry")
+async def retry_cycle(session_id: str, dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Rerun a terminal exploration cycle in place."""
+    session = await _session_or_404(session_id, db)
+    if session.status in ("running", "awaiting_input", "awaiting_approval"):
+        raise HTTPException(status_code=400, detail="Exploration is currently running")
+    if session.status not in ("awaiting_feedback", "error"):
+        raise HTTPException(status_code=400, detail="Exploration is not ready to retry a cycle")
+
+    dag_result = await db.execute(
+        select(MasterDAG).where(
+            MasterDAG.id == dag_id,
+            MasterDAG.exploration_session_id == session.id,
+        )
+    )
+    dag = dag_result.scalar_one_or_none()
+    if not dag:
+        raise HTTPException(status_code=404, detail="Cycle DAG not found for this exploration")
+
+    dag_status = str(getattr(dag.status, "value", dag.status))
+    if dag_status not in ("cancelled", "failed", "completed"):
+        raise HTTPException(status_code=400, detail=f"Cycle DAG is not terminal (status: {dag_status})")
+
+    cycle_result = await db.execute(
+        select(ExplorationCycle).where(
+            ExplorationCycle.session_id == session.id,
+            ExplorationCycle.dag_id == dag_id,
+        )
+    )
+    cycle = cycle_result.scalar_one_or_none()
+    if not cycle:
+        raise HTTPException(status_code=404, detail="Exploration cycle not found")
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    for node in nodes_result.scalars().all():
+        node.status = NodeStatus.PENDING
+        node.output_data = None
+        node.task_id = None
+        node.container_id = None
+        node.started_at = None
+        node.completed_at = None
+
+    dag.status = DAGStatus.READY
+    dag.completed_at = None
+    dag.started_at = None
+
+    await db.execute(
+        delete(ExplorationMessage).where(
+            ExplorationMessage.cycle_id == cycle.id,
+            ExplorationMessage.kind == "cycle_result",
+        )
+    )
+    await db.commit()
+    await db.refresh(dag)
+
+    from routers.dags import start_dag
+    await start_dag(dag_id, db)
+
+    cycle.status = "running"
+    session.status = "running"
+    session.last_activity_at = datetime.utcnow()
+    db.add(ExplorationMessage(
+        session_id=session.id,
+        cycle_id=None,
+        role="system",
+        kind="status",
+        content=f"Cycle {cycle.cycle_number} restarted.",
+        metadata_json={"dag_id": dag_id, "status": "running"},
+    ))
+    await db.commit()
+    return {"session_id": session.id, "cycle_number": cycle.cycle_number, "dag_id": dag_id, "status": "running"}
 
 
 @router.post("/{session_id}/cycles/{dag_id}/start")
@@ -440,6 +586,46 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=True)}\n\n"
 
 
+QUEUEABLE_FEEDBACK_STATUSES = {
+    "planning",
+    "running",
+    "awaiting_run",
+    "awaiting_input",
+    "awaiting_approval",
+}
+
+
+async def _queued_feedback_messages(db: AsyncSession, session_id: str) -> list[ExplorationMessage]:
+    result = await db.execute(
+        select(ExplorationMessage)
+        .where(
+            ExplorationMessage.session_id == session_id,
+            ExplorationMessage.role == "user",
+        )
+        .order_by(ExplorationMessage.created_at.asc())
+    )
+    queued: list[ExplorationMessage] = []
+    for message in result.scalars().all():
+        metadata = message.metadata_json or {}
+        if metadata.get("feedback_queue") is True and not metadata.get("feedback_consumed_cycle"):
+            queued.append(message)
+    return queued
+
+
+async def _mark_feedback_consumed(
+    db: AsyncSession,
+    messages: list[ExplorationMessage],
+    cycle_number: int,
+) -> None:
+    for message in messages:
+        metadata = dict(message.metadata_json or {})
+        metadata["feedback_queue"] = False
+        metadata["feedback_consumed_cycle"] = cycle_number
+        message.metadata_json = metadata
+    if messages:
+        await db.commit()
+
+
 async def _chat_stream(
     session_id: str,
     message: str,
@@ -450,11 +636,79 @@ async def _chat_stream(
         session = await _session_or_404(session_id, db)
         await reconcile_session(session, db)
         can_plan = session.status in ("awaiting_feedback", "error")
+        queueable = session.status in QUEUEABLE_FEEDBACK_STATUSES
 
         if mode == "feedback" and not can_plan:
+            if session.status in QUEUEABLE_FEEDBACK_STATUSES:
+                queued_message = ExplorationMessage(
+                    session_id=session.id,
+                    role="user",
+                    kind="text",
+                    content=message,
+                    metadata_json={
+                        "mode": "feedback",
+                        "feedback_queue": True,
+                        "queued_at": datetime.utcnow().isoformat(),
+                        "queued_cycle": session.current_cycle,
+                    },
+                )
+                ack = f"Feedback queued for after Cycle {session.current_cycle}."
+                db.add(queued_message)
+                db.add(ExplorationMessage(
+                    session_id=session.id,
+                    role="assistant",
+                    kind="text",
+                    content=ack,
+                ))
+                session.last_activity_at = datetime.utcnow()
+                await db.commit()
+                yield _sse({"type": "text_delta", "text": ack})
+                yield _sse({"type": "done"})
+                return
             yield _sse({"type": "error", "message": "Exploration is not waiting for feedback."})
             return
 
+        if mode in ("auto", "chat") and session.status == "awaiting_run":
+            query = message.lower().strip()
+            status_question = any(
+                phrase in query
+                for phrase in (
+                    "is it finalized", "is it done", "is it complete",
+                    "is it finished", "is it ready", "has it completed",
+                    "has it finished", "what is the status", "what's the status",
+                    "what score", "what is the score", "what are the deliverables",
+                    "are the deliverables", "what did cycle", "why did cycle",
+                    "did the cycle", "did cycle", "what did it produce",
+                )
+            )
+            if status_question:
+                cycle_number = session.current_cycle
+                answer = (
+                    f"No. Cycle {cycle_number} is only planned and has not run yet, "
+                    "so there are no deliverables or audit score. Expand the Agent "
+                    "Plan and click Run cycle; after it completes I can review the "
+                    "results and finalize."
+                )
+                db.add(ExplorationMessage(
+                    session_id=session.id,
+                    role="user",
+                    kind="text",
+                    content=message,
+                    metadata_json={"mode": mode},
+                ))
+                db.add(ExplorationMessage(
+                    session_id=session.id,
+                    role="assistant",
+                    kind="text",
+                    content=answer,
+                ))
+                session.last_activity_at = datetime.utcnow()
+                await db.commit()
+                yield _sse({"type": "text_delta", "text": answer})
+                yield _sse({"type": "done"})
+                return
+
+        queued_feedback = await _queued_feedback_messages(db, session.id)
         context = await build_chat_context(session, db)
         context.append({"role": "user", "content": message})
 
@@ -476,8 +730,11 @@ async def _chat_stream(
             "stream": True,
             "temperature": 0.6,
         }
-        if can_plan:
+        if mode == "auto" and can_plan:
             payload["tools"] = [PROPOSE_TOOL]
+            payload["tool_choice"] = "auto"
+        elif mode == "auto" and queueable:
+            payload["tools"] = [QUEUE_FEEDBACK_TOOL]
             payload["tool_choice"] = "auto"
 
         content_parts: list[str] = []
@@ -507,7 +764,8 @@ async def _chat_stream(
                         text = delta.get("content")
                         if isinstance(text, str) and text and mode != "feedback":
                             content_parts.append(text)
-                            yield _sse({"type": "text_delta", "text": text})
+                            if mode == "chat":
+                                yield _sse({"type": "text_delta", "text": text})
                         for tc in delta.get("tool_calls") or []:
                             index = int(tc.get("index", 0))
                             current = tool_calls.setdefault(index, {"name": "", "arguments": ""})
@@ -522,11 +780,37 @@ async def _chat_stream(
             yield _sse({"type": "error", "message": error_text[:500]})
 
         assistant_text = "".join(content_parts).strip()
-        tool_called = any(
+        propose_called = any(
             call.get("name") == "propose_exploration_cycle"
             for call in tool_calls.values()
         )
-        suppress_text = mode == "chat" and can_plan and tool_called
+        queue_called = any(
+            call.get("name") == "queue_exploration_feedback"
+            for call in tool_calls.values()
+        )
+        suppress_text = bool((propose_called or queue_called) and mode in ("auto", "feedback"))
+
+        if queue_called and queueable and mode == "auto" and not error_text:
+            metadata = dict(user_message.metadata_json or {})
+            metadata.update({
+                "feedback_queue": True,
+                "queued_at": datetime.utcnow().isoformat(),
+                "queued_cycle": session.current_cycle,
+                "queued_by": "intent",
+            })
+            user_message.metadata_json = metadata
+            ack = f"Feedback queued for after Cycle {session.current_cycle}."
+            db.add(ExplorationMessage(
+                session_id=session.id,
+                role="assistant",
+                kind="text",
+                content=ack,
+            ))
+            session.last_activity_at = datetime.utcnow()
+            await db.commit()
+            yield _sse({"type": "text_delta", "text": ack})
+            yield _sse({"type": "done"})
+            return
 
         # Persist the chat answer before the proposal so the transcript reads
         # user -> assistant -> proposal, and so the legacy narration filter does
@@ -542,9 +826,12 @@ async def _chat_stream(
             ))
             session.last_activity_at = datetime.utcnow()
             await db.commit()
+            if mode == "auto":
+                yield _sse({"type": "text_delta", "text": assistant_text})
 
         should_plan = not error_text and (
-            mode == "feedback" or (mode == "chat" and can_plan and tool_called)
+            mode == "feedback"
+            or (mode == "auto" and can_plan and propose_called)
         )
 
         if should_plan:
@@ -557,7 +844,7 @@ async def _chat_stream(
                         focus = str(args.get("focus") or focus)
                     except Exception:
                         pass
-            if mode == "chat":
+            if mode in ("chat", "auto"):
                 recent = [
                     f"{item.get('role')}: {str(item.get('content') or '')[:600]}"
                     for item in context[1:]
@@ -566,9 +853,15 @@ async def _chat_stream(
                 if recent:
                     focus = f"{focus}\n\nRecent conversation:\n" + "\n".join(recent)
                 focus = focus[-6000:]
+            if queued_feedback:
+                queued_text = "\n".join(
+                    f"- {item.content}" for item in queued_feedback
+                )
+                focus = f"{focus}\n\nQUEUED FEEDBACK FROM EARLIER:\n{queued_text}"[-8000:]
             try:
                 await db.refresh(session)
-                dag, cycle = await plan_next_cycle(session, focus, db)
+                dag, cycle = await plan_next_cycle(session, focus, db, source_feedback=message)
+                await _mark_feedback_consumed(db, queued_feedback, cycle.cycle_number)
                 proposal_messages = await db.execute(
                     select(ExplorationMessage)
                     .where(
@@ -592,6 +885,43 @@ async def _chat_stream(
                 yield _sse({"type": "error", "message": f"Planning failed: {exc}"})
 
         yield _sse({"type": "done"})
+
+
+@router.post("/{session_id}/feedback/plan")
+async def plan_queued_feedback(session_id: str, db: AsyncSession = Depends(get_db)):
+    """Plan the next cycle from feedback queued while a cycle was running."""
+    session = await _session_or_404(session_id, db)
+    await reconcile_session(session, db)
+    if session.status not in ("awaiting_feedback", "error"):
+        raise HTTPException(status_code=400, detail="Exploration is not waiting for feedback")
+    queued = await _queued_feedback_messages(db, session.id)
+    if not queued:
+        raise HTTPException(status_code=400, detail="No queued feedback to plan from")
+    focus = "\n".join(item.content for item in queued if item.content).strip()
+    if not focus:
+        raise HTTPException(status_code=400, detail="Queued feedback is empty")
+    try:
+        await db.refresh(session)
+        dag, cycle = await plan_next_cycle(session, focus, db, source_feedback=focus)
+    except Exception as exc:
+        logger.warning("Queued feedback planning failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Planning failed: {exc}")
+    await _mark_feedback_consumed(db, queued, cycle.cycle_number)
+    proposal_result = await db.execute(
+        select(ExplorationMessage)
+        .where(
+            ExplorationMessage.cycle_id == cycle.id,
+            ExplorationMessage.kind == "cycle_proposal",
+        )
+        .order_by(ExplorationMessage.created_at.desc())
+        .limit(1)
+    )
+    proposal = proposal_result.scalars().first()
+    return {
+        "cycle": _cycle_dict(cycle),
+        "dag_id": dag.id,
+        "message": _message_dict(proposal) if proposal else None,
+    }
 
 
 @router.post("/{session_id}/chat")

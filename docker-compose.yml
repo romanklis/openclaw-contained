@@ -65,9 +65,14 @@ services:
       - AGENT_IMAGES_DIR=/agent-images
       - CONTROL_PLANE_URL=http://control-plane:8000
     depends_on:
-      - docker-dind
-      - postgres
-      - registry
+      docker-dind:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      registry:
+        condition: service_started
+      control-plane:
+        condition: service_healthy
     volumes:
       - ./services/image-builder:/app
       - ./services/image-builder/templates:/app/templates

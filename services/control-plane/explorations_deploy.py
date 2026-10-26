@@ -19,6 +19,7 @@ from models import (
 
 APP_FILES = {
     "app.py": "Flask",
+    "api.py": "Flask",
     "main.py": "FastAPI",
     "server.py": "Express",
     "asgi.py": "FastAPI",
@@ -101,6 +102,30 @@ def _flask_port(text: str) -> int:
     return int(match.group(1)) if match else 5000
 
 
+def _is_express_server(text: str) -> bool:
+    if any(marker in text for marker in ("document.", "window.", "addEventListener(")):
+        return False
+    return bool(
+        re.search(r"require\(\s*[\"']express[\"']\s*\)", text)
+        or re.search(r"from\s+[\"']express[\"']", text)
+        or re.search(r"\bexpress\s*\(", text)
+    )
+
+
+def _imported_flask_target(root: str, rel: str, text: str) -> Optional[str]:
+    """Follow a thin app.py -> api.py import to find the real app module."""
+    match = re.search(
+        r"from\s+([A-Za-z_][\w.]*)\s+import\s+.*\b(?:app|create_app)\b",
+        text,
+    )
+    if not match:
+        return None
+    module = match.group(1).replace(".", "/")
+    base_dir = os.path.dirname(rel)
+    target = f"{base_dir}/{module}.py" if base_dir else f"{module}.py"
+    return target if os.path.isfile(os.path.join(root, target)) else None
+
+
 def _detect_app(root: str, workspace_files: list[str], deliverable: str) -> Optional[DeployableApp]:
     rel = _resolve_path(root, workspace_files, deliverable)
     if not rel:
@@ -147,23 +172,33 @@ def _detect_app(root: str, workspace_files: list[str], deliverable: str) -> Opti
         match = re.search(r"listen\(\s*(\d+)", text)
         port = int(match.group(1)) if match else 3000
         entrypoint = f"node {rel}"
-    elif base in ("app.py", "wsgi.py", "asgi.py"):
-        if "Flask(" in text or "from flask" in text or "flask import" in text:
+    elif base in ("app.py", "api.py", "wsgi.py", "asgi.py"):
+        marker_text = text
+        if base in ("app.py", "wsgi.py") and not ("Flask(" in text or "from flask" in text or "FastAPI(" in text or "from fastapi" in text):
+            imported = _imported_flask_target(root, rel, text)
+            if imported:
+                marker_text = _read_text(os.path.join(root, imported))
+        if "Flask(" in marker_text or "from flask" in marker_text or "flask import" in marker_text:
             framework = "Flask"
-            port = _flask_port(text)
+            port = _flask_port(marker_text)
             entrypoint = f"python {rel}"
-        elif "FastAPI(" in text or "from fastapi" in text:
+        elif "FastAPI(" in marker_text or "from fastapi" in marker_text:
             framework = "FastAPI"
             port = 8000
             entrypoint = _fastapi_entrypoint(rel, port)
     elif base == "main.py":
-        if "FastAPI(" in text or "from fastapi" in text:
+        marker_text = text
+        if not ("FastAPI(" in text or "from fastapi" in text or "Flask(" in text or "from flask" in text):
+            imported = _imported_flask_target(root, rel, text)
+            if imported:
+                marker_text = _read_text(os.path.join(root, imported))
+        if "FastAPI(" in marker_text or "from fastapi" in marker_text:
             framework = "FastAPI"
             port = 8000
             entrypoint = _fastapi_entrypoint(rel, port)
-        elif "Flask(" in text or "from flask" in text:
+        elif "Flask(" in marker_text or "from flask" in marker_text:
             framework = "Flask"
-            port = _flask_port(text)
+            port = _flask_port(marker_text)
             entrypoint = f"python {rel}"
     elif base in ("server.py", "index.js", "server.js", "app.js"):
         if base == "server.py" and ("Flask(" in text or "from flask" in text):
@@ -174,7 +209,7 @@ def _detect_app(root: str, workspace_files: list[str], deliverable: str) -> Opti
             framework = "FastAPI"
             port = 8000
             entrypoint = _fastapi_entrypoint(rel, port)
-        elif "express" in text:
+        elif _is_express_server(text):
             framework = "Express"
             match = re.search(r"listen\(\s*(\d+)", text)
             port = int(match.group(1)) if match else 3000
@@ -223,7 +258,13 @@ async def detect_cycle_deployables(session: ExplorationSession, db: AsyncSession
         dag_nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == cycle.dag_id))
         dag_nodes = list(dag_nodes_result.scalars().all())
         task_ids = {node.node_id: node.task_id for node in dag_nodes if node.task_id}
-        for deliverable in deliverables:
+        deliverable_set = set(str(item) for item in deliverables)
+        for node in dag_nodes:
+            deliverable_set.update(
+                path for path in workspace_files
+                if path.startswith(f"{node.node_id}/") and "/static/" not in f"/{path}"
+            )
+        for deliverable in sorted(deliverable_set):
             candidate = _detect_app(root, workspace_files, str(deliverable))
             if not candidate:
                 continue
@@ -246,8 +287,28 @@ async def detect_cycle_deployables(session: ExplorationSession, db: AsyncSession
             candidate.name = f"{session.title} — Cycle {cycle.cycle_number}"
             by_path[candidate.app_path] = candidate
 
+    candidates = list(by_path.values())
+    non_verify = [
+        candidate for candidate in candidates
+        if not candidate.app_path.startswith("verify-")
+        and "/app-snapshot/" not in candidate.app_path
+    ]
+    if non_verify:
+        candidates = non_verify
+    grouped: dict[str, list[DeployableApp]] = {}
+    for candidate in candidates:
+        grouped.setdefault(os.path.dirname(candidate.app_path), []).append(candidate)
+    canonical: list[DeployableApp] = []
+    for group in grouped.values():
+        group.sort(key=lambda item: (
+            0 if os.path.basename(item.app_path) == "app.py" else 1,
+            0 if "api.py" not in item.app_path else 2,
+            item.app_path,
+        ))
+        canonical.append(group[0])
+
     deployables: list[DeployableApp] = []
-    for candidate in by_path.values():
+    for candidate in canonical:
         if not candidate.task_id:
             continue
         task_result = await db.execute(select(Task).where(Task.id == candidate.task_id))

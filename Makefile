@@ -2,7 +2,7 @@
 # Auditable Agent Orchestration for OpenClaw
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
-		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-all-images \
+		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 build-banking build-ann2snn catalog-sync seed-images build-all-images \
 		docker-clean-dag docker-clean-dag-dry-run dind-images dind-clean dind-prune \
 		examples example-up example-down test-ollama set-ollama-url
 
@@ -84,14 +84,14 @@ build-frontend: ## Rebuild only the frontend
 # Base Agent Image
 # ─────────────────────────────────────────────────────────
 
-build-base: ## Force rebuild the base agent image (openclaw-agent:openclaw)
-	@echo "Triggering base agent image rebuild via image-builder..."
-	@curl -sf http://localhost:8000/health > /dev/null 2>&1 || \
-		{ echo "❌ Services must be running first. Run: make up"; exit 1; }
-	docker-compose exec image-builder python -c "import httpx; r = httpx.post('http://localhost:8002/build', json={'task_id': '_base_rebuild', 'base_image': 'python:3.11-slim', 'capabilities': {'pip_packages': []}}, timeout=300); print(r.json())"
-	@echo ""
-	@echo "  Base image rebuild triggered. Watch logs:"
-	@echo "    make logs-service SERVICE=image-builder"
+build-base: ## Bootstrap the base agent image (openclaw-agent:openclaw)
+	@echo "Building the local Python TaskForge base agent image inside DinD..."
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:openclaw \
+		-f /agent-images/base/Dockerfile \
+		/agent-images/base
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:openclaw
+	@echo "  ✅  openclaw-agent:openclaw built & pushed"
 
 build-octaveclaw: ## Build the OctaveClaw agent image (OpenClaw + GNU Octave) and push to registry
 	@echo "Building OctaveClaw agent image inside DinD..."
@@ -220,7 +220,14 @@ dind-prune: ## FULL DinD wipe: docker system prune -af (removes all unused image
 	@echo "  ✅ Done"
 
 
-build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 ## Build all 8 agent base images
+catalog-sync: ## Seed/link built registry images into the platform image catalog
+	@echo "Synchronizing built images into the platform catalog..."
+	@curl -fsS -X POST http://localhost:8000/api/image-catalog/sync-agent-images
+	@echo ""
+
+seed-images: build-all-images ## Initial bootstrap: build images and seed the platform catalog
+
+build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 build-banking build-ann2snn ## Initial bootstrap: build all agent images and seed the catalog
 	@echo ""
 	@echo "  ✅  All agent base images built & pushed to registry:"
 	@echo "      openclaw-agent:openclaw  (Full Python)"
@@ -231,6 +238,11 @@ build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build
 	@echo "      openclaw-agent:browser   (Chromium + agent-browser)"
 	@echo "      openclaw-agent:browser_v2 (Chromium + agent-browser + obscura)"
 	@echo "      openclaw-agent:browser_v3 (Chromium + agent-browser + lightpanda)"
+	@echo "      openclaw-agent:browser_v4 (Chromium + Camoufox)"
+	@echo "      openclaw-agent:banking   (MongoDB/PostgreSQL drivers)"
+	@echo "      openclaw-agent:ann2snn   (CPU PyTorch/Flask/Gunicorn)"
+	@echo ""
+	@$(MAKE) catalog-sync
 
 # ─────────────────────────────────────────────────────────
 # Logs & Status

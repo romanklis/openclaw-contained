@@ -202,6 +202,8 @@ class AgentTaskWorkflow:
         self._trial_failures = 0  # Track trial deployment failures
         self._trial_rework_pending = False  # True when agent must fix a trial failure
         self._approved_capabilities = set()  # Track already-approved resource names to prevent loops
+        self._handled_capability_ids = set()  # Capability requests already applied
+        self._pending_metrics = {}  # waits recorded for the next iteration output
 
     async def _resolve_capability_state(
         self,
@@ -244,6 +246,9 @@ class AgentTaskWorkflow:
             ts_ref = ts_ref.astimezone(timezone.utc).replace(tzinfo=None)
         window_start = ts_ref - timedelta(minutes=5)
         for row in capability_rows or []:
+            request_id = str(row.get("id") or "")
+            if request_id and request_id in self._handled_capability_ids:
+                continue
             requested_at = _parse_iso_datetime(row.get("requested_at"))
             if requested_at and requested_at < window_start:
                 continue
@@ -266,6 +271,7 @@ class AgentTaskWorkflow:
                 "state": "requested_pending",
                 "capability": capability,
                 "source": "control_plane_pending",
+                "request_id": str(pending_row.get("id") or ""),
                 "should_create_request": False,
             }
 
@@ -280,6 +286,7 @@ class AgentTaskWorkflow:
                 "state": "requested_resolved",
                 "capability": capability,
                 "source": f"control_plane_{(resolved_row.get('status') or '').lower()}",
+                "request_id": str(resolved_row.get("id") or ""),
                 "should_create_request": False,
             }
 
@@ -288,6 +295,7 @@ class AgentTaskWorkflow:
                 "state": "requested_pending",
                 "capability": capability or marker_capability or {},
                 "source": "agent_signal",
+                "request_id": None,
                 "should_create_request": True,
             }
 
@@ -295,6 +303,7 @@ class AgentTaskWorkflow:
             "state": "none",
             "capability": {},
             "source": "none",
+            "request_id": None,
             "should_create_request": False,
         }
     
@@ -308,6 +317,7 @@ class AgentTaskWorkflow:
         dag_id: str = "",
         deliverables_required: bool = True,
         max_agent_turns: int = 30,
+        max_iterations: int = 50,
     ) -> Dict[str, Any]:
         """Execute agent task.
 
@@ -356,12 +366,18 @@ class AgentTaskWorkflow:
             logger.info(f"♻️  Continuing from iteration {start_iteration}")
 
         # Step 2: Agent execution loop
-        max_iterations = 50
         iteration = start_iteration
         
         while iteration < max_iterations:
             iteration += 1
             iteration_started_at = workflow.now()
+            pending_metrics = self._pending_metrics
+            self._pending_metrics = {}
+            iteration_reason = "agent"
+            if self._capability_feedback:
+                iteration_reason = "capability"
+            if self._trial_rework_pending:
+                iteration_reason = "trial_rework"
             
             # Heartbeat: update task status to RUNNING at start of each iteration
             await workflow.execute_activity(
@@ -418,6 +434,17 @@ class AgentTaskWorkflow:
             if _committed:
                 self.current_image = _committed
                 logger.info(f"📸 DAG image updated from commit: {_committed}")
+
+            result.update(pending_metrics)
+            result["started_at"] = iteration_started_at.isoformat()
+            result["finished_at"] = workflow.now().isoformat()
+            try:
+                result["duration_ms"] = max(
+                    0, int((workflow.now() - iteration_started_at).total_seconds() * 1000)
+                )
+            except Exception:
+                pass
+            result["iteration_reason"] = iteration_reason
 
             # Store output in the control-plane database (fire-and-forget, don't block workflow)
             try:
@@ -549,6 +576,7 @@ class AgentTaskWorkflow:
                 )
                 self.approval_received = False
                 self.capability_approved = False
+                _credential_wait_started = workflow.now()
                 await workflow.execute_activity(
                     update_task_status,
                     args=[task_id, "waiting_approval"],
@@ -561,6 +589,9 @@ class AgentTaskWorkflow:
                 )
                 for _r in _unhandled:
                     self._handled_credential_ids.add(_r.get("id"))
+                self._pending_metrics["approval_wait_ms"] = max(
+                    0, int((workflow.now() - _credential_wait_started).total_seconds() * 1000)
+                )
                 if not self.capability_approved:
                     raise RuntimeError(
                         f"credential '{_req.get('credential_name')}' was denied for {_req.get('origin')}"
@@ -584,14 +615,23 @@ class AgentTaskWorkflow:
             resource_name = capability.get("resource", "") if isinstance(capability, dict) else ""
 
             if cap_state == "requested_resolved":
+                request_id = str(capability_state.get("request_id") or "")
                 logger.info(
                     f"🔐 Capability already resolved for {task_id} "
                     f"(source={capability_state.get('source')}, resource={resource_name or 'unknown'})"
                 )
+                if request_id:
+                    self._handled_capability_ids.add(request_id)
                 if resource_name:
                     self._approved_capabilities.add(resource_name)
-                # Capability activity happened this iteration; continue so completion
-                # is evaluated on the next clean iteration.
+                    self._capability_feedback = (
+                        "--- SYSTEM NOTICE ---\n"
+                        f"Capability '{resource_name}' is approved and installed. "
+                        "Use it now; do not re-request it.\n"
+                        "--- END NOTICE ---"
+                    )
+                # The agent has not seen the installed capability yet. Run one
+                # targeted pass, then completion is evaluated normally.
                 continue
 
             if cap_state == "requested_pending":
@@ -604,6 +644,9 @@ class AgentTaskWorkflow:
                 # (prevents infinite loops from stale results or LLM re-requesting)
                 already_approved = resource_name in self._approved_capabilities
                 if already_approved:
+                    request_id = str(capability_state.get("request_id") or "")
+                    if request_id:
+                        self._handled_capability_ids.add(request_id)
                     logger.info(
                         f"⏭️ Skipping duplicate capability request for '{resource_name}' "
                         f"— already approved this run"
@@ -613,6 +656,8 @@ class AgentTaskWorkflow:
                         args=[task_id],
                         start_to_close_timeout=timedelta(seconds=15),
                     )
+                    if result.get("completed"):
+                        break
                     continue
 
                 if capability_state.get("should_create_request"):
@@ -626,6 +671,7 @@ class AgentTaskWorkflow:
                 # from a prior iteration from immediately satisfying the wait)
                 self.approval_received = False
                 self.capability_approved = False
+                _capability_wait_started = workflow.now()
 
                 # Update status: waiting for human approval
                 await workflow.execute_activity(
@@ -640,6 +686,9 @@ class AgentTaskWorkflow:
                     timeout=timedelta(hours=24)
                 )
 
+                self._pending_metrics["approval_wait_ms"] = max(
+                    0, int((workflow.now() - _capability_wait_started).total_seconds() * 1000)
+                )
                 if self.capability_approved:
                     # Update status: building new agent image
                     await workflow.execute_activity(
@@ -660,10 +709,14 @@ class AgentTaskWorkflow:
                         start_to_close_timeout=timedelta(seconds=15),
                     )
 
+                    _image_build_started = workflow.now()
                     build_result = await workflow.execute_activity(
                         build_agent_image,
                         args=[task_id, capability, self.current_image],
                         start_to_close_timeout=timedelta(minutes=10)
+                    )
+                    self._pending_metrics["image_build_wait_ms"] = max(
+                        0, int((workflow.now() - _image_build_started).total_seconds() * 1000)
                     )
 
                     new_image = build_result.get("image", self.current_image)
@@ -687,6 +740,13 @@ class AgentTaskWorkflow:
                             "--- SYSTEM NOTICE ---\n"
                             + supply_chain_feedback
                             + "\n--- END NOTICE ---"
+                        )
+                    else:
+                        self._capability_feedback = (
+                            "--- SYSTEM NOTICE ---\n"
+                            f"Capability '{resource_name or 'requested tool'}' is approved and installed. "
+                            "Use it now; do not re-request it.\n"
+                            "--- END NOTICE ---"
                         )
 
                     await workflow.execute_activity(
@@ -720,6 +780,9 @@ class AgentTaskWorkflow:
 
                 self.approval_received = False
                 self.capability_approved = False
+                request_id = str(capability_state.get("request_id") or "")
+                if request_id:
+                    self._handled_capability_ids.add(request_id)
 
                 try:
                     guard = await workflow.execute_activity(
@@ -893,6 +956,7 @@ class AgentStepWorkflow:
             f"🔬 AgentStepWorkflow done | Task: {task_id} | Iteration: {iteration} | "
             f"Turns: {turns_seen} | Completed: {result.get('completed')}"
         )
+        result["turn_count"] = turns_seen
         return result
 
 
@@ -1916,6 +1980,28 @@ async def record_agent_turn(
             else:
                 logger.info(f"   └─ 🔧 {name}: {str(args)[:120]}")
 
+    # Persist durable turn metrics (counts/tokens/tool names only; no prompts).
+    try:
+        import httpx
+        control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{control_plane_url}/api/tasks/{task_id}/turns",
+                json={
+                    "iteration": iteration,
+                    "turn_number": turn_number,
+                    "provider": provider,
+                    "model": turn_data.get("model") or resp.get("model"),
+                    "input_tokens": usage.get("input_tokens") or 0,
+                    "output_tokens": usage.get("output_tokens") or 0,
+                    "total_tokens": usage.get("total_tokens") or 0,
+                    "tool_names": tool_names,
+                    "turn_timestamp": timestamp,
+                },
+            )
+    except Exception as exc:
+        logger.debug(f"Could not persist turn metrics for {task_id}: {exc}")
+
     return {
         "task_id": task_id,
         "iteration": iteration,
@@ -1942,13 +2028,13 @@ async def store_task_output(
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
-    # Extract duration from OpenClaw meta if available
-    duration_ms = None
+    # Prefer the workflow-measured iteration duration.
+    duration_ms = result.get("duration_ms")
     output_str = result.get("output", "")
     if isinstance(output_str, str) and '"durationMs"' in output_str:
         import re
         m = re.search(r'"durationMs"\s*:\s*(\d+)', output_str)
-        if m:
+        if m and duration_ms is None:
             duration_ms = int(m.group(1))
 
     # Extract deliverables (files created by the agent)
@@ -1978,6 +2064,12 @@ async def store_task_output(
         "model_used": model_used,
         "image_used": image_used,
         "duration_ms": duration_ms,
+        "turn_count": result.get("turn_count", 0),
+        "started_at": result.get("started_at"),
+        "finished_at": result.get("finished_at"),
+        "approval_wait_ms": result.get("approval_wait_ms", 0),
+        "image_build_wait_ms": result.get("image_build_wait_ms", 0),
+        "iteration_reason": result.get("iteration_reason"),
         "deliverables": deliverables,
         "raw_result": result,
     }
@@ -2947,18 +3039,11 @@ async def build_agent_image(
         import traceback
         logger.error(f"❌ BUILD_ERROR | Task: {task_id} | {type(e).__name__}: {repr(e)}")
         logger.error(f"   └─ Traceback:\n{traceback.format_exc()}")
-        logger.warning(f"⚠️  FALLBACK | Task: {task_id} | Continuing with previous image: {current_image}")
-        # Fall back to the image we already had — include build error as feedback
-        return {
-            "image": current_image,
-            "feedback": (
-                f"CAPABILITY_BUILD_FAILED: Could not install '{resource}'. "
-                f"Error: {str(e)[:300]}. "
-                "The package may not be available for this platform. "
-                "Find an alternative approach."
-            ),
-            "denied": [],
-        }
+        raise ApplicationError(
+            f"CAPABILITY_BUILD_FAILED: Could not install '{resource}'. "
+            f"Error: {str(e)[:500]}",
+            non_retryable=True,
+        ) from e
 
 
 @activity.defn
@@ -4719,8 +4804,9 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
         return str(value).strip().lower() in ("1", "true", "yes", "y")
 
     gate_cfg = ((config or {}).get("deliverable_gate") or {}) if isinstance(config, dict) else {}
-    if gate_cfg.get("enabled") is False:
-        return {"valid": True, "reason": "deliverable gate disabled by node config"}
+    verification_mode = str((config or {}).get("verification_mode") or "full").lower()
+    if verification_mode == "off" or gate_cfg.get("enabled") is False:
+        return {"valid": True, "reason": "verification disabled by execution profile", "verification_mode": "off"}
 
     if str(output.get("status", "")).lower() != "completed":
         return {"valid": False, "reason": f"task status is '{output.get('status')}', expected 'completed'"}
@@ -4763,6 +4849,14 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
                 "valid": False,
                 "reason": "hallucination_risk: logs contain mock/placeholder patterns with no evidence of real network fetch",
             }
+
+    if verification_mode == "deterministic":
+        return {
+            "valid": True,
+            "reason": "deterministic checks passed",
+            "verification_mode": "deterministic",
+            "deep_review": None,
+        }
 
     # The evidence-based deep review (control-plane integrity audit of the
     # task's FINAL iteration) is the sole LLM judge: it sees the actual
@@ -4939,8 +5033,10 @@ class DAGNodeWorkflow:
             config.get("max_turns")
             or min(_cap_turns, _base_turns + _per_upstream * upstream_count)
         )
+        max_iterations = int(config.get("max_iterations") or 50)
         logger.info(
-            f"🔧 DAGNodeWorkflow | Node {node_id} | upstream_count={upstream_count} | max_agent_turns={max_agent_turns}"
+            f"🔧 DAGNodeWorkflow | Node {node_id} | upstream_count={upstream_count} | "
+            f"max_agent_turns={max_agent_turns} | max_iterations={max_iterations}"
         )
 
         # Update node to RUNNING
@@ -5020,10 +5116,25 @@ class DAGNodeWorkflow:
                 follow_up_parts.append(f"- {str(criterion)[:240]}")
         follow_up_parts.append(
             f"--- Turn budget ---\n"
-            f"You have up to {max_agent_turns} turns for this step (scaled for {upstream_count} "
-            f"upstream step output(s) you must aggregate). Write your deliverable(s) incrementally — "
-            f"do not spend the whole budget exploring."
+            f"You have up to {max_agent_turns} turns for this step. Write your deliverable(s) "
+            f"incrementally — do not spend the whole budget exploring."
         )
+        thinking_budget = str(config.get("thinking_budget") or "").lower()
+        if thinking_budget == "lean":
+            follow_up_parts.append(
+                "--- Thinking budget: lean ---\n"
+                "Do not repeat discovery. Implement, test once, and finish."
+            )
+        elif thinking_budget == "standard":
+            follow_up_parts.append(
+                "--- Thinking budget: standard ---\n"
+                "Work efficiently; reuse existing files; avoid redundant scans."
+            )
+        quality_instructions = config.get("quality_instructions")
+        if quality_instructions:
+            follow_up_parts.append(
+                "--- Cross-check budget ---\n" + str(quality_instructions)[:1200]
+            )
         template_guidance = config.get("template_guidance")
         if template_guidance:
             follow_up_parts.append(
@@ -5112,7 +5223,7 @@ class DAGNodeWorkflow:
 
             result = await workflow.execute_child_workflow(
                 AgentTaskWorkflow.run,
-                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns],
+                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations],
                 id=child_workflow_id,
             )
 
@@ -5250,7 +5361,7 @@ class DAGNodeWorkflow:
 
                 retry_result = await workflow.execute_child_workflow(
                     AgentTaskWorkflow.run,
-                    args=[task_id, llm_model, result.get("current_image", agent_image), retry_follow_up, dag_id, _deliverables_required, max_agent_turns],
+                    args=[task_id, llm_model, result.get("current_image", agent_image), retry_follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations],
                     id=f"{child_workflow_id}-assessment-retry",
                 )
 

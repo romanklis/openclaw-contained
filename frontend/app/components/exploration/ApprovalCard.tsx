@@ -31,6 +31,9 @@ export default function ApprovalCard({ request, reviewing, onReview }: ApprovalC
   return (
     <div className="my-3 rounded-md border border-amber-700/50 bg-[#1a150d] p-3">
       <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded border border-cyan-700/40 bg-cyan-500/10 px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-cyan-300">
+          Agent · Approval
+        </span>
         <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-300">⚠ Approval required</span>
         <span className="font-mono text-[10px] text-gray-400">{title(request)}</span>
         {request.requested_at && (

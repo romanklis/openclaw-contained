@@ -825,6 +825,15 @@ async def get_build(build_ref: str, db: AsyncSession = Depends(get_db)):
     }
 
 
+@router.post("/builds/{build_ref}/retry")
+async def retry_build(build_ref: str, db: AsyncSession = Depends(get_db)):
+    build = await _resolve_build(db, build_ref)
+    if build.status == "succeeded":
+        raise HTTPException(status_code=409, detail="Build already succeeded")
+    build = await image_catalog.retry_catalog_build(db, build, requested_by="user")
+    return _build_dict(build)
+
+
 @router.get("/builds/{build_ref}/logs")
 async def get_build_logs(build_ref: str, db: AsyncSession = Depends(get_db)):
     build = await _resolve_build(db, build_ref)
@@ -979,6 +988,16 @@ async def seed_predefined_images(db: AsyncSession = Depends(get_db)):
 
     catalog = await image_catalog.import_from_agent_images(db)
     return {"catalog": catalog, "agent_images": agent_images}
+
+
+@router.get("/bootstrap-status")
+async def bootstrap_status(db: AsyncSession = Depends(get_db)):
+    return await image_catalog.catalog_bootstrap_status(db)
+
+
+@router.post("/sync-agent-images")
+async def sync_agent_images(force: bool = False, db: AsyncSession = Depends(get_db)):
+    return await image_catalog.sync_built_agent_images(db, force=force)
 
 
 @router.post("/reconcile")

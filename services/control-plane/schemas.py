@@ -166,6 +166,18 @@ class PolicyResponse(BaseModel):
         from_attributes = True
 
 
+class TaskTurnCreate(BaseModel):
+    iteration: int
+    turn_number: int
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
+    total_tokens: Optional[int] = 0
+    tool_names: Optional[List[str]] = []
+    turn_timestamp: Optional[str] = None
+
+
 # Task output schemas
 class TaskOutputCreate(BaseModel):
     task_id: str
@@ -179,6 +191,12 @@ class TaskOutputCreate(BaseModel):
     model_used: Optional[str] = None
     image_used: Optional[str] = None
     duration_ms: Optional[int] = None
+    turn_count: Optional[int] = 0
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    approval_wait_ms: Optional[int] = 0
+    image_build_wait_ms: Optional[int] = 0
+    iteration_reason: Optional[str] = None
     deliverables: Optional[Dict[str, Any]] = None
     compact_summary: Optional[str] = None
     external_assessment: Optional[Dict[str, Any]] = None
@@ -198,6 +216,12 @@ class TaskOutputResponse(BaseModel):
     model_used: Optional[str]
     image_used: Optional[str]
     duration_ms: Optional[int]
+    turn_count: Optional[int] = 0
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    approval_wait_ms: Optional[int] = 0
+    image_build_wait_ms: Optional[int] = 0
+    iteration_reason: Optional[str] = None
     deliverables: Optional[Dict[str, Any]]
     compact_summary: Optional[str]
     external_assessment: Optional[Dict[str, Any]]
@@ -705,12 +729,14 @@ class ExplorationCreateRequest(BaseModel):
     objective: str
     model: Optional[str] = None
     project_id: Optional[str] = None
+    thinking_budget: str = "standard"
+    quality_budget: str = "standard"
     skill_ids: List[str] = []
 
 
 class ExplorationChatRequest(BaseModel):
     message: str
-    mode: Literal["chat", "feedback"] = "chat"
+    mode: Literal["chat", "feedback", "auto"] = "auto"
 
 
 class ExplorationFeedbackRequest(BaseModel):

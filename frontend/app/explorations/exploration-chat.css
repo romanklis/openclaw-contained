@@ -86,3 +86,12 @@
 .exploration-chat .ps__rail-y.ps--clicking {
   background-color: transparent;
 }
+
+/* Keep the conversation readable while the header/config bar stay full width. */
+.exploration-chat-stream .cs-message-list__scroll-wrapper {
+  max-width: none;
+  width: 100%;
+  margin: 0;
+  padding-left: 1.5rem;
+  padding-right: 1.5rem;
+}

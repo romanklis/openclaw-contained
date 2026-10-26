@@ -18,11 +18,14 @@ interface WorkflowTableRowProps {
   group: WorkflowSummary
   projectName?: string
   expanded: boolean
+  variant?: 'workflow' | 'template'
+  highlight?: boolean
   onToggleExpand: () => void
   onRun: (group: WorkflowSummary) => void
   onResume: (group: WorkflowSummary) => void
   onOpenLatest: (group: WorkflowSummary) => void
   onOpenTemplate: (group: WorkflowSummary) => void
+  onEditTemplate?: (group: WorkflowSummary) => void
   onRerunProblem: (group: WorkflowSummary) => void
   onConvert: (group: WorkflowSummary) => void
   onMerge: (group: WorkflowSummary) => void
@@ -56,6 +59,16 @@ function runStatus(run: WorkflowRun): { label: string; className: string; icon: 
   return { label: run.status, className: 'border-gray-700 bg-gray-800/70 text-gray-400', icon: '○' }
 }
 
+function templateStability(group: WorkflowSummary): { label: string; score: number | null; className: string; icon: string } {
+  const score = group.latest_score ?? group.reliability_pct ?? null
+  if (score === null) return { label: 'No data', score: null, className: 'text-gray-500', icon: '—' }
+  if (group.latest_run?.status === 'failed') return { label: 'Fail', score, className: 'text-red-400', icon: '✕' }
+  if (group.latest_run?.flagged) return { label: 'Review', score, className: 'text-amber-400', icon: '⚠' }
+  if (score >= 90) return { label: 'Rock', score, className: 'text-emerald-400', icon: '✓' }
+  if (score >= 70) return { label: 'Pass', score, className: 'text-emerald-300', icon: '✓' }
+  return { label: 'Watch', score, className: 'text-amber-300', icon: '⚠' }
+}
+
 function dotClass(run: WorkflowRun): string {
   if (run.status === 'running') return 'bg-blue-400'
   if (run.status === 'failed') return 'bg-red-400'
@@ -68,11 +81,14 @@ export default function WorkflowTableRow({
   group,
   projectName,
   expanded,
+  variant = 'workflow',
+  highlight = false,
   onToggleExpand,
   onRun,
   onResume,
   onOpenLatest,
   onOpenTemplate,
+  onEditTemplate,
   onRerunProblem,
   onConvert,
   onMerge,
@@ -87,10 +103,12 @@ export default function WorkflowTableRow({
   const [showMenu, setShowMenu] = useState(false)
   const stage = STAGE_META[group.stage]
   const status = latestStatus(group)
+  const stability = templateStability(group)
   const objective = sanitizeObjectiveText(group.objective, 220)
   const recent = [...group.recent_runs].reverse()
   const latest = group.latest_run
   const isExperiment = group.stage === 'experimenting'
+  const isTemplate = variant === 'template'
 
   useEffect(() => {
     setDetail(null)
@@ -134,7 +152,9 @@ export default function WorkflowTableRow({
     <>
       <tr
         id={`workflow-${group.id}`}
-        className={`cursor-pointer border-b border-gray-800/80 text-xs transition-colors hover:bg-gray-900/50 ${expanded ? 'bg-gray-900/40' : ''}`}
+        className={`cursor-pointer border-b border-gray-800/80 text-xs transition-colors hover:bg-gray-900/50 ${
+          expanded ? 'bg-gray-900/40' : highlight ? 'bg-amber-500/5' : ''
+        }`}
         onClick={onToggleExpand}
       >
         <td className="px-3 py-2.5">
@@ -155,7 +175,16 @@ export default function WorkflowTableRow({
         </td>
 
         <td className="px-3 py-2.5">
-          {group.mode === 'exploration' ? (
+          {isTemplate ? (
+            <>
+              <div className="text-[10px] font-medium text-purple-300">🔒 Locked Template</div>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                {group.step_count > 0
+                  ? `${group.block_count}/${group.step_count} blocks (${group.determinism_pct}%)`
+                  : 'No executable steps'}
+              </div>
+            </>
+          ) : group.mode === 'exploration' ? (
             <>
               <div className="text-[10px] font-medium text-cyan-300">🧭 Exploration</div>
               <div className="mt-0.5 text-[9px] text-gray-600">
@@ -177,43 +206,98 @@ export default function WorkflowTableRow({
         </td>
 
         <td className="px-3 py-2.5">
-          <div className={`flex items-center gap-1.5 text-[10px] font-medium ${status.className}`}>
-            <span>{status.icon}</span>
-            <span>{status.label}</span>
-            {group.latest_score !== null && <span className="text-gray-400">• {group.latest_score}/100</span>}
-          </div>
-          <div className="mt-0.5 text-[9px] text-gray-600">
-            {latest ? `Run #${latest.run_number} • ${formatDuration(latest.duration_seconds)}` : '—'}
-          </div>
+          {isTemplate ? (
+            <>
+              <div className={`flex items-center gap-1 text-[10px] font-medium ${stability.className}`}>
+                <span>{stability.icon}</span>
+                {stability.score === null ? (
+                  <span>{stability.label}</span>
+                ) : (
+                  <>
+                    <span>{stability.score}</span>
+                    <span className="text-gray-500">/100</span>
+                    <span>({stability.label})</span>
+                  </>
+                )}
+              </div>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                {group.reliability_pct !== null
+                  ? `Fleet reliability ${group.reliability_pct}%`
+                  : 'No fleet history'}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className={`flex items-center gap-1.5 text-[10px] font-medium ${status.className}`}>
+                <span>{status.icon}</span>
+                <span>{status.label}</span>
+                {group.latest_score !== null && <span className="text-gray-400">• {group.latest_score}/100</span>}
+              </div>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                {latest ? `Run #${latest.run_number} • ${formatDuration(latest.duration_seconds)}` : '—'}
+              </div>
+            </>
+          )}
         </td>
 
         <td className="px-3 py-2.5">
-          <div className="flex items-center gap-1.5">
-            {recent.length === 0 && <span className="text-[10px] text-gray-600">—</span>}
-            {recent.map((run) => (
-              <span
-                key={run.id}
-                className={`h-2 w-2 rounded-full ${dotClass(run)}`}
-                title={`Run #${run.run_number} • ${run.status}${run.score !== null ? ` • ${run.score}/100` : ''}`}
-              />
-            ))}
-          </div>
-          <div className="mt-0.5 text-[9px] text-gray-600">
-            {group.run_count} run{group.run_count === 1 ? '' : 's'} • {group.latest_node_counts.completed} passed
-          </div>
+          {isTemplate ? (
+            <>
+              <button
+                onClick={onToggleExpand}
+                className="flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-gray-300 hover:bg-gray-800"
+              >
+                {group.run_count} run{group.run_count === 1 ? '' : 's'} {expanded ? '▴' : '▾'}
+              </button>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                {group.completed_count} passed
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-1.5">
+                {recent.length === 0 && <span className="text-[10px] text-gray-600">—</span>}
+                {recent.map((run) => (
+                  <span
+                    key={run.id}
+                    className={`h-2 w-2 rounded-full ${dotClass(run)}`}
+                    title={`Run #${run.run_number} • ${run.status}${run.score !== null ? ` • ${run.score}/100` : ''}`}
+                  />
+                ))}
+              </div>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                {group.run_count} run{group.run_count === 1 ? '' : 's'} • {group.latest_node_counts.completed} passed
+              </div>
+            </>
+          )}
         </td>
 
-        <td className="px-3 py-2.5" onClick={(event) => event.stopPropagation()}>
-          <button
-            onClick={onToggleExpand}
-            className="flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-gray-300 hover:bg-gray-800"
-          >
-            {group.run_count} run{group.run_count === 1 ? '' : 's'} {expanded ? '▴' : '▾'}
-          </button>
-        </td>
-
-        <td className="whitespace-nowrap px-3 py-2.5 text-[10px] text-gray-500">
-          {formatRelativeTime(group.updated_at)}
+        <td className="whitespace-nowrap px-3 py-2.5" onClick={(event) => event.stopPropagation()}>
+          {isTemplate ? (
+            <>
+              <div className={`flex items-center gap-1.5 text-[10px] font-medium ${status.className}`}>
+                <span>{status.icon}</span>
+                <span>{status.label}</span>
+              </div>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                {latest
+                  ? `${formatRelativeTime(latest.completed_at || latest.created_at)} • ${formatDuration(latest.duration_seconds)}`
+                  : '—'}
+              </div>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={onToggleExpand}
+                className="flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-gray-300 hover:bg-gray-800"
+              >
+                {group.run_count} run{group.run_count === 1 ? '' : 's'} {expanded ? '▴' : '▾'}
+              </button>
+              <div className="mt-0.5 text-[9px] text-gray-600">
+                {formatRelativeTime(group.updated_at)}
+              </div>
+            </>
+          )}
         </td>
 
         <td className="px-3 py-2.5" onClick={(event) => event.stopPropagation()}>
@@ -226,15 +310,25 @@ export default function WorkflowTableRow({
                 🧭 Open
               </Link>
             ) : (
-              <button
-                onClick={() => (group.locked ? onRun(group) : isExperiment ? onResume(group) : onRun(group))}
-                disabled={!latest}
-                className={`rounded px-2.5 py-1 text-[10px] font-semibold text-white disabled:opacity-40 ${
-                  group.locked ? 'bg-purple-600 hover:bg-purple-500' : isExperiment ? 'bg-indigo-600 hover:bg-indigo-500' : 'bg-emerald-600 hover:bg-emerald-500'
-                }`}
-              >
-                {group.locked ? '▷ New Run' : isExperiment ? '↗ Resume' : '▷ Run'}
-              </button>
+              <>
+                <button
+                  onClick={() => (group.locked ? onRun(group) : isExperiment ? onResume(group) : onRun(group))}
+                  disabled={!isTemplate && !latest}
+                  className={`rounded px-2.5 py-1 text-[10px] font-semibold text-white disabled:opacity-40 ${
+                    group.locked ? 'bg-purple-600 hover:bg-purple-500' : isExperiment ? 'bg-indigo-600 hover:bg-indigo-500' : 'bg-emerald-600 hover:bg-emerald-500'
+                  }`}
+                >
+                  {isTemplate ? '▷ Run' : group.locked ? '▷ New Run' : isExperiment ? '↗ Resume' : '▷ Run'}
+                </button>
+                {isTemplate && onEditTemplate && (
+                  <button
+                    onClick={() => onEditTemplate(group)}
+                    className="rounded border border-purple-700/60 px-2 py-1 text-[10px] font-medium text-purple-300 hover:border-purple-500 hover:text-purple-200"
+                  >
+                    ✎ Edit
+                  </button>
+                )}
+              </>
             )}
             <div className="relative">
               <button
@@ -298,7 +392,7 @@ export default function WorkflowTableRow({
 
       {expanded && (
         <tr className="border-b border-gray-800 bg-gray-950/50">
-          <td colSpan={7} className="px-4 py-3">
+          <td colSpan={6} className="px-4 py-3">
             <div className="rounded border border-gray-800 bg-gray-900/40 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>

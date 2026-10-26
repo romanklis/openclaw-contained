@@ -242,6 +242,12 @@ class TaskOutput(Base):
     model_used = Column(String)
     image_used = Column(String)
     duration_ms = Column(Integer)
+    turn_count = Column(Integer, default=0)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    approval_wait_ms = Column(Integer, default=0)
+    image_build_wait_ms = Column(Integer, default=0)
+    iteration_reason = Column(String)
 
     # Deliverable files created by the agent {filename: content}
     deliverables = Column(JSON)
@@ -252,6 +258,24 @@ class TaskOutput(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     task = relationship("Task", backref="outputs")
+
+
+class AgentTurn(Base):
+    """Durable per-LLM-turn metrics for a task iteration."""
+    __tablename__ = "agent_turns"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False, index=True)
+    iteration = Column(Integer, nullable=False, index=True)
+    turn_number = Column(Integer, nullable=False)
+    provider = Column(String)
+    model = Column(String)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    tool_names = Column(JSON, default=list)
+    turn_timestamp = Column(String)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class TaskMessage(Base):
@@ -992,6 +1016,8 @@ class ExplorationSession(Base):
     objective = Column(Text, nullable=False)
     status = Column(String, default="planning", nullable=False, index=True)
     model = Column(String, nullable=True)
+    thinking_budget = Column(String, default="standard", nullable=False, server_default="standard")
+    quality_budget = Column(String, default="standard", nullable=False, server_default="standard")
     project_id = Column(String, nullable=True, index=True)
     workspace_id = Column(String, nullable=True)
     current_cycle = Column(Integer, default=0, nullable=False)
@@ -1010,6 +1036,7 @@ class ExplorationCycle(Base):
     dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
     status = Column(String, default="proposed", nullable=False)
     feedback = Column(Text, nullable=True)
+    source_feedback = Column(Text, nullable=True)
     finalized_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
@@ -1178,5 +1205,7 @@ class ImageBuild(Base):
     image_digest = Column(String, default="")
     logs = Column(Text, default="")
     error = Column(Text, default="")
+    attempts = Column(Integer, default=0)
+    last_attempt_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     finished_at = Column(DateTime, nullable=True)

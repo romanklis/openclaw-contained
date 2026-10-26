@@ -5,6 +5,8 @@ export interface ExplorationSession {
   objective: string
   status: string
   model: string | null
+  thinking_budget: string
+  quality_budget: string
   project_id: string | null
   current_cycle: number
   created_at: string | null
@@ -105,4 +107,20 @@ export const DEPLOYMENT_STATUS_LABEL: Record<string, string> = {
   running: 'Running',
   stopped: 'Stopped',
   failed: 'Failed',
+}
+
+export const THINKING_BUDGET_OPTIONS = [
+  { value: 'lean', label: 'Lean', detail: '12 turns/node · 2 iterations · 48 turns/cycle' },
+  { value: 'standard', label: 'Standard', detail: '24 turns/node · 5 iterations · 96 turns/cycle' },
+  { value: 'deep', label: 'Deep', detail: 'Dynamic turns · 15 iterations · 240 turns/cycle' },
+] as const
+
+export const QUALITY_BUDGET_OPTIONS = [
+  { value: 'minimal', label: 'Minimal', detail: 'No gate or report artifacts; tests only' },
+  { value: 'standard', label: 'Standard', detail: 'Deterministic checks; concise output' },
+  { value: 'full', label: 'Full', detail: 'Deep review, retries, and full reports' },
+] as const
+
+export function budgetLabel(value: string | null | undefined, options: readonly { value: string; label: string }[]): string {
+  return options.find((option) => option.value === value)?.label || 'Standard'
 }

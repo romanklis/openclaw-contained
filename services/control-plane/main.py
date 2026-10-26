@@ -4,6 +4,7 @@ OpenClaw Control Plane - Main Application Entry Point
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 import os
 from sqlalchemy import text
@@ -30,6 +31,19 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+async def _image_build_reconciler() -> None:
+    """Retry capability builds whose in-memory image-builder job was lost."""
+    from image_catalog import reconcile_pending_builds
+
+    while True:
+        try:
+            async with async_session() as db:
+                await reconcile_pending_builds(db)
+        except Exception as exc:
+            logger.warning("Capability image-build reconciliation failed: %s", exc)
+        await asyncio.sleep(30)
 
 
 @asynccontextmanager
@@ -92,6 +106,21 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE image_versions ADD COLUMN IF NOT EXISTS commit_message TEXT"))
         # Deployments: trial preflight required before building/starting
         await conn.execute(text("ALTER TABLE deployments ADD COLUMN IF NOT EXISTS trial_required BOOLEAN NOT NULL DEFAULT TRUE"))
+        # Exploration: distinguish raw user feedback from planner focus
+        await conn.execute(text("ALTER TABLE exploration_cycles ADD COLUMN IF NOT EXISTS source_feedback TEXT"))
+        # Exploration execution budgets
+        await conn.execute(text("ALTER TABLE exploration_sessions ADD COLUMN IF NOT EXISTS thinking_budget VARCHAR NOT NULL DEFAULT 'standard'"))
+        await conn.execute(text("ALTER TABLE exploration_sessions ADD COLUMN IF NOT EXISTS quality_budget VARCHAR NOT NULL DEFAULT 'standard'"))
+        # Image build retry/reconciliation metadata
+        await conn.execute(text("ALTER TABLE image_builds ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE image_builds ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP"))
+        # Durable per-iteration and per-turn metrics
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS turn_count INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS approval_wait_ms INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS image_build_wait_ms INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS iteration_reason VARCHAR"))
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS dag_user_requests (
                 id SERIAL PRIMARY KEY,
@@ -113,6 +142,7 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'BUILDING_IMAGE'"))
 
     logger.info("Database initialized")
+    asyncio.create_task(_image_build_reconciler())
 
     try:
         async with async_session() as session:
@@ -205,8 +235,13 @@ async def lifespan(app: FastAPI):
         try:
             import image_catalog
             async with async_session() as session:
-                result = await image_catalog.import_from_agent_images(session)
-            logger.info("Image catalog bootstrap: %s", result)
+                bootstrap = await image_catalog.catalog_bootstrap_status(session)
+                if bootstrap.get("bootstrapped"):
+                    logger.info("Image catalog already bootstrapped; skipping agent-images import")
+                else:
+                    result = await image_catalog.import_from_agent_images(session)
+                    sync_result = await image_catalog.sync_built_agent_images(session)
+                    logger.info("Image catalog bootstrap: %s | built-image sync: %s", result, sync_result)
         except Exception as exc:
             logger.warning(f"Image catalog bootstrap skipped: {exc}")
 

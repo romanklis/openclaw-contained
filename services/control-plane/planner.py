@@ -334,6 +334,8 @@ Use them when they match the task requirements. For unique tasks, create inline 
 
 {skills_v2_section}
 
+{budget_section}
+
 {blocks_section}
 
 ## DAG JSON Schema
@@ -546,7 +548,28 @@ async def _build_blocks_section(db: AsyncSession, objective: str = "") -> str:
     return "\n".join(lines)
 
 
-async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None, skill_ids: list[str] | None = None, agent_model: str | None = None) -> dict:
+def _build_budget_section(thinking_budget: str, quality_budget: str) -> str:
+    thinking = {
+        "lean": "Lean thinking budget: use the fewest useful steps; avoid redundant discovery and repeated verification.",
+        "standard": "Standard thinking budget: work efficiently and reuse existing deliverables.",
+        "deep": "Deep thinking budget: thorough investigation is allowed when the task requires it.",
+    }.get(thinking_budget, "Standard thinking budget: work efficiently.")
+    quality = {
+        "minimal": (
+            "Minimal cross-check: do not add separate verification, report, README, or "
+            "output-regeneration nodes. Fold tests into the implementation node. "
+            "Do not request REPORT.md, VERIFICATION.md, provenance, or extra logs."
+        ),
+        "standard": (
+            "Standard cross-check: do not add a separate LLM verifier or report node. "
+            "At most one deterministic verification block is allowed. Keep README concise."
+        ),
+        "full": "Full cross-check: full verification and report artifacts are allowed.",
+    }.get(quality_budget, "Standard cross-check.")
+    return f"## Execution Budget\n{thinking}\n{quality}"
+
+
+async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None, skill_ids: list[str] | None = None, agent_model: str | None = None, thinking_budget: str = "standard", quality_budget: str = "standard") -> dict:
     """Generate a DAG plan from a user objective using the LLM router.
 
     Args:
@@ -590,6 +613,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
     system_prompt = PLANNER_SYSTEM_PROMPT.format(
         skills_section=skills_section,
         skills_v2_section=skills_v2_section,
+        budget_section=_build_budget_section(thinking_budget, quality_budget),
         blocks_section=await _build_blocks_section(db, objective=objective),
         base_images_section=await _build_base_images_section(db),
     )

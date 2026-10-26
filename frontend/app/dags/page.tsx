@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { API } from '../lib/api'
 import { useProject } from '../lib/ProjectContext'
+import ExplorationTableRow from '../components/ExplorationTableRow'
 import WorkflowTableRow from '../components/WorkflowTableRow'
 import MergeWorkflowDialog from '../components/MergeWorkflowDialog'
 import TemplateRunDialog, { type TemplateDag } from '../components/TemplateRunDialog'
@@ -12,6 +13,7 @@ import {
   type WorkflowStage,
   type WorkflowSummary,
 } from '../lib/workflows'
+import { type ExplorationSession } from '../lib/explorations'
 
 interface DAGRecord extends TemplateDag {
   locked: boolean
@@ -19,17 +21,97 @@ interface DAGRecord extends TemplateDag {
   status: string
 }
 
-const STAGE_ORDER: WorkflowStage[] = ['hardened', 'locked', 'experimenting']
-type SortMode = 'active' | 'name' | 'stage' | 'score'
+interface ExplorationRow {
+  session: ExplorationSession
+  group: WorkflowSummary | null
+}
+
+type SectionId = 'explorations' | 'workflows' | 'templates'
+type SortMode = 'active' | 'name' | 'score'
+type FocusStage = 'exploration' | WorkflowStage
+
+function groupMatches(group: WorkflowSummary, term: string, projectName?: string): boolean {
+  if (!term) return true
+  return (
+    group.title.toLowerCase().includes(term) ||
+    group.objective.toLowerCase().includes(term) ||
+    group.id.toLowerCase().includes(term) ||
+    (group.latest_run?.id || '').toLowerCase().includes(term) ||
+    (projectName || '').toLowerCase().includes(term)
+  )
+}
+
+function sortGroups(list: WorkflowSummary[], sortBy: SortMode): WorkflowSummary[] {
+  const sorted = [...list]
+  if (sortBy === 'name') {
+    sorted.sort((a, b) => a.title.localeCompare(b.title))
+  } else if (sortBy === 'score') {
+    sorted.sort((a, b) => (b.latest_score ?? -1) - (a.latest_score ?? -1))
+  } else {
+    sorted.sort(
+      (a, b) =>
+        new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime(),
+    )
+  }
+  return sorted
+}
+
+function SectionHeader({
+  number,
+  icon,
+  title,
+  total,
+  matched,
+  searchActive,
+  description,
+  collapsed,
+  onToggle,
+}: {
+  number: number
+  icon: string
+  title: string
+  total: number
+  matched: number
+  searchActive: boolean
+  description: string
+  collapsed: boolean
+  onToggle: () => void
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3 border-b border-gray-800 bg-[#15151f] px-3 py-2.5">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[10px] font-medium text-gray-600">{number}.</span>
+          <span className="text-sm">{icon}</span>
+          <h2 className="text-[11px] font-semibold uppercase tracking-wide text-gray-200">
+            {title} <span className="font-normal text-gray-500">({total})</span>
+          </h2>
+          {searchActive && matched !== total && (
+            <span className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[9px] text-amber-300">
+              {matched} matches
+            </span>
+          )}
+        </div>
+        <p className="mt-0.5 text-[10px] text-gray-500">{description}</p>
+      </div>
+      <button
+        onClick={onToggle}
+        className="shrink-0 rounded border border-gray-700 px-2 py-0.5 text-[9px] text-gray-400 hover:border-gray-600 hover:text-gray-200"
+      >
+        {collapsed ? 'Expand' : 'Collapse'}
+      </button>
+    </div>
+  )
+}
 
 export default function WorkflowStudioPage() {
   const router = useRouter()
   const { activeProject, projects } = useProject()
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([])
   const [dags, setDags] = useState<DAGRecord[]>([])
+  const [sessions, setSessions] = useState<ExplorationSession[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [stage, setStage] = useState<'all' | 'exploration' | WorkflowStage>('all')
   const [search, setSearch] = useState('')
   const [showArchived, setShowArchived] = useState(false)
   const [showMore, setShowMore] = useState(false)
@@ -40,8 +122,15 @@ export default function WorkflowStudioPage() {
   const [template, setTemplate] = useState<DAGRecord | null>(null)
   const [mergeTarget, setMergeTarget] = useState<WorkflowSummary | null>(null)
   const [focusWorkflow, setFocusWorkflow] = useState<string | null>(null)
+  const [focusStage, setFocusStage] = useState<FocusStage | null>(null)
+  const [highlightStage, setHighlightStage] = useState<WorkflowStage | null>(null)
   const [sortBy, setSortBy] = useState<SortMode>('active')
   const [expandedWorkflowId, setExpandedWorkflowId] = useState<string | null>(null)
+  const [collapsed, setCollapsed] = useState<Record<SectionId, boolean>>({
+    explorations: false,
+    workflows: false,
+    templates: false,
+  })
   const searchRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
@@ -60,29 +149,38 @@ export default function WorkflowStudioPage() {
     [projects],
   )
 
-  const fetchWorkflows = async () => {
+  const fetchStudio = async () => {
     setLoading(true)
     setError(null)
     try {
-      const qs = new URLSearchParams({
+      const workflowQs = new URLSearchParams({
         archived: String(showArchived),
         limit: '200',
       })
-      if (activeProject) qs.set('project_id', activeProject)
       const dagQs = new URLSearchParams({
         archived: String(showArchived),
         limit: '200',
       })
-      if (activeProject) dagQs.set('project_id', activeProject)
-      const [workflowRes, dagRes] = await Promise.all([
-        fetch(`${API}/api/workflows?${qs}`),
+      const sessionQs = new URLSearchParams({ limit: '300' })
+      if (activeProject) {
+        workflowQs.set('project_id', activeProject)
+        dagQs.set('project_id', activeProject)
+        sessionQs.set('project_id', activeProject)
+      }
+      const [workflowRes, dagRes, sessionRes] = await Promise.all([
+        fetch(`${API}/api/workflows?${workflowQs}`),
         fetch(`${API}/api/dags?${dagQs}`),
+        fetch(`${API}/api/explorations?${sessionQs}`),
       ])
       const workflowData = await workflowRes.json().catch(() => [])
       const dagData = await dagRes.json().catch(() => [])
-      if (!workflowRes.ok) throw new Error(`HTTP ${workflowRes.status}`)
+      const sessionData = await sessionRes.json().catch(() => [])
+      if (!workflowRes.ok) throw new Error(`Workflows: HTTP ${workflowRes.status}`)
+      if (!dagRes.ok) throw new Error(`DAGs: HTTP ${dagRes.status}`)
+      if (!sessionRes.ok) throw new Error(`Explorations: HTTP ${sessionRes.status}`)
       setWorkflows(Array.isArray(workflowData) ? workflowData : [])
       setDags(Array.isArray(dagData) ? dagData : [])
+      setSessions(Array.isArray(sessionData) ? sessionData : [])
     } catch (err: any) {
       setError(err.message)
     } finally {
@@ -91,84 +189,162 @@ export default function WorkflowStudioPage() {
   }
 
   useEffect(() => {
-    fetchWorkflows()
+    fetchStudio()
   }, [showArchived, activeProject])
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
-    const stageParam = params.get('stage')
-    if (stageParam === 'exploration' || stageParam === 'experimenting' || stageParam === 'locked' || stageParam === 'hardened') {
-      setStage(stageParam)
-    }
     const workflowParam = params.get('workflow')
     if (workflowParam) {
-      setStage('all')
       setSearch('')
       setFocusWorkflow(workflowParam)
+      return
+    }
+    const stageParam = params.get('stage')
+    if (
+      stageParam === 'exploration' ||
+      stageParam === 'experimenting' ||
+      stageParam === 'hardened' ||
+      stageParam === 'locked'
+    ) {
+      setFocusStage(stageParam)
+      if (stageParam === 'experimenting' || stageParam === 'hardened') {
+        setHighlightStage(stageParam)
+      }
     }
   }, [])
 
   useEffect(() => {
+    if (!highlightStage || loading) return
+    const timer = window.setTimeout(() => setHighlightStage(null), 4000)
+    return () => window.clearTimeout(timer)
+  }, [highlightStage, loading])
+
+  useEffect(() => {
+    if (!focusStage || loading) return
+    const section: SectionId =
+      focusStage === 'exploration'
+        ? 'explorations'
+        : focusStage === 'locked'
+          ? 'templates'
+          : 'workflows'
+    setCollapsed((current) => (current[section] ? { ...current, [section]: false } : current))
+    const timer = window.setTimeout(() => {
+      document.getElementById(`section-${section}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      setFocusStage(null)
+    }, 80)
+    return () => window.clearTimeout(timer)
+  }, [focusStage, loading])
+
+  useEffect(() => {
     if (!focusWorkflow || loading) return
-    const target = document.getElementById(`workflow-${focusWorkflow}`)
-    if (target) {
-      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    const group = workflows.find((item) => item.id === focusWorkflow)
+    if (!group) return
+    const section: SectionId =
+      group.mode === 'exploration'
+        ? 'explorations'
+        : group.stage === 'locked'
+          ? 'templates'
+          : 'workflows'
+    setCollapsed((current) => (current[section] ? { ...current, [section]: false } : current))
+    const timer = window.setTimeout(() => {
+      document.getElementById(`workflow-${focusWorkflow}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
       setFocusWorkflow(null)
-    }
+    }, 100)
+    return () => window.clearTimeout(timer)
   }, [focusWorkflow, loading, workflows])
 
-  const counts = useMemo(() => {
-    const nonExploration = workflows.filter((group) => group.mode !== 'exploration')
-    return {
-      all: workflows.length,
-      explorations: workflows.filter((group) => group.mode === 'exploration').length,
-      experimenting: nonExploration.filter((group) => group.stage === 'experimenting').length,
-      locked: nonExploration.filter((group) => group.stage === 'locked').length,
-      hardened: nonExploration.filter((group) => group.stage === 'hardened').length,
+  const explorationGroupsBySession = useMemo(() => {
+    const map = new Map<string, WorkflowSummary>()
+    for (const group of workflows) {
+      if (group.mode !== 'exploration' || !group.exploration_session_id) continue
+      const existing = map.get(group.exploration_session_id)
+      if (
+        !existing ||
+        new Date(group.updated_at || 0).getTime() > new Date(existing.updated_at || 0).getTime()
+      ) {
+        map.set(group.exploration_session_id, group)
+      }
     }
+    return map
   }, [workflows])
 
-  const determinism = counts.hardened > 0
+  const activeSessions = useMemo(
+    () => sessions.filter((session) => session.status !== 'finished'),
+    [sessions],
+  )
+
+  const workflowGroups = useMemo(
+    () => workflows.filter((group) => group.mode !== 'exploration' && !group.locked),
+    [workflows],
+  )
+
+  const templateGroups = useMemo(
+    () => workflows.filter((group) => group.mode !== 'exploration' && group.locked),
+    [workflows],
+  )
+
+  const hardenedGroups = useMemo(
+    () => workflowGroups.filter((group) => group.stage === 'hardened'),
+    [workflowGroups],
+  )
+
+  const determinism = hardenedGroups.length
     ? Math.round(
-        workflows
-          .filter((group) => group.mode !== 'exploration' && group.stage === 'hardened')
-          .reduce((sum, group) => sum + group.determinism_pct, 0) / counts.hardened,
+        hardenedGroups.reduce((sum, group) => sum + group.determinism_pct, 0) /
+          hardenedGroups.length,
       )
     : 0
 
-  const filtered = useMemo(() => {
-    const term = search.trim().toLowerCase()
-    return workflows.filter((group) => {
-      if (stage === 'exploration') {
-        if (group.mode !== 'exploration') return false
-      } else if (stage !== 'all') {
-        if (group.mode === 'exploration' || group.stage !== stage) return false
-      }
+  const term = search.trim().toLowerCase()
+  const searchActive = term.length > 0
+
+  const explorationRows = useMemo(() => {
+    const rows: ExplorationRow[] = activeSessions.map((session) => ({
+      session,
+      group: explorationGroupsBySession.get(session.id) || null,
+    }))
+    const filtered = rows.filter(({ session, group }) => {
       if (!term) return true
+      const projectName = session.project_id ? projectNameById.get(session.project_id) : undefined
       return (
-        group.title.toLowerCase().includes(term) ||
-        group.objective.toLowerCase().includes(term) ||
-        (group.latest_run?.id || '').toLowerCase().includes(term)
+        session.title.toLowerCase().includes(term) ||
+        session.objective.toLowerCase().includes(term) ||
+        session.id.toLowerCase().includes(term) ||
+        (projectName || '').toLowerCase().includes(term) ||
+        (group ? groupMatches(group, term, projectName) : false)
       )
     })
-  }, [workflows, stage, search])
-
-  const sorted = useMemo(() => {
-    const list = [...filtered]
-    if (sortBy === 'name') {
-      list.sort((a, b) => a.title.localeCompare(b.title))
-    } else if (sortBy === 'stage') {
-      list.sort((a, b) => STAGE_ORDER.indexOf(a.stage) - STAGE_ORDER.indexOf(b.stage))
-    } else if (sortBy === 'score') {
-      list.sort((a, b) => (b.latest_score ?? -1) - (a.latest_score ?? -1))
-    } else {
-      list.sort(
-        (a, b) =>
-          new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime(),
+    filtered.sort((a, b) => {
+      if (sortBy === 'name') return a.session.title.localeCompare(b.session.title)
+      if (sortBy === 'score') {
+        return (b.group?.latest_score ?? -1) - (a.group?.latest_score ?? -1)
+      }
+      return (
+        new Date(b.session.last_activity_at || b.session.updated_at || 0).getTime() -
+        new Date(a.session.last_activity_at || a.session.updated_at || 0).getTime()
       )
-    }
-    return list
-  }, [filtered, sortBy])
+    })
+    return filtered
+  }, [activeSessions, explorationGroupsBySession, term, sortBy, projectNameById])
+
+  const filteredWorkflows = useMemo(() => {
+    const filtered = workflowGroups.filter((group) =>
+      groupMatches(group, term, group.project_id ? projectNameById.get(group.project_id) : undefined),
+    )
+    return sortGroups(filtered, sortBy)
+  }, [workflowGroups, term, sortBy, projectNameById])
+
+  const filteredTemplates = useMemo(() => {
+    const filtered = templateGroups.filter((group) =>
+      groupMatches(group, term, group.project_id ? projectNameById.get(group.project_id) : undefined),
+    )
+    return sortGroups(filtered, sortBy)
+  }, [templateGroups, term, sortBy, projectNameById])
+
+  const toggleSection = (section: SectionId) => {
+    setCollapsed((current) => ({ ...current, [section]: !current[section] }))
+  }
 
   const openLatest = (group: WorkflowSummary) => {
     if (group.latest_run?.id) router.push(`/dags/${group.latest_run.id}`)
@@ -212,7 +388,7 @@ export default function WorkflowStudioPage() {
     try {
       const res = await fetch(`${API}/api/dags/${dagId}/archive`, { method: 'POST' })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      fetchWorkflows()
+      fetchStudio()
     } catch (err: any) {
       setError(err.message)
     }
@@ -226,7 +402,7 @@ export default function WorkflowStudioPage() {
         const data = await res.json().catch(() => ({}))
         throw new Error((data as any).detail || `HTTP ${res.status}`)
       }
-      fetchWorkflows()
+      fetchStudio()
     } catch (err: any) {
       setError(err.message)
     }
@@ -258,7 +434,7 @@ export default function WorkflowStudioPage() {
       }
       setImportMsg(`✅ Created ${(data as any).id}.`)
       setImportJson('')
-      fetchWorkflows()
+      fetchStudio()
     } catch (err: any) {
       setImportMsg(`❌ ${err.message}`)
     } finally {
@@ -266,21 +442,13 @@ export default function WorkflowStudioPage() {
     }
   }
 
-  const filterButtons: { id: 'all' | 'exploration' | WorkflowStage; label: string; count: number }[] = [
-    { id: 'all', label: 'All Workflows', count: counts.all },
-    { id: 'exploration', label: '🧭 Explorations', count: counts.explorations },
-    { id: 'experimenting', label: '🧪 Experiments', count: counts.experimenting },
-    { id: 'locked', label: '🔒 Templates', count: counts.locked },
-    { id: 'hardened', label: '⚡ Hardened', count: counts.hardened },
-  ]
-
   return (
     <div>
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-white">Workflows &amp; Pipelines</h1>
           <p className="mt-1 max-w-3xl text-xs text-gray-500">
-            Manage workflow reliability: iterate with AI → lock into templates → convert steps to deterministic blocks.
+            Manage workflow reliability: Explore with AI → Harden DAG Workflows → Lock into Reusable Templates.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -291,6 +459,18 @@ export default function WorkflowStudioPage() {
             placeholder="Search workflows... (⌘K)"
             className="w-64 rounded border border-gray-700 bg-gray-900 px-2.5 py-1.5 text-xs text-gray-300 placeholder:text-gray-600"
           />
+          <select
+            value={sortBy}
+            onChange={(event) => setSortBy(event.target.value as SortMode)}
+            className="rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-[10px] text-gray-300"
+          >
+            <option value="active">Sort: Last Active</option>
+            <option value="name">Sort: Name</option>
+            <option value="score">Sort: Latest Score</option>
+          </select>
+          <Link href="/explorations?new=1" className="rounded border border-cyan-700/60 px-3 py-1.5 text-sm text-cyan-300 hover:border-cyan-500 hover:text-cyan-200">
+            + New Exploration
+          </Link>
           <Link href="/?new=1" className="btn-primary text-sm">
             + New Workflow
           </Link>
@@ -302,7 +482,7 @@ export default function WorkflowStudioPage() {
               More ▾
             </button>
             {showMore && (
-              <div className="absolute right-0 z-40 mt-1 w-56 rounded border border-gray-700 bg-gray-900 shadow-xl">
+              <div className="absolute right-0 z-50 mt-1 w-56 rounded border border-gray-700 bg-gray-900 shadow-xl">
                 <Link href="/template-skills" className="block px-3 py-2 text-left text-xs text-purple-300 hover:bg-gray-800">
                   🧩 Template Skills
                 </Link>
@@ -329,44 +509,13 @@ export default function WorkflowStudioPage() {
       </div>
 
       <div className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-gray-500">
-        <span className="font-medium text-gray-300">{counts.all} Total</span>
+        <span>🧭 <span className="font-medium text-cyan-300">{activeSessions.length}</span> Active Explorations</span>
         <span className="text-gray-700">•</span>
-        <span><span className="text-cyan-300">{counts.explorations}</span> 🧭 Explorations</span>
+        <span>🧪 <span className="font-medium text-amber-300">{workflowGroups.length}</span> Workflows in Hardening</span>
         <span className="text-gray-700">•</span>
-        <span><span className="text-amber-300">{counts.experimenting}</span> 🧪 Experiments</span>
+        <span>🔒 <span className="font-medium text-purple-300">{templateGroups.length}</span> Locked Templates</span>
         <span className="text-gray-700">•</span>
-        <span><span className="text-purple-300">{counts.locked}</span> 🔒 Templates</span>
-        <span className="text-gray-700">•</span>
-        <span><span className="text-emerald-300">{counts.hardened}</span> ⚡ Hardened ({determinism}% deterministic)</span>
-      </div>
-
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        {filterButtons.map((button) => (
-          <button
-            key={button.id}
-            onClick={() => setStage(button.id)}
-            className={`rounded border px-2.5 py-1 text-[10px] ${
-              stage === button.id
-                ? 'border-blue-500 bg-gray-700 text-white'
-                : 'border-gray-700 text-gray-400 hover:border-gray-600 hover:text-gray-200'
-            }`}
-          >
-            {button.label} ({button.count})
-          </button>
-        ))}
-        <div className="ml-auto flex items-center gap-2 text-[10px] text-gray-500">
-          <span>Sort:</span>
-          <select
-            value={sortBy}
-            onChange={(event) => setSortBy(event.target.value as SortMode)}
-            className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-300"
-          >
-            <option value="active">Last Active</option>
-            <option value="name">Name</option>
-            <option value="stage">Stage</option>
-            <option value="score">Latest Score</option>
-          </select>
-        </div>
+        <span>⚡ <span className="font-medium text-emerald-300">{hardenedGroups.length}</span> Blockified ({determinism}%)</span>
       </div>
 
       {error && <div className="mb-3 rounded border border-red-500/30 bg-red-900/20 p-3 text-xs text-red-300">{error}</div>}
@@ -399,54 +548,184 @@ export default function WorkflowStudioPage() {
       )}
 
       {loading ? (
-        <div className="overflow-hidden rounded-lg border border-gray-800">
-          {Array.from({ length: 8 }).map((_, index) => (
-            <div key={index} className="h-12 animate-pulse border-b border-gray-800 bg-gray-900/40" />
+        <div className="space-y-3">
+          {Array.from({ length: 3 }).map((_, index) => (
+            <div key={index} className="overflow-hidden rounded-lg border border-gray-800">
+              <div className="h-12 animate-pulse border-b border-gray-800 bg-gray-900/40" />
+              {Array.from({ length: 4 }).map((__, row) => (
+                <div key={row} className="h-14 animate-pulse border-b border-gray-800 bg-gray-900/20" />
+              ))}
+            </div>
           ))}
         </div>
-      ) : sorted.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-gray-700 p-12 text-center text-sm text-gray-500">
-          {showArchived
-            ? 'No archived workflows.'
-            : workflows.length === 0
-              ? 'No workflows yet. Start with a new workflow.'
-              : 'No workflows match this filter.'}
-        </div>
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-gray-800">
-          <table className="w-full min-w-[980px] border-collapse">
-            <thead className="bg-[#15151f] text-left text-[9px] uppercase tracking-wide text-gray-600">
-              <tr>
-                <th className="px-3 py-2 font-medium">Workflow name &amp; objective</th>
-                <th className="px-3 py-2 font-medium">Maturity stage</th>
-                <th className="px-3 py-2 font-medium">Latest run</th>
-                <th className="px-3 py-2 font-medium">History (last 5)</th>
-                <th className="px-3 py-2 font-medium">Executions</th>
-                <th className="px-3 py-2 font-medium">Last active</th>
-                <th className="px-3 py-2 text-right font-medium">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sorted.map((group) => (
-                <WorkflowTableRow
-                  key={group.id}
-                  group={group}
-                  projectName={group.project_id ? projectNameById.get(group.project_id) : undefined}
-                  expanded={expandedWorkflowId === group.id}
-                  onToggleExpand={() => setExpandedWorkflowId((current) => current === group.id ? null : group.id)}
-                  onRun={runWorkflow}
-                  onResume={rerunFailed}
-                  onOpenLatest={openLatest}
-                  onOpenTemplate={openTemplate}
-                  onRerunProblem={rerunFailed}
-                  onConvert={convertStep}
-                  onMerge={setMergeTarget}
-                  onArchiveRun={archiveRun}
-                  onDeleteRun={deleteRun}
-                />
-              ))}
-            </tbody>
-          </table>
+        <div className="space-y-4">
+          <section id="section-explorations" className="overflow-hidden rounded-lg border border-gray-800">
+            <SectionHeader
+              number={1}
+              icon="🧭"
+              title="Active Explorations"
+              total={activeSessions.length}
+              matched={explorationRows.length}
+              searchActive={searchActive}
+              description="Conversational agent sessions testing ideas and iterating through steering cycles."
+              collapsed={collapsed.explorations}
+              onToggle={() => toggleSection('explorations')}
+            />
+            {!collapsed.explorations && (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[920px] border-collapse">
+                  <thead className="bg-[#15151f] text-left text-[9px] uppercase tracking-wide text-gray-600">
+                    <tr>
+                      <th className="px-3 py-2 font-medium">Exploration &amp; objective</th>
+                      <th className="px-3 py-2 font-medium">Current state</th>
+                      <th className="px-3 py-2 font-medium">Latest audit</th>
+                      <th className="px-3 py-2 font-medium">Last active</th>
+                      <th className="px-3 py-2 text-right font-medium">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {explorationRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="px-3 py-8 text-center text-[11px] text-gray-500">
+                          {searchActive ? 'No explorations match this search.' : 'No active explorations.'}
+                        </td>
+                      </tr>
+                    ) : (
+                      explorationRows.map(({ session, group }) => (
+                        <ExplorationTableRow
+                          key={session.id}
+                          session={session}
+                          group={group}
+                          projectName={session.project_id ? projectNameById.get(session.project_id) : undefined}
+                        />
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section id="section-workflows" className="overflow-hidden rounded-lg border border-gray-800">
+            <SectionHeader
+              number={2}
+              icon="🧪"
+              title="Workflows & DAG Hardening"
+              total={workflowGroups.length}
+              matched={filteredWorkflows.length}
+              searchActive={searchActive}
+              description="Multi-step execution pipelines undergoing iterative validation and conversion into deterministic Blocks."
+              collapsed={collapsed.workflows}
+              onToggle={() => toggleSection('workflows')}
+            />
+            {!collapsed.workflows && (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[1080px] border-collapse">
+                  <thead className="bg-[#15151f] text-left text-[9px] uppercase tracking-wide text-gray-600">
+                    <tr>
+                      <th className="px-3 py-2 font-medium">Workflow name &amp; domain</th>
+                      <th className="px-3 py-2 font-medium">Maturity &amp; blocks</th>
+                      <th className="px-3 py-2 font-medium">Latest run</th>
+                      <th className="px-3 py-2 font-medium">History (last 5)</th>
+                      <th className="px-3 py-2 font-medium">Runs count</th>
+                      <th className="px-3 py-2 text-right font-medium">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredWorkflows.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="px-3 py-8 text-center text-[11px] text-gray-500">
+                          {searchActive ? 'No workflows match this search.' : 'No workflows in hardening.'}
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredWorkflows.map((group) => (
+                        <WorkflowTableRow
+                          key={group.id}
+                          group={group}
+                          projectName={group.project_id ? projectNameById.get(group.project_id) : undefined}
+                          expanded={expandedWorkflowId === group.id}
+                          variant="workflow"
+                          highlight={highlightStage === group.stage}
+                          onToggleExpand={() => setExpandedWorkflowId((current) => current === group.id ? null : group.id)}
+                          onRun={runWorkflow}
+                          onResume={rerunFailed}
+                          onOpenLatest={openLatest}
+                          onOpenTemplate={openTemplate}
+                          onRerunProblem={rerunFailed}
+                          onConvert={convertStep}
+                          onMerge={setMergeTarget}
+                          onArchiveRun={archiveRun}
+                          onDeleteRun={deleteRun}
+                        />
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section id="section-templates" className="overflow-hidden rounded-lg border border-gray-800">
+            <SectionHeader
+              number={3}
+              icon="🔒"
+              title="Locked Templates"
+              total={templateGroups.length}
+              matched={filteredTemplates.length}
+              searchActive={searchActive}
+              description="Predefined, validated workflows frozen for reliable, production-grade execution."
+              collapsed={collapsed.templates}
+              onToggle={() => toggleSection('templates')}
+            />
+            {!collapsed.templates && (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[1040px] border-collapse">
+                  <thead className="bg-[#15151f] text-left text-[9px] uppercase tracking-wide text-gray-600">
+                    <tr>
+                      <th className="px-3 py-2 font-medium">Template name &amp; objective</th>
+                      <th className="px-3 py-2 font-medium">Determinism level</th>
+                      <th className="px-3 py-2 font-medium">Fleet stability</th>
+                      <th className="px-3 py-2 font-medium">Total executions</th>
+                      <th className="px-3 py-2 font-medium">Last run</th>
+                      <th className="px-3 py-2 text-right font-medium">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredTemplates.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="px-3 py-8 text-center text-[11px] text-gray-500">
+                          {searchActive ? 'No templates match this search.' : 'No locked templates.'}
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredTemplates.map((group) => (
+                        <WorkflowTableRow
+                          key={group.id}
+                          group={group}
+                          projectName={group.project_id ? projectNameById.get(group.project_id) : undefined}
+                          expanded={expandedWorkflowId === group.id}
+                          variant="template"
+                          onToggleExpand={() => setExpandedWorkflowId((current) => current === group.id ? null : group.id)}
+                          onRun={runWorkflow}
+                          onResume={rerunFailed}
+                          onOpenLatest={openLatest}
+                          onOpenTemplate={openTemplate}
+                          onEditTemplate={openTemplate}
+                          onRerunProblem={rerunFailed}
+                          onConvert={convertStep}
+                          onMerge={setMergeTarget}
+                          onArchiveRun={archiveRun}
+                          onDeleteRun={deleteRun}
+                        />
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
         </div>
       )}
 
@@ -465,7 +744,7 @@ export default function WorkflowStudioPage() {
           onClose={() => setMergeTarget(null)}
           onMerged={() => {
             setMergeTarget(null)
-            fetchWorkflows()
+            fetchStudio()
           }}
         />
       )}

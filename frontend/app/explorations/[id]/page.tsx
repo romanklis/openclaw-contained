@@ -10,17 +10,21 @@ import {
   MessageList,
   TypingIndicator,
 } from '@chatscope/chat-ui-kit-react'
-import { API } from '../../lib/api'
+import { API, TEMPORAL_UI } from '../../lib/api'
 import { useProject } from '../../lib/ProjectContext'
 import { RenderedMarkdown } from '../../components/DeliverablePreview'
 import DeliverablePreview from '../../components/DeliverablePreview'
 import CycleCard from '../../components/exploration/CycleCard'
-import CycleGroupCard from '../../components/exploration/CycleGroupCard'
+import CycleProposalCard from '../../components/exploration/CycleProposalCard'
+import ChatMessageBubble from '../../components/exploration/ChatMessageBubble'
 import FilesDrawer from '../../components/exploration/FilesDrawer'
 import ApprovalCard from '../../components/exploration/ApprovalCard'
 import DeployDialog from '../../components/exploration/DeployDialog'
 import CycleProgressCard from '../../components/exploration/CycleProgressCard'
 import {
+  QUALITY_BUDGET_OPTIONS,
+  THINKING_BUDGET_OPTIONS,
+  budgetLabel,
   explorationStatus,
   type DeployableApp,
   type ExplorationDetail,
@@ -50,21 +54,22 @@ export default function ExplorationChatPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [sending, setSending] = useState(false)
-  const [mode, setMode] = useState<'chat' | 'feedback'>('chat')
+  const mode = 'auto' as const
   const [streamingText, setStreamingText] = useState('')
   const [preview, setPreview] = useState<{ dagId: string; path: string } | null>(null)
   const [answering, setAnswering] = useState<number | null>(null)
   const [reviewingApproval, setReviewingApproval] = useState<number | null>(null)
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null)
+  const [commandNotice, setCommandNotice] = useState<string | null>(null)
+  const [planningQueued, setPlanningQueued] = useState(false)
   const [progress, setProgress] = useState<any>(null)
-  const [expandedCycles, setExpandedCycles] = useState<Set<number>>(new Set())
+  const [cycleViews, setCycleViews] = useState<Record<number, 'collapsed' | 'summary' | 'full'>>({})
   const [filesOpen, setFilesOpen] = useState(false)
   const [fileEntries, setFileEntries] = useState<{ path: string; size: number }[]>([])
   const [deployables, setDeployables] = useState<DeployableApp[]>([])
   const [deployCandidate, setDeployCandidate] = useState<DeployableApp | null>(null)
   const treeCache = useRef<Map<string, any[]>>(new Map())
   const dagOrderCache = useRef<Map<string, string[]>>(new Map())
-  const autoExpandedCycle = useRef<number | null>(null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
 
   const load = async (showLoading = false) => {
@@ -133,10 +138,33 @@ export default function ExplorationChatPage() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [detail?.messages.length, streamingText, sending])
 
+  useEffect(() => {
+    if (!commandNotice) return
+    const timer = window.setTimeout(() => setCommandNotice(null), 6000)
+    return () => window.clearTimeout(timer)
+  }, [commandNotice])
+
+  useEffect(() => {
+    if (!approvalNotice) return
+    const timer = window.setTimeout(() => setApprovalNotice(null), 4000)
+    return () => window.clearTimeout(timer)
+  }, [approvalNotice])
+
   const session = detail?.session
   const status = session ? explorationStatus(session.status) : null
   const latestCycle = detail?.cycles?.[detail.cycles.length - 1]
   const feedbackAvailable = session?.status === 'awaiting_feedback' || session?.status === 'error'
+  const queuedFeedback = useMemo(
+    () => (detail?.messages || []).filter(
+      (message) => message.role === 'user' && message.metadata?.feedback_queue === true,
+    ),
+    [detail?.messages],
+  )
+  const hasInitialRequest = Boolean(
+    (detail?.messages || []).some(
+      (message) => message.role === 'user' && message.metadata?.initial_request === true,
+    ),
+  )
 
   const fetchTree = async (dagId: string) => {
     const cached = treeCache.current.get(dagId)
@@ -185,6 +213,10 @@ export default function ExplorationChatPage() {
 
   const send = async (text: string) => {
     if (!text.trim() || !session || sending) return
+    if (text.trim().startsWith('/')) {
+      await handleCommand(text.trim())
+      return
+    }
     setSending(true)
     setError(null)
     setStreamingText('')
@@ -236,7 +268,6 @@ export default function ExplorationChatPage() {
       setStreamingText('')
       await load(false)
       await loadSessions()
-      setMode('chat')
     } catch (err: any) {
       setError(err.message)
       await load(false)
@@ -257,19 +288,98 @@ export default function ExplorationChatPage() {
     }
   }
 
-  const retryCycle = async (dagId: string, nodeId?: string) => {
-    if (!nodeId) {
-      window.location.href = `/dags/${dagId}`
-      return
-    }
+  const retryCycle = async (dagId: string, nodeId?: string, status?: string) => {
+    if (!session) return
+    if (!window.confirm('Retry this cycle? Its previous result will be replaced.')) return
     try {
-      const res = await fetch(`${API}/api/dags/${dagId}/retry-from/${encodeURIComponent(nodeId)}`, { method: 'POST' })
+      const url = nodeId && status === 'failed'
+        ? `${API}/api/dags/${dagId}/retry-from/${encodeURIComponent(nodeId)}`
+        : `${API}/api/explorations/${session.id}/cycles/${dagId}/retry`
+      const res = await fetch(url, { method: 'POST' })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error((data as any)?.detail || `HTTP ${res.status}`)
       await load(false)
+      await loadSessions()
     } catch (err: any) {
       setError(err.message)
     }
+  }
+
+  const finish = async () => {
+    if (!session) return
+    if (!window.confirm('Finish this exploration? No further cycles will be planned.')) return
+    try {
+      const res = await fetch(`${API}/api/explorations/${session.id}/finish`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await load(false)
+      await loadSessions()
+      setCommandNotice('Exploration finished and locked.')
+    } catch (err: any) {
+      setError(err.message)
+    }
+  }
+
+  const planQueuedFeedback = async () => {
+    if (!session) return
+    setPlanningQueued(true)
+    setError(null)
+    try {
+      const res = await fetch(`${API}/api/explorations/${session.id}/feedback/plan`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any)?.detail || `HTTP ${res.status}`)
+      await load(false)
+      await loadSessions()
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setPlanningQueued(false)
+    }
+  }
+
+  const focusComposer = () => {
+    const editor = document.querySelector<HTMLElement>('.exploration-chat .cs-message-input__content-editor')
+    editor?.focus()
+  }
+
+  const handleCommand = async (raw: string) => {
+    const command = raw.trim().split(/\s+/)[0].toLowerCase()
+    if (command === '/run' || command === '/start') {
+      if (session?.status === 'awaiting_run' && latestCycle) {
+        await runCycle(latestCycle.dag_id)
+      } else {
+        setCommandNotice('There is no proposed cycle ready to run.')
+      }
+      return
+    }
+    if (command === '/retry') {
+      if (latestCycle) await retryCycle(latestCycle.dag_id)
+      else setCommandNotice('There is no cycle to retry.')
+      return
+    }
+    if (command === '/finish' || command === '/lock') {
+      if (session?.status === 'finished') setCommandNotice('Exploration is already finished.')
+      else await finish()
+      return
+    }
+    if (command === '/files') {
+      setFilesOpen(true)
+      return
+    }
+    if (command === '/dag') {
+      if (latestCycle) window.location.href = `/dags/${latestCycle.dag_id}`
+      else setCommandNotice('There is no DAG yet.')
+      return
+    }
+    if (command === '/feedback') {
+      focusComposer()
+      setCommandNotice('Type a question or change request; the copilot will detect which one it is.')
+      return
+    }
+    if (command === '/help') {
+      setCommandNotice('Commands: /run, /retry, /finish, /files, /dag, /feedback, /help')
+      return
+    }
+    setCommandNotice(`Unknown command: ${command}. Type /help for commands.`)
   }
 
   const answerRequest = async (request: ExplorationRequest, answer: any) => {
@@ -344,6 +454,21 @@ export default function ExplorationChatPage() {
     }
   }
 
+  const changeBudget = async (field: 'thinking_budget' | 'quality_budget', value: string) => {
+    if (!session) return
+    try {
+      const res = await fetch(`${API}/api/explorations/${session.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [field]: value }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setDetail((current) => current ? { ...current, session: { ...current.session, [field]: value } } : current)
+    } catch (err: any) {
+      setError(err.message)
+    }
+  }
+
   const openPreview = async (dagId: string, path: string) => {
     let normalized = String(path || '').replace(/^\/workspace\//, '').replace(/^\/+/, '')
     try {
@@ -386,23 +511,6 @@ export default function ExplorationChatPage() {
       .sort((a, b) => (a.metadata?.cycle_number || 0) - (b.metadata?.cycle_number || 0)),
     [detail?.messages],
   )
-
-  const latestResultNumber = cycleResults.length > 0
-    ? cycleResults[cycleResults.length - 1].metadata?.cycle_number
-    : null
-
-  useEffect(() => {
-    if (latestResultNumber === null || latestResultNumber === undefined) return
-    const previousAuto = autoExpandedCycle.current
-    if (previousAuto === latestResultNumber) return
-    autoExpandedCycle.current = latestResultNumber
-    setExpandedCycles((prev) => {
-      const next = new Set(prev)
-      if (previousAuto !== null) next.delete(previousAuto)
-      next.add(latestResultNumber)
-      return next
-    })
-  }, [latestResultNumber])
 
   const versionMap = useMemo(() => {
     const versions = new Map<number, Map<string, number>>()
@@ -461,32 +569,16 @@ export default function ExplorationChatPage() {
   const conversationItems = useMemo(() => {
     type CycleItem = { type: 'cycle'; number: number; message: ExplorationMessage }
     type MessageItem = { type: 'message'; message: ExplorationMessage }
-    type GroupItem = { type: 'cycleGroup'; items: CycleItem[] }
-    const items: (CycleItem | MessageItem | GroupItem)[] = []
-    let group: CycleItem[] = []
-    const flush = () => {
-      if (group.length === 1) items.push(group[0])
-      else if (group.length > 1) items.push({ type: 'cycleGroup', items: [...group] })
-      group = []
-    }
+    const items: (CycleItem | MessageItem)[] = []
     for (const message of filteredMessages) {
       if (message.kind === 'cycle_result') {
-        const number = Number(message.metadata?.cycle_number || 0)
-        const item: CycleItem = { type: 'cycle', number, message }
-        if (expandedCycles.has(number)) {
-          flush()
-          items.push(item)
-        } else {
-          group.push(item)
-        }
+        items.push({ type: 'cycle', number: Number(message.metadata?.cycle_number || 0), message })
       } else {
-        flush()
         items.push({ type: 'message', message })
       }
     }
-    flush()
     return items
-  }, [filteredMessages, expandedCycles])
+  }, [filteredMessages])
 
   const fileSizes = useMemo(() => {
     const map = new Map<string, number>()
@@ -498,34 +590,17 @@ export default function ExplorationChatPage() {
     return map
   }, [fileEntries])
 
-  const toggleCycle = (number: number) => {
-    setExpandedCycles((prev) => {
-      const next = new Set(prev)
-      if (next.has(number)) next.delete(number)
-      else next.add(number)
-      return next
-    })
-  }
 
   const renderMessage = (message: ExplorationMessage) => {
     if (message.kind === 'cycle_proposal') {
       const meta = message.metadata || {}
       return (
-        <div key={message.id} className="my-3 border-l-2 border-purple-500/50 py-0.5 pl-3 text-xs text-gray-300">
-          <span>Planned cycle {meta.cycle_number}</span>
-          <span className="ml-1 text-gray-600">· {meta.node_count} steps</span>
-          <Link href={`/dags/${meta.dag_id}`} className="ml-2 text-cyan-400 hover:text-cyan-300">
-            Review DAG →
-          </Link>
-          {session.status === 'awaiting_run' && latestCycle?.dag_id === meta.dag_id && (
-            <button
-              onClick={() => runCycle(meta.dag_id)}
-              className="ml-2 text-emerald-400 hover:text-emerald-300"
-            >
-              ▷ Run cycle
-            </button>
-          )}
-        </div>
+        <CycleProposalCard
+          key={message.id}
+          meta={meta}
+          canRun={session.status === 'awaiting_run' && latestCycle?.dag_id === meta.dag_id}
+          onRun={runCycle}
+        />
       )
     }
 
@@ -535,7 +610,10 @@ export default function ExplorationChatPage() {
       const answered = request?.status === 'answered'
       return (
         <div key={message.id} className="my-3 border-l-2 border-amber-500/60 py-1 pl-3">
-          <div className="text-[9px] uppercase tracking-wide text-gray-600">🤖 TaskForge Agent</div>
+          <div className="flex items-center gap-1.5 text-[9px] uppercase tracking-wide text-gray-500">
+            <span className="rounded border border-cyan-700/40 bg-cyan-500/10 px-1.5 py-0.5 text-cyan-300">Agent</span>
+            <span>TaskForge Agent</span>
+          </div>
           <div className="mt-1 text-[10px] uppercase tracking-wide text-amber-300">Needs input • {meta.node_id}</div>
           <p className="mt-1 text-xs text-gray-200">{meta.prompt}</p>
           {answered ? (
@@ -555,21 +633,23 @@ export default function ExplorationChatPage() {
 
     const isUser = message.role === 'user'
     if (isUser) {
+      const consumedCycle = message.metadata?.feedback_consumed_cycle
       return (
-        <div key={message.id} className="my-3 flex justify-end">
-          <div className="max-w-[78%] rounded-lg bg-indigo-600 px-3 py-2 text-xs text-white">
-            {message.content}
-          </div>
-        </div>
+        <ChatMessageBubble key={message.id} sender="user">
+          <div>{message.content}</div>
+          {message.metadata?.feedback_queue === true && (
+            <div className="mt-1 text-[9px] text-indigo-200/80">Queued for next cycle</div>
+          )}
+          {consumedCycle && (
+            <div className="mt-1 text-[9px] text-indigo-200/80">Applied to cycle {consumedCycle}</div>
+          )}
+        </ChatMessageBubble>
       )
     }
     return (
-      <div key={message.id} className="my-3">
-        <div className="mb-1 text-[9px] uppercase tracking-wide text-gray-600">🤖 TaskForge Agent</div>
-        <div className="border-l-2 border-indigo-500/30 py-0.5 pl-3 text-xs text-gray-200">
-          <RenderedMarkdown content={message.content} />
-        </div>
-      </div>
+      <ChatMessageBubble key={message.id} sender="agent">
+        <RenderedMarkdown content={message.content} />
+      </ChatMessageBubble>
     )
   }
 
@@ -581,7 +661,7 @@ export default function ExplorationChatPage() {
   }
 
   return (
-    <div className="exploration-chat flex h-[calc(100vh-4rem)] gap-3">
+    <div className="exploration-chat flex h-full min-h-0 gap-3">
       <aside className="hidden w-60 shrink-0 flex-col border-r border-gray-800/60 pr-2 md:flex">
         <div className="mb-2 flex items-center justify-between px-1">
           <span className="text-[10px] uppercase tracking-wide text-gray-500">Sessions</span>
@@ -606,10 +686,9 @@ export default function ExplorationChatPage() {
           <Link href="/explorations" className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-400 md:hidden">← Sessions</Link>
           <div className="min-w-0 flex-1">
             <div className="truncate text-sm font-semibold text-white">{session.title}</div>
-            <div className="flex flex-wrap items-center gap-2 text-[10px] text-gray-500">
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-gray-500">
+              <span className="rounded border border-gray-700 px-1.5 py-0.5">Cycle {session.current_cycle}/{session.max_cycles}</span>
               {status && <span className={`rounded border px-1.5 py-0.5 uppercase ${status.className}`}>{status.label}</span>}
-              <span>Cycle {session.current_cycle}/{session.max_cycles}</span>
-              {session.model && <span className="font-mono">{session.model}</span>}
             </div>
           </div>
           <button
@@ -622,17 +701,103 @@ export default function ExplorationChatPage() {
           {latestCycle && (
             <Link href={`/dags/${latestCycle.dag_id}`} className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:border-gray-500">👁 DAG</Link>
           )}
+          {progress?.workflow_id && (
+            <a
+              href={`${TEMPORAL_UI}/namespaces/default/workflows/${encodeURIComponent(progress.workflow_id)}`}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded border border-blue-700/50 px-2 py-1 text-[10px] text-blue-300 hover:border-blue-500"
+              title={progress.workflow_id}
+            >
+              Temporal ↗
+            </a>
+          )}
           {(session.status === 'running' || session.status === 'awaiting_input') && latestCycle && (
             <button onClick={cancelCycle} className="rounded border border-red-700/50 px-2 py-1 text-[10px] text-red-300 hover:border-red-500">Cancel cycle</button>
+          )}
+          {session.status === 'finished' ? (
+            <span className="rounded border border-emerald-700/40 px-2 py-1 text-[10px] text-emerald-300">🔒 Locked</span>
+          ) : (
+            <button
+              onClick={finish}
+              disabled={['running', 'awaiting_input', 'awaiting_approval'].includes(session.status)}
+              className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:border-emerald-500 hover:text-emerald-300 disabled:opacity-40"
+              title="Finish and lock this exploration"
+            >
+              Finish 🔒
+            </button>
           )}
         </div>
 
         {error && <div className="mb-2 rounded border border-red-700/40 bg-red-950/30 p-2 text-xs text-red-300">{error}</div>}
+        {commandNotice && (
+          <div className="mb-2 rounded border border-cyan-700/30 bg-cyan-950/20 p-2 text-xs text-cyan-200">{commandNotice}</div>
+        )}
 
-        <div className="relative min-h-0 flex-1">
-          <MainContainer className="h-full">
-            <ChatContainer>
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          {queuedFeedback.length > 0 && (
+            <div className="mb-1 flex flex-wrap items-center gap-2 rounded border border-amber-700/30 bg-amber-950/20 px-2 py-1 text-[10px] text-amber-200">
+              <span>
+                {queuedFeedback.length} feedback note{queuedFeedback.length === 1 ? '' : 's'} queued for after Cycle {session.current_cycle}.
+              </span>
+              {feedbackAvailable && (
+                <button
+                  onClick={planQueuedFeedback}
+                  disabled={planningQueued}
+                  className="ml-auto rounded border border-amber-600/50 px-2 py-0.5 text-[10px] text-amber-200 hover:border-amber-400 disabled:opacity-50"
+                >
+                  {planningQueued ? 'Planning…' : '▷ Plan next cycle with queued feedback'}
+                </button>
+              )}
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-2 border-b border-gray-800/60 px-2 py-1">
+            <span className="text-[9px] uppercase tracking-wide text-gray-600">Config:</span>
+            <select
+              value={session.model || ''}
+              onChange={(event) => changeModel(event.target.value)}
+              className="rounded border border-gray-800 bg-gray-900 px-1.5 py-0.5 text-[10px] text-gray-400"
+            >
+              <option value="">Default model</option>
+              {session.model && !models.some((item) => item.id === session.model) && (
+                <option value={session.model}>{session.model}</option>
+              )}
+              {models.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
+            </select>
+            <select
+              value={session.thinking_budget || 'standard'}
+              onChange={(event) => changeBudget('thinking_budget', event.target.value)}
+              className="rounded border border-gray-800 bg-gray-900 px-1.5 py-0.5 text-[10px] text-gray-400"
+              title="Thought/turn budget for the next cycle"
+            >
+              {THINKING_BUDGET_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>🧠 {option.label} Mode</option>
+              ))}
+            </select>
+            <select
+              value={session.quality_budget || 'standard'}
+              onChange={(event) => changeBudget('quality_budget', event.target.value)}
+              className="rounded border border-gray-800 bg-gray-900 px-1.5 py-0.5 text-[10px] text-gray-400"
+              title="Quality cross-check budget for the next cycle"
+            >
+              {QUALITY_BUDGET_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  🛡 {option.value === 'standard' ? 'Standard Tests' : option.value === 'full' ? 'Full Audit' : 'Minimal Checks'}
+                </option>
+              ))}
+            </select>
+            <span className="ml-auto text-[9px] text-gray-600">
+              Questions are answered; change requests plan or queue the next cycle.
+            </span>
+          </div>
+          <MainContainer className="min-h-0 flex-1">
+            <ChatContainer className="exploration-chat-stream">
               <MessageList>
+                {!hasInitialRequest && session.objective && (
+                  <ChatMessageBubble sender="user">
+                    <div className="whitespace-pre-wrap">{session.objective}</div>
+                  </ChatMessageBubble>
+                )}
                 {conversationItems.map((item) => {
                   if (item.type === 'message') return renderMessage(item.message)
                   if (item.type === 'cycle') {
@@ -641,27 +806,28 @@ export default function ExplorationChatPage() {
                       <CycleCard
                         key={item.message.id}
                         meta={meta}
-                        expanded={expandedCycles.has(item.number)}
-                        onToggle={() => toggleCycle(item.number)}
+                        view={cycleViews[item.number] || 'collapsed'}
+                        onViewChange={(next) => setCycleViews((current) => ({ ...current, [item.number]: next }))}
                         versionMap={versionMap.get(item.number)}
                         fileSizes={fileSizes}
                         onPreview={openPreview}
                         onRetry={retryCycle}
+                        onFinish={finish}
+                        sessionStatus={session.status}
                         deployable={deployables.find((candidate) => candidate.cycle_number === item.number) || null}
                         onDeploy={(candidate) => setDeployCandidate(candidate)}
                       />
                     )
                   }
-                  return (
-                    <CycleGroupCard
-                      key={`group-${item.items[0].message.id}`}
-                      cycles={item.items.map((cycle) => ({ message: cycle.message, meta: cycle.message.metadata || {} }))}
-                      onExpand={toggleCycle}
-                    />
-                  )
+                  return null
                 })}
                 {progress && ['running', 'awaiting_input', 'awaiting_approval'].includes(session.status) && (
-                  <CycleProgressCard sessionStatus={session.status} progress={progress} />
+                  <CycleProgressCard
+                    sessionStatus={session.status}
+                    progress={progress}
+                    thinkingBudget={session.thinking_budget}
+                    qualityBudget={session.quality_budget}
+                  />
                 )}
                 {(detail.approvals || [])
                   .filter((approval: any) => approval.status === 'pending')
@@ -674,51 +840,32 @@ export default function ExplorationChatPage() {
                     />
                   ))}
                 {approvalNotice && (
-                  <div className="my-2 text-center text-[10px] text-emerald-300">{approvalNotice}</div>
+                  <div className="my-2 flex items-center justify-center gap-2 text-[10px] text-emerald-300">
+                    <span>{approvalNotice}</span>
+                    <button onClick={() => setApprovalNotice(null)} className="text-emerald-500/70 hover:text-emerald-300">✕</button>
+                  </div>
+                )}
+                {feedbackAvailable && latestCycle && (
+                  <div className="my-3 flex flex-wrap items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/40 px-3 py-2 text-[10px] text-gray-400">
+                    <span className="uppercase tracking-wide text-gray-600">Suggested next steps:</span>
+                    <button onClick={finish} className="rounded border border-emerald-700/50 px-2 py-0.5 text-emerald-300 hover:border-emerald-500">
+                      ▷ Looks good, finalize 🔒
+                    </button>
+                    <button onClick={focusComposer} className="rounded border border-gray-700 px-2 py-0.5 text-gray-300 hover:border-gray-500">
+                      ↔ Give feedback
+                    </button>
+                  </div>
                 )}
                 {streamingText && (
-                  <div className="my-3">
-                    <div className="mb-1 text-[9px] uppercase tracking-wide text-gray-600">🤖 TaskForge Agent</div>
-                    <div className="border-l-2 border-indigo-500/30 py-0.5 pl-3 text-xs text-gray-200">
-                      <RenderedMarkdown content={streamingText} />
-                    </div>
-                  </div>
+                  <ChatMessageBubble sender="agent" streaming>
+                    <RenderedMarkdown content={streamingText} />
+                  </ChatMessageBubble>
                 )}
                 {sending && !streamingText && <TypingIndicator content="Thinking…" />}
                 <div ref={bottomRef} />
               </MessageList>
-              <div className="flex flex-wrap items-center gap-2 border-t border-gray-800/60 px-2 py-1">
-                <select
-                  value={session.model || ''}
-                  onChange={(event) => changeModel(event.target.value)}
-                  className="rounded border border-gray-800 bg-gray-900 px-1.5 py-0.5 text-[10px] text-gray-400"
-                >
-                  <option value="">Default model</option>
-                  {session.model && !models.some((item) => item.id === session.model) && (
-                    <option value={session.model}>{session.model}</option>
-                  )}
-                  {models.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
-                </select>
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => setMode('chat')}
-                    className={`rounded px-2 py-0.5 text-[10px] ${mode === 'chat' ? 'text-gray-200' : 'text-gray-600 hover:text-gray-400'}`}
-                  >
-                    💬 Chat
-                  </button>
-                  <button
-                    onClick={() => feedbackAvailable && setMode('feedback')}
-                    disabled={!feedbackAvailable}
-                    className={`rounded px-2 py-0.5 text-[10px] disabled:opacity-40 ${mode === 'feedback' ? 'text-amber-300' : 'text-gray-600 hover:text-gray-400'}`}
-                    title={feedbackAvailable ? 'Finalize this cycle and plan the next one' : 'Available after a cycle finishes'}
-                  >
-                    ↩ Feedback
-                  </button>
-                </div>
-                {mode === 'feedback' && <span className="text-[9px] text-amber-300/80">Finalizes the current cycle</span>}
-              </div>
               <MessageInput
-                placeholder={mode === 'feedback' ? 'Describe the feedback and what the next cycle should do…' : 'Ask about results or give steering feedback…'}
+                placeholder="Ask about results or describe changes for the next cycle…"
                 onSend={(_html, text) => send(text)}
                 attachButton={false}
                 sendButton

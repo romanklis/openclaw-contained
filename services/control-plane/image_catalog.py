@@ -574,6 +574,152 @@ async def create_version_from_bundle(
     return image_version, lint
 
 
+async def retry_catalog_build(
+    db: AsyncSession,
+    build: ImageBuild,
+    *,
+    requested_by: str = "system",
+) -> ImageBuild:
+    """Reissue a catalog build for an existing ImageBuild record."""
+    version = await db.get(ImageVersion, build.version_id) if build.version_id else None
+    definition = await db.get(ImageDefinition, build.definition_id) if build.definition_id else None
+    if not version or not definition:
+        await update_build_record(db, build, status="failed", error="Build has no version/definition")
+        await db.commit()
+        return build
+    if not version.source_available:
+        await update_build_record(db, build, status="failed", error="Source bundle is not available")
+        version.status = "failed"
+        await db.commit()
+        return build
+
+    registry_tag = f"{settings.REGISTRY_URL}/{definition.id}:{version.version}"
+    build.attempts = int(build.attempts or 0) + 1
+    build.last_attempt_at = datetime.utcnow()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{settings.IMAGE_BUILDER_URL}/build-catalog",
+                json={
+                    "version_id": version.id,
+                    "definition_id": definition.id,
+                    "version": version.version,
+                    "registry_tag": registry_tag,
+                },
+            )
+            resp.raise_for_status()
+            result = resp.json()
+    except Exception as exc:
+        logger.warning("Catalog build retry failed for %s: %s", build.id, exc)
+        if build.attempts >= 3:
+            await update_build_record(
+                db, build, status="failed",
+                error=f"Build retry failed after {build.attempts} attempts: {str(exc)[:500]}",
+            )
+            version.status = "failed"
+        else:
+            build.error = f"Retry attempt {build.attempts} failed: {str(exc)[:500]}"
+        await db.commit()
+        return build
+
+    build.build_id = result.get("build_id", "")
+    build.status = "pending"
+    build.error = ""
+    build.image_tag = registry_tag
+    build.finished_at = None
+    version.status = "building"
+    version.image_tag = registry_tag
+    db.add(ImageEvent(
+        definition_id=build.definition_id,
+        version_id=build.version_id,
+        event_type="build_retry",
+        message=f"Capability build retry attempt {build.attempts}",
+        data={"build_id": build.build_id, "requested_by": requested_by},
+    ))
+    await db.commit()
+    return build
+
+
+async def reconcile_pending_builds(db: AsyncSession, limit: int = 50) -> int:
+    """Retry capability builds whose image-builder job was lost or stalled."""
+    result = await db.execute(
+        select(ImageBuild)
+        .where(
+            ImageBuild.status.in_(("pending", "building")),
+            ImageBuild.trigger_type == "capability_request",
+        )
+        .order_by(ImageBuild.created_at.asc())
+        .limit(limit)
+    )
+    builds = list(result.scalars().all())
+    now = datetime.utcnow()
+    touched = 0
+    for build in builds:
+        age = (now - build.created_at).total_seconds() if build.created_at else 0
+        last_attempt = (now - build.last_attempt_at).total_seconds() if build.last_attempt_at else None
+        if last_attempt is not None and last_attempt < 45:
+            continue
+
+        builder_status = None
+        if build.build_id:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(f"{settings.IMAGE_BUILDER_URL}/builds/{build.build_id}")
+                    if resp.status_code == 200:
+                        builder_status = resp.json()
+                    elif resp.status_code == 404:
+                        builder_status = {"status": "missing"}
+            except Exception as exc:
+                logger.debug("Build status check failed for %s: %s", build.id, exc)
+
+        status = (builder_status or {}).get("status")
+        if status == "success":
+            await update_build_record(
+                db, build, status="succeeded",
+                image_tag=(builder_status or {}).get("image_tag") or build.image_tag,
+                image_digest=(builder_status or {}).get("digest") or build.image_digest,
+                logs=(builder_status or {}).get("logs") or build.logs,
+            )
+            version = await db.get(ImageVersion, build.version_id) if build.version_id else None
+            if version:
+                version.status = "ready"
+                version.image_tag = build.image_tag or version.image_tag
+                version.image_digest = build.image_digest or version.image_digest
+            touched += 1
+        elif status == "failed":
+            await update_build_record(
+                db, build, status="failed",
+                error=(builder_status or {}).get("error") or "Image build failed",
+                logs=(builder_status or {}).get("logs") or build.logs,
+            )
+            version = await db.get(ImageVersion, build.version_id) if build.version_id else None
+            if version:
+                version.status = "failed"
+            touched += 1
+        elif status in ("pending", "building"):
+            await update_build_record(
+                db, build, status=status,
+                logs=(builder_status or {}).get("logs") or build.logs,
+            )
+            touched += 1
+        else:
+            # Missing build, no build id, or stale in-memory status.
+            if build.attempts < 3 and (status == "missing" or not build.build_id or age > 120):
+                await retry_catalog_build(db, build, requested_by="reconciler")
+                touched += 1
+            elif build.attempts >= 3 or age > 1200:
+                await update_build_record(
+                    db, build, status="failed",
+                    error="Build lost by image-builder and retry budget exhausted",
+                )
+                version = await db.get(ImageVersion, build.version_id) if build.version_id else None
+                if version:
+                    version.status = "failed"
+                touched += 1
+        await db.commit()
+    return touched
+
+
 async def ingest_build_result(
     db: AsyncSession,
     version_id: str,
@@ -1107,7 +1253,7 @@ async def import_from_agent_images(db: AsyncSession) -> dict:
                 files,
                 version=version,
                 message="Import existing agent image source bundle",
-                status="ready",
+                status="draft",
                 created_by="import",
             )
             # Derived images inherit their adapter/runner/entrypoint from the
@@ -1197,10 +1343,172 @@ async def import_from_agent_images(db: AsyncSession) -> dict:
     return {"definitions": created_defs, "versions": created_versions, "skipped": skipped}
 
 
+async def catalog_bootstrap_status(db: AsyncSession) -> dict:
+    result = await db.execute(
+        select(ImageEvent)
+        .where(ImageEvent.event_type == "catalog_bootstrap_completed")
+        .order_by(ImageEvent.created_at.desc())
+        .limit(1)
+    )
+    marker = result.scalars().first()
+    return {
+        "bootstrapped": marker is not None,
+        "bootstrapped_at": marker.created_at.isoformat() if marker and marker.created_at else None,
+        "details": marker.data if marker else None,
+    }
+
+
+async def sync_built_agent_images(db: AsyncSession, force: bool = False) -> dict:
+    """Seed ready ImageVersions/aliases for already-built bootstrap tags.
+
+    This is the one-time handoff from agent-images/ to the platform catalog. Once
+    the marker exists, subsequent calls are no-ops unless force=True.
+    """
+    marker = await catalog_bootstrap_status(db)
+    if marker["bootstrapped"] and not force:
+        return {"bootstrapped": True, "skipped": True, "created": 0, "missing": [], **marker}
+
+    yaml_path = AGENT_IMAGES_DIR / "agent_profiles.yaml"
+    profiles = {}
+    if yaml_path.is_file():
+        try:
+            profiles = (yaml.safe_load(yaml_path.read_text()) or {}).get("base_images", {}) or {}
+        except Exception as exc:
+            logger.warning("Could not parse agent_profiles.yaml for bootstrap: %s", exc)
+    if not isinstance(profiles, dict) or not profiles:
+        return {"bootstrapped": False, "created": 0, "missing": [], "error": "agent_profiles.yaml has no base_images"}
+
+    registry = (settings.REGISTRY_URL or "registry:5000").replace("http://", "").replace("https://", "").rstrip("/")
+    registry_base = f"http://{registry}"
+    created = 0
+    missing: list[str] = []
+    expected = 0
+
+    for profile_key, info in profiles.items():
+        if not isinstance(info, dict):
+            continue
+        tag = str(info.get("tag") or "").strip()
+        if not tag:
+            continue
+        expected += 1
+        definition_id = "openclaw" if profile_key == "base" else _safe_id(profile_key)
+        definition = await db.get(ImageDefinition, definition_id)
+        if not definition:
+            definition = await create_definition(
+                db,
+                definition_id,
+                name=str(info.get("name") or profile_key.capitalize()),
+                description=str(info.get("description") or ""),
+                runtime_family=str(info.get("runtime_family") or profile_key).lower(),
+                enabled=bool(info.get("enabled", True)),
+                tags=list(info.get("capabilities", []) or []),
+                created_by="bootstrap",
+            )
+
+        repo, _, image_version_tag = tag.partition(":")
+        if not image_version_tag:
+            image_version_tag = "1.0.0"
+        registry_tag = tag if tag.startswith(f"{registry}/") else f"{registry}/{tag}"
+        digest = ""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{registry_base}/v2/{repo}/manifests/{image_version_tag}",
+                    headers={"Accept": "application/vnd.docker.distribution.manifest.v2+json"},
+                )
+                if resp.status_code != 200:
+                    missing.append(registry_tag)
+                    continue
+                digest = resp.headers.get("Docker-Content-Digest", "")
+        except Exception:
+            missing.append(registry_tag)
+            continue
+
+        existing_result = await db.execute(
+            select(ImageVersion).where(ImageVersion.image_tag == registry_tag).limit(1)
+        )
+        image_version = existing_result.scalars().first()
+        if not image_version:
+            image_version = ImageVersion(
+                id=f"imgv-{uuid.uuid4().hex[:8]}",
+                definition_id=definition.id,
+                version=image_version_tag,
+                image_tag=registry_tag,
+                image_digest=digest,
+                runtime_family=definition.runtime_family,
+                adapter_type=definition.adapter_type,
+                entrypoint=definition.entrypoint,
+                capability_fingerprint="",
+                capabilities=list(info.get("capabilities", []) or []),
+                status="ready",
+                source_available=False,
+                commit_message=f"Bootstrap registry image {tag}",
+                created_by="bootstrap",
+            )
+            db.add(image_version)
+            await db.flush()
+            for capability in image_version.capabilities or []:
+                if isinstance(capability, str):
+                    db.add(ImageCapability(
+                        version_id=image_version.id,
+                        manager="capability",
+                        name=capability,
+                        version="",
+                    ))
+            db.add(ImageEvent(
+                definition_id=definition.id,
+                version_id=image_version.id,
+                event_type="version_created",
+                message=f"Bootstrap registry image {registry_tag}",
+                data={"image_tag": registry_tag, "image_digest": digest},
+            ))
+        elif image_version.status != "ready":
+            image_version.status = "ready"
+            image_version.image_tag = registry_tag
+            image_version.image_digest = image_version.image_digest or digest
+        else:
+            image_version.image_digest = image_version.image_digest or digest
+
+        await _upsert_alias(db, definition.id, "latest", image_version.id)
+        await _upsert_alias(db, definition.id, "stable", image_version.id)
+        binding = await db.execute(
+            select(AgentImageBinding).where(AgentImageBinding.agent_image_id == definition.id)
+        )
+        if binding.scalars().first() is None:
+            agent_image = await db.get(AgentImage, definition.id)
+            if agent_image:
+                db.add(AgentImageBinding(agent_image_id=definition.id, image_version_id=image_version.id))
+        created += 1
+
+    await db.commit()
+    if expected > 0 and not missing:
+        db.add(ImageEvent(
+            definition_id=None,
+            version_id=None,
+            event_type="catalog_bootstrap_completed",
+            message="Initial agent-image catalog bootstrap completed",
+            data={"seeded_versions": created, "profiles": expected},
+        ))
+        await db.commit()
+        return {"bootstrapped": True, "skipped": False, "created": created, "missing": [], "profiles": expected}
+    return {"bootstrapped": False, "skipped": False, "created": created, "missing": missing, "profiles": expected}
+
+
 async def reconcile_registry(db: AsyncSession) -> dict:
     """Scan the registry for images not yet registered in the catalog."""
     registry = (settings.REGISTRY_URL or "registry:5000").replace("http://", "").replace("https://", "").rstrip("/")
     base = f"http://{registry}"
+    known_bootstrap_tags = set()
+    try:
+        profiles_path = AGENT_IMAGES_DIR / "agent_profiles.yaml"
+        if profiles_path.is_file():
+            profiles = (yaml.safe_load(profiles_path.read_text()) or {}).get("base_images", {}) or {}
+            for info in profiles.values():
+                tag = str((info or {}).get("tag") or "").strip()
+                if tag:
+                    known_bootstrap_tags.add(tag if tag.startswith(f"{registry}/") else f"{registry}/{tag}")
+    except Exception:
+        pass
     created = 0
     scanned = 0
     errors: List[str] = []
@@ -1216,6 +1524,8 @@ async def reconcile_registry(db: AsyncSession) -> dict:
                 for tag in tags_resp.json().get("tags", []) or []:
                     scanned += 1
                     image_tag = f"{registry}/{repo}:{tag}"
+                    if image_tag in known_bootstrap_tags:
+                        continue
                     existing = await db.execute(
                         select(ImageVersion).where(ImageVersion.image_tag == image_tag).limit(1)
                     )
