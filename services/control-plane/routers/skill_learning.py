@@ -10,7 +10,7 @@ from models import (
     SkillV2, SkillV2Status, SkillV2Source,
     SkillDemo, SkillReview, SkillSelectionEvent,
     AgentImage, TaskOutput, Task, DAGNode, Skill, DeepReview,
-    TemplateSkill, TemplateSkillStatus,
+    LlmUsage, TemplateSkill, TemplateSkillStatus,
 )
 from typing import Optional, List, Any
 from datetime import datetime
@@ -1147,6 +1147,40 @@ class GateTriageRequest(BaseModel):
     config: Optional[dict] = None  # node config; may carry gate_triage overrides
 
 
+async def _record_llm_usage(
+    db: AsyncSession,
+    usage: dict,
+    *,
+    dag_id: Optional[str],
+    task_id: Optional[str],
+    node_id: Optional[str],
+    purpose: str,
+    model: Optional[str],
+    attempt: int = 1,
+) -> None:
+    if not usage:
+        return
+    input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+    db.add(LlmUsage(
+        dag_id=dag_id,
+        task_id=task_id,
+        node_id=node_id,
+        purpose=purpose,
+        provider=(model or "").split("-")[0] or None,
+        model=model,
+        attempt=attempt,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        cached_input_tokens=int(prompt_details.get("cached_tokens") or usage.get("prompt_cache_hit_tokens") or 0),
+        reasoning_tokens=int(completion_details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0),
+    ))
+
+
 class GateTriageResponse(BaseModel):
     decision: str  # "pass" | "escalate"
     p_escalate: Optional[float] = None
@@ -1413,6 +1447,16 @@ async def gate_triage(data: GateTriageRequest, db: AsyncSession = Depends(get_db
         )
 
     latency_ms = int((time.monotonic() - started) * 1000)
+    await _record_llm_usage(
+        db,
+        res.get("usage") or {},
+        dag_id=task.dag_id,
+        task_id=data.task_id,
+        node_id=data.node_id or task.node_id,
+        purpose="gate_triage",
+        model=res.get("model") or cfg["model"],
+    )
+    await db.commit()
     p_escalate = res["p_escalate"]
     features = {
         "red_flags": state.get("red_flags", []),
@@ -1799,7 +1843,8 @@ async def _call_skill_analysis_llm(summary: dict, skill_used: Optional[dict], ta
             if resp.status_code != 200:
                 logger.warning("Skill analysis LLM returned %s for %s: %s", resp.status_code, model, resp.text[:500])
                 break
-            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            response_data = resp.json()
+            content = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
             parsed = _extract_json_object(content)
             if parsed is not None:
                 normalized = _normalize_review_payload(parsed)
@@ -2121,6 +2166,7 @@ async def _call_deep_review_llm(summary: dict, skill_used: Optional[dict], task:
                         normalized["verdict"] = verdict
                 if verdict:
                     normalized["model"] = model
+                    normalized["_llm_usage"] = response_data.get("usage") or {}
                     return normalized
             logger.warning("Deep review: could not parse output for %s (strict=%s); retrying", model, strict)
     return {"verdict": "needs_attention", "score": 0, "summary": "Could not parse LLM output", "issues": [], "positives": [], "model": model}
@@ -2172,6 +2218,16 @@ async def deep_review_task(data: DeepReviewRequest, db: AsyncSession = Depends(g
     summary = _build_execution_summary(task, outputs[-1:], node=node, image_id=image_id)
 
     review = await _call_deep_review_llm(summary, skill_used, task, include_skill=data.include_skill)
+    await _record_llm_usage(
+        db,
+        review.get("_llm_usage") or {},
+        dag_id=data.dag_id or task.dag_id,
+        task_id=data.task_id,
+        node_id=data.node_id or task.node_id,
+        purpose="deep_review",
+        model=review.get("model") or _deep_review_model(),
+    )
+    review.pop("_llm_usage", None)
 
     merged_issues = [DeepReviewIssue(**i) for i in (review.get("issues") or []) if isinstance(i, dict)]
 

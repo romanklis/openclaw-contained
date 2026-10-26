@@ -367,6 +367,25 @@ async def list_workflows(
         }
         for summary in summaries:
             summary.exploration_session_id = session_by_group.get(summary.id)
+    if summaries:
+        from token_usage import get_token_totals_for_dags
+        all_runs: dict[str, list[MasterDAG]] = {}
+        for group in groups:
+            all_runs[group.id] = runs_by_group.get(group.id, [])
+        token_totals = await get_token_totals_for_dags(
+            [dag.id for runs in all_runs.values() for dag in runs], db
+        )
+        for summary in summaries:
+            group_runs = all_runs.get(summary.id, [])
+            if summary.latest_run:
+                summary.latest_token_usage = token_totals.get(summary.latest_run.id)
+            total = {"input": 0, "output": 0, "total": 0, "cached_input": 0, "reasoning": 0, "calls": 0, "turns": 0, "cost_usd": None}
+            for run in group_runs:
+                usage = token_totals.get(run.id)
+                if usage:
+                    for key in ("input", "output", "total", "cached_input", "reasoning", "calls", "turns"):
+                        total[key] += usage.get(key, 0)
+            summary.total_token_usage = total
     summaries.sort(key=lambda item: item.updated_at or datetime.min, reverse=True)
     return summaries[:limit]
 
@@ -491,6 +510,18 @@ async def merge_workflow(
     summary = _build_summary(target, runs, nodes_by_dag, reviews_by_dag, archived_view=False)
     if summary is None:
         summary = _build_summary(target, runs, nodes_by_dag, reviews_by_dag, archived_view=True)
+    if summary:
+        from token_usage import get_token_totals_for_dags
+        token_totals = await get_token_totals_for_dags([run.id for run in runs], db)
+        if summary.latest_run:
+            summary.latest_token_usage = token_totals.get(summary.latest_run.id)
+        total = {"input": 0, "output": 0, "total": 0, "cached_input": 0, "reasoning": 0, "calls": 0, "turns": 0, "cost_usd": None}
+        for run in runs:
+            usage = token_totals.get(run.id)
+            if usage:
+                for key in ("input", "output", "total", "cached_input", "reasoning", "calls", "turns"):
+                    total[key] += usage.get(key, 0)
+        summary.total_token_usage = total
     if summary is None:
         raise HTTPException(status_code=404, detail="Workflow has no runs")
     return summary
@@ -498,7 +529,7 @@ async def merge_workflow(
 
 @router.get("/{group_id}/run-tokens")
 async def get_run_tokens(group_id: str, db: AsyncSession = Depends(get_db)):
-    """Lazily aggregate token usage per run, cached for 10 minutes."""
+    """Exact durable token totals for every DAG run in a workflow group."""
     group_result = await db.execute(
         select(WorkflowGroup).where(WorkflowGroup.id == group_id)
     )
@@ -512,46 +543,19 @@ async def get_run_tokens(group_id: str, db: AsyncSession = Depends(get_db)):
     if not run_ids:
         return {}
 
-    nodes_result = await db.execute(
-        select(DAGNode.dag_id, DAGNode.task_id).where(DAGNode.dag_id.in_(run_ids))
-    )
-    task_by_dag: dict[str, str] = {}
-    for dag_id, task_id in nodes_result.all():
-        if task_id and dag_id not in task_by_dag:
-            task_by_dag[dag_id] = task_id
+    from token_usage import get_dag_token_usage
 
-    semaphore = asyncio.Semaphore(3)
-
-    async def one_run(dag_id: str) -> tuple[str, Optional[dict[str, int]]]:
-        cached = _TOKEN_CACHE.get(dag_id)
-        if cached and (time.time() - cached[0]) < _TOKEN_TTL_SECONDS:
-            return dag_id, cached[1]
-        task_id = task_by_dag.get(dag_id)
-        if not task_id:
-            return dag_id, None
-        async with semaphore:
-            try:
-                from routers.tasks_extended import get_audit_turns
-
-                async with async_session() as session:
-                    data = await asyncio.wait_for(
-                        get_audit_turns(task_id, session),
-                        timeout=20,
-                    )
-                totals = {
-                    "total": int(data.get("total_input_tokens", 0))
-                    + int(data.get("total_output_tokens", 0)),
-                    "input": int(data.get("total_input_tokens", 0)),
-                    "output": int(data.get("total_output_tokens", 0)),
-                }
-                _TOKEN_CACHE[dag_id] = (time.time(), totals)
-                return dag_id, totals
-            except Exception as exc:
-                logger.info("Token aggregation failed for %s: %s", dag_id, exc)
-                return dag_id, None
-
-    results = await asyncio.gather(*(one_run(run_id) for run_id in run_ids))
-    return {run_id: totals for run_id, totals in results}
+    results = {}
+    for run_id in run_ids:
+        usage = await get_dag_token_usage(run_id, db)
+        results[run_id] = {
+            "total": usage["total"]["total"],
+            "input": usage["total"]["input"],
+            "output": usage["total"]["output"],
+            "calls": usage["total"]["calls"],
+            "coverage": usage["coverage"],
+        }
+    return results
 
 
 @router.get("/{group_id}", response_model=WorkflowDetail)

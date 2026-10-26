@@ -87,6 +87,7 @@ export default function LaunchpadPage() {
   const [error, setError] = useState<string | null>(null)
   const [templateId, setTemplateId] = useState('')
   const [activeTemplate, setActiveTemplate] = useState<DAGRecord | null>(null)
+  const [modeGuideDismissed, setModeGuideDismissed] = useState(false)
 
   const fetchGroups = async () => {
     setLoadingGroups(true)
@@ -120,6 +121,28 @@ export default function LaunchpadPage() {
       setTimeout(() => promptRef.current?.focus(), 50)
     }
   }, [activeProject])
+
+  useEffect(() => {
+    try {
+      setModeGuideDismissed(window.localStorage.getItem('mode-guide-dismissed') === '1')
+    } catch {
+      setModeGuideDismissed(false)
+    }
+  }, [])
+
+  const dismissModeGuide = () => {
+    setModeGuideDismissed(true)
+    try {
+      window.localStorage.setItem('mode-guide-dismissed', '1')
+    } catch {}
+  }
+
+  const reopenModeGuide = () => {
+    setModeGuideDismissed(false)
+    try {
+      window.localStorage.removeItem('mode-guide-dismissed')
+    } catch {}
+  }
 
   const templates = useMemo(
     () => dags.filter((dag) => dag.locked && !dag.archived),
@@ -250,6 +273,56 @@ export default function LaunchpadPage() {
         </Link>
       </div>
 
+      {!modeGuideDismissed ? (
+        <section className="mb-4 rounded-xl border border-indigo-800/40 bg-indigo-950/10 p-4">
+          <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-indigo-200">How modes work</h2>
+              <p className="mt-0.5 text-[11px] text-gray-500">
+                Each mode has a different job. Use the lightest one that fits what you already know.
+              </p>
+            </div>
+            <button
+              onClick={dismissModeGuide}
+              className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-400 hover:border-gray-500 hover:text-gray-200"
+            >
+              Dismiss ✕
+            </button>
+          </div>
+          <div className="grid gap-2 md:grid-cols-3">
+            <div className="rounded-lg border border-cyan-800/40 bg-cyan-950/10 p-3">
+              <div className="text-xs font-semibold text-cyan-200">🧭 Exploration — Discover</div>
+              <p className="mt-1 text-[10px] text-gray-400">Clarify unknowns through chat and cycles.</p>
+              <p className="mt-1 text-[10px] text-gray-500">Outputs: a draft workflow or a one-off deliverable.</p>
+              <p className="mt-1 text-[10px] text-amber-300/80">Expected to be iterative; token spend can be higher.</p>
+            </div>
+            <div className="rounded-lg border border-amber-800/40 bg-amber-950/10 p-3">
+              <div className="text-xs font-semibold text-amber-200">🧪 Experiment — Build &amp; refine</div>
+              <p className="mt-1 text-[10px] text-gray-400">
+                Run the workflow, inspect results, fix steps, and harden into deterministic blocks.
+              </p>
+            </div>
+            <div className="rounded-lg border border-purple-800/40 bg-purple-950/10 p-3">
+              <div className="text-xs font-semibold text-purple-200">🔒 Template — Run proven work</div>
+              <p className="mt-1 text-[10px] text-gray-400">
+                Reuse a locked workflow with known inputs and a pinned image/version.
+              </p>
+            </div>
+          </div>
+          <div className="mt-3 rounded-lg border border-gray-800 bg-gray-950/40 px-2.5 py-2 text-[10px]">
+            <div className="font-mono text-indigo-300">Explore → Experiment / Harden → Lock → Run as Template</div>
+            <p className="mt-1 text-gray-500">
+              Explore when the shape is unknown. Once stable, lock the workflow so repeated runs reuse the pinned
+              workflow instead of paying for planning and iteration.
+            </p>
+          </div>
+        </section>
+      ) : (
+        <button onClick={reopenModeGuide} className="mb-4 text-[11px] text-indigo-400 hover:text-indigo-300">
+          How modes work
+        </button>
+      )}
+
       {error && (
         <div className="mb-4 rounded border border-red-500/30 bg-red-900/20 p-3 text-sm text-red-300">{error}</div>
       )}
@@ -268,7 +341,7 @@ export default function LaunchpadPage() {
               🧭 Exploration
             </div>
             <div className="mt-0.5 text-[10px] text-gray-500">
-              Chat, run a cycle, review results, then replan from feedback.
+              Discover what is needed; output a draft workflow or a one-off deliverable.
             </div>
           </button>
           <button
@@ -283,7 +356,7 @@ export default function LaunchpadPage() {
               🧪 Experiment
             </div>
             <div className="mt-0.5 text-[10px] text-gray-500">
-              Describe an objective and let the planner build a fresh workflow.
+              Build, execute, and refine the actual workflow.
             </div>
           </button>
           <button

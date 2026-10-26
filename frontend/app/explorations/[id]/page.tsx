@@ -11,6 +11,7 @@ import {
   TypingIndicator,
 } from '@chatscope/chat-ui-kit-react'
 import { API, TEMPORAL_UI } from '../../lib/api'
+import { formatTokens } from '../../lib/workflows'
 import { useProject } from '../../lib/ProjectContext'
 import { RenderedMarkdown } from '../../components/DeliverablePreview'
 import DeliverablePreview from '../../components/DeliverablePreview'
@@ -68,6 +69,7 @@ export default function ExplorationChatPage() {
   const [fileEntries, setFileEntries] = useState<{ path: string; size: number }[]>([])
   const [deployables, setDeployables] = useState<DeployableApp[]>([])
   const [deployCandidate, setDeployCandidate] = useState<DeployableApp | null>(null)
+  const [tokenTotal, setTokenTotal] = useState<number | null>(null)
   const treeCache = useRef<Map<string, any[]>>(new Map())
   const dagOrderCache = useRef<Map<string, string[]>>(new Map())
   const bottomRef = useRef<HTMLDivElement | null>(null)
@@ -96,6 +98,17 @@ export default function ExplorationChatPage() {
       setSessions(Array.isArray(data) ? data : [])
     }
   }
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API}/api/explorations/${sessionId}/token-usage`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!cancelled && data?.total) setTokenTotal(Number(data.total.total || 0))
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [sessionId, detail?.cycles.length, detail?.session.status])
 
   useEffect(() => {
     load(true)
@@ -689,6 +702,11 @@ export default function ExplorationChatPage() {
             <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-gray-500">
               <span className="rounded border border-gray-700 px-1.5 py-0.5">Cycle {session.current_cycle}/{session.max_cycles}</span>
               {status && <span className={`rounded border px-1.5 py-0.5 uppercase ${status.className}`}>{status.label}</span>}
+              {tokenTotal !== null && tokenTotal > 0 && (
+                <span className="rounded border border-cyan-800/40 px-1.5 py-0.5 text-cyan-300" title="Provider-reported DAG token usage">
+                  🪙 {formatTokens(tokenTotal)} tokens
+                </span>
+              )}
             </div>
           </div>
           <button
@@ -888,6 +906,7 @@ export default function ExplorationChatPage() {
       {filesOpen && (
         <FilesDrawer
           files={fileEntries}
+          dagId={latestCycle?.dag_id}
           onClose={() => setFilesOpen(false)}
           onPreview={(path) => {
             setFilesOpen(false)

@@ -620,6 +620,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
 
     max_attempts = 3
     last_error = ""
+    usage_entries: list[dict] = []
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         for attempt in range(1, max_attempts + 1):
@@ -652,6 +653,31 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                usage = data.get("usage") or {}
+                input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+                prompt_details = usage.get("prompt_tokens_details") or {}
+                completion_details = usage.get("completion_tokens_details") or {}
+                usage_entries.append({
+                    "provider": data.get("provider") or data.get("model") or llm_model,
+                    "model": data.get("model") or llm_model,
+                    "attempt": attempt,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens,
+                    "cached_input_tokens": int(
+                        prompt_details.get("cached_tokens")
+                        or usage.get("prompt_cache_hit_tokens")
+                        or 0
+                    ),
+                    "reasoning_tokens": int(
+                        completion_details.get("reasoning_tokens")
+                        or usage.get("reasoning_tokens")
+                        or 0
+                    ),
+                    "request_id": data.get("id"),
+                })
             except Exception as e:
                 last_error = f"LLM request failed: {e}"
                 logger.warning(f"Planner attempt {attempt}/{max_attempts}: {last_error}")
@@ -705,6 +731,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
 
             dag_json = await _apply_v2_skill_fallback(db, dag_json, objective)
 
+            dag_json["_llm_usage"] = usage_entries
             logger.info(f"Planner generated valid DAG with {len(dag_json.get('nodes', []))} nodes")
             return dag_json
 

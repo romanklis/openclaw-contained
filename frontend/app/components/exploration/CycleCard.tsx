@@ -183,6 +183,11 @@ export default function CycleCard({
               </>
             )
           })()}
+          {all.length > 0 && (
+            <a href={`${API}/api/dags/${meta.dag_id}/deliverables.zip`} className="text-cyan-300 hover:text-cyan-200" title="Download all deliverables">
+              ⭳ ZIP
+            </a>
+          )}
           <Link href={`/dags/${meta.dag_id}`} className="text-gray-400 hover:text-gray-200">👁 View DAG</Link>
           <button
             onClick={() => onViewChange(view === 'collapsed' ? 'summary' : view === 'summary' ? 'full' : 'summary')}
@@ -201,6 +206,17 @@ export default function CycleCard({
       {view !== 'collapsed' && (<>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-gray-800/50 px-3 py-1.5 text-[10px] text-gray-500">
         <span>{meta.turn_count ?? 0} Turns • {all.length} Files Generated</span>
+        {meta.token_usage?.total ? (
+          <span className="rounded border border-cyan-800/40 px-1.5 py-0.5 text-cyan-300">
+            🪙 {Number(meta.token_usage.total).toLocaleString()} tokens
+            <span className="ml-1 text-gray-600">
+              ({Number(meta.token_usage.input || 0).toLocaleString()} in / {Number(meta.token_usage.output || 0).toLocaleString()} out)
+            </span>
+            {meta.token_usage.cost_usd !== null && meta.token_usage.cost_usd !== undefined && (
+              <span className="ml-1 text-emerald-300">· ${Number(meta.token_usage.cost_usd).toFixed(4)}</span>
+            )}
+          </span>
+        ) : null}
         <span className={`rounded border px-1.5 py-0.5 ${verification.className}`}>Tests: {verification.label}</span>
         {meta.score !== null && meta.score !== undefined ? (
           <span className={`rounded border px-1.5 py-0.5 ${meta.flagged ? 'border-amber-500/40 text-amber-300' : 'border-emerald-500/40 text-emerald-300'}`}>

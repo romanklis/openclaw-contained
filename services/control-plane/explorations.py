@@ -23,6 +23,7 @@ from models import (
     RequestStatus,
     TaskOutput,
     AgentTurn,
+    LlmUsage,
     WorkflowGroup,
 )
 from planner import plan_dag
@@ -212,6 +213,7 @@ async def _create_cycle_dag(
         thinking_budget=thinking_budget,
         quality_budget=quality_budget,
     )
+    usage_entries = dag_json.pop("_llm_usage", [])
     dag_json = _normalize_interactive_nodes(dag_json)
     await _resolve_node_capabilities(dag_json, db)
     dag_json = _apply_execution_budgets(dag_json, thinking_budget, quality_budget)
@@ -263,6 +265,23 @@ async def _create_cycle_dag(
 
     await db.commit()
     await db.refresh(dag)
+    for usage in usage_entries:
+        db.add(LlmUsage(
+            dag_id=dag.id,
+            session_id=session.id,
+            purpose="planning",
+            provider=str(usage.get("provider") or ""),
+            model=str(usage.get("model") or ""),
+            attempt=int(usage.get("attempt") or 1),
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+            total_tokens=int(usage.get("total_tokens") or 0),
+            cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+            reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
+            request_id=str(usage.get("request_id") or ""),
+        ))
+    if usage_entries:
+        await db.commit()
     return dag
 
 

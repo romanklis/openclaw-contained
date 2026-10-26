@@ -58,6 +58,8 @@ export interface WorkflowSummary {
   blocker: string | null
   key_output: string | null
   latest_active_node_id: string | null
+  latest_token_usage?: Record<string, any> | null
+  total_token_usage?: Record<string, any> | null
 }
 
 export interface WorkflowDetail extends WorkflowSummary {
@@ -183,3 +185,4 @@ export const MODE_ORDER: Record<string, number> = {
 export function modeRank(mode?: string | null): number {
   return MODE_ORDER[mode || 'experiment'] ?? MODE_ORDER.experiment
 }
+

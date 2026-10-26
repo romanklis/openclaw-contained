@@ -1939,6 +1939,9 @@ async def record_agent_turn(
     finish_reason = resp.get("finish_reason", "")
     tool_calls = resp.get("tool_calls", [])
     usage = resp.get("usage", {})
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
     content_preview = (resp.get("content") or "")[:300]
 
     tool_names = [tc.get("name", "?") for tc in tool_calls]
@@ -1992,9 +1995,9 @@ async def record_agent_turn(
                     "turn_number": turn_number,
                     "provider": provider,
                     "model": turn_data.get("model") or resp.get("model"),
-                    "input_tokens": usage.get("input_tokens") or 0,
-                    "output_tokens": usage.get("output_tokens") or 0,
-                    "total_tokens": usage.get("total_tokens") or 0,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens,
                     "tool_names": tool_names,
                     "turn_timestamp": timestamp,
                 },
@@ -2010,8 +2013,9 @@ async def record_agent_turn(
         "finish_reason": finish_reason,
         "tool_calls": tool_names,
         "tool_results_received": len(tool_results_in),
-        "input_tokens": usage.get("input_tokens"),
-        "output_tokens": usage.get("output_tokens"),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
         "timestamp": timestamp,
     }
 

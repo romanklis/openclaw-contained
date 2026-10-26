@@ -107,6 +107,14 @@ export default function LLMProvidersPage() {
   const [savingConfig, setSavingConfig] = useState(false)
   const [configMsg, setConfigMsg] = useState<string | null>(null)
 
+  // Token pricing
+  const [modelPrices, setModelPrices] = useState<any[]>([])
+  const [priceModel, setPriceModel] = useState('')
+  const [priceInput, setPriceInput] = useState('')
+  const [priceOutput, setPriceOutput] = useState('')
+  const [priceCurrency, setPriceCurrency] = useState('USD')
+  const [priceMsg, setPriceMsg] = useState<string | null>(null)
+
   // DAG model defaults
   const [dagPlanningModel, setDagPlanningModel] = useState('')
   const [dagAgentModel, setDagAgentModel] = useState('')
@@ -529,6 +537,29 @@ export default function LLMProvidersPage() {
     )
   }
 
+  const saveModelPrice = async () => {
+    if (!priceModel.trim()) return
+    setPriceMsg(null)
+    try {
+      const res = await fetch(`${API}/api/llm/pricing`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: priceModel.trim(),
+          input_per_million: Number(priceInput) || 0,
+          output_per_million: Number(priceOutput) || 0,
+          currency: priceCurrency || 'USD',
+        }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const refreshed = await fetch(`${API}/api/llm/pricing`).then((r) => (r.ok ? r.json() : []))
+      setModelPrices(Array.isArray(refreshed) ? refreshed : [])
+      setPriceMsg('Saved. Existing token counts are unchanged.')
+    } catch (err: any) {
+      setPriceMsg(err.message)
+    }
+  }
+
   // ─── Render ────────────────────────────────────────────────────
 
   const decisionAnswer = (decisionResult?.answers?.decision ?? {}) as Record<string, any>
@@ -654,6 +685,35 @@ export default function LLMProvidersPage() {
           </div>
         </section>
       )}
+
+      {/* ─── Token Pricing ───────────────────────────────────── */}
+      <section className="mb-8">
+        <h2 className="section-title">Token Pricing</h2>
+        <div className="card p-4 space-y-3">
+          <p className="text-[11px] text-gray-500">
+            Optional per-million-token rates for cost estimates. Token counts are provider-reported; costs are estimates.
+          </p>
+          <div className="grid gap-2 sm:grid-cols-4">
+            <input value={priceModel} onChange={(event) => setPriceModel(event.target.value)} placeholder="model id" className="rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-xs text-gray-300" />
+            <input value={priceInput} onChange={(event) => setPriceInput(event.target.value)} placeholder="input $/1M" type="number" step="0.0001" className="rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-xs text-gray-300" />
+            <input value={priceOutput} onChange={(event) => setPriceOutput(event.target.value)} placeholder="output $/1M" type="number" step="0.0001" className="rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-xs text-gray-300" />
+            <button onClick={saveModelPrice} className="btn-primary text-xs">Save pricing</button>
+          </div>
+          {priceMsg && <div className="text-xs text-gray-400">{priceMsg}</div>}
+          {modelPrices.length > 0 && (
+            <div className="space-y-1 text-[10px] text-gray-500">
+              {modelPrices.map((row) => (
+                <div key={row.model} className="flex flex-wrap gap-3">
+                  <span className="font-mono text-gray-300">{row.model}</span>
+                  <span>in {row.input_per_million}/1M</span>
+                  <span>out {row.output_per_million}/1M</span>
+                  <span>{row.currency || 'USD'}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
 
       {/* ─── API Keys ────────────────────────────────────────── */}
       <section className="mb-8">

@@ -1,7 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
+import { API } from '../lib/api'
 import {
   explorationStatus,
   type ExplorationSession,
@@ -9,6 +10,7 @@ import {
 import {
   formatDuration,
   formatRelativeTime,
+  formatTokens,
   sanitizeObjectiveText,
   type WorkflowRun,
   type WorkflowSummary,
@@ -35,6 +37,7 @@ function auditMeta(run: WorkflowRun | null): { label: string; icon: string; clas
 
 export default function ExplorationTableRow({ session, group, projectName }: ExplorationTableRowProps) {
   const [showMenu, setShowMenu] = useState(false)
+  const [tokenTotal, setTokenTotal] = useState<number | null>(null)
   const status = session.status === 'awaiting_feedback'
     ? { ...explorationStatus(session.status), label: 'Awaiting Review' }
     : explorationStatus(session.status)
@@ -43,6 +46,17 @@ export default function ExplorationTableRow({ session, group, projectName }: Exp
   const objective = sanitizeObjectiveText(session.objective, 220)
   const latestDagId = session.latest_cycle?.dag_id || latest?.id || null
   const rowId = `workflow-${group?.id || session.id}`
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API}/api/explorations/${session.id}/token-usage`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!cancelled && data?.total) setTokenTotal(Number(data.total.total || 0))
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [session.id])
 
   return (
     <tr id={rowId} className="border-b border-gray-800/80 text-xs hover:bg-gray-900/50">
@@ -92,6 +106,9 @@ export default function ExplorationTableRow({ session, group, projectName }: Exp
           {latest
             ? `Run #${latest.run_number} • ${formatDuration(latest.duration_seconds)}`
             : 'No runs yet'}
+          {tokenTotal !== null && tokenTotal > 0 && (
+            <span className="ml-1 text-cyan-400/80">· 🪙 {formatTokens(tokenTotal)} tokens</span>
+          )}
         </div>
       </td>
 

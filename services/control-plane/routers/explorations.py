@@ -357,6 +357,13 @@ async def get_progress(session_id: str, db: AsyncSession = Depends(get_db)):
     return {"session_status": session.status, "progress": progress}
 
 
+@router.get("/{session_id}/token-usage")
+async def get_exploration_tokens(session_id: str, db: AsyncSession = Depends(get_db)):
+    from token_usage import get_session_token_usage
+    await _session_or_404(session_id, db)
+    return await get_session_token_usage(session_id, db)
+
+
 @router.get("/{session_id}")
 async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
     session = await _session_or_404(session_id, db)

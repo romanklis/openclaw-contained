@@ -564,6 +564,12 @@ async def list_dags(skip: int = 0, limit: int = 50, archived: bool = False, proj
     return list(result.scalars().all())
 
 
+@router.get("/{dag_id}/token-usage")
+async def get_dag_tokens(dag_id: str, db: AsyncSession = Depends(get_db)):
+    from token_usage import get_dag_token_usage
+    return await get_dag_token_usage(dag_id, db)
+
+
 @router.get("/{dag_id}", response_model=DAGDetail)
 async def get_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     """Get a DAG with its nodes."""
@@ -1884,6 +1890,130 @@ async def get_dag_workspace_tree(dag_id: str, db: AsyncSession = Depends(get_db)
         "entries": entries,
         "truncated": truncated,
     }
+
+
+@router.get("/{dag_id}/deliverables.zip")
+async def download_dag_deliverables(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Download the selected DAG run's deliverables as a ZIP archive."""
+    import json
+    import os
+    import tempfile
+    import zipfile
+    from datetime import datetime
+    from starlette.background import BackgroundTask
+    from fastapi.responses import FileResponse
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}")
+    if not os.path.isdir(root):
+        raise HTTPException(status_code=404, detail="DAG workspace not found")
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    nodes = list(nodes_result.scalars().all())
+    skip_names = {"AGENTS.md", "SOUL.md", "result.json"}
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".next"}
+
+    files: list[dict] = []
+    seen: set[str] = set()
+    skipped: list[dict] = []
+    total_size = 0
+    max_files = 2000
+    max_size = 500 * 1024 * 1024
+
+    def add_file(node_id: str, key: str) -> None:
+        nonlocal total_size
+        normalized = str(key or "").replace("\\", "/").lstrip("/")
+        if not normalized:
+            return
+        parts = normalized.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            skipped.append({"node_id": node_id, "path": normalized, "reason": "unsafe path"})
+            return
+        if parts[-1] in skip_names or any(part in skip_dirs for part in parts):
+            return
+        candidates = [normalized]
+        if not normalized.startswith(f"{node_id}/"):
+            candidates.append(f"{node_id}/{normalized}")
+        abs_path = None
+        rel_path = None
+        for candidate in candidates:
+            path = os.path.realpath(os.path.join(root, candidate))
+            if path != root and path.startswith(root + os.sep) and os.path.isfile(path) and not os.path.islink(path):
+                abs_path = path
+                rel_path = os.path.relpath(path, root).replace(os.sep, "/")
+                break
+        if not abs_path:
+            skipped.append({"node_id": node_id, "path": normalized, "reason": "file not found"})
+            return
+        if rel_path in seen:
+            return
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError as exc:
+            skipped.append({"node_id": node_id, "path": rel_path, "reason": str(exc)})
+            return
+        if size > max_size or total_size + size > max_size:
+            raise HTTPException(status_code=413, detail="Deliverable archive exceeds 500 MB")
+        if len(files) >= max_files:
+            raise HTTPException(status_code=413, detail="Deliverable archive exceeds 2000 files")
+        seen.add(rel_path)
+        total_size += size
+        files.append({"node_id": node_id, "path": rel_path, "size": size, "abs_path": abs_path})
+
+    for node in nodes:
+        node_deliverables = (node.output_data or {}).get("deliverables") if isinstance(node.output_data, dict) else None
+        keys = list(node_deliverables.keys()) if isinstance(node_deliverables, dict) else []
+        if not keys and node.task_id:
+            outputs_result = await db.execute(
+                select(TaskOutput)
+                .where(TaskOutput.task_id == node.task_id)
+                .order_by(TaskOutput.iteration.desc())
+            )
+            for output in outputs_result.scalars().all():
+                if isinstance(output.deliverables, dict) and output.deliverables:
+                    keys = list(output.deliverables.keys())
+                    break
+        for key in keys:
+            add_file(node.node_id, key)
+
+    if not files:
+        raise HTTPException(status_code=404, detail="No deliverables found for this DAG run")
+
+    temp = tempfile.NamedTemporaryFile(prefix=f"{dag_id}-", suffix=".zip", delete=False)
+    temp_path = temp.name
+    temp.close()
+    try:
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for record in files:
+                archive.write(record["abs_path"], arcname=record["path"])
+            manifest = {
+                "dag_id": dag.id,
+                "objective": dag.objective,
+                "workspace_id": workspace_id,
+                "exploration_session_id": dag.exploration_session_id,
+                "exploration_cycle": dag.exploration_cycle,
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "files": [
+                    {"node_id": record["node_id"], "path": record["path"], "size": record["size"]}
+                    for record in files
+                ],
+                "skipped": skipped,
+            }
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+    return FileResponse(
+        temp_path,
+        media_type="application/zip",
+        filename=f"{dag_id}-deliverables.zip",
+        background=BackgroundTask(os.unlink, temp_path),
+    )
 
 
 @router.get("/{dag_id}/workspace/files/{file_path:path}")

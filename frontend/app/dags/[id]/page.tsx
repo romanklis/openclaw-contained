@@ -10,6 +10,7 @@ import DeliverablePreview, { RenderedMarkdown } from '../../components/Deliverab
 import AuditReviewTab from '../../components/AuditReviewTab'
 import DAGTree from '../../components/DAGTree'
 import { API, API_GATEWAY, TEMPORAL_UI } from '../../lib/api'
+import { formatTokens } from '../../lib/workflows'
 
 const DAGGraph = dynamic(() => import('../../components/DAGGraph'), { ssr: false })
 
@@ -308,6 +309,7 @@ export default function DAGDetailPage() {
   }>>({})
   const [nodeDataLoading, setNodeDataLoading] = useState(false)
   const [nodeState, setNodeState] = useState<Record<string, { latest: NodeStateSnapshot | null; events: NodeAuditEvent[] }>>({})
+  const [tokenUsage, setTokenUsage] = useState<any>(null)
   const [nodeAcceptance, setNodeAcceptance] = useState<Record<string, NodeAcceptanceResponse | null>>({})
   const [workspaceManifest, setWorkspaceManifest] = useState<WorkspaceManifestResponse | null>(null)
   const [workspaceTree, setWorkspaceTree] = useState<{ path: string; name: string; size: number }[] | null>(null)
@@ -369,6 +371,14 @@ export default function DAGDetailPage() {
   }, [dagId])
 
   useEffect(() => { fetchDag() }, [fetchDag])
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API}/api/dags/${dagId}/token-usage`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (!cancelled) setTokenUsage(data) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [dagId, dag?.status, dag?.completed_at])
   useEffect(() => { loadDeepReviews() }, [loadDeepReviews])
 
   // ── Pending interactive steps (decision / input) ──────────────────────
@@ -1771,6 +1781,25 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             <span className="text-gray-600">/</span>
             <h1 className="text-xl font-bold font-mono">{dag.id}</h1>
             <StatusBadge status={dag.status} />
+            {tokenUsage?.total?.total > 0 && (
+              <details className="text-[10px] text-cyan-300">
+                <summary className="cursor-pointer rounded border border-cyan-800/40 px-1.5 py-0.5">
+                  🪙 {formatTokens(tokenUsage.total.total)} tokens
+                </summary>
+                <div className="absolute z-20 mt-1 w-64 rounded border border-gray-700 bg-gray-900 p-2 text-[10px] text-gray-400 shadow-xl">
+                  <div>Input: {Number(tokenUsage.total.input || 0).toLocaleString()}</div>
+                  <div>Output: {Number(tokenUsage.total.output || 0).toLocaleString()}</div>
+                  <div>Planning: {formatTokens(tokenUsage.buckets?.planning?.total)}</div>
+                  <div>Agent: {formatTokens(tokenUsage.buckets?.agent?.total)}</div>
+                  <div>Triage: {formatTokens(tokenUsage.buckets?.gate_triage?.total)}</div>
+                  <div>Deep review: {formatTokens(tokenUsage.buckets?.deep_review?.total)}</div>
+                  {tokenUsage.total?.cost_usd !== null && tokenUsage.total?.cost_usd !== undefined && (
+                    <div className="text-emerald-300">Estimated: ${Number(tokenUsage.total.cost_usd).toFixed(4)}</div>
+                  )}
+                  <div className="mt-1 text-gray-600">Coverage: {tokenUsage.coverage}</div>
+                </div>
+              </details>
+            )}
             {dag.locked && <span className="text-xs bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded">🔒 template</span>}
             {dag.template_source_dag_id && <span className="text-xs bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded">follow-the-guidance</span>}
             {dag.exploration_session_id && (
@@ -1830,6 +1859,13 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
             </button>
             {showDagMore && (
               <div className="absolute right-0 z-50 mt-1 w-56 rounded border border-gray-700 bg-gray-900 shadow-xl">
+                <a
+                  href={`${API}/api/dags/${dag.id}/deliverables.zip`}
+                  onClick={() => setShowDagMore(false)}
+                  className="block px-3 py-2 text-left text-xs text-cyan-300 hover:bg-gray-800"
+                >
+                  ⭳ Download all deliverables
+                </a>
                 {(dag.status === 'completed' || dag.status === 'failed' || dag.status === 'cancelled') && !dag.locked && (
                   <button
                     onClick={() => { setShowDagMore(false); setShowRevise((value) => !value) }}

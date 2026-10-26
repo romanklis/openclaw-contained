@@ -236,6 +236,11 @@ export default function WorkflowTableRow({
               <div className="mt-0.5 text-[9px] text-gray-600">
                 {latest ? `Run #${latest.run_number} • ${formatDuration(latest.duration_seconds)}` : '—'}
               </div>
+              {group.latest_token_usage?.total ? (
+                <div className="mt-0.5 text-[9px] text-cyan-300" title={`${group.latest_token_usage.total.toLocaleString()} tokens in latest run`}>
+                  🪙 {formatTokens(group.latest_token_usage.total)} tokens
+                </div>
+              ) : null}
             </>
           )}
         </td>
@@ -252,6 +257,11 @@ export default function WorkflowTableRow({
               <div className="mt-0.5 text-[9px] text-gray-600">
                 {group.completed_count} passed
               </div>
+              {group.total_token_usage?.total ? (
+                <div className="mt-0.5 text-[9px] text-cyan-300">
+                  🪙 {formatTokens(group.total_token_usage.total)} tokens
+                </div>
+              ) : null}
             </>
           ) : (
             <>
@@ -343,6 +353,15 @@ export default function WorkflowTableRow({
                   <button onClick={() => { setShowMenu(false); onOpenLatest(group) }} className="block w-full px-3 py-2 text-left text-[10px] text-gray-300 hover:bg-gray-800">
                     Open latest run
                   </button>
+                  {latest && (
+                    <a
+                      href={`${API}/api/dags/${latest.id}/deliverables.zip`}
+                      onClick={() => setShowMenu(false)}
+                      className="block px-3 py-2 text-left text-[10px] text-cyan-300 hover:bg-gray-800"
+                    >
+                      ⭳ Download deliverables
+                    </a>
+                  )}
                   {group.locked && (
                     <button onClick={() => { setShowMenu(false); onOpenTemplate(group) }} className="block w-full px-3 py-2 text-left text-[10px] text-purple-300 hover:bg-gray-800">
                       Open locked template

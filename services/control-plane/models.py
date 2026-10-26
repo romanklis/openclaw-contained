@@ -1,7 +1,7 @@
 """
 Database models
 """
-from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text, Boolean, UniqueConstraint
+from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text, Boolean, UniqueConstraint, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -276,6 +276,45 @@ class AgentTurn(Base):
     tool_names = Column(JSON, default=list)
     turn_timestamp = Column(String)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class LlmUsage(Base):
+    """Durable provider-reported token usage for non-agent LLM calls."""
+    __tablename__ = "llm_usage"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=True, index=True)
+    cycle_id = Column(String, nullable=True, index=True)
+    session_id = Column(String, nullable=True, index=True)
+    task_id = Column(String, nullable=True, index=True)
+    node_id = Column(String, nullable=True)
+    purpose = Column(String, nullable=False, index=True)
+    provider = Column(String)
+    model = Column(String)
+    attempt = Column(Integer, default=1)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    cached_input_tokens = Column(Integer, default=0)
+    reasoning_tokens = Column(Integer, default=0)
+    request_id = Column(String)
+    metadata_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ModelPrice(Base):
+    """Optional operator-configured model rates for token cost estimates."""
+    __tablename__ = "model_prices"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model = Column(String, unique=True, nullable=False, index=True)
+    provider = Column(String)
+    input_per_million = Column(Float, nullable=False, default=0)
+    output_per_million = Column(Float, nullable=False, default=0)
+    cached_input_per_million = Column(Float, nullable=False, default=0)
+    reasoning_per_million = Column(Float, nullable=False, default=0)
+    currency = Column(String, nullable=False, default="USD")
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class TaskMessage(Base):

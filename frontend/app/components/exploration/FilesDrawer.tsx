@@ -1,6 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import { API } from '../../lib/api'
 
 interface FileEntry {
   path: string
@@ -9,6 +10,7 @@ interface FileEntry {
 
 interface FilesDrawerProps {
   files: FileEntry[]
+  dagId?: string
   onClose: () => void
   onPreview: (path: string) => void
 }
@@ -27,7 +29,7 @@ function formatBytes(value: number) {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export default function FilesDrawer({ files, onClose, onPreview }: FilesDrawerProps) {
+export default function FilesDrawer({ files, dagId, onClose, onPreview }: FilesDrawerProps) {
   const [search, setSearch] = useState('')
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase()
@@ -56,7 +58,14 @@ export default function FilesDrawer({ files, onClose, onPreview }: FilesDrawerPr
       >
         <div className="flex items-center justify-between border-b border-gray-800 px-3 py-2">
           <span className="text-xs font-semibold text-gray-200">Files ({files.length})</span>
-          <button onClick={onClose} className="text-gray-500 hover:text-gray-200">✕</button>
+          <div className="flex items-center gap-2">
+            {dagId && (
+              <a href={`${API}/api/dags/${dagId}/deliverables.zip`} className="rounded border border-cyan-800/40 px-1.5 py-0.5 text-[9px] text-cyan-300 hover:border-cyan-600">
+                ⭳ Download all
+              </a>
+            )}
+            <button onClick={onClose} className="text-gray-500 hover:text-gray-200">✕</button>
+          </div>
         </div>
         <div className="border-b border-gray-800 px-3 py-2">
           <input

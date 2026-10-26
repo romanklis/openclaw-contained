@@ -26,11 +26,12 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from database import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -389,6 +390,53 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+
+
+class ModelPricePayload(BaseModel):
+    model: str
+    provider: Optional[str] = None
+    input_per_million: float = 0
+    output_per_million: float = 0
+    cached_input_per_million: float = 0
+    reasoning_per_million: float = 0
+    currency: str = "USD"
+
+
+@router.get("/pricing")
+async def get_model_pricing(db: AsyncSession = Depends(get_db)):
+    from models import ModelPrice
+    result = await db.execute(select(ModelPrice).order_by(ModelPrice.model.asc()))
+    return [
+        {
+            "model": row.model,
+            "provider": row.provider,
+            "input_per_million": row.input_per_million,
+            "output_per_million": row.output_per_million,
+            "cached_input_per_million": row.cached_input_per_million,
+            "reasoning_per_million": row.reasoning_per_million,
+            "currency": row.currency,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+        for row in result.scalars().all()
+    ]
+
+
+@router.put("/pricing")
+async def set_model_pricing(payload: ModelPricePayload, db: AsyncSession = Depends(get_db)):
+    from models import ModelPrice
+    result = await db.execute(select(ModelPrice).where(ModelPrice.model == payload.model))
+    row = result.scalar_one_or_none()
+    if not row:
+        row = ModelPrice(model=payload.model)
+        db.add(row)
+    row.provider = payload.provider
+    row.input_per_million = payload.input_per_million
+    row.output_per_million = payload.output_per_million
+    row.cached_input_per_million = payload.cached_input_per_million
+    row.reasoning_per_million = payload.reasoning_per_million
+    row.currency = payload.currency or "USD"
+    await db.commit()
+    return {"ok": True, "model": row.model}
 
 
 class ChatCompletionResponse(BaseModel):

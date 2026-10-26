@@ -714,6 +714,8 @@ class WorkflowSummary(BaseModel):
     blocker: Optional[str] = None
     key_output: Optional[str] = None
     latest_active_node_id: Optional[str] = None
+    latest_token_usage: Optional[Dict[str, Any]] = None
+    total_token_usage: Optional[Dict[str, Any]] = None
 
 
 class WorkflowDetail(WorkflowSummary):
