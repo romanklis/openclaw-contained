@@ -202,6 +202,8 @@ class AgentTaskWorkflow:
         self._trial_failures = 0  # Track trial deployment failures
         self._trial_rework_pending = False  # True when agent must fix a trial failure
         self._approved_capabilities = set()  # Track already-approved resource names to prevent loops
+        self._handled_capability_ids = set()  # Capability requests already applied
+        self._pending_metrics = {}  # waits recorded for the next iteration output
 
     async def _resolve_capability_state(
         self,
@@ -244,6 +246,9 @@ class AgentTaskWorkflow:
             ts_ref = ts_ref.astimezone(timezone.utc).replace(tzinfo=None)
         window_start = ts_ref - timedelta(minutes=5)
         for row in capability_rows or []:
+            request_id = str(row.get("id") or "")
+            if request_id and request_id in self._handled_capability_ids:
+                continue
             requested_at = _parse_iso_datetime(row.get("requested_at"))
             if requested_at and requested_at < window_start:
                 continue
@@ -266,6 +271,7 @@ class AgentTaskWorkflow:
                 "state": "requested_pending",
                 "capability": capability,
                 "source": "control_plane_pending",
+                "request_id": str(pending_row.get("id") or ""),
                 "should_create_request": False,
             }
 
@@ -280,6 +286,7 @@ class AgentTaskWorkflow:
                 "state": "requested_resolved",
                 "capability": capability,
                 "source": f"control_plane_{(resolved_row.get('status') or '').lower()}",
+                "request_id": str(resolved_row.get("id") or ""),
                 "should_create_request": False,
             }
 
@@ -288,6 +295,7 @@ class AgentTaskWorkflow:
                 "state": "requested_pending",
                 "capability": capability or marker_capability or {},
                 "source": "agent_signal",
+                "request_id": None,
                 "should_create_request": True,
             }
 
@@ -295,6 +303,7 @@ class AgentTaskWorkflow:
             "state": "none",
             "capability": {},
             "source": "none",
+            "request_id": None,
             "should_create_request": False,
         }
     
@@ -308,6 +317,7 @@ class AgentTaskWorkflow:
         dag_id: str = "",
         deliverables_required: bool = True,
         max_agent_turns: int = 30,
+        max_iterations: int = 50,
     ) -> Dict[str, Any]:
         """Execute agent task.
 
@@ -356,12 +366,18 @@ class AgentTaskWorkflow:
             logger.info(f"♻️  Continuing from iteration {start_iteration}")
 
         # Step 2: Agent execution loop
-        max_iterations = 50
         iteration = start_iteration
         
         while iteration < max_iterations:
             iteration += 1
             iteration_started_at = workflow.now()
+            pending_metrics = self._pending_metrics
+            self._pending_metrics = {}
+            iteration_reason = "agent"
+            if self._capability_feedback:
+                iteration_reason = "capability"
+            if self._trial_rework_pending:
+                iteration_reason = "trial_rework"
             
             # Heartbeat: update task status to RUNNING at start of each iteration
             await workflow.execute_activity(
@@ -384,11 +400,32 @@ class AgentTaskWorkflow:
                 )
                 self._capability_feedback = ""  # one-shot — don't repeat
 
-            result = await workflow.execute_child_workflow(
-                AgentStepWorkflow.run,
-                args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns],
-                id=f"agent-step-{task_id}-iter-{iteration}",
-            )
+            try:
+                result = await workflow.execute_child_workflow(
+                    AgentStepWorkflow.run,
+                    args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns],
+                    id=f"agent-step-{task_id}-iter-{iteration}",
+                )
+            except Exception as child_exc:
+                logger.error(
+                    f"❌ AgentStepWorkflow failed | Task: {task_id} | "
+                    f"Iteration: {iteration} | {child_exc}"
+                )
+                try:
+                    await workflow.execute_activity(
+                        finalize_task,
+                        args=[task_id, "failed"],
+                        start_to_close_timeout=timedelta(minutes=2),
+                    )
+                except Exception as finalize_exc:
+                    logger.error(
+                        f"❌ Failed to finalize failed task {task_id}: {finalize_exc}"
+                    )
+                return {
+                    "status": "failed",
+                    "error": str(child_exc)[:1000],
+                    "iteration": iteration,
+                }
 
             # If a DAG container was committed, update current_image so
             # subsequent iterations (and eventually the parent DAGNodeWorkflow)
@@ -397,6 +434,17 @@ class AgentTaskWorkflow:
             if _committed:
                 self.current_image = _committed
                 logger.info(f"📸 DAG image updated from commit: {_committed}")
+
+            result.update(pending_metrics)
+            result["started_at"] = iteration_started_at.isoformat()
+            result["finished_at"] = workflow.now().isoformat()
+            try:
+                result["duration_ms"] = max(
+                    0, int((workflow.now() - iteration_started_at).total_seconds() * 1000)
+                )
+            except Exception:
+                pass
+            result["iteration_reason"] = iteration_reason
 
             # Store output in the control-plane database (fire-and-forget, don't block workflow)
             try:
@@ -528,6 +576,7 @@ class AgentTaskWorkflow:
                 )
                 self.approval_received = False
                 self.capability_approved = False
+                _credential_wait_started = workflow.now()
                 await workflow.execute_activity(
                     update_task_status,
                     args=[task_id, "waiting_approval"],
@@ -540,6 +589,9 @@ class AgentTaskWorkflow:
                 )
                 for _r in _unhandled:
                     self._handled_credential_ids.add(_r.get("id"))
+                self._pending_metrics["approval_wait_ms"] = max(
+                    0, int((workflow.now() - _credential_wait_started).total_seconds() * 1000)
+                )
                 if not self.capability_approved:
                     raise RuntimeError(
                         f"credential '{_req.get('credential_name')}' was denied for {_req.get('origin')}"
@@ -563,14 +615,23 @@ class AgentTaskWorkflow:
             resource_name = capability.get("resource", "") if isinstance(capability, dict) else ""
 
             if cap_state == "requested_resolved":
+                request_id = str(capability_state.get("request_id") or "")
                 logger.info(
                     f"🔐 Capability already resolved for {task_id} "
                     f"(source={capability_state.get('source')}, resource={resource_name or 'unknown'})"
                 )
+                if request_id:
+                    self._handled_capability_ids.add(request_id)
                 if resource_name:
                     self._approved_capabilities.add(resource_name)
-                # Capability activity happened this iteration; continue so completion
-                # is evaluated on the next clean iteration.
+                    self._capability_feedback = (
+                        "--- SYSTEM NOTICE ---\n"
+                        f"Capability '{resource_name}' is approved and installed. "
+                        "Use it now; do not re-request it.\n"
+                        "--- END NOTICE ---"
+                    )
+                # The agent has not seen the installed capability yet. Run one
+                # targeted pass, then completion is evaluated normally.
                 continue
 
             if cap_state == "requested_pending":
@@ -583,6 +644,9 @@ class AgentTaskWorkflow:
                 # (prevents infinite loops from stale results or LLM re-requesting)
                 already_approved = resource_name in self._approved_capabilities
                 if already_approved:
+                    request_id = str(capability_state.get("request_id") or "")
+                    if request_id:
+                        self._handled_capability_ids.add(request_id)
                     logger.info(
                         f"⏭️ Skipping duplicate capability request for '{resource_name}' "
                         f"— already approved this run"
@@ -592,6 +656,8 @@ class AgentTaskWorkflow:
                         args=[task_id],
                         start_to_close_timeout=timedelta(seconds=15),
                     )
+                    if result.get("completed"):
+                        break
                     continue
 
                 if capability_state.get("should_create_request"):
@@ -605,6 +671,7 @@ class AgentTaskWorkflow:
                 # from a prior iteration from immediately satisfying the wait)
                 self.approval_received = False
                 self.capability_approved = False
+                _capability_wait_started = workflow.now()
 
                 # Update status: waiting for human approval
                 await workflow.execute_activity(
@@ -619,6 +686,9 @@ class AgentTaskWorkflow:
                     timeout=timedelta(hours=24)
                 )
 
+                self._pending_metrics["approval_wait_ms"] = max(
+                    0, int((workflow.now() - _capability_wait_started).total_seconds() * 1000)
+                )
                 if self.capability_approved:
                     # Update status: building new agent image
                     await workflow.execute_activity(
@@ -639,10 +709,14 @@ class AgentTaskWorkflow:
                         start_to_close_timeout=timedelta(seconds=15),
                     )
 
+                    _image_build_started = workflow.now()
                     build_result = await workflow.execute_activity(
                         build_agent_image,
                         args=[task_id, capability, self.current_image],
                         start_to_close_timeout=timedelta(minutes=10)
+                    )
+                    self._pending_metrics["image_build_wait_ms"] = max(
+                        0, int((workflow.now() - _image_build_started).total_seconds() * 1000)
                     )
 
                     new_image = build_result.get("image", self.current_image)
@@ -666,6 +740,13 @@ class AgentTaskWorkflow:
                             "--- SYSTEM NOTICE ---\n"
                             + supply_chain_feedback
                             + "\n--- END NOTICE ---"
+                        )
+                    else:
+                        self._capability_feedback = (
+                            "--- SYSTEM NOTICE ---\n"
+                            f"Capability '{resource_name or 'requested tool'}' is approved and installed. "
+                            "Use it now; do not re-request it.\n"
+                            "--- END NOTICE ---"
                         )
 
                     await workflow.execute_activity(
@@ -699,6 +780,9 @@ class AgentTaskWorkflow:
 
                 self.approval_received = False
                 self.capability_approved = False
+                request_id = str(capability_state.get("request_id") or "")
+                if request_id:
+                    self._handled_capability_ids.add(request_id)
 
                 try:
                     guard = await workflow.execute_activity(
@@ -872,6 +956,7 @@ class AgentStepWorkflow:
             f"🔬 AgentStepWorkflow done | Task: {task_id} | Iteration: {iteration} | "
             f"Turns: {turns_seen} | Completed: {result.get('completed')}"
         )
+        result["turn_count"] = turns_seen
         return result
 
 
@@ -1445,6 +1530,131 @@ async def poll_agent_turns(
     }
 
 
+def _compact_agent_result_for_temporal(
+    result: Dict[str, Any],
+    workspace_dir: str,
+    inline_limit_bytes: int = 32 * 1024,
+    safe_payload_bytes: int = 1_500_000,
+) -> Dict[str, Any]:
+    """Replace large inline deliverables with workspace file references.
+
+    Temporal activity results are capped at ~2 MB. Agent steps can legitimately
+    produce multi-megabyte DOCX/PDF/PNG deliverables; returning those as
+    ``base64:`` strings makes the whole workflow result exceed the limit. The
+    files already live in the shared workspace, so return refs that the
+    control-plane file endpoint can serve instead.
+    """
+    import base64 as _b64
+    import json as _json
+
+    deliverables = result.get("deliverables")
+    if not isinstance(deliverables, dict) or not deliverables:
+        return result
+
+    file_index: list[tuple[str, str, int]] = []
+    try:
+        for root, _dirs, names in os.walk(workspace_dir):
+            for name in names:
+                abs_path = os.path.join(root, name)
+                try:
+                    rel = os.path.relpath(abs_path, workspace_dir).replace(os.sep, "/")
+                    if rel.startswith(".."):
+                        continue
+                    file_index.append((rel, os.path.realpath(abs_path), os.path.getsize(abs_path)))
+                except Exception:
+                    continue
+    except Exception as exc:
+        logger.warning(f"⚠️ Could not index workspace for deliverable refs: {exc}")
+
+    # Prefer the node directory that owns the largest share of this result's
+    # deliverables. Several nodes can contain a file with the same basename
+    # (e.g. figures/fig2_results.png copied from an upstream step).
+    deliverable_keys = [str(key).replace("\\", "/").lstrip("/") for key in deliverables.keys()]
+    dir_scores: Dict[str, int] = {}
+    for key in deliverable_keys:
+        for rel, _abs, _size in file_index:
+            if rel == key or rel.endswith("/" + key):
+                prefix = rel.split("/", 1)[0] if "/" in rel else ""
+                if prefix:
+                    dir_scores[prefix] = dir_scores.get(prefix, 0) + 1
+    preferred_prefix = max(dir_scores, key=dir_scores.get) if dir_scores else ""
+
+    def resolve(key: str) -> tuple[str, str, int] | None:
+        normalized = key.replace("\\", "/").lstrip("/")
+        direct = os.path.realpath(os.path.join(workspace_dir, normalized))
+        workspace_real = os.path.realpath(workspace_dir)
+        if direct.startswith(workspace_real + os.sep) and os.path.isfile(direct):
+            rel = os.path.relpath(direct, workspace_dir).replace(os.sep, "/")
+            return rel, direct, os.path.getsize(direct)
+        matches = [
+            entry for entry in file_index
+            if entry[0] == normalized or entry[0].endswith("/" + normalized)
+        ]
+        if preferred_prefix:
+            preferred = [
+                entry for entry in matches
+                if entry[0].startswith(preferred_prefix + "/")
+            ]
+            if preferred:
+                matches = preferred
+        if matches:
+            return min(matches, key=lambda entry: len(entry[0]))
+        return None
+
+    def decoded_size(value: str) -> int:
+        if value.startswith("base64:"):
+            try:
+                return len(_b64.b64decode(value[7:], validate=False))
+            except Exception:
+                return max(0, (len(value) - 7) * 3 // 4)
+        return len(value)
+
+    def to_ref(key: str, value: str) -> Dict[str, Any]:
+        size = decoded_size(value)
+        resolved = resolve(key)
+        if resolved:
+            rel, _abs, actual_size = resolved
+            return {"ref": "file", "path": f"/workspace/{rel}", "size": actual_size}
+        return {"ref": "file", "path": f"/workspace/{key.lstrip('/')}", "size": size, "missing": True}
+
+    compacted = {}
+    for key, value in deliverables.items():
+        if isinstance(value, dict) and value.get("ref") == "file":
+            compacted[key] = value
+            continue
+        if isinstance(value, str) and value.startswith("base64:") and decoded_size(value) > inline_limit_bytes:
+            compacted[key] = to_ref(str(key), value)
+        else:
+            compacted[key] = value
+    result["deliverables"] = compacted
+
+    def payload_size(payload: Dict[str, Any]) -> int:
+        try:
+            return len(_json.dumps(payload, default=str).encode("utf-8"))
+        except Exception:
+            return 0
+
+    # Second pass if the payload is still too large: ref large text artifacts too.
+    if payload_size(result) > safe_payload_bytes:
+        for key, value in list(compacted.items()):
+            if isinstance(value, str) and len(value) > inline_limit_bytes * 2:
+                compacted[key] = to_ref(str(key), value)
+        if isinstance(result.get("agent_logs"), str):
+            result["agent_logs"] = result["agent_logs"][:20_000]
+        if isinstance(result.get("output"), str):
+            result["output"] = result["output"][:20_000]
+        turns = result.get("_remaining_turns")
+        if isinstance(turns, list) and len(turns) > 100:
+            result["_remaining_turns"] = turns[-100:]
+
+    logger.info(
+        "📦 Compacted agent result for Temporal: %s bytes (deliverables=%s)",
+        payload_size(result),
+        len(compacted),
+    )
+    return result
+
+
 @activity.defn
 async def collect_agent_result(
     task_id: str,
@@ -1654,7 +1864,7 @@ async def collect_agent_result(
         result["_remaining_turns"] = slim_turns
         if committed_image:
             result["committed_image"] = committed_image
-        return result
+        return _compact_agent_result_for_temporal(result, workspace_dir)
 
     # Fallback: no structured result — check control plane for pending
     # capability requests that the agent may have posted directly.
@@ -1729,6 +1939,9 @@ async def record_agent_turn(
     finish_reason = resp.get("finish_reason", "")
     tool_calls = resp.get("tool_calls", [])
     usage = resp.get("usage", {})
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
     content_preview = (resp.get("content") or "")[:300]
 
     tool_names = [tc.get("name", "?") for tc in tool_calls]
@@ -1770,6 +1983,28 @@ async def record_agent_turn(
             else:
                 logger.info(f"   └─ 🔧 {name}: {str(args)[:120]}")
 
+    # Persist durable turn metrics (counts/tokens/tool names only; no prompts).
+    try:
+        import httpx
+        control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{control_plane_url}/api/tasks/{task_id}/turns",
+                json={
+                    "iteration": iteration,
+                    "turn_number": turn_number,
+                    "provider": provider,
+                    "model": turn_data.get("model") or resp.get("model"),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens,
+                    "tool_names": tool_names,
+                    "turn_timestamp": timestamp,
+                },
+            )
+    except Exception as exc:
+        logger.debug(f"Could not persist turn metrics for {task_id}: {exc}")
+
     return {
         "task_id": task_id,
         "iteration": iteration,
@@ -1778,8 +2013,9 @@ async def record_agent_turn(
         "finish_reason": finish_reason,
         "tool_calls": tool_names,
         "tool_results_received": len(tool_results_in),
-        "input_tokens": usage.get("input_tokens"),
-        "output_tokens": usage.get("output_tokens"),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
         "timestamp": timestamp,
     }
 
@@ -1796,13 +2032,13 @@ async def store_task_output(
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
-    # Extract duration from OpenClaw meta if available
-    duration_ms = None
+    # Prefer the workflow-measured iteration duration.
+    duration_ms = result.get("duration_ms")
     output_str = result.get("output", "")
     if isinstance(output_str, str) and '"durationMs"' in output_str:
         import re
         m = re.search(r'"durationMs"\s*:\s*(\d+)', output_str)
-        if m:
+        if m and duration_ms is None:
             duration_ms = int(m.group(1))
 
     # Extract deliverables (files created by the agent)
@@ -1832,6 +2068,12 @@ async def store_task_output(
         "model_used": model_used,
         "image_used": image_used,
         "duration_ms": duration_ms,
+        "turn_count": result.get("turn_count", 0),
+        "started_at": result.get("started_at"),
+        "finished_at": result.get("finished_at"),
+        "approval_wait_ms": result.get("approval_wait_ms", 0),
+        "image_build_wait_ms": result.get("image_build_wait_ms", 0),
+        "iteration_reason": result.get("iteration_reason"),
         "deliverables": deliverables,
         "raw_result": result,
     }
@@ -2801,18 +3043,11 @@ async def build_agent_image(
         import traceback
         logger.error(f"❌ BUILD_ERROR | Task: {task_id} | {type(e).__name__}: {repr(e)}")
         logger.error(f"   └─ Traceback:\n{traceback.format_exc()}")
-        logger.warning(f"⚠️  FALLBACK | Task: {task_id} | Continuing with previous image: {current_image}")
-        # Fall back to the image we already had — include build error as feedback
-        return {
-            "image": current_image,
-            "feedback": (
-                f"CAPABILITY_BUILD_FAILED: Could not install '{resource}'. "
-                f"Error: {str(e)[:300]}. "
-                "The package may not be available for this platform. "
-                "Find an alternative approach."
-            ),
-            "denied": [],
-        }
+        raise ApplicationError(
+            f"CAPABILITY_BUILD_FAILED: Could not install '{resource}'. "
+            f"Error: {str(e)[:500]}",
+            non_retryable=True,
+        ) from e
 
 
 @activity.defn
@@ -3066,6 +3301,7 @@ async def create_deployment(task_id: str, deployment: Dict[str, Any]) -> Dict[st
         "port": deployment.get("port", 5000),
         "files": deployment.get("files"),
         "agent_image": deployment.get("agent_image"),
+        "trial_required": False,
     }
     
     logger.info(f"📦 CREATE_DEPLOYMENT | Task: {task_id} | Name: {payload['name']} | Port: {payload['port']}")
@@ -3082,6 +3318,26 @@ async def create_deployment(task_id: str, deployment: Dict[str, Any]) -> Dict[st
             return result
     except Exception as e:
         logger.error(f"❌ Failed to create deployment: {e}")
+        return {"error": str(e)}
+
+
+@activity.defn
+async def patch_deployment(deployment_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Update a deployment record via the control-plane API."""
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(
+                f"{control_plane_url}/api/deployments/{deployment_id}",
+                json=updates,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error(f"❌ Failed to patch deployment {deployment_id}: {e}")
         return {"error": str(e)}
 
 
@@ -3213,6 +3469,7 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
     import httpx
     
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    container = None
     
     logger.info(f"▶️  START_DEPLOYMENT | {deployment_id}")
     
@@ -3267,6 +3524,11 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
             detach=True,
             name=f"deploy-{deployment_id}",
             ports={f"{port}/tcp": host_port},
+            environment={
+                "HOST": "0.0.0.0",
+                "FLASK_RUN_HOST": "0.0.0.0",
+                "PORT": str(port),
+            },
             restart_policy={"Name": "unless-stopped"},
             labels={
                 "openclaw.deployment": deployment_id,
@@ -3276,9 +3538,52 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
         
         url = f"http://localhost:{host_port}" if host_port else None
         
+        logger.info(f"▶️  DEPLOYMENT_CONTAINER_STARTED | {deployment_id} | Container: {container.short_id} | Port: {host_port}")
+
+        healthy = False
+        probe_error = ""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for attempt in range(12):
+                for probe_path in ("/health", "/"):
+                    try:
+                        probe = await client.get(f"http://docker-dind:{host_port}{probe_path}")
+                        if probe.status_code < 500:
+                            healthy = True
+                            break
+                        probe_error = f"HTTP {probe.status_code} on {probe_path}"
+                    except Exception as exc:
+                        probe_error = f"{type(exc).__name__}: {exc}"
+                if healthy:
+                    break
+                try:
+                    container.reload()
+                except Exception:
+                    pass
+                else:
+                    if container.status != "running":
+                        logs = container.logs(tail=30).decode("utf-8", errors="replace")
+                        raise Exception(
+                            f"Container exited during startup (status: {container.status}). "
+                            f"Logs: {logs[:600]}"
+                        )
+                if attempt < 11:
+                    await asyncio.sleep(5)
+
+        if not healthy:
+            logs = ""
+            try:
+                logs = container.logs(tail=30).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise Exception(
+                f"Container started but published port {host_port} did not respond "
+                f"({probe_error}). Check that the app binds HOST=0.0.0.0. "
+                f"Logs: {logs[:600]}"
+            )
+
         logger.info(f"✅ DEPLOYMENT_STARTED | {deployment_id} | Container: {container.short_id} | Port: {host_port}")
         
-        # Update deployment record
+        # Update deployment record only after the published port responds
         async with httpx.AsyncClient(timeout=15.0) as client:
             await client.patch(
                 f"{control_plane_url}/api/deployments/{deployment_id}",
@@ -3294,6 +3599,11 @@ async def start_deployment_container(deployment_id: str) -> Dict[str, Any]:
     
     except Exception as e:
         logger.error(f"❌ DEPLOYMENT_START_FAILED | {deployment_id} | {e}")
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.patch(
@@ -3321,7 +3631,7 @@ async def trial_deploy(
 
     image_builder_url = os.getenv("IMAGE_BUILDER_URL", "http://openclaw-image-builder:8002")
 
-    trial_id = f"trial-{task_id[-8:]}"
+    trial_id = deployment.get("trial_id") or f"trial-{task_id[-8:]}"
     entrypoint = deployment.get("entrypoint", "python app.py")
     port = deployment.get("port", 5000)
     container = None
@@ -3413,6 +3723,11 @@ async def trial_deploy(
             detach=True,
             name=container_name,
             ports={f"{port}/tcp": host_port},
+            environment={
+                "HOST": "0.0.0.0",
+                "FLASK_RUN_HOST": "0.0.0.0",
+                "PORT": str(port),
+            },
             labels={"openclaw.trial": "true", "openclaw.task": task_id},
         )
         logger.info(f"🧪 Trial container started: {container.short_id} on port {host_port}")
@@ -3798,15 +4113,26 @@ async def post_node_structured_output(dag_id: str, node_id: str, task_id: str, o
     import httpx
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
 
+    gate_result = output.get("gate_result", {}) or {}
+    deep_review = gate_result.get("deep_review") or {}
+    triage = gate_result.get("triage") or {}
+    if deep_review:
+        acceptance_score = deep_review.get("score")
+    elif triage:
+        # Deep review was skipped by triage — no quality score was produced.
+        acceptance_score = None
+    else:
+        acceptance_score = (gate_result.get("external_assessment") or {}).get("score", 0)
+
     # Build structured payload from the collected output
     structured_payload = {
         "task_id": task_id,
         "status": "completed" if output.get("completed") else "failed",
         "objective": output.get("node_objective", ""),
         "success_criteria": output.get("success_criteria", []),
-        "acceptance_verdict": "pass" if output.get("gate_result", {}).get("valid") else "fail",
-        "acceptance_score": output.get("gate_result", {}).get("deep_review", {}).get("score") if output.get("gate_result", {}).get("deep_review") else output.get("gate_result", {}).get("external_assessment", {}).get("score", 0),
-        "criteria_met": {c: True for c in output.get("success_criteria", [])} if output.get("gate_result", {}).get("valid") else {},
+        "acceptance_verdict": "pass" if gate_result.get("valid") else "fail",
+        "acceptance_score": acceptance_score,
+        "criteria_met": {c: True for c in output.get("success_criteria", [])} if gate_result.get("valid") else {},
         "skill_id": output.get("skill_id"),
         "skill_followed": None,  # Will be populated by skill reference extraction
         "deliverables_count": len(output.get("deliverables") or {}),
@@ -3816,6 +4142,7 @@ async def post_node_structured_output(dag_id: str, node_id: str, task_id: str, o
         "output_text": output.get("output", ""),
         "error_text": output.get("error"),
         "workspace_step_path": output.get("workspace_step_path"),
+        "triage": triage or None,
     }
 
     try:
@@ -3838,6 +4165,7 @@ async def create_node_task(
     agent_image: str = "localhost:5000/openclaw-agent:openclaw",
     llm_model: str = "gemma3:4b",
     workspace_id: str = "",
+    base_image_override: str = "",
 ) -> str:
     """Create a Task record for a DAG node and return the task_id."""
     import httpx
@@ -3846,9 +4174,12 @@ async def create_node_task(
     task_id = f"task-{uuid.uuid4().hex[:8]}"
 
     # Control-plane /api/tasks expects a base_image key (e.g. "browser", "openclaw"), not a full image URL.
-    base_image = (agent_image or "openclaw").strip()
-    if "/" in base_image and ":" in base_image:
-        base_image = base_image.rsplit(":", 1)[-1]
+    if base_image_override:
+        base_image = base_image_override.strip()
+    else:
+        base_image = (agent_image or "openclaw").strip()
+        if "/" in base_image and ":" in base_image:
+            base_image = base_image.rsplit(":", 1)[-1]
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"{control_plane_url}/api/tasks",
@@ -4333,18 +4664,81 @@ def _build_prior_state_review_prompt(upstream_state_review: List[Dict[str, Any]]
     return "\n".join(lines)
 
 
-async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], assessment: Dict[str, Any]) -> Dict[str, Any]:
-    """Judge the node via the deep review (the control-plane's integrity audit
-    of the task's FINAL iteration).
+async def _gate_triage_precheck(
+    task_id: str,
+    node_id: str,
+    config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Ask the control-plane decision-model triage whether deep review is needed.
 
-    A clean or needs_attention verdict passes the node; issues_found only
-    hard-fails when the score is <= 55 (a convincing LLM failure); if the deep
-    review is unavailable the node passes (a broken reviewer must never sink a
-    well-executed step).
+    Returns the triage payload, or None when the triage service is unreachable
+    (callers then run the deep review). Triage can only pass or escalate; it can
+    never fail a node.
+    """
+    import httpx as _httpx_triage
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    gate_cfg = ((config or {}).get("gate_triage") or {}) if isinstance(config, dict) else {}
+    try:
+        async with _httpx_triage.AsyncClient(timeout=20.0) as _triage_client:
+            resp = await _triage_client.post(
+                f"{control_plane_url}/api/skill-learning/gate-triage",
+                json={
+                    "task_id": task_id,
+                    "node_id": node_id or None,
+                    "force_deep_review": bool(gate_cfg.get("force_deep_review")),
+                    "config": config or {},
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning(
+            f"gate_triage: triage unavailable ({exc}) — falling back to deep review for node {node_id}"
+        )
+        return None
+
+
+async def _deep_review_gate_fallback(
+    task_id: str,
+    output: Dict[str, Any],
+    assessment: Dict[str, Any],
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Judge the node via decision-model triage, then (if needed) the deep review.
+
+    Triage is a cheap pre-screen: a confident "pass" skips the deep review. It
+    can only pass or escalate — never fail a node. The deep review remains the
+    sole failure authority and runs whenever triage escalates, is uncertain, or
+    is unavailable. A clean/needs_attention deep-review verdict passes the node;
+    issues_found only hard-fails when the score is <= 55 (a convincing LLM
+    failure); if the deep review is unavailable the node passes (a broken
+    reviewer must never sink a well-executed step).
     """
     import httpx as _httpx_dr
     control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
     node_id = (output or {}).get("node_id") or ""
+
+    triage = await _gate_triage_precheck(task_id, node_id, config)
+    if triage and str(triage.get("decision") or "").lower() == "pass":
+        p_escalate = triage.get("p_escalate")
+        reason = (
+            f"ok (triage pass, p_escalate={p_escalate})"
+            if p_escalate is not None
+            else "ok (triage pass)"
+        )
+        logger.info(
+            f"gate_triage: node {node_id} passed triage "
+            f"(model={triage.get('model')}, p={p_escalate}, "
+            f"latency={triage.get('latency_ms')}ms) — deep review skipped"
+        )
+        return {
+            "valid": True,
+            "reason": reason,
+            "external_assessment": assessment,
+            "deep_review": None,
+            "triage": triage,
+        }
+
     try:
         async with _httpx_dr.AsyncClient(timeout=180.0) as _dr_client:
             resp = await _dr_client.post(
@@ -4364,6 +4758,7 @@ async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], asses
             "reason": "deep review unavailable",
             "external_assessment": assessment,
             "deep_review": None,
+            "triage": triage,
         }
 
     verdict = str((review or {}).get("verdict") or "").lower()
@@ -4379,12 +4774,14 @@ async def _deep_review_gate_fallback(task_id: str, output: Dict[str, Any], asses
             "reason": f"deep_review: issues_found (hard integrity signals, score {score})",
             "external_assessment": assessment,
             "deep_review": review,
+            "triage": triage,
         }
     return {
         "valid": True,
         "reason": f"ok (deep review: {verdict or 'n/a'}" + (f", score {score})" if score is not None else ")"),
         "external_assessment": assessment,
         "deep_review": review,
+        "triage": triage,
     }
 
 
@@ -4411,8 +4808,9 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
         return str(value).strip().lower() in ("1", "true", "yes", "y")
 
     gate_cfg = ((config or {}).get("deliverable_gate") or {}) if isinstance(config, dict) else {}
-    if gate_cfg.get("enabled") is False:
-        return {"valid": True, "reason": "deliverable gate disabled by node config"}
+    verification_mode = str((config or {}).get("verification_mode") or "full").lower()
+    if verification_mode == "off" or gate_cfg.get("enabled") is False:
+        return {"valid": True, "reason": "verification disabled by execution profile", "verification_mode": "off"}
 
     if str(output.get("status", "")).lower() != "completed":
         return {"valid": False, "reason": f"task status is '{output.get('status')}', expected 'completed'"}
@@ -4456,13 +4854,21 @@ async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optio
                 "reason": "hallucination_risk: logs contain mock/placeholder patterns with no evidence of real network fetch",
             }
 
+    if verification_mode == "deterministic":
+        return {
+            "valid": True,
+            "reason": "deterministic checks passed",
+            "verification_mode": "deterministic",
+            "deep_review": None,
+        }
+
     # The evidence-based deep review (control-plane integrity audit of the
     # task's FINAL iteration) is the sole LLM judge: it sees the actual
     # deliverable contents, tool turns and agent logs — unlike a summary-only
     # reviewer. A clean/needs_attention verdict passes; issues_found hard-fails
     # only at score <= 55 (a convincing failure); an unavailable deep review
     # passes (a broken reviewer must never sink a well-executed step).
-    return await _deep_review_gate_fallback(task_id, output, {})
+    return await _deep_review_gate_fallback(task_id, output, {}, config)
 
 
 @activity.defn
@@ -4602,7 +5008,11 @@ class DAGNodeWorkflow:
         # Prefer the DAG-inherited enriched image over the static base_image
         # from the node config.  dag_image is injected by DAGWorkflow when a
         # previous wave already built capabilities.
-        agent_image = config.get("dag_image") or config.get("base_image", "openclaw")
+        agent_image = (
+            config.get("dag_image")
+            or config.get("resolved_image")
+            or config.get("base_image", "openclaw")
+        )
         if "/" not in agent_image:
             agent_image = f"localhost:5000/openclaw-agent:{agent_image}"
         if config.get("dag_image"):
@@ -4627,8 +5037,10 @@ class DAGNodeWorkflow:
             config.get("max_turns")
             or min(_cap_turns, _base_turns + _per_upstream * upstream_count)
         )
+        max_iterations = int(config.get("max_iterations") or 50)
         logger.info(
-            f"🔧 DAGNodeWorkflow | Node {node_id} | upstream_count={upstream_count} | max_agent_turns={max_agent_turns}"
+            f"🔧 DAGNodeWorkflow | Node {node_id} | upstream_count={upstream_count} | "
+            f"max_agent_turns={max_agent_turns} | max_iterations={max_iterations}"
         )
 
         # Update node to RUNNING
@@ -4681,6 +5093,24 @@ class DAGNodeWorkflow:
             f"in `/tmp` or `/workspace/.cache/` — they are NOT collected. If the task fetches web data, save the "
             f"raw pages outside the deliverables directory and place only the parsed/structured data inside it."
         )
+        input_attachments = config.get("input_attachments") or []
+        if isinstance(input_attachments, list) and input_attachments:
+            follow_up_parts.append("--- Attached Reference Files (read-only) ---")
+            for att in input_attachments[:50]:
+                if not isinstance(att, dict):
+                    continue
+                stored = att.get("stored_as") or att.get("name")
+                mime = att.get("mime") or "application/octet-stream"
+                size = att.get("size")
+                size_str = f"{size} bytes" if isinstance(size, int) else "unknown size"
+                follow_up_parts.append(
+                    f"- /workspace/attachments/{stored} ({mime}, {size_str})"
+                )
+            follow_up_parts.append(
+                "The user attached these files to this DAG. They are in the shared workspace "
+                "and visible to all steps. Read them as needed; do not modify them. Files "
+                "produced by earlier steps appear in the input data below."
+            )
         if node_objective:
             follow_up_parts.append("--- Step Objective ---")
             follow_up_parts.append(node_objective)
@@ -4690,10 +5120,25 @@ class DAGNodeWorkflow:
                 follow_up_parts.append(f"- {str(criterion)[:240]}")
         follow_up_parts.append(
             f"--- Turn budget ---\n"
-            f"You have up to {max_agent_turns} turns for this step (scaled for {upstream_count} "
-            f"upstream step output(s) you must aggregate). Write your deliverable(s) incrementally — "
-            f"do not spend the whole budget exploring."
+            f"You have up to {max_agent_turns} turns for this step. Write your deliverable(s) "
+            f"incrementally — do not spend the whole budget exploring."
         )
+        thinking_budget = str(config.get("thinking_budget") or "").lower()
+        if thinking_budget == "lean":
+            follow_up_parts.append(
+                "--- Thinking budget: lean ---\n"
+                "Do not repeat discovery. Implement, test once, and finish."
+            )
+        elif thinking_budget == "standard":
+            follow_up_parts.append(
+                "--- Thinking budget: standard ---\n"
+                "Work efficiently; reuse existing files; avoid redundant scans."
+            )
+        quality_instructions = config.get("quality_instructions")
+        if quality_instructions:
+            follow_up_parts.append(
+                "--- Cross-check budget ---\n" + str(quality_instructions)[:1200]
+            )
         template_guidance = config.get("template_guidance")
         if template_guidance:
             follow_up_parts.append(
@@ -4724,7 +5169,15 @@ class DAGNodeWorkflow:
             # Create a task for tracking
             task_id = await workflow.execute_activity(
                 create_node_task,
-                args=[dag_id, node_id, description, agent_image, llm_model, workspace_id],
+                args=[
+                    dag_id,
+                    node_id,
+                    description,
+                    agent_image,
+                    llm_model,
+                    workspace_id,
+                    config.get("resolved_runtime") or "",
+                ],
                 start_to_close_timeout=timedelta(seconds=30),
             )
 
@@ -4774,7 +5227,7 @@ class DAGNodeWorkflow:
 
             result = await workflow.execute_child_workflow(
                 AgentTaskWorkflow.run,
-                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns],
+                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations],
                 id=child_workflow_id,
             )
 
@@ -4813,8 +5266,37 @@ class DAGNodeWorkflow:
             gate_result = await workflow.execute_activity(
                 evaluate_node_gate,
                 args=[task_id, output, config],
-                start_to_close_timeout=timedelta(seconds=30),
+                # Triage is fast, but the fallback deep review allows 180s.
+                start_to_close_timeout=timedelta(seconds=300),
             )
+
+            # Record the decision-model triage outcome (even when it escalated)
+            # so the UI/audit trail shows why a deep review ran or was skipped.
+            triage_result = gate_result.get("triage")
+            if triage_result:
+                await workflow.execute_activity(
+                    post_node_audit_event,
+                    args=[
+                        dag_id,
+                        node_id,
+                        {
+                            "task_id": task_id,
+                            "event_type": "gate_triage",
+                            "severity": "info",
+                            "message": (
+                                f"Decision-model triage: {triage_result.get('decision')} "
+                                f"(p_escalate={triage_result.get('p_escalate')}, "
+                                f"model={triage_result.get('model')}, "
+                                f"reason={triage_result.get('reason')})"
+                            ),
+                            "event_data": {
+                                "triage": triage_result,
+                                "deep_review_skipped": not gate_result.get("deep_review"),
+                            },
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
 
             # Soft-fail retry policy: when the deep review reports a hard
             # integrity failure (issues_found, score <= 55), run one corrective
@@ -4883,7 +5365,7 @@ class DAGNodeWorkflow:
 
                 retry_result = await workflow.execute_child_workflow(
                     AgentTaskWorkflow.run,
-                    args=[task_id, llm_model, result.get("current_image", agent_image), retry_follow_up, dag_id, _deliverables_required, max_agent_turns],
+                    args=[task_id, llm_model, result.get("current_image", agent_image), retry_follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations],
                     id=f"{child_workflow_id}-assessment-retry",
                 )
 
@@ -4900,10 +5382,15 @@ class DAGNodeWorkflow:
                     args=[task_id],
                     start_to_close_timeout=timedelta(seconds=30),
                 )
+                # After a corrective retry, always run the deep review to
+                # confirm the fix — triage must not short-circuit verification.
+                _retry_gate_cfg = dict((config.get("gate_triage") or {}))
+                _retry_gate_cfg["force_deep_review"] = True
+                _retry_config = {**config, "gate_triage": _retry_gate_cfg}
                 gate_result = await workflow.execute_activity(
                     evaluate_node_gate,
-                    args=[task_id, output, config],
-                    start_to_close_timeout=timedelta(seconds=30),
+                    args=[task_id, output, _retry_config],
+                    start_to_close_timeout=timedelta(seconds=300),
                 )
 
                 if retry_result.get("current_image"):
@@ -5034,7 +5521,11 @@ class DAGNodeWorkflow:
                         "acceptance_result": gate_result,
                         "acceptance_state": {
                             "verdict": "pass" if gate_result.get("valid") else "fail",
-                            "score": (gate_result.get("deep_review") or {}).get("score") or gate_result.get("external_assessment", {}).get("score", 0),
+                            "score": (
+                                (gate_result.get("deep_review") or {}).get("score")
+                                if gate_result.get("deep_review")
+                                else (gate_result.get("external_assessment") or {}).get("score")
+                            ),
                             "criteria_results": [],
                             "checked_at": workflow.now().isoformat(),
                         },
@@ -5924,11 +6415,102 @@ class DAGWorkflow:
 
 @workflow.defn
 class DeploymentBuildWorkflow:
-    """Workflow to build a deployment image after approval."""
+    """Validate and/or build a deployment image after approval."""
 
     @workflow.run
-    async def run(self, deployment_id: str) -> Dict[str, Any]:
+    async def run(
+        self,
+        deployment_id: str,
+        deployment: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         logger.info(f"DeploymentBuildWorkflow started for {deployment_id}")
+
+        if deployment and deployment.get("trial_required"):
+            normalized_entrypoint = _normalize_deployment_entrypoint(
+                deployment.get("entrypoint", "python app.py"),
+                deployment.get("port", 5000),
+            )
+            trial_payload = {
+                **deployment,
+                "entrypoint": normalized_entrypoint,
+                "trial_id": deployment_id,
+            }
+            await workflow.execute_activity(
+                patch_deployment,
+                args=[
+                    deployment_id,
+                    {
+                        "status": "building",
+                        "entrypoint": normalized_entrypoint,
+                    },
+                ],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+
+            trial = await workflow.execute_activity(
+                trial_deploy,
+                args=[deployment.get("task_id"), trial_payload],
+                start_to_close_timeout=timedelta(minutes=10),
+            )
+            if not trial.get("passed"):
+                error = trial.get("error", "Trial deployment failed")
+                phase = trial.get("phase") or "unknown"
+                logs = (trial.get("logs") or "")[:1000]
+                detail = f"Trial preflight failed ({phase}): {error}"
+                if logs:
+                    detail = f"{detail}\n{logs}"
+                await workflow.execute_activity(
+                    patch_deployment,
+                    args=[
+                        deployment_id,
+                        {
+                            "status": "failed",
+                            "error": detail,
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                return {
+                    "status": "failed",
+                    "phase": phase,
+                    "error": error,
+                    "logs": logs,
+                }
+
+            image_tag = trial.get("image_tag")
+            if not image_tag:
+                await workflow.execute_activity(
+                    patch_deployment,
+                    args=[
+                        deployment_id,
+                        {
+                            "status": "failed",
+                            "error": "Trial passed without an image tag",
+                        },
+                    ],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                return {"status": "failed", "error": "Trial passed without an image tag"}
+
+            result = await workflow.execute_activity(
+                patch_deployment,
+                args=[
+                    deployment_id,
+                    {
+                        "status": "built",
+                        "image_tag": image_tag,
+                        "entrypoint": normalized_entrypoint,
+                    },
+                ],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            logger.info(f"✅ Trial image reused for deployment {deployment_id}: {image_tag}")
+            return {
+                "status": "built",
+                "image_tag": image_tag,
+                "trial_passed": True,
+                "deployment": result,
+            }
 
         result = await workflow.execute_activity(
             build_deployment_image,
@@ -6003,6 +6585,7 @@ async def main():
             check_verdict_guard,
             finalize_task,
             create_deployment,
+            patch_deployment,
             build_deployment_image,
             start_deployment_container,
             stop_deployment_container,

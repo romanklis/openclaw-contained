@@ -334,6 +334,8 @@ Use them when they match the task requirements. For unique tasks, create inline 
 
 {skills_v2_section}
 
+{budget_section}
+
 {blocks_section}
 
 ## DAG JSON Schema
@@ -354,7 +356,15 @@ You MUST respond with ONLY a valid JSON object (no markdown, no text before/afte
         "timeout_minutes": 15,
         "deploy_authorized": false,
         "selected_skill_v2_id": null,
-        "skill_selection_reason": null
+        "skill_selection_reason": null,
+        "required_capabilities": {{
+          "runtime_family": "openclaw",
+          "categories": ["data", "pdf"],
+          "packages": [{{"manager": "pip", "name": "pandas"}}],
+          "binaries": [],
+          "modalities": ["document"],
+          "rationale": "Why these capabilities are required"
+        }}
       }},
       "input_mapping": {{
         "input_name": "dependency-node-id.output_key"
@@ -408,9 +418,10 @@ Default — executes in an isolated container using the selected base_image + sk
 7. Use review/verdict (decision) nodes sparingly — only when the objective explicitly calls for a human review/approval gate, not as a default for every step. When used, give 2-3 clear options and wire each branch with a "decision:<value>" edge condition.
 8. Use input nodes only when the user must supply data (measurements/parameters) mid-flow that cannot be derived automatically; wire the fields so downstream nodes can consume them via input_mapping.
 9. base_image options: {base_images_section}. Choose using runtime + capabilities + best_for, and avoid images whose avoid_for conflicts with the node's task.
-10. Set each node config.llm_model to the requested execution model and do not use GPT models.
-11. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
-12. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
+10. Declare config.required_capabilities for every agent node: runtime_family, categories (web/pdf/office/data/browser/gpu/…), concrete packages (manager+name; only what the step actually needs), binaries, modalities, and a one-sentence rationale. The platform resolves/reuses a compatible image version before execution. Do not invent packages or request runtime-specific tools that the chosen base_image already provides.
+11. Set each node config.llm_model to the requested execution model and do not use GPT models.
+12. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
+13. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
 """
 
 
@@ -537,7 +548,28 @@ async def _build_blocks_section(db: AsyncSession, objective: str = "") -> str:
     return "\n".join(lines)
 
 
-async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None, skill_ids: list[str] | None = None, agent_model: str | None = None) -> dict:
+def _build_budget_section(thinking_budget: str, quality_budget: str) -> str:
+    thinking = {
+        "lean": "Lean thinking budget: use the fewest useful steps; avoid redundant discovery and repeated verification.",
+        "standard": "Standard thinking budget: work efficiently and reuse existing deliverables.",
+        "deep": "Deep thinking budget: thorough investigation is allowed when the task requires it.",
+    }.get(thinking_budget, "Standard thinking budget: work efficiently.")
+    quality = {
+        "minimal": (
+            "Minimal cross-check: do not add separate verification, report, README, or "
+            "output-regeneration nodes. Fold tests into the implementation node. "
+            "Do not request REPORT.md, VERIFICATION.md, provenance, or extra logs."
+        ),
+        "standard": (
+            "Standard cross-check: do not add a separate LLM verifier or report node. "
+            "At most one deterministic verification block is allowed. Keep README concise."
+        ),
+        "full": "Full cross-check: full verification and report artifacts are allowed.",
+    }.get(quality_budget, "Standard cross-check.")
+    return f"## Execution Budget\n{thinking}\n{quality}"
+
+
+async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image: str | None = None, skill_ids: list[str] | None = None, agent_model: str | None = None, thinking_budget: str = "standard", quality_budget: str = "standard") -> dict:
     """Generate a DAG plan from a user objective using the LLM router.
 
     Args:
@@ -581,12 +613,14 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
     system_prompt = PLANNER_SYSTEM_PROMPT.format(
         skills_section=skills_section,
         skills_v2_section=skills_v2_section,
+        budget_section=_build_budget_section(thinking_budget, quality_budget),
         blocks_section=await _build_blocks_section(db, objective=objective),
         base_images_section=await _build_base_images_section(db),
     )
 
     max_attempts = 3
     last_error = ""
+    usage_entries: list[dict] = []
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         for attempt in range(1, max_attempts + 1):
@@ -619,6 +653,31 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                usage = data.get("usage") or {}
+                input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+                prompt_details = usage.get("prompt_tokens_details") or {}
+                completion_details = usage.get("completion_tokens_details") or {}
+                usage_entries.append({
+                    "provider": data.get("provider") or data.get("model") or llm_model,
+                    "model": data.get("model") or llm_model,
+                    "attempt": attempt,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens,
+                    "cached_input_tokens": int(
+                        prompt_details.get("cached_tokens")
+                        or usage.get("prompt_cache_hit_tokens")
+                        or 0
+                    ),
+                    "reasoning_tokens": int(
+                        completion_details.get("reasoning_tokens")
+                        or usage.get("reasoning_tokens")
+                        or 0
+                    ),
+                    "request_id": data.get("id"),
+                })
             except Exception as e:
                 last_error = f"LLM request failed: {e}"
                 logger.warning(f"Planner attempt {attempt}/{max_attempts}: {last_error}")
@@ -672,6 +731,7 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
 
             dag_json = await _apply_v2_skill_fallback(db, dag_json, objective)
 
+            dag_json["_llm_usage"] = usage_entries
             logger.info(f"Planner generated valid DAG with {len(dag_json.get('nodes', []))} nodes")
             return dag_json
 

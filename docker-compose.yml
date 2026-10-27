@@ -18,6 +18,9 @@ services:
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
       - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-gvisor}
       - AGENT_IMAGES_DIR=/agent-images
+      - IMAGE_CATALOG_DIR=/data/image-repos
+      - SHARED_COMPONENTS_DIR=/agent-executor
+      - REGISTRY_URL=registry:5000
       - CREDENTIAL_GATEWAY_URL=${CREDENTIAL_GATEWAY_URL:-http://credential-gateway:8083}
       - CREDENTIAL_GATEWAY_ADMIN_TOKEN=${CREDENTIAL_GATEWAY_ADMIN_TOKEN:-openclaw-admin}
     depends_on:
@@ -32,8 +35,10 @@ services:
     volumes:
       - ./workspaces:/workspaces
       - ./agent-images:/agent-images:ro
+      - ./services/agent-executor:/agent-executor:ro
       - ./config/supply-chain.yaml:/config/supply-chain.yaml:ro
       - ./services/control-plane:/app
+      - ./image-repos:/data/image-repos
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -60,10 +65,16 @@ services:
       - AGENT_IMAGES_DIR=/agent-images
       - CONTROL_PLANE_URL=http://control-plane:8000
     depends_on:
-      - docker-dind
-      - postgres
-      - registry
+      docker-dind:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      registry:
+        condition: service_started
+      control-plane:
+        condition: service_healthy
     volumes:
+      - ./services/image-builder:/app
       - ./services/image-builder/templates:/app/templates
       - ./services/agent-executor:/agent-executor:ro
       - ./openclaw:/openclaw:ro

@@ -36,6 +36,13 @@ ANTHROPIC_API_KEY=your-key-here
 OPENAI_API_KEY=your-key-here
 ```
 
+> **Windows + WSL2:** if Ollama runs on Windows and TaskForge runs in WSL2,
+> `host.docker.internal` points at the WSL VM, not Windows. Run
+> `make test-ollama` to detect the Windows LAN IP and `make set-ollama-url` to
+> write it to `.env` and update the running control-plane (recreate it only if it
+> isn't running). Allow TCP 11434 in Windows Firewall and enable "Expose Ollama
+> to the network".
+
 ## 2. Start the Platform
 
 ```bash

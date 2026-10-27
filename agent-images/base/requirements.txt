@@ -8,6 +8,15 @@ requests==2.31.0
 # Data processing (minimal baseline)
 pydantic==2.6.0
 
+# Scientific / data stack (pinned, pre-baked so agents don't rebuild per task)
+numpy==1.26.4
+scipy==1.13.1
+matplotlib==3.9.2
+pillow==10.4.0
+pandas==2.2.3
+seaborn==0.13.2
+scikit-learn==1.5.2
+
 # PDF processing
 pypdf
 pymupdf

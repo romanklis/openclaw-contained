@@ -10,11 +10,14 @@ from models import (
     SkillV2, SkillV2Status, SkillV2Source,
     SkillDemo, SkillReview, SkillSelectionEvent,
     AgentImage, TaskOutput, Task, DAGNode, Skill, DeepReview,
-    TemplateSkill, TemplateSkillStatus,
+    LlmUsage, TemplateSkill, TemplateSkillStatus,
 )
 from typing import Optional, List, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
+import os
+import random
+import time
 import uuid
 import logging
 import json
@@ -1127,6 +1130,371 @@ def _extract_turns_from_agent_logs(agent_logs: str) -> List[dict]:
 
 
 
+# ---------------------------------------------------------------------------
+# Decision-model triage — cheap pre-screen before the expensive deep review
+# ---------------------------------------------------------------------------
+#
+# Triage asks a small Ollama decision model (System One /v1/systemone) whether
+# an execution looks suspicious. It can only PASS (skip the deep review) or
+# ESCALATE (run the deep review). It never fails a node; the deep review remains
+# the sole failure authority.
+
+class GateTriageRequest(BaseModel):
+    task_id: str
+    node_id: Optional[str] = None
+    dag_id: Optional[str] = None
+    force_deep_review: bool = False
+    config: Optional[dict] = None  # node config; may carry gate_triage overrides
+
+
+async def _record_llm_usage(
+    db: AsyncSession,
+    usage: dict,
+    *,
+    dag_id: Optional[str],
+    task_id: Optional[str],
+    node_id: Optional[str],
+    purpose: str,
+    model: Optional[str],
+    attempt: int = 1,
+) -> None:
+    if not usage:
+        return
+    input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+    db.add(LlmUsage(
+        dag_id=dag_id,
+        task_id=task_id,
+        node_id=node_id,
+        purpose=purpose,
+        provider=(model or "").split("-")[0] or None,
+        model=model,
+        attempt=attempt,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        cached_input_tokens=int(prompt_details.get("cached_tokens") or usage.get("prompt_cache_hit_tokens") or 0),
+        reasoning_tokens=int(completion_details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0),
+    ))
+
+
+class GateTriageResponse(BaseModel):
+    decision: str  # "pass" | "escalate"
+    p_escalate: Optional[float] = None
+    model: Optional[str] = None
+    latency_ms: int = 0
+    reason: str = ""
+    sampled: bool = False
+    features: dict = {}
+    usage: dict = {}
+
+
+_TRIAGE_RED_FLAG_CHECKS = {
+    "mock_or_synthetic": (
+        "mock_data", "mock data", "mocking the", "fake_data", "fabricated",
+        "synthetic data", "dummy data", "simulated data",
+    ),
+    "placeholder": (
+        "# todo", "todo:", "tbd", "lorem ipsum", "placeholder value",
+        "unimplemented",
+    ),
+    "empty_result": (
+        "0 items", "0 results", "no results found", "returned 0",
+        "empty result", "empty dataframe", "no records found",
+    ),
+    "failed_fetch": (
+        "curl: (", "connection refused", "timed out", "status_code\": 4",
+        "status_code\":4", "status_code\": 5", "status_code\":5",
+        "http/1.1 4", "http/1.1 5", "403 forbidden", "404 not found",
+    ),
+}
+
+
+def _scan_triage_red_flags(text: str) -> List[str]:
+    """Return deterministic red-flag names found in the execution text."""
+    lowered = (text or "").lower()
+    return [
+        name
+        for name, needles in _TRIAGE_RED_FLAG_CHECKS.items()
+        if any(needle in lowered for needle in needles)
+    ]
+
+
+def _build_triage_state(task: Task, output: TaskOutput, node: Optional[object] = None) -> dict:
+    """Build a compact, deterministic summary for the decision model.
+
+    Decision models have short effective context, so this deliberately avoids
+    the full deep-review payload (large deliverables + 12k log chars).
+    """
+    deliverables = output.deliverables or {}
+    raw = output.raw_result if isinstance(output.raw_result, dict) else {}
+    agent_logs = raw.get("agent_logs", "") or ""
+    final_output = raw.get("output", "") or ""
+    turns = _extract_turns_from_agent_logs(agent_logs)
+
+    excerpts: dict = {}
+    for key in list(deliverables.keys())[:10]:
+        value = deliverables.get(key)
+        if not isinstance(value, str):
+            excerpts[key] = f"[non-text {type(value).__name__}]"
+        elif key.lower().endswith((".html", ".htm")):
+            excerpts[key] = f"[HTML deliverable, {len(value)} bytes]"
+        else:
+            excerpts[key] = value[:200]
+
+    tool_names: List[str] = []
+    for turn in turns[:50]:
+        for call in turn.get("command_issued") or []:
+            tool = call.get("tool")
+            if tool and tool not in tool_names:
+                tool_names.append(tool)
+
+    log_lines = [line for line in agent_logs.splitlines() if line.strip()][-12:]
+    log_tail = "\n".join(line[:200] for line in log_lines)
+
+    scan_text = "\n".join(
+        [agent_logs[-20000:], final_output[:5000]] + [str(v) for v in excerpts.values()]
+    )
+    red_flags = _scan_triage_red_flags(scan_text)
+    if not turns and deliverables:
+        red_flags.append("no_tool_calls_with_deliverables")
+
+    completed = output.completed
+    completed_true = completed is True or str(completed).strip().lower() == "true"
+    node_id = None
+    if node is not None:
+        node_id = getattr(node, "node_id", None)
+    return {
+        "task": {
+            "name": task.name,
+            "description": (task.description or "")[:500],
+            "base_image": getattr(task, "current_image", None),
+            "dag_id": task.dag_id,
+            "node_id": node_id or task.node_id,
+        },
+        "output": {
+            "status": "completed" if completed_true else str(completed),
+            "error": (output.error or "")[:300],
+            "iteration": output.iteration,
+            "turn_count": len(turns),
+            "tool_names": tool_names,
+            "output_text": final_output[:600],
+        },
+        "deliverables": excerpts,
+        "log_tail": log_tail,
+        "red_flags": red_flags,
+    }
+
+
+def _triage_config() -> dict:
+    """Resolve triage settings from DAG model defaults (DB + env overrides)."""
+    from routers.dags import _dag_model_defaults
+
+    def _get(key: str, default: str) -> str:
+        return _dag_model_defaults.get(key) or default
+
+    enabled = str(_get("triage_enabled", "true")).strip().lower() in ("1", "true", "yes", "on")
+    try:
+        threshold = float(_get("triage_threshold", "0.20"))
+    except (TypeError, ValueError):
+        threshold = 0.20
+    try:
+        sample_rate = float(_get("triage_sample_rate", "0.05"))
+    except (TypeError, ValueError):
+        sample_rate = 0.05
+    return {
+        "enabled": enabled,
+        "provider": str(_get("triage_provider", "ollama")),
+        "model": str(_get("triage_model", "kev:0.8b-q8_0")),
+        "threshold": max(0.0, min(1.0, threshold)),
+        "sample_rate": max(0.0, min(1.0, sample_rate)),
+        "max_state_chars": 6000,
+        "timeout_s": 10.0,
+    }
+
+
+async def _call_systemone(state: dict, model: str, timeout_s: float = 10.0) -> dict:
+    """Call Ollama's System One decision endpoint and return p(escalate)."""
+    import httpx
+    from routers.llm import _ollama_url
+
+    base_url = _ollama_url().rstrip("/")
+    payload = {
+        "model": model,
+        "state": state,
+        # Ollama's System One endpoint streams by default and keeps the HTTP
+        # connection open; force a single JSON response.
+        "stream": False,
+        "questions": {
+            "needs_audit": {
+                "type": "noul",
+                "instructions": (
+                    "Does this agent execution show evidence of hallucination, "
+                    "fabricated or synthetic data, shortcuts, unverified claims, "
+                    "or deliverables that do not match the task? Answer true if "
+                    "a full integrity audit is needed."
+                ),
+                "criteria": {
+                    "true": "A full integrity audit is needed",
+                    "false": "The execution looks clean",
+                },
+            }
+        },
+    }
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.post(f"{base_url}/v1/systemone", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    answer = (data.get("answers") or {}).get("needs_audit") or {}
+    p_escalate = answer.get("noul")
+    if not isinstance(p_escalate, (int, float)):
+        raise ValueError(f"System One response missing noul probability: {str(data)[:300]}")
+    return {
+        "p_escalate": float(p_escalate),
+        "model": data.get("model") or model,
+        "usage": data.get("usage") or {},
+    }
+
+
+@router.post("/gate-triage", response_model=GateTriageResponse)
+async def gate_triage(data: GateTriageRequest, db: AsyncSession = Depends(get_db)):
+    """Cheap decision-model pre-screen for a node's final output.
+
+    Returns decision="pass" when the execution looks clean enough to skip the
+    deep review, otherwise decision="escalate". Every error path escalates so a
+    broken decision model can never sink a well-executed node.
+    """
+    def _as_bool(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    cfg = _triage_config()
+    overrides = data.config.get("gate_triage") if isinstance(data.config, dict) else None
+    if isinstance(overrides, dict):
+        if "enabled" in overrides:
+            cfg["enabled"] = _as_bool(overrides["enabled"])
+        if overrides.get("model"):
+            cfg["model"] = str(overrides["model"])
+        for key, cast in (
+            ("threshold", float),
+            ("sample_rate", float),
+            ("timeout_s", float),
+            ("max_state_chars", int),
+        ):
+            if overrides.get(key) is not None:
+                try:
+                    cfg[key] = cast(overrides[key])
+                except (TypeError, ValueError):
+                    pass
+
+    def _escalate(reason: str, **kwargs) -> GateTriageResponse:
+        return GateTriageResponse(
+            decision="escalate", reason=reason, model=cfg["model"], **kwargs
+        )
+
+    force_deep = data.force_deep_review or (
+        isinstance(overrides, dict) and _as_bool(overrides.get("force_deep_review"))
+    )
+    if force_deep:
+        return _escalate("force_deep_review")
+    if not cfg["enabled"]:
+        return _escalate("disabled")
+
+    task = await db.get(Task, data.task_id)
+    if not task:
+        return _escalate("task_not_found")
+
+    node = None
+    if task.dag_id and data.node_id:
+        node_result = await db.execute(
+            select(DAGNode).where(
+                DAGNode.dag_id == task.dag_id, DAGNode.node_id == data.node_id
+            )
+        )
+        node = node_result.scalars().first()
+
+    result = await db.execute(
+        select(TaskOutput).where(TaskOutput.task_id == data.task_id).order_by(TaskOutput.iteration)
+    )
+    outputs = list(result.scalars().all())
+    if not outputs:
+        return _escalate("no_outputs")
+
+    state = _build_triage_state(task, outputs[-1], node)
+    state_json = json.dumps(state, default=str)
+    if len(state_json) > cfg["max_state_chars"]:
+        return _escalate("state_too_large", features={"state_chars": len(state_json)})
+    if state.get("red_flags"):
+        return _escalate(
+            f"red_flag:{state['red_flags'][0]}",
+            features={"red_flags": state["red_flags"]},
+        )
+
+    started = time.monotonic()
+    try:
+        res = await _call_systemone(state, cfg["model"], timeout_s=cfg["timeout_s"])
+    except Exception as exc:
+        logger.warning("gate_triage: decision model unavailable (%s)", exc)
+        return _escalate(
+            f"decision_model_unavailable: {str(exc)[:200]}",
+            latency_ms=int((time.monotonic() - started) * 1000),
+            features={"red_flags": state.get("red_flags", [])},
+        )
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    await _record_llm_usage(
+        db,
+        res.get("usage") or {},
+        dag_id=task.dag_id,
+        task_id=data.task_id,
+        node_id=data.node_id or task.node_id,
+        purpose="gate_triage",
+        model=res.get("model") or cfg["model"],
+    )
+    await db.commit()
+    p_escalate = res["p_escalate"]
+    features = {
+        "red_flags": state.get("red_flags", []),
+        "deliverables": list((state.get("deliverables") or {}).keys()),
+        "turn_count": (state.get("output") or {}).get("turn_count", 0),
+    }
+    if p_escalate >= cfg["threshold"]:
+        return GateTriageResponse(
+            decision="escalate",
+            p_escalate=p_escalate,
+            model=res["model"],
+            latency_ms=latency_ms,
+            reason="threshold",
+            features=features,
+            usage=res["usage"],
+        )
+    if random.random() < cfg["sample_rate"]:
+        return GateTriageResponse(
+            decision="escalate",
+            p_escalate=p_escalate,
+            model=res["model"],
+            latency_ms=latency_ms,
+            reason="sampled",
+            sampled=True,
+            features=features,
+            usage=res["usage"],
+        )
+    return GateTriageResponse(
+        decision="pass",
+        p_escalate=p_escalate,
+        model=res["model"],
+        latency_ms=latency_ms,
+        reason="ok",
+        features=features,
+        usage=res["usage"],
+    )
+
+
 def _normalize_review_payload(parsed: dict) -> dict:
     """Normalize a parsed deep-review/analysis payload.
 
@@ -1475,7 +1843,8 @@ async def _call_skill_analysis_llm(summary: dict, skill_used: Optional[dict], ta
             if resp.status_code != 200:
                 logger.warning("Skill analysis LLM returned %s for %s: %s", resp.status_code, model, resp.text[:500])
                 break
-            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            response_data = resp.json()
+            content = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
             parsed = _extract_json_object(content)
             if parsed is not None:
                 normalized = _normalize_review_payload(parsed)
@@ -1797,6 +2166,7 @@ async def _call_deep_review_llm(summary: dict, skill_used: Optional[dict], task:
                         normalized["verdict"] = verdict
                 if verdict:
                     normalized["model"] = model
+                    normalized["_llm_usage"] = response_data.get("usage") or {}
                     return normalized
             logger.warning("Deep review: could not parse output for %s (strict=%s); retrying", model, strict)
     return {"verdict": "needs_attention", "score": 0, "summary": "Could not parse LLM output", "issues": [], "positives": [], "model": model}
@@ -1848,6 +2218,16 @@ async def deep_review_task(data: DeepReviewRequest, db: AsyncSession = Depends(g
     summary = _build_execution_summary(task, outputs[-1:], node=node, image_id=image_id)
 
     review = await _call_deep_review_llm(summary, skill_used, task, include_skill=data.include_skill)
+    await _record_llm_usage(
+        db,
+        review.get("_llm_usage") or {},
+        dag_id=data.dag_id or task.dag_id,
+        task_id=data.task_id,
+        node_id=data.node_id or task.node_id,
+        purpose="deep_review",
+        model=review.get("model") or _deep_review_model(),
+    )
+    review.pop("_llm_usage", None)
 
     merged_issues = [DeepReviewIssue(**i) for i in (review.get("issues") or []) if isinstance(i, dict)]
 

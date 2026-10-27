@@ -17,6 +17,10 @@ interface CapabilityRequest {
   reviewed_by?: string
   decision?: string
   alternative_suggestion?: string
+  image_build_id?: number | null
+  image_version_id?: string | null
+  image_build_status?: string | null
+  image_tag?: string | null
   details?: {
     packages?: string[]
     original_type?: string
@@ -195,6 +199,19 @@ function ApprovalsContent() {
       fetchRequests()
     } catch (error) {
       console.error('Review failed:', error)
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const retryBuild = async (requestId: number, buildId: number) => {
+    setActionLoading(requestId)
+    try {
+      const resp = await fetch(`${API}/api/image-catalog/builds/${buildId}/retry`, { method: 'POST' })
+      if (!resp.ok) throw new Error(await resp.text())
+      await fetchRequests()
+    } catch (error) {
+      console.error('Build retry failed:', error)
     } finally {
       setActionLoading(null)
     }
@@ -488,6 +505,17 @@ function ApprovalsContent() {
                             <span className="ml-3">{new Date(req.requested_at).toLocaleString()}</span>
                           </div>
 
+                          {req.image_build_id && (
+                            <div className="bg-emerald-500/5 border border-emerald-500/15 rounded-lg p-3 mb-3 text-xs">
+                              <span className="text-emerald-400 font-medium">🖼 Image version:</span>{' '}
+                              <Link href="/image-catalog" className="text-emerald-300 hover:text-emerald-200 font-mono">
+                                {req.image_version_id || `build #${req.image_build_id}`}
+                              </Link>
+                              {req.image_build_status && <span className="ml-2 text-gray-400">{req.image_build_status}</span>}
+                              {req.image_tag && <span className="ml-2 text-gray-500 font-mono">{req.image_tag}</span>}
+                            </div>
+                          )}
+
                           {/* Task context */}
                           {task && task.description && (
                             <div className="bg-indigo-500/5 border border-indigo-500/15 rounded-lg p-3 mb-3">
@@ -656,6 +684,24 @@ function ApprovalsContent() {
                         <span className="ml-2 text-blue-400">Alt: {req.alternative_suggestion}</span>
                       )}
                     </div>
+                    {req.image_version_id && (
+                      <div className="text-xs mt-1">
+                        <Link href="/image-catalog" className="text-emerald-400 hover:text-emerald-300 font-mono">
+                          {req.image_version_id}
+                        </Link>
+                        {req.image_build_status && <span className="ml-2 text-gray-500">{req.image_build_status}</span>}
+                        {req.image_tag && <span className="ml-2 text-gray-600 font-mono">{req.image_tag}</span>}
+                        {req.image_build_id && req.image_build_status !== 'succeeded' && (
+                          <button
+                            onClick={() => retryBuild(req.id, req.image_build_id as number)}
+                            disabled={actionLoading === req.id}
+                            className="ml-2 rounded border border-amber-600/40 px-1.5 py-0.5 text-[10px] text-amber-300 hover:border-amber-400 disabled:opacity-40"
+                          >
+                            {actionLoading === req.id ? 'Retrying…' : 'Retry build'}
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

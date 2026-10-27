@@ -1,13 +1,15 @@
 """
 DAGs Router — CRUD and lifecycle for Master DAGs.
 """
-from typing import Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from typing import Any, Optional, List
+from fastapi import APIRouter, Depends, HTTPException, status, Body, File, Form, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from database import get_db
+from workflow_groups import ensure_workflow_group, cleanup_empty_group
 from models import (
     MasterDAG,
+    WorkflowGroup,
     DAGNode,
     Task,
     DAGStatus,
@@ -49,10 +51,18 @@ from schemas import (
 from dag_validator import validate_dag
 from planner import plan_dag, _normalize_interactive_nodes
 from routers.openai_dag import MODEL_CONFIGS
+from attachments import (
+    save_attachments,
+    validate_uploads,
+    attachments_block,
+    copy_attachments,
+    strip_attachments,
+)
 from temporal_client import start_dag_workflow, get_temporal_client
 import uuid
 import logging
 import json
+import os
 import httpx
 from datetime import datetime
 from copy import deepcopy
@@ -61,7 +71,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Default model config — persisted to DB (llm_provider_config) so it survives restarts
-_DAG_MODEL_KEYS = ["planning_model", "agent_model", "deep_review_model", "agent_context_mode"]
+_DAG_MODEL_KEYS = [
+    "planning_model",
+    "agent_model",
+    "deep_review_model",
+    "agent_context_mode",
+    "triage_enabled",
+    "triage_provider",
+    "triage_model",
+    "triage_threshold",
+    "triage_sample_rate",
+]
 _dag_model_defaults: dict[str, str] = {
     "planning_model": "gemini-flash-lite-latest",
     "agent_model": "gemini-flash-lite-latest",
@@ -69,7 +89,30 @@ _dag_model_defaults: dict[str, str] = {
     # none = full history replay each turn (quadratic cost);
     # linear = trim + fold old turns into a summary (bounded growth)
     "agent_context_mode": "none",
+    # Decision-model triage: cheap pre-screen before the expensive deep review.
+    # Triage can only pass or escalate; it never fails a node.
+    "triage_enabled": "true",
+    "triage_provider": "ollama",
+    "triage_model": "kev:0.8b-q8_0",
+    "triage_threshold": "0.20",
+    "triage_sample_rate": "0.05",
 }
+
+# Env overrides (env wins over DB/defaults for the triage settings).
+_TRIAGE_ENV_OVERRIDES = {
+    "triage_enabled": "DECISION_TRIAGE_ENABLED",
+    "triage_provider": "DECISION_TRIAGE_PROVIDER",
+    "triage_model": "DECISION_TRIAGE_MODEL",
+    "triage_threshold": "DECISION_TRIAGE_THRESHOLD",
+    "triage_sample_rate": "DECISION_TRIAGE_SAMPLE_RATE",
+}
+
+
+def _apply_triage_env_overrides() -> None:
+    for key, env_name in _TRIAGE_ENV_OVERRIDES.items():
+        value = os.getenv(env_name)
+        if value is not None and str(value).strip() != "":
+            _dag_model_defaults[key] = str(value).strip()
 
 
 async def _load_dag_model_defaults_from_db():
@@ -77,17 +120,21 @@ async def _load_dag_model_defaults_from_db():
     try:
         from sqlalchemy import text
         from database import async_session
+        params = {f"k{i}": key for i, key in enumerate(_DAG_MODEL_KEYS)}
+        placeholders = ", ".join(f":k{i}" for i in range(len(_DAG_MODEL_KEYS)))
         session = async_session()
         async with session:
             result = await session.execute(
-                text("SELECT key, value FROM llm_provider_config WHERE key IN (:k1, :k2, :k3, :k4)"),
-                {"k1": "planning_model", "k2": "agent_model", "k3": "deep_review_model", "k4": "agent_context_mode"},
+                text(f"SELECT key, value FROM llm_provider_config WHERE key IN ({placeholders})"),
+                params,
             )
             for key, value in result.fetchall():
                 if key in _DAG_MODEL_KEYS and value:
                     _dag_model_defaults[key] = value
     except Exception as e:
         logger.warning(f"Could not load DAG model defaults from DB: {e}")
+    # Env always wins after the DB load.
+    _apply_triage_env_overrides()
 
 
 async def _save_dag_model_default_to_db(key: str, value: str):
@@ -146,49 +193,115 @@ def _normalize_node_skill_fields(node_def: dict, node_config: dict) -> tuple[str
     return skill_id, selected_skill_v2_id, skill_selection_reason
 
 
-@router.post("", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
-async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
-    """Create a new DAG from an objective using the LLM Planner."""
+async def _resolve_node_capabilities(dag_json: dict, db: AsyncSession) -> None:
+    """Resolve base-image aliases and planner capabilities to catalog pins."""
+    try:
+        import image_catalog
+        await image_catalog.resolve_planner_capabilities(dag_json, db)
+    except Exception as exc:
+        logger.warning("Base/capability image resolution failed: %s", exc)
+
+
+async def _create_dag_impl(
+    objective: str,
+    *,
+    llm_model: Optional[str],
+    base_image: Optional[str],
+    auto_start: bool,
+    skill_ids: Optional[List[str]],
+    project_id: Optional[str],
+    files: Optional[List[UploadFile]],
+    db: AsyncSession,
+):
+    """Plan and persist a DAG, optionally saving attached reference files first."""
     dag_id = _gen_dag_id()
     workspace_id = _gen_workspace_id(dag_id)
 
     # Resolve model config: llm_model can be a MODEL_CONFIGS key or a raw model name
-    cfg = MODEL_CONFIGS.get(data.llm_model or "")
+    cfg = MODEL_CONFIGS.get(llm_model or "")
     if cfg:
         planning_model = cfg["planning_model"]
         agent_model = cfg["agent_model"]
-    elif data.llm_model:
-        planning_model = data.llm_model
+    elif llm_model:
+        planning_model = llm_model
         agent_model = planning_model
     else:
         # Use stored defaults
         planning_model = _dag_model_defaults["planning_model"]
         agent_model = _dag_model_defaults["agent_model"]
 
+    # Validate uploads before creating any DAG record so rejected files do not
+    # leave failed DAGs behind.
+    if files:
+        validate_uploads(files)
+
+    workflow_group = await ensure_workflow_group(
+        objective, project_id, db, llm_model=agent_model
+    )
+
     # Create DAG record in PLANNING state
     dag = MasterDAG(
         id=dag_id,
-        objective=data.objective,
+        objective=objective,
         status=DAGStatus.PLANNING,
         dag_json={},
         workspace_id=workspace_id,
         llm_model=agent_model,
-        project_id=data.project_id,
+        project_id=project_id,
+        workflow_group_id=workflow_group.id,
     )
     db.add(dag)
     await db.commit()
 
+    # Save attachments into the shared DAG workspace before planning so the
+    # planner (manifest only) and every node can use them.
+    attachments: List[dict] = []
+    if files:
+        try:
+            attachments = await save_attachments(workspace_id, files)
+        except HTTPException as exc:
+            dag.status = DAGStatus.FAILED
+            dag.dag_json = {"error": f"attachment upload failed: {exc.detail}"}
+            await db.commit()
+            raise
+        except Exception as exc:
+            dag.status = DAGStatus.FAILED
+            dag.dag_json = {"error": f"attachment upload failed: {exc}"}
+            await db.commit()
+            raise HTTPException(status_code=500, detail=f"Attachment upload failed: {exc}")
+
+    planner_objective = objective
+    if attachments:
+        planner_objective = f"{objective}\n\n{attachments_block(attachments)}"
+
     # Run the planner
     try:
-        dag_json = await plan_dag(data.objective, planning_model, db, base_image=data.base_image, skill_ids=data.skill_ids, agent_model=agent_model)
+        dag_json = await plan_dag(
+            planner_objective,
+            planning_model,
+            db,
+            base_image=base_image,
+            skill_ids=skill_ids,
+            agent_model=agent_model,
+        )
     except ValueError as e:
         dag.status = DAGStatus.FAILED
         dag.dag_json = {"error": str(e)}
         await db.commit()
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        dag.status = DAGStatus.FAILED
+        dag.dag_json = {"error": str(e)}
+        await db.commit()
+        raise HTTPException(status_code=500, detail=f"Planning failed: {e}")
 
     # Store DAG JSON and create node records
     dag_json = _normalize_interactive_nodes(dag_json)
+    await _resolve_node_capabilities(dag_json, db)
+    if attachments:
+        dag_json["input_attachments"] = attachments
+        for node_def in dag_json.get("nodes", []):
+            node_def.setdefault("config", {})["input_attachments"] = attachments
     dag.dag_json = dag_json
     dag.status = DAGStatus.READY
 
@@ -232,10 +345,60 @@ async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
 
     await db.commit()
     await db.refresh(dag)
-    if data.auto_start:
+    if auto_start:
         return await _start_dag(dag, db)
 
     return _build_dag_detail(dag, nodes)
+
+
+@router.post("", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
+async def create_dag(data: DAGCreate, db: AsyncSession = Depends(get_db)):
+    """Create a new DAG from an objective using the LLM Planner."""
+    return await _create_dag_impl(
+        data.objective,
+        llm_model=data.llm_model,
+        base_image=data.base_image,
+        auto_start=data.auto_start,
+        skill_ids=data.skill_ids,
+        project_id=data.project_id,
+        files=None,
+        db=db,
+    )
+
+
+@router.post("/with-files", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
+async def create_dag_with_files(
+    objective: str = Form(...),
+    auto_start: bool = Form(False),
+    skill_ids: Optional[str] = Form(None),
+    project_id: Optional[str] = Form(None),
+    llm_model: Optional[str] = Form(None),
+    base_image: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[]),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a DAG with optional attached reference files."""
+    parsed_skill_ids: Optional[List[str]] = None
+    if skill_ids:
+        try:
+            parsed = json.loads(skill_ids)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=422, detail="skill_ids must be a JSON array")
+        if isinstance(parsed, list):
+            parsed_skill_ids = [str(s) for s in parsed]
+        elif parsed is not None:
+            raise HTTPException(status_code=422, detail="skill_ids must be a JSON array")
+
+    return await _create_dag_impl(
+        objective,
+        llm_model=llm_model,
+        base_image=base_image,
+        auto_start=auto_start,
+        skill_ids=parsed_skill_ids,
+        project_id=project_id or None,
+        files=files or [],
+        db=db,
+    )
 
 
 @router.post("/manual", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
@@ -258,6 +421,9 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
     if not is_valid:
         raise HTTPException(status_code=422, detail={"errors": errors})
 
+    workflow_group = await ensure_workflow_group(
+        data.objective, data.project_id, db, llm_model=data.default_llm
+    )
     dag = MasterDAG(
         id=dag_id,
         objective=data.objective,
@@ -266,6 +432,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
         workspace_id=workspace_id,
         llm_model=data.default_llm,
         project_id=data.project_id,
+        workflow_group_id=workflow_group.id,
     )
     db.add(dag)
 
@@ -331,7 +498,7 @@ async def get_model_defaults():
 
 @router.post("/model-defaults")
 async def set_model_defaults(body: dict):
-    """Update the default planning and/or agent model."""
+    """Update the default planning / agent / review / triage settings."""
     changed = []
     if "planning_model" in body and body["planning_model"]:
         _dag_model_defaults["planning_model"] = body["planning_model"]
@@ -348,9 +515,36 @@ async def set_model_defaults(body: dict):
             mode = "none"
         _dag_model_defaults["agent_context_mode"] = mode
         changed.append(f"agent_context_mode={mode}")
+
+    # Decision-model triage settings
+    if "triage_enabled" in body:
+        enabled = str(body["triage_enabled"]).strip().lower() in ("1", "true", "yes", "on")
+        _dag_model_defaults["triage_enabled"] = "true" if enabled else "false"
+        changed.append(f"triage_enabled={_dag_model_defaults['triage_enabled']}")
+    if "triage_provider" in body and body["triage_provider"]:
+        _dag_model_defaults["triage_provider"] = str(body["triage_provider"]).strip()
+        changed.append(f"triage_provider={_dag_model_defaults['triage_provider']}")
+    if "triage_model" in body and body["triage_model"]:
+        _dag_model_defaults["triage_model"] = str(body["triage_model"]).strip()
+        changed.append(f"triage_model={_dag_model_defaults['triage_model']}")
+    if "triage_threshold" in body and body["triage_threshold"] not in (None, ""):
+        try:
+            threshold = max(0.0, min(1.0, float(body["triage_threshold"])))
+        except (TypeError, ValueError):
+            threshold = 0.20
+        _dag_model_defaults["triage_threshold"] = f"{threshold:.2f}"
+        changed.append(f"triage_threshold={_dag_model_defaults['triage_threshold']}")
+    if "triage_sample_rate" in body and body["triage_sample_rate"] not in (None, ""):
+        try:
+            sample_rate = max(0.0, min(1.0, float(body["triage_sample_rate"])))
+        except (TypeError, ValueError):
+            sample_rate = 0.05
+        _dag_model_defaults["triage_sample_rate"] = f"{sample_rate:.2f}"
+        changed.append(f"triage_sample_rate={_dag_model_defaults['triage_sample_rate']}")
+
     # Persist changed keys to DB so they survive restarts
-    for key in ("planning_model", "agent_model", "deep_review_model", "agent_context_mode"):
-        if key in _dag_model_defaults and (key in body and body[key]):
+    for key in _DAG_MODEL_KEYS:
+        if key in body and body[key] not in (None, ""):
             await _save_dag_model_default_to_db(key, _dag_model_defaults[key])
     logger.info(f"DAG model defaults updated: {', '.join(changed)}")
     return dict(_dag_model_defaults)
@@ -368,6 +562,12 @@ async def list_dags(skip: int = 0, limit: int = 50, archived: bool = False, proj
         q = q.where(MasterDAG.project_id == project_id)
     result = await db.execute(q.order_by(MasterDAG.created_at.desc()).offset(skip).limit(limit))
     return list(result.scalars().all())
+
+
+@router.get("/{dag_id}/token-usage")
+async def get_dag_tokens(dag_id: str, db: AsyncSession = Depends(get_db)):
+    from token_usage import get_dag_token_usage
+    return await get_dag_token_usage(dag_id, db)
 
 
 @router.get("/{dag_id}", response_model=DAGDetail)
@@ -508,6 +708,8 @@ async def delete_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Cannot delete a running DAG")
     if dag.locked:
         raise HTTPException(status_code=400, detail="Cannot delete a locked template DAG")
+    if getattr(dag, "exploration_session_id", None):
+        raise HTTPException(status_code=400, detail="Cannot delete an exploration cycle DAG; finish or replan the exploration")
 
     workspace_path = f"/workspaces/{dag.workspace_id}"
 
@@ -528,7 +730,10 @@ async def delete_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     if task_ids:
         await db.execute(delete(Task).where(Task.dag_id == dag_id))
     await db.execute(delete(DAGNode).where(DAGNode.dag_id == dag_id))
+    workflow_group_id = dag.workflow_group_id
     await db.delete(dag)
+    await db.commit()
+    await cleanup_empty_group(workflow_group_id, db)
     await db.commit()
 
     # Best-effort workspace cleanup.
@@ -547,6 +752,11 @@ async def lock_dag(dag_id: str, body: DAGLockRequest, db: AsyncSession = Depends
     params = [p.model_dump() for p in body.parameters]
     dag.locked = True
     dag.template_params = params
+    if dag.workflow_group_id:
+        group_result = await db.execute(select(WorkflowGroup).where(WorkflowGroup.id == dag.workflow_group_id))
+        group = group_result.scalar_one_or_none()
+        if group and getattr(group, "mode", "experiment") != "exploration":
+            group.mode = "template"
 
     # Parameterize the DAG text: replace each param's concrete default with its
     # {key} placeholder so a future instantiation substitutes new inputs.
@@ -640,6 +850,11 @@ async def unlock_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     """Unlock a DAG template so it can be modified again."""
     dag = await _get_dag_or_404(dag_id, db)
     dag.locked = False
+    if dag.workflow_group_id:
+        group_result = await db.execute(select(WorkflowGroup).where(WorkflowGroup.id == dag.workflow_group_id))
+        group = group_result.scalar_one_or_none()
+        if group and getattr(group, "mode", "experiment") == "template":
+            group.mode = "experiment"
     await db.commit()
     await db.refresh(dag)
     nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
@@ -914,6 +1129,16 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
             "input_mapping": input_mapping,
             "config": cfg,
         })
+    if body.llm_model:
+        overridden_model = str(body.llm_model).strip()
+        if overridden_model:
+            for nd in new_nodes:
+                if str(nd.get("node_type") or "agent") == "agent":
+                    cfg = dict(nd.get("config") or {})
+                    cfg["llm_model"] = overridden_model
+                    nd["config"] = cfg
+            src_dag_json["default_llm"] = overridden_model
+
     new_dag_json = {
         **{k: v for k, v in src_dag_json.items() if k != "nodes"},
         "nodes": new_nodes,
@@ -924,15 +1149,27 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
         raise HTTPException(status_code=422, detail={"errors": errors})
 
     new_dag_id = _gen_dag_id()
+    new_workspace_id = _gen_workspace_id(new_dag_id)
+    workflow_group = await ensure_workflow_group(
+        source.objective,
+        source.project_id,
+        db,
+        llm_model=source.llm_model,
+        existing_group_id=source.workflow_group_id,
+        use_llm_title=False,
+    )
+    if not source.workflow_group_id:
+        source.workflow_group_id = workflow_group.id
     new_dag = MasterDAG(
         id=new_dag_id,
         objective=objective,
         status=DAGStatus.READY,
         dag_json=new_dag_json,
-        workspace_id=_gen_workspace_id(new_dag_id),
+        workspace_id=new_workspace_id,
         llm_model=new_dag_json.get("default_llm") or source.llm_model,
         template_params=list(source.template_params or []),
         template_source_dag_id=source.id,
+        workflow_group_id=workflow_group.id,
         project_id=source.project_id,
     )
     db.add(new_dag)
@@ -961,6 +1198,19 @@ async def instantiate_dag(dag_id: str, body: DAGInstantiateRequest, db: AsyncSes
         )
         db.add(node)
         created_nodes.append(node)
+
+    # Attachments live on disk, not in the DB. Copy them into the new
+    # workspace; if that is impossible, drop the references so no phantom
+    # files are advertised to nodes.
+    source_attachments = (source.dag_json or {}).get("input_attachments") or []
+    if source_attachments:
+        if not copy_attachments(source.workspace_id, new_workspace_id):
+            strip_attachments(new_dag_json)
+            new_dag.dag_json = new_dag_json
+            for node in created_nodes:
+                node_config = dict(node.config or {})
+                node_config.pop("input_attachments", None)
+                node.config = node_config
 
     await db.commit()
     await db.refresh(new_dag)
@@ -1159,6 +1409,7 @@ async def create_node_state_snapshot(
         acquisition_log=payload.acquisition_log,
         acceptance_result=payload.acceptance_result,
         pending_items=payload.pending_items,
+        acceptance_state=payload.acceptance_state,
     )
     db.add(snapshot)
     await db.commit()
@@ -1387,6 +1638,7 @@ async def get_dag_workspace_manifest(dag_id: str, db: AsyncSession = Depends(get
         "step_manifest": step_manifest,
         "total_files": sum(len(v) for v in step_manifest.values()),
         "steps_with_deliverables": list(step_manifest.keys()),
+        "attachments": (dag.dag_json or {}).get("input_attachments", []) or [],
     }
 
 
@@ -1510,6 +1762,64 @@ async def patch_node(dag_id: str, node_id: str, payload: DAGNodePatch, db: Async
     return {"ok": True}
 
 
+@router.patch("/{dag_id}/nodes/{node_id}/model")
+async def patch_node_model(
+    dag_id: str,
+    node_id: str,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a node's execution model without changing graph structure.
+
+    Allowed for editable and completed/failed DAGs; the change applies to the
+    next run/retry of that node.
+    """
+    dag = await _get_dag_or_404(dag_id, db)
+    result = await db.execute(
+        select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id)
+    )
+    node = result.scalar_one_or_none()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    model = str(payload.get("llm_model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=422, detail="llm_model is required")
+
+    node_config = dict(node.config or {})
+    node_config["llm_model"] = model
+    node.config = node_config
+
+    dag_json = deepcopy(dag.dag_json or {})
+    for node_def in dag_json.get("nodes", []):
+        if node_def.get("node_id") == node_id:
+            node_def.setdefault("config", {})["llm_model"] = model
+            break
+    dag.dag_json = dag_json
+
+    await db.commit()
+    return {"ok": True, "llm_model": model}
+
+
+@router.get("/{dag_id}/attachments/{filename:path}")
+async def get_dag_attachment(dag_id: str, filename: str, db: AsyncSession = Depends(get_db)):
+    """Serve a DAG-level attached reference file from <workspace>/attachments/."""
+    import mimetypes
+    import os
+    from fastapi.responses import FileResponse
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}/attachments")
+    abs_path = os.path.realpath(os.path.join(root, filename))
+    if not abs_path.startswith(root + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not os.path.isfile(abs_path):
+        raise HTTPException(status_code=404, detail=f"Attachment '{filename}' not found")
+    mime = mimetypes.guess_type(abs_path)[0] or "application/octet-stream"
+    return FileResponse(abs_path, media_type=mime, filename=os.path.basename(abs_path))
+
+
 @router.get("/{dag_id}/nodes/{node_id}/files/{filename:path}")
 async def get_node_workspace_file(
     dag_id: str,
@@ -1540,6 +1850,200 @@ async def get_node_workspace_file(
         content=raw,
         media_type=mime,
         headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+    )
+
+
+@router.get("/{dag_id}/workspace/tree")
+async def get_dag_workspace_tree(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """List the actual DAG workspace files (paths, sizes) for inspection."""
+    import os
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}")
+    entries: list[dict] = []
+    truncated = False
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".next"}
+
+    if os.path.isdir(root):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if name not in skip_dirs and not name.startswith(".cache")
+            )
+            for name in sorted(filenames):
+                full_path = os.path.join(dirpath, name)
+                relative = os.path.relpath(full_path, root).replace(os.sep, "/")
+                try:
+                    size = os.path.getsize(full_path)
+                except OSError:
+                    size = 0
+                entries.append({"path": relative, "name": name, "size": size})
+                if len(entries) >= 2000:
+                    truncated = True
+                    break
+            if truncated:
+                break
+
+    return {
+        "workspace_id": workspace_id,
+        "entries": entries,
+        "truncated": truncated,
+    }
+
+
+@router.get("/{dag_id}/deliverables.zip")
+async def download_dag_deliverables(dag_id: str, db: AsyncSession = Depends(get_db)):
+    """Download the selected DAG run's deliverables as a ZIP archive."""
+    import json
+    import os
+    import tempfile
+    import zipfile
+    from datetime import datetime
+    from starlette.background import BackgroundTask
+    from fastapi.responses import FileResponse
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}")
+    if not os.path.isdir(root):
+        raise HTTPException(status_code=404, detail="DAG workspace not found")
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    nodes = list(nodes_result.scalars().all())
+    skip_names = {"AGENTS.md", "SOUL.md", "result.json"}
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".next"}
+
+    files: list[dict] = []
+    seen: set[str] = set()
+    skipped: list[dict] = []
+    total_size = 0
+    max_files = 2000
+    max_size = 500 * 1024 * 1024
+
+    def add_file(node_id: str, key: str) -> None:
+        nonlocal total_size
+        normalized = str(key or "").replace("\\", "/").lstrip("/")
+        if not normalized:
+            return
+        parts = normalized.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            skipped.append({"node_id": node_id, "path": normalized, "reason": "unsafe path"})
+            return
+        if parts[-1] in skip_names or any(part in skip_dirs for part in parts):
+            return
+        candidates = [normalized]
+        if not normalized.startswith(f"{node_id}/"):
+            candidates.append(f"{node_id}/{normalized}")
+        abs_path = None
+        rel_path = None
+        for candidate in candidates:
+            path = os.path.realpath(os.path.join(root, candidate))
+            if path != root and path.startswith(root + os.sep) and os.path.isfile(path) and not os.path.islink(path):
+                abs_path = path
+                rel_path = os.path.relpath(path, root).replace(os.sep, "/")
+                break
+        if not abs_path:
+            skipped.append({"node_id": node_id, "path": normalized, "reason": "file not found"})
+            return
+        if rel_path in seen:
+            return
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError as exc:
+            skipped.append({"node_id": node_id, "path": rel_path, "reason": str(exc)})
+            return
+        if size > max_size or total_size + size > max_size:
+            raise HTTPException(status_code=413, detail="Deliverable archive exceeds 500 MB")
+        if len(files) >= max_files:
+            raise HTTPException(status_code=413, detail="Deliverable archive exceeds 2000 files")
+        seen.add(rel_path)
+        total_size += size
+        files.append({"node_id": node_id, "path": rel_path, "size": size, "abs_path": abs_path})
+
+    for node in nodes:
+        node_deliverables = (node.output_data or {}).get("deliverables") if isinstance(node.output_data, dict) else None
+        keys = list(node_deliverables.keys()) if isinstance(node_deliverables, dict) else []
+        if not keys and node.task_id:
+            outputs_result = await db.execute(
+                select(TaskOutput)
+                .where(TaskOutput.task_id == node.task_id)
+                .order_by(TaskOutput.iteration.desc())
+            )
+            for output in outputs_result.scalars().all():
+                if isinstance(output.deliverables, dict) and output.deliverables:
+                    keys = list(output.deliverables.keys())
+                    break
+        for key in keys:
+            add_file(node.node_id, key)
+
+    if not files:
+        raise HTTPException(status_code=404, detail="No deliverables found for this DAG run")
+
+    temp = tempfile.NamedTemporaryFile(prefix=f"{dag_id}-", suffix=".zip", delete=False)
+    temp_path = temp.name
+    temp.close()
+    try:
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for record in files:
+                archive.write(record["abs_path"], arcname=record["path"])
+            manifest = {
+                "dag_id": dag.id,
+                "objective": dag.objective,
+                "workspace_id": workspace_id,
+                "exploration_session_id": dag.exploration_session_id,
+                "exploration_cycle": dag.exploration_cycle,
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "files": [
+                    {"node_id": record["node_id"], "path": record["path"], "size": record["size"]}
+                    for record in files
+                ],
+                "skipped": skipped,
+            }
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+    return FileResponse(
+        temp_path,
+        media_type="application/zip",
+        filename=f"{dag_id}-deliverables.zip",
+        background=BackgroundTask(os.unlink, temp_path),
+    )
+
+
+@router.get("/{dag_id}/workspace/files/{file_path:path}")
+async def get_dag_workspace_file(
+    dag_id: str,
+    file_path: str,
+    inline: int = 1,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve an arbitrary DAG workspace file (inline preview or download)."""
+    import mimetypes
+    import os
+    from fastapi.responses import FileResponse
+
+    dag = await _get_dag_or_404(dag_id, db)
+    workspace_id = dag.workspace_id or f"workspace-{dag_id}"
+    root = os.path.realpath(f"/workspaces/{workspace_id}")
+    abs_path = os.path.realpath(os.path.join(root, file_path))
+    if not abs_path.startswith(root + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not os.path.isfile(abs_path):
+        raise HTTPException(status_code=404, detail=f"File '{file_path}' not found")
+    mime = mimetypes.guess_type(abs_path)[0] or "application/octet-stream"
+    disposition = "inline" if inline else "attachment"
+    return FileResponse(
+        abs_path,
+        media_type=mime,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{os.path.basename(abs_path)}"'
+        },
     )
 
 
@@ -2223,6 +2727,17 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
     new_dag_id = _gen_dag_id()
     workspace_id = old_dag.workspace_id
 
+    workflow_group = await ensure_workflow_group(
+        old_dag.objective,
+        old_dag.project_id,
+        db,
+        llm_model=llm_model,
+        existing_group_id=old_dag.workflow_group_id,
+        use_llm_title=False,
+    )
+    if not old_dag.workflow_group_id:
+        old_dag.workflow_group_id = workflow_group.id
+
     new_dag = MasterDAG(
         id=new_dag_id,
         objective=revision_objective,
@@ -2230,6 +2745,7 @@ async def revise_dag(dag_id: str, body: DAGRevise, db: AsyncSession = Depends(ge
         dag_json={},
         workspace_id=workspace_id,
         llm_model=llm_model,
+        workflow_group_id=workflow_group.id,
     )
     db.add(new_dag)
     await db.commit()
@@ -2474,8 +2990,13 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
         "locked": bool(getattr(dag, "locked", False)),
         "template_params": list(getattr(dag, "template_params", []) or []),
         "template_source_dag_id": getattr(dag, "template_source_dag_id", None),
+        "workflow_group_id": getattr(dag, "workflow_group_id", None),
+        "exploration_session_id": getattr(dag, "exploration_session_id", None),
+        "exploration_cycle": getattr(dag, "exploration_cycle", None),
+        "archived": bool(getattr(dag, "archived", False)),
         "project_id": getattr(dag, "project_id", None),
         "dag_json": dag.dag_json,
+        "input_attachments": (dag.dag_json or {}).get("input_attachments", []) or [],
         "edges": [dict(e) for e in (dag.dag_json or {}).get("edges", [])],
         "nodes": [
             {

@@ -17,10 +17,11 @@ from typing import List, Dict, Any, Optional
 import os
 import json
 import logging
+from datetime import timezone
 
 from database import get_db
-from models import Task, CapabilityRequest, TaskStatus, TaskOutput, TaskMessage
-from schemas import TaskOutputCreate, TaskOutputResponse, TaskMessageCreate, TaskMessageResponse
+from models import Task, CapabilityRequest, TaskStatus, TaskOutput, TaskMessage, AgentTurn
+from schemas import TaskOutputCreate, TaskOutputResponse, TaskMessageCreate, TaskMessageResponse, TaskTurnCreate
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/tasks", tags=["tasks-extended"])
@@ -206,6 +207,81 @@ async def get_execution_timeline(
 
 
 # =========================================================================
+# Agent turn metrics
+# =========================================================================
+
+@router.post("/{task_id}/turns")
+async def create_agent_turn(
+    task_id: str,
+    turn_data: TaskTurnCreate,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """Persist one LLM turn metric for durable auditing."""
+    task = await db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    existing = await db.execute(
+        select(AgentTurn).where(
+            AgentTurn.task_id == task_id,
+            AgentTurn.iteration == turn_data.iteration,
+            AgentTurn.turn_number == turn_data.turn_number,
+        )
+    )
+    if existing.scalars().first():
+        return {"ok": True, "duplicate": True}
+    turn = AgentTurn(
+        task_id=task_id,
+        iteration=turn_data.iteration,
+        turn_number=turn_data.turn_number,
+        provider=turn_data.provider,
+        model=turn_data.model,
+        input_tokens=turn_data.input_tokens or 0,
+        output_tokens=turn_data.output_tokens or 0,
+        total_tokens=turn_data.total_tokens or 0,
+        tool_names=turn_data.tool_names or [],
+        turn_timestamp=turn_data.turn_timestamp,
+    )
+    db.add(turn)
+    await db.commit()
+    return {"ok": True, "id": turn.id}
+
+
+@router.get("/{task_id}/turns")
+async def get_agent_turns(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return durable per-turn metrics for a task."""
+    task = await db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    result = await db.execute(
+        select(AgentTurn)
+        .where(AgentTurn.task_id == task_id)
+        .order_by(AgentTurn.iteration.asc(), AgentTurn.turn_number.asc())
+    )
+    turns = list(result.scalars().all())
+    return {
+        "task_id": task_id,
+        "count": len(turns),
+        "turns": [
+            {
+                "iteration": turn.iteration,
+                "turn_number": turn.turn_number,
+                "provider": turn.provider,
+                "model": turn.model,
+                "input_tokens": turn.input_tokens,
+                "output_tokens": turn.output_tokens,
+                "total_tokens": turn.total_tokens,
+                "tool_names": turn.tool_names or [],
+                "timestamp": turn.turn_timestamp,
+            }
+            for turn in turns
+        ],
+    }
+
+
+# =========================================================================
 # Task Outputs — iteration results from agent execution
 # =========================================================================
 
@@ -234,6 +310,13 @@ async def create_task_output(
     if not external_assessment and output_data.raw_result and isinstance(output_data.raw_result, dict):
         external_assessment = output_data.raw_result.get("external_assessment")
 
+    def _naive_utc(value):
+        if value is None:
+            return None
+        if getattr(value, "tzinfo", None) is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
     output = TaskOutput(
         task_id=task_id,
         iteration=output_data.iteration,
@@ -246,6 +329,12 @@ async def create_task_output(
         model_used=output_data.model_used,
         image_used=output_data.image_used,
         duration_ms=output_data.duration_ms,
+        turn_count=output_data.turn_count or 0,
+        started_at=_naive_utc(output_data.started_at),
+        finished_at=_naive_utc(output_data.finished_at),
+        approval_wait_ms=output_data.approval_wait_ms or 0,
+        image_build_wait_ms=output_data.image_build_wait_ms or 0,
+        iteration_reason=output_data.iteration_reason,
         deliverables=deliverables,
         raw_result=output_data.raw_result,
     )
@@ -364,6 +453,12 @@ async def get_task_outputs(
                 "model_used": o.model_used,
                 "image_used": o.image_used,
                 "duration_ms": o.duration_ms,
+                "turn_count": o.turn_count,
+                "started_at": o.started_at.isoformat() if o.started_at else None,
+                "finished_at": o.finished_at.isoformat() if o.finished_at else None,
+                "approval_wait_ms": o.approval_wait_ms,
+                "image_build_wait_ms": o.image_build_wait_ms,
+                "iteration_reason": o.iteration_reason,
                 "deliverables": o.deliverables,
                 "compact_summary": (o.raw_result or {}).get("compact_summary") if isinstance(o.raw_result, dict) else None,
                 "external_assessment": (o.raw_result or {}).get("external_assessment") if isinstance(o.raw_result, dict) else None,
@@ -801,6 +896,40 @@ async def get_audit_turns(
                 "turns": turns,
                 "turn_count": len(turns),
             })
+
+    if not all_iterations_data:
+        turn_result = await db.execute(
+            select(AgentTurn)
+            .where(AgentTurn.task_id.in_(relevant_task_ids))
+            .order_by(AgentTurn.task_id, AgentTurn.iteration, AgentTurn.turn_number)
+        )
+        grouped: Dict[tuple, Dict[str, Any]] = {}
+        for turn in turn_result.scalars().all():
+            key = (turn.task_id, turn.iteration)
+            entry = grouped.setdefault(key, {
+                "iteration": turn.iteration,
+                "task_id": turn.task_id,
+                "turns": [],
+                "turn_count": 0,
+                "container": {},
+            })
+            entry["turns"].append({
+                "turn_number": turn.turn_number,
+                "tool_names": turn.tool_names or [],
+                "data": {
+                    "provider": turn.provider,
+                    "model": turn.model,
+                    "response": {
+                        "usage": {
+                            "input_tokens": turn.input_tokens or 0,
+                            "output_tokens": turn.output_tokens or 0,
+                            "total_tokens": turn.total_tokens or 0,
+                        }
+                    },
+                },
+            })
+            entry["turn_count"] += 1
+        all_iterations_data = list(grouped.values())
 
     # Sort all iterations by creation time, then by iteration number
     all_iterations_data.sort(key=lambda x: (x.get("created_at", ""), x["iteration"])) # Assuming created_at will be available or can be added

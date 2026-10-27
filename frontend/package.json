@@ -19,7 +19,9 @@
     "autoprefixer": "^10.4.17",
     "postcss": "^8.4.33",
     "@headlessui/react": "^1.7.18",
-    "@heroicons/react": "^2.1.1"
+    "@heroicons/react": "^2.1.1",
+    "@chatscope/chat-ui-kit-react": "^2.0.3",
+    "@chatscope/chat-ui-kit-styles": "^1.2.1"
   },
   "devDependencies": {
     "@types/node": "^20.11.5",

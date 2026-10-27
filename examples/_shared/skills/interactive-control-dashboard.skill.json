@@ -1,0 +1,8 @@
+{
+  "name": "interactive-control-dashboard",
+  "image_id": "ann2snn",
+  "description": "Build the interactive browser dashboard for the ANN2SNN simulator (controller picker, trajectory, error-vs-time, SNN spike raster) using Node/npm for bundling and the Flask API as the only simulation backend.",
+  "tags": ["dashboard", "frontend", "nodejs", "visualization"],
+  "source_type": "manual",
+  "files": ["interactive-control-dashboard.md"]
+}

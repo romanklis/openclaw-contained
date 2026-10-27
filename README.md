@@ -136,6 +136,14 @@ ANTHROPIC_API_KEY=your-key-here
 OPENAI_API_KEY=your-key-here
 ```
 
+> **Windows + WSL2:** if TaskForge runs in WSL2 and Ollama runs on Windows,
+> `host.docker.internal` resolves to the WSL VM, not Windows. Run
+> `make test-ollama` to detect the Windows LAN IP, then `make set-ollama-url`
+> to write it to `.env`, and recreate the control-plane:
+> `docker-compose up -d --no-deps --force-recreate control-plane`.
+> Allow TCP 11434 inbound in Windows Firewall (see
+> [Ollama on Windows](#ollama-on-windows-wsl2) below).
+
 ### 2. Start the platform
 
 ```bash
@@ -303,6 +311,44 @@ Agents produce deliverables — either as standalone files or as running applica
 
 ![Deliverable — Running Application](docs/images/deliverable-in-form-of-running-application.png)
 
+### DAG Input Attachments
+
+When creating a DAG from the dashboard (`/dags` → **+ New DAG**), you can attach
+reference files (PDF, documents, spreadsheets, CSV/JSON, images, code, archives).
+Files are streamed into the DAG's shared workspace at
+`/workspaces/<workspace_id>/attachments/` and are visible to every node at
+`/workspace/attachments/` — including downstream steps, retries, and post-run
+reads. The planner receives a manifest (names/types/sizes), while agents read the
+files themselves. Attachments are read-only and persist for the life of the DAG
+workspace.
+
+Limits: 20 files, 25 MB per file, 100 MB total. The pre-existing OpenAI-compatible
+DAG endpoint also accepts files for Open WebUI integrations.
+
+### Platform Image Catalog
+
+An agent image is a **source bundle**, not just a Dockerfile: the Dockerfile,
+adapter/runner/runtime/policy/config code, requirements, entrypoint, and tests are
+versioned together. The platform stores each definition in a git-backed bare repo
+under `/data/image-repos` and manages it from `/image-catalog`:
+
+- Version timeline with bundle/adapter/runner hashes and capability deltas.
+- Promote/rollback moves the whole bundle atomically (adapter included).
+- Source file viewer + registry detection for images built outside the platform.
+- Capabilities are indexed from SBOMs; the resolver reuses the smallest compatible
+  image whose capabilities are a superset of a node/runtime request.
+- Planner nodes can declare `required_capabilities`; the platform resolves/pins a
+  compatible image version instead of rebuilding per task/sibling.
+
+On startup the catalog imports `agent-images/*` (idempotent). Use **Seed predefined
+images** in the catalog (`POST /api/image-catalog/seed`) to re-run the import and
+upsert the planner's `AgentImage` metadata from `agent_profiles.yaml`. Seeding
+imports the **full source bundles** (Dockerfile, Python scripts, adapters/runners,
+requirements, tests) and does **not** build images — use the catalog **Build**
+action or the `make build-*` targets for that. The legacy `/agent-images` page
+now redirects to `/image-catalog`. Use **Scan registry**
+(`POST /api/image-catalog/reconcile`) to catch externally built images.
+
 ### LLM Providers
 
 TaskForge includes a built-in LLM router that agents call via an OpenAI-compatible endpoint.
@@ -456,6 +502,29 @@ docker exec openclaw-docker-dind docker ps -a
 
 At least one LLM provider must be configured for agents to function.
 
+### Ollama on Windows (WSL2)
+
+When TaskForge runs in WSL2 and Ollama runs on the Windows host:
+
+1. In Ollama on Windows, enable **Expose Ollama to the network** and keep it running.
+2. Allow TCP 11434 inbound (admin PowerShell):
+   ```powershell
+   New-NetFirewallRule -DisplayName "Ollama 11434" -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Allow
+   ```
+3. In WSL, detect and save the Windows LAN IP:
+   ```bash
+   make test-ollama       # tests host.docker.internal, the WSL gateway, and Windows LAN IPs
+   make set-ollama-url    # writes .env and updates the running control-plane config
+   # If the control-plane isn't running yet: docker-compose up -d --no-deps control-plane
+   ```
+4. Open the LLM Router dashboard (`http://localhost:3000/llm-providers`) and use
+   **Diagnose**; test chat models in the Playground and decision models in the
+   **Decision Model (System One)** panel (e.g. `kev:0.8b-q8_0`).
+
+`host.docker.internal` points at the WSL VM, not Windows, so it will not reach
+Ollama on the Windows host. Prefer the Windows LAN IP; the WSL gateway IP can
+change when WSL restarts.
+
 ---
 
 ## Author
@@ -474,3 +543,5 @@ Senior Data Scientist (Corporate Engineering) and AI Program Leader operating at
 Copyright © 2025-2026 Roman Pawel Klis.
 
 See [LICENSE](LICENSE) for details.
+
+

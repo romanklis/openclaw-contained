@@ -4,7 +4,9 @@ OpenClaw Control Plane - Main Application Entry Point
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import asyncio
 import logging
+import os
 from sqlalchemy import text
 
 from routers import tasks, capabilities, policies, auth, llm, tasks_extended, deployments, sbom, supply_chain, skills, environments, dags
@@ -16,7 +18,11 @@ from routers import projects as projects_router
 from routers import credentials as credentials_router
 from routers import credential_management as credential_management_router
 from routers import blocks as blocks_router
+from routers import image_catalog as image_catalog_router
+from routers import workflows as workflows_router
+from routers import explorations as explorations_router
 from database import engine, Base, async_session
+from workflow_groups import backfill_workflow_groups
 from config import settings
 
 # Configure logging
@@ -25,6 +31,19 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+async def _image_build_reconciler() -> None:
+    """Retry capability builds whose in-memory image-builder job was lost."""
+    from image_catalog import reconcile_pending_builds
+
+    while True:
+        try:
+            async with async_session() as db:
+                await reconcile_pending_builds(db)
+        except Exception as exc:
+            logger.warning("Capability image-build reconciliation failed: %s", exc)
+        await asyncio.sleep(30)
 
 
 @asynccontextmanager
@@ -65,9 +84,43 @@ async def lifespan(app: FastAPI):
             )
         """))
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
+        # Workflow groups (logical objectives containing multiple DAG runs)
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS workflow_group_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS exploration_session_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS exploration_cycle INTEGER"))
+        await conn.execute(text("ALTER TABLE workflow_groups ADD COLUMN IF NOT EXISTS title_source VARCHAR DEFAULT 'derived'"))
+        await conn.execute(text("ALTER TABLE workflow_groups ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'experiment'"))
+        await conn.execute(text("""
+            UPDATE workflow_groups SET mode = 'template'
+            WHERE mode = 'experiment' AND EXISTS (
+                SELECT 1 FROM master_dags d
+                WHERE d.workflow_group_id = workflow_groups.id AND d.locked = true
+            )
+        """))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_master_dags_workflow_group_id ON master_dags (workflow_group_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_groups_project_objective ON workflow_groups (project_id, objective_key)"))
         await conn.execute(text("ALTER TABLE skills_v2 ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
         # Interactive steps: decision / input node type on DAG nodes
         await conn.execute(text("ALTER TABLE dag_nodes ADD COLUMN IF NOT EXISTS node_type VARCHAR DEFAULT 'agent'"))
+        # Image catalog: commit message for build/version history
+        await conn.execute(text("ALTER TABLE image_versions ADD COLUMN IF NOT EXISTS commit_message TEXT"))
+        # Deployments: trial preflight required before building/starting
+        await conn.execute(text("ALTER TABLE deployments ADD COLUMN IF NOT EXISTS trial_required BOOLEAN NOT NULL DEFAULT TRUE"))
+        # Exploration: distinguish raw user feedback from planner focus
+        await conn.execute(text("ALTER TABLE exploration_cycles ADD COLUMN IF NOT EXISTS source_feedback TEXT"))
+        # Exploration execution budgets
+        await conn.execute(text("ALTER TABLE exploration_sessions ADD COLUMN IF NOT EXISTS thinking_budget VARCHAR NOT NULL DEFAULT 'standard'"))
+        await conn.execute(text("ALTER TABLE exploration_sessions ADD COLUMN IF NOT EXISTS quality_budget VARCHAR NOT NULL DEFAULT 'standard'"))
+        # Image build retry/reconciliation metadata
+        await conn.execute(text("ALTER TABLE image_builds ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE image_builds ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP"))
+        # Durable per-iteration and per-turn metrics
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS turn_count INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS approval_wait_ms INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS image_build_wait_ms INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS iteration_reason VARCHAR"))
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS dag_user_requests (
                 id SERIAL PRIMARY KEY,
@@ -89,6 +142,13 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TYPE taskstatus ADD VALUE IF NOT EXISTS 'BUILDING_IMAGE'"))
 
     logger.info("Database initialized")
+    asyncio.create_task(_image_build_reconciler())
+
+    try:
+        async with async_session() as session:
+            await backfill_workflow_groups(session)
+    except Exception as e:
+        logger.warning(f"Workflow group backfill skipped: {e}")
 
     # Load persisted DAG model defaults (planning/agent/deep-review models) from
     # the DB at startup so a saved deep-review model selection is honored even
@@ -169,6 +229,22 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Agent images sync skipped: {exc}")
 
+    # Bootstrap the git-backed platform image catalog from the project sources.
+    # Idempotent: existing definitions/versions are left untouched.
+    if os.getenv("IMAGE_CATALOG_AUTO_IMPORT", "true").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            import image_catalog
+            async with async_session() as session:
+                bootstrap = await image_catalog.catalog_bootstrap_status(session)
+                if bootstrap.get("bootstrapped"):
+                    logger.info("Image catalog already bootstrapped; skipping agent-images import")
+                else:
+                    result = await image_catalog.import_from_agent_images(session)
+                    sync_result = await image_catalog.sync_built_agent_images(session)
+                    logger.info("Image catalog bootstrap: %s | built-image sync: %s", result, sync_result)
+        except Exception as exc:
+            logger.warning(f"Image catalog bootstrap skipped: {exc}")
+
     yield
     
     # Shutdown
@@ -207,8 +283,11 @@ app.include_router(skills.router, prefix="/api/skills", tags=["skills"])
 app.include_router(environments.router, prefix="/api/environments", tags=["environments"])
 app.include_router(dag_user_requests.router, prefix="/api/dags", tags=["dag-user-requests"])
 app.include_router(dags.router, prefix="/api/dags", tags=["dags"])
+app.include_router(workflows_router.router, prefix="/api/workflows", tags=["workflows"])
+app.include_router(explorations_router.router, prefix="/api/explorations", tags=["explorations"])
 app.include_router(openai_dag.router, prefix="/api/dag-ui", tags=["openai-dag"])
 app.include_router(agent_images_router.router, prefix="/api/agent-images", tags=["agent-images"])
+app.include_router(image_catalog_router.router, prefix="/api/image-catalog", tags=["image-catalog"])
 app.include_router(skill_learning_router.router, prefix="/api/skill-learning", tags=["skill-learning"])
 app.include_router(projects_router.router, prefix="/api/projects", tags=["projects"])
 app.include_router(credentials_router.router)

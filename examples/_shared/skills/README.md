@@ -20,6 +20,11 @@ composed into the skill's `instructions`:
 | Skill | Image | Purpose |
 |---|---|---|
 | `browser-pdf-download` (`skv2-16a3b5a1`) | `browser_v4` | Find PDF links on a page and download them with `curl_cffi` (TLS impersonation), verifying PDF content-type + `%PDF` magic, writing files + `pdf_manifest.json`; credential-gateway fallback for JS/login-gated sites. |
+| `torch-simulation-refactor` | `ann2snn` | Refactor a monolithic PyTorch ANN/SNN prototype into an importable package with identical numerics. |
+| `control-benchmark-tests` | `ann2snn` | pytest suite for physics invariants, controller bounds/Dale's law/SNN micro-steps, determinism and convergence. |
+| `flask-gunicorn-sim-api` | `ann2snn` | Flask API exposing the controllers; test with the test client and emit a Gunicorn `DEPLOYMENT_REQUEST`. |
+| `interactive-control-dashboard` | `ann2snn` | Browser dashboard (controller picker, trajectory, error, spike raster) built with Node/npm against the Flask API. |
+| `github-push-with-token` | `ann2snn` | Commit/push the project with a token from env, scrubbing the remote URL and never committing secrets. |
 
 ## Using a skill in a DAG template
 

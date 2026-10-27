@@ -1,7 +1,7 @@
 """
 Database models
 """
-from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text, Boolean
+from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text, Boolean, UniqueConstraint, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -242,6 +242,12 @@ class TaskOutput(Base):
     model_used = Column(String)
     image_used = Column(String)
     duration_ms = Column(Integer)
+    turn_count = Column(Integer, default=0)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    approval_wait_ms = Column(Integer, default=0)
+    image_build_wait_ms = Column(Integer, default=0)
+    iteration_reason = Column(String)
 
     # Deliverable files created by the agent {filename: content}
     deliverables = Column(JSON)
@@ -252,6 +258,63 @@ class TaskOutput(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     task = relationship("Task", backref="outputs")
+
+
+class AgentTurn(Base):
+    """Durable per-LLM-turn metrics for a task iteration."""
+    __tablename__ = "agent_turns"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False, index=True)
+    iteration = Column(Integer, nullable=False, index=True)
+    turn_number = Column(Integer, nullable=False)
+    provider = Column(String)
+    model = Column(String)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    tool_names = Column(JSON, default=list)
+    turn_timestamp = Column(String)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class LlmUsage(Base):
+    """Durable provider-reported token usage for non-agent LLM calls."""
+    __tablename__ = "llm_usage"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=True, index=True)
+    cycle_id = Column(String, nullable=True, index=True)
+    session_id = Column(String, nullable=True, index=True)
+    task_id = Column(String, nullable=True, index=True)
+    node_id = Column(String, nullable=True)
+    purpose = Column(String, nullable=False, index=True)
+    provider = Column(String)
+    model = Column(String)
+    attempt = Column(Integer, default=1)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    cached_input_tokens = Column(Integer, default=0)
+    reasoning_tokens = Column(Integer, default=0)
+    request_id = Column(String)
+    metadata_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ModelPrice(Base):
+    """Optional operator-configured model rates for token cost estimates."""
+    __tablename__ = "model_prices"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model = Column(String, unique=True, nullable=False, index=True)
+    provider = Column(String)
+    input_per_million = Column(Float, nullable=False, default=0)
+    output_per_million = Column(Float, nullable=False, default=0)
+    cached_input_per_million = Column(Float, nullable=False, default=0)
+    reasoning_per_million = Column(Float, nullable=False, default=0)
+    currency = Column(String, nullable=False, default="USD")
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class TaskMessage(Base):
@@ -293,6 +356,7 @@ class Deployment(Base):
     agent_image = Column(String)  # agent's committed image (used as deploy base)
     entrypoint = Column(String)  # e.g. "python app.py"
     port = Column(Integer)  # primary exposed port
+    trial_required = Column(Boolean, nullable=False, default=True, server_default="true")
 
     # Runtime
     status = Column(SQLEnum(DeploymentStatus), default=DeploymentStatus.PENDING_APPROVAL)
@@ -398,6 +462,22 @@ class Skill(Base):
     updated_at = Column(DateTime, onupdate=func.now())
 
 
+class WorkflowGroup(Base):
+    """A logical workflow objective that groups multiple DAG runs/iterations."""
+    __tablename__ = "workflow_groups"
+
+    id = Column(String, primary_key=True)  # wf-<uuid8>
+    title = Column(Text, nullable=False)
+    title_source = Column(String, default="derived", nullable=False)
+    mode = Column(String, default="experiment", nullable=False)  # experiment|template|exploration
+    objective = Column(Text, nullable=False)
+    objective_key = Column(Text, nullable=False, index=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)
+    created_by = Column(String)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
 class MasterDAG(Base):
     """A Master DAG representing a decomposed user objective.
 
@@ -434,6 +514,9 @@ class MasterDAG(Base):
     locked = Column(Boolean, default=False, nullable=False)
     template_params = Column(JSON, default=list)  # [{key,label,type,default,description}]
     template_source_dag_id = Column(String, nullable=True)  # set on instances
+    workflow_group_id = Column(String, ForeignKey("workflow_groups.id"), nullable=True, index=True)
+    exploration_session_id = Column(String, nullable=True, index=True)
+    exploration_cycle = Column(Integer, nullable=True)
     project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)  # project namespace
 
     # Archiving: hides the DAG from the default list (soft delete), keeps data.
@@ -960,3 +1043,208 @@ class DagUserRequest(Base):
 
     created_at = Column(DateTime, server_default=func.now())
     answered_at = Column(DateTime, nullable=True)
+
+
+class ExplorationSession(Base):
+    """A chat-driven, continuous exploration workflow."""
+    __tablename__ = "exploration_sessions"
+
+    id = Column(String, primary_key=True)  # exp-<uuid8>
+    workflow_group_id = Column(String, ForeignKey("workflow_groups.id"), nullable=False, unique=True, index=True)
+    title = Column(Text, nullable=False)
+    objective = Column(Text, nullable=False)
+    status = Column(String, default="planning", nullable=False, index=True)
+    model = Column(String, nullable=True)
+    thinking_budget = Column(String, default="standard", nullable=False, server_default="standard")
+    quality_budget = Column(String, default="standard", nullable=False, server_default="standard")
+    project_id = Column(String, nullable=True, index=True)
+    workspace_id = Column(String, nullable=True)
+    current_cycle = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    last_activity_at = Column(DateTime, server_default=func.now())
+
+
+class ExplorationCycle(Base):
+    """One DAG run in an exploration session."""
+    __tablename__ = "exploration_cycles"
+
+    id = Column(String, primary_key=True)  # cyc-<uuid8>
+    session_id = Column(String, ForeignKey("exploration_sessions.id"), nullable=False, index=True)
+    cycle_number = Column(Integer, nullable=False)
+    dag_id = Column(String, ForeignKey("master_dags.id"), nullable=False, index=True)
+    status = Column(String, default="proposed", nullable=False)
+    feedback = Column(Text, nullable=True)
+    source_feedback = Column(Text, nullable=True)
+    finalized_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class ExplorationMessage(Base):
+    """Persisted chat/card message in an exploration session."""
+    __tablename__ = "exploration_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String, ForeignKey("exploration_sessions.id"), nullable=False, index=True)
+    cycle_id = Column(String, ForeignKey("exploration_cycles.id"), nullable=True, index=True)
+    role = Column(String, nullable=False)  # user|assistant|system
+    kind = Column(String, default="text", nullable=False)  # text|cycle_proposal|cycle_result|cycle_input|status|error
+    content = Column(Text, default="")
+    metadata_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+# =========================================================================
+# Platform Image Catalog — git-backed image definitions and versions
+# =========================================================================
+#
+# An ImageDefinition is one bare git repo containing a complete runnable bundle:
+# Dockerfile, adapter/runner/runtime/policy/config, requirements, tests,
+# VERSION/CHANGELOG. An ImageVersion is an immutable commit/tag of that bundle
+# built into a registry image. Capabilities are extracted from the image SBOM.
+
+class ImageDefinition(Base):
+    """A versioned, platform-managed agent image source bundle."""
+    __tablename__ = "image_definitions"
+
+    id = Column(String, primary_key=True)              # slug, e.g. "picoclaw"
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    runtime_family = Column(String, default="openclaw")  # openclaw/nanobot/picoclaw/zeroclaw/browser/octaveclaw
+    adapter_type = Column(String, default="")
+    entrypoint = Column(String, default="")
+    enabled = Column(Boolean, default=True, nullable=False)
+    tags = Column(JSON, default=list)
+    created_by = Column(String, default="system")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class ImageVersion(Base):
+    """An immutable build of an ImageDefinition bundle."""
+    __tablename__ = "image_versions"
+
+    id = Column(String, primary_key=True)              # imgv-<uuid8>
+    definition_id = Column(String, ForeignKey("image_definitions.id"), nullable=False, index=True)
+    version = Column(String, nullable=False)            # semver or vN
+    git_tag = Column(String)
+    git_commit = Column(String)
+    bundle_hash = Column(String, index=True)
+    dockerfile_hash = Column(String)
+    base_image = Column(String)
+    base_digest = Column(String)
+    runtime_family = Column(String)
+    adapter_type = Column(String)
+    adapter_sha = Column(String)
+    runner_sha = Column(String)
+    component_manifest = Column(JSON, default=dict)
+    entrypoint = Column(String)
+    runtime_description = Column(Text, default="")
+    capability_fingerprint = Column(String, index=True)
+    capabilities = Column(JSON, default=list)
+    image_tag = Column(String)
+    image_digest = Column(String)
+    parent_version_id = Column(String, ForeignKey("image_versions.id"), nullable=True)
+    sbom_id = Column(Integer, nullable=True)            # image_version_sboms.id (no FK: cycle-free)
+    status = Column(String, default="draft")            # draft/building/ready/failed/detected
+    source_available = Column(Boolean, default=True)
+    commit_message = Column(Text, default="")
+    created_by = Column(String, default="system")
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ImageAlias(Base):
+    """Named pointer to an ImageVersion (latest/stable/custom)."""
+    __tablename__ = "image_aliases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    definition_id = Column(String, ForeignKey("image_definitions.id"), nullable=False, index=True)
+    alias = Column(String, nullable=False)
+    version_id = Column(String, ForeignKey("image_versions.id"), nullable=False)
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint("definition_id", "alias", name="uq_image_alias"),)
+
+
+class ImageCapability(Base):
+    """Normalized capability row for fast package/manager search."""
+    __tablename__ = "image_capabilities"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version_id = Column(String, ForeignKey("image_versions.id"), nullable=False, index=True)
+    manager = Column(String, nullable=False)            # pip/npm/apt/apk/binary
+    name = Column(String, nullable=False, index=True)
+    version = Column(String, default="")
+
+
+class ImageVersionSBOM(Base):
+    """SBOM for an image version (the existing sboms table is task-scoped)."""
+    __tablename__ = "image_version_sboms"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version_id = Column(String, ForeignKey("image_versions.id"), nullable=False, index=True)
+    format = Column(String, default="cyclonedx-json")
+    document = Column(JSON, default=dict)
+    packages = Column(JSON, default=list)
+    generated_at = Column(DateTime, server_default=func.now())
+
+
+class AgentImageBinding(Base):
+    """Bind a planner-facing AgentImage alias to a catalog ImageVersion."""
+    __tablename__ = "agent_image_bindings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_image_id = Column(String, ForeignKey("agent_images.id"), nullable=False, index=True)
+    image_version_id = Column(String, ForeignKey("image_versions.id"), nullable=False)
+
+    __table_args__ = (UniqueConstraint("agent_image_id", name="uq_agent_image_binding"),)
+
+
+class EnvironmentImageVersion(Base):
+    """Resolved image version for a reusable NodeEnvironment."""
+    __tablename__ = "environment_image_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    environment_id = Column(String, ForeignKey("node_environments.id"), nullable=False, index=True)
+    image_version_id = Column(String, ForeignKey("image_versions.id"), nullable=False)
+    is_current = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ImageEvent(Base):
+    """Audit trail for catalog builds/detections/promotions/capability deltas."""
+    __tablename__ = "image_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    definition_id = Column(String, nullable=True, index=True)
+    version_id = Column(String, nullable=True, index=True)
+    event_type = Column(String, nullable=False)
+    message = Column(Text, default="")
+    data = Column(JSON, default=dict)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ImageBuild(Base):
+    """A build attempt for an ImageVersion (manual or capability-triggered)."""
+    __tablename__ = "image_builds"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version_id = Column(String, ForeignKey("image_versions.id"), nullable=True, index=True)
+    definition_id = Column(String, ForeignKey("image_definitions.id"), nullable=True, index=True)
+    build_id = Column(String, index=True)                     # image-builder build id
+    trigger_type = Column(String, default="manual")           # manual|capability_request|import|detected
+    capability_request_id = Column(Integer, nullable=True, index=True)
+    task_id = Column(String, nullable=True, index=True)
+    node_id = Column(String, nullable=True)
+    requested_by = Column(String, default="")
+    approved_by = Column(String, default="")
+    status = Column(String, default="pending")                # pending|building|succeeded|failed|denied
+    image_tag = Column(String, default="")
+    image_digest = Column(String, default="")
+    logs = Column(Text, default="")
+    error = Column(Text, default="")
+    attempts = Column(Integer, default=0)
+    last_attempt_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    finished_at = Column(DateTime, nullable=True)

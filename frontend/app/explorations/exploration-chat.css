@@ -1,0 +1,97 @@
+/* Dark Chatscope overrides, scoped to the exploration chat only. */
+.exploration-chat {
+  color-scheme: dark;
+}
+
+.exploration-chat .cs-main-container {
+  background-color: #0d1117;
+  border: 0;
+  border-radius: 0;
+  color: #e5e7eb;
+}
+
+.exploration-chat .cs-chat-container,
+.exploration-chat .cs-message-list {
+  background-color: #0d1117;
+  color: #e5e7eb;
+}
+
+.exploration-chat .cs-message-list__scroll-wrapper {
+  background-color: transparent;
+}
+
+.exploration-chat .cs-message-list__loading-more {
+  background-color: #0d1117;
+}
+
+.exploration-chat .cs-message {
+  color: #e5e7eb;
+}
+
+.exploration-chat .cs-chat-container .cs-message-input,
+.exploration-chat .cs-message-input {
+  background-color: #0d1117;
+  border-top-color: #1f2937;
+  color: #e5e7eb;
+}
+
+.exploration-chat .cs-message-input__content-editor-wrapper,
+.exploration-chat .cs-message-input__content-editor-container,
+.exploration-chat .cs-message-input__content-editor {
+  background-color: #161b22;
+  color: #e5e7eb;
+}
+
+.exploration-chat .cs-message-input__content-editor[data-placeholder]:empty:before {
+  color: #64748b;
+}
+
+.exploration-chat .cs-message-input--disabled .cs-message-input__content-editor-wrapper,
+.exploration-chat .cs-message-input--disabled .cs-message-input__content-editor-container,
+.exploration-chat .cs-message-input--disabled .cs-message-input__content-editor {
+  background-color: #111827;
+  color: #6b7280;
+}
+
+.exploration-chat .cs-button--send,
+.exploration-chat .cs-button--attachment {
+  color: #818cf8;
+}
+
+.exploration-chat .cs-message-list .cs-typing-indicator {
+  background-color: #0d1117;
+  color: #94a3b8;
+}
+
+.exploration-chat .cs-typing-indicator__dot {
+  background-color: #6366f1;
+}
+
+.exploration-chat .cs-typing-indicator__text {
+  color: #94a3b8;
+}
+
+.exploration-chat .ps__thumb-y {
+  background-color: #374151;
+}
+
+.exploration-chat .ps__rail-y:hover > .ps__thumb-y,
+.exploration-chat .ps__rail-y:focus > .ps__thumb-y,
+.exploration-chat .ps__rail-y.ps--clicking .ps__thumb-y {
+  background-color: #4b5563;
+}
+
+.exploration-chat .ps__rail-y:hover,
+.exploration-chat .ps__rail-y:focus,
+.exploration-chat .ps__rail-y.ps--clicking {
+  background-color: transparent;
+}
+
+/* Keep the conversation readable while the header/config bar stay full width. */
+.exploration-chat-stream .cs-message-list__scroll-wrapper {
+  max-width: none;
+  width: 100%;
+  margin: 0;
+  padding-left: 1.5rem;
+  padding-right: 1.5rem;
+}

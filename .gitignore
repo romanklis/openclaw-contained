@@ -63,6 +63,7 @@ ollama-data/
 
 # Workspaces
 workspaces/
+image-repos/
 /tmp/
 
 # Agent runtime artifacts (generated per-task)

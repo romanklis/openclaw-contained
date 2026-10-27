@@ -50,6 +50,8 @@ def main() -> int:
     if not skills_dir.is_dir():
         print(f"  skills dir not found: {skills_dir}")
         return 0
+    # Make sure agent-image profiles (the skills' image_id) exist before creating skills.
+    _call("POST", "/api/agent-images/sync-from-yaml", {})
     imported = 0
     for spec_file in sorted(skills_dir.glob("*.skill.json")):
         spec = json.loads(spec_file.read_text())

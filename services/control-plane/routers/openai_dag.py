@@ -32,6 +32,7 @@ from models import MasterDAG, DAGNode, DAGStatus, NodeStatus, Skill, TaskOutput,
 from planner import plan_dag, is_gemini_lite_model
 from temporal_client import start_dag_workflow
 from config import settings
+from workflow_groups import ensure_workflow_group
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -484,6 +485,9 @@ async def _stream_dag_execution(
 
     yield _sse_chunk(f"📋 **Planning DAG** (planner: `{planning_model}`, agents: `{agent_model}`)...\n\n")
 
+    workflow_group = await ensure_workflow_group(
+        objective, None, db, llm_model=planning_model
+    )
     dag = MasterDAG(
         id=dag_id,
         objective=objective,
@@ -491,6 +495,7 @@ async def _stream_dag_execution(
         dag_json={},
         workspace_id=workspace_id,
         llm_model=agent_model,
+        workflow_group_id=workflow_group.id,
     )
     db.add(dag)
     await db.commit()
@@ -510,6 +515,13 @@ async def _stream_dag_execution(
         yield _sse_chunk("", finish_reason="stop")
         yield _sse_done()
         return
+
+    # Resolve planner-declared capabilities (reuse/pin or queue a build).
+    try:
+        import image_catalog
+        await image_catalog.resolve_planner_capabilities(dag_json, db)
+    except Exception as exc:
+        logger.warning("Capability resolution skipped: %s", exc)
 
     # Store nodes
     dag.dag_json = dag_json
@@ -787,6 +799,9 @@ async def _blocking_dag_execution(
         saved = _save_files_to_workspace(workspace_id, uploaded_files)
         objective += f"\n\nThe following files have been uploaded to the workspace: {', '.join(saved)}"
 
+    workflow_group = await ensure_workflow_group(
+        objective, None, db, llm_model=planning_model
+    )
     dag = MasterDAG(
         id=dag_id,
         objective=objective,
@@ -794,6 +809,7 @@ async def _blocking_dag_execution(
         dag_json={},
         workspace_id=workspace_id,
         llm_model=agent_model,
+        workflow_group_id=workflow_group.id,
     )
     db.add(dag)
     await db.commit()
@@ -802,6 +818,12 @@ async def _blocking_dag_execution(
         dag_json = await plan_dag(objective, planning_model, db, base_image=base_image, skill_ids=skill_ids if skill_ids else None, agent_model=agent_model)
     except ValueError as e:
         return _non_streaming_response(f"Planning failed: {e}")
+
+    try:
+        import image_catalog
+        await image_catalog.resolve_planner_capabilities(dag_json, db)
+    except Exception as exc:
+        logger.warning("Capability resolution skipped: %s", exc)
 
     dag.dag_json = dag_json
     dag.status = DAGStatus.READY

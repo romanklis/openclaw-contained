@@ -1,0 +1,8 @@
+{
+  "name": "flask-gunicorn-sim-api",
+  "image_id": "ann2snn",
+  "description": "Build a Flask (+flask-cors) API exposing the four controllers (/api/controllers, /api/simulate) for the interactive ANN2SNN simulator; test with the Flask test client and emit a Gunicorn DEPLOYMENT_REQUEST instead of starting the server.",
+  "tags": ["flask", "gunicorn", "api", "simulation"],
+  "source_type": "manual",
+  "files": ["flask-gunicorn-sim-api.md"]
+}

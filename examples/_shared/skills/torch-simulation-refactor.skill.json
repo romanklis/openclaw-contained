@@ -1,0 +1,8 @@
+{
+  "name": "torch-simulation-refactor",
+  "image_id": "ann2snn",
+  "description": "Refactor a monolithic PyTorch ball-and-plate ANN/SNN prototype into an importable package with identical numerics (seeds, constants, architectures, training), ready for tests and an API.",
+  "tags": ["pytorch", "simulation", "refactor", "ann", "snn"],
+  "source_type": "manual",
+  "files": ["torch-simulation-refactor.md"]
+}
