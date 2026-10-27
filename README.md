@@ -1,4 +1,4 @@
-# TaskForge
+# TaskForge Platform
 
 **Auditable Agent Orchestration for [OpenClaw](https://github.com/openclaw/openclaw)**
 
@@ -543,3 +543,5 @@ Senior Data Scientist (Corporate Engineering) and AI Program Leader operating at
 Copyright © 2025-2026 Roman Pawel Klis.
 
 See [LICENSE](LICENSE) for details.
+
+
