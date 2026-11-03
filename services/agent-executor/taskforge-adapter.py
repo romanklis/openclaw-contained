@@ -36,6 +36,11 @@ NODE_ID = os.getenv("NODE_ID", "")  # For step-scoped deliverables in DAG nodes
 # may end. Mirrors config.deliverable_gate.require_deliverables on the worker;
 # when false, a bare no-tool-call message ends the run as before.
 DELIVERABLES_REQUIRED = os.getenv("DELIVERABLES_REQUIRED", "true").strip().lower() in ("1", "true", "yes", "y")
+# Deploy-authorized nodes must not end after preparing the app: they must emit
+# DEPLOYMENT_REQUEST so the platform creates the deployment. The control-plane
+# fallback (deployment.json) is authoritative, but this keeps the agent path
+# correct too.
+REQUIRE_DEPLOYMENT_REQUEST = os.getenv("REQUIRE_DEPLOYMENT_REQUEST", "").strip().lower() in ("1", "true", "yes", "y")
 
 # Runtime description can be overridden via OPENCLAW_RUNTIME_DESCRIPTION env var
 # (set in each image's Dockerfile). Falls back to get_runtime_description().
@@ -628,7 +633,7 @@ The system will build a deployment image and the user can start/stop it.
 - Image: {agent_image}
 - Runtime: {IMAGE_TYPE}
 - Workspace: `/workspace` (files here are collected as deliverables)
-- Deliverables: write final outputs to your node's deliverables directory (e.g. `/workspace/<node_id>/`, given in the task prompt); intermediates/raw fetched HTML to `/tmp` or `/workspace/.cache/`
+- Deliverables: {('write final outputs to your node deliverables directory (e.g. /workspace/<node_id>/, given in the task prompt); intermediates/raw fetched HTML to /tmp or /workspace/.cache/' if DELIVERABLES_REQUIRED else 'in-place modification: deliverables are NOT required; edit the target files in /workspace in place, run the specified tests, and report the exact result. Do NOT create a node deliverables directory.')}
 """
 
     with open(os.path.join(workspace, "AGENTS.md"), "w") as f:
@@ -872,25 +877,42 @@ def build_system_prompt() -> str:
     parts = [
         "You are a task execution agent running inside a managed container.",
         "Your workspace is /workspace. All files you create there are collected as deliverables.",
-        "Write final deliverables to your node's deliverables directory (e.g. /workspace/<node_id>/, given in the task prompt).",
-        "Intermediate/raw files (fetched HTML pages, caches, scratch) go to /tmp or /workspace/.cache/ and are NOT collected.",
-        "",
-        "You have these tools: write, read, exec, edit, wait.",
-        "- write: Create/overwrite a file",
-        "- read: Read a file's content",
-        "- exec: Run a shell command (use to test your code!)",
-        "- edit: Replace a string in a file",
-        "- wait: Block until a shell condition is true (use for long external jobs, e.g. async indexing/search). No LLM turns are spent while waiting.",
-        "",
-        "IMPORTANT RULES:",
-        "1. Always write code to /workspace",
-        "2. Always exec your code to verify it works",
-        "3. If the skill instructions include a complete, ready-to-run script, COPY it into your deliverables directory and EXECUTE it. Only modify it if it errors or the deliverable is wrong — do NOT rewrite or re-derive a working script from scratch; re-discovering what the skill already encodes is wasteful.",
-        "4. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:<type>/<pkg>:<reason> and STOP (type is pip, npm, apt, or auto)",
-        "5. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>",
-        "6. Do NOT try pip install or apt-get — they will fail",
-        "",
     ]
+    if DELIVERABLES_REQUIRED:
+        parts.extend(
+            [
+                "Write final deliverables to your node's deliverables directory (e.g. /workspace/<node_id>/, given in the task prompt).",
+                "Intermediate/raw files (fetched HTML pages, caches, scratch) go to /tmp or /workspace/.cache/ and are NOT collected.",
+            ]
+        )
+    else:
+        parts.append(
+            "This is an in-place modification: deliverables are NOT required. Edit the target "
+            "files in /workspace in place, run the specified tests, and report the exact result. "
+            "Do NOT create a node deliverables directory."
+        )
+    parts.extend(
+        [
+            "",
+            "You have these tools: write, read, exec, edit, wait.",
+            "- write: Create/overwrite a file",
+            "- read: Read a file's content",
+            "- exec: Run a shell command (use to test your code!)",
+            "- edit: Replace a string in a file",
+            "- wait: Block until a shell condition is true (use for long external jobs, e.g. async indexing/search). No LLM turns are spent while waiting.",
+            "",
+            "IMPORTANT RULES:",
+            "1. Always write code to /workspace",
+            "2. Always exec your code to verify it works",
+            "3. If the skill instructions include a complete, ready-to-run script, COPY it into "
+            + ("your deliverables directory" if DELIVERABLES_REQUIRED else "the target app location in /workspace")
+            + " and EXECUTE it. Only modify it if it errors or the deliverable is wrong — do NOT rewrite or re-derive a working script from scratch; re-discovering what the skill already encodes is wasteful.",
+            "4. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:<type>/<pkg>:<reason> and STOP (type is pip, npm, apt, or auto)",
+            "5. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>",
+            "6. Do NOT try pip install or apt-get — they will fail",
+            "",
+        ]
+    )
 
     # Inject workspace context files if they exist
     for ctx_file in ["AGENTS.md", "SOUL.md"]:
@@ -918,7 +940,11 @@ _STEP_DELIVERABLE_SKIP_FILES = {
 
 def _step_deliverable_dirs() -> list:
     if NODE_ID:
-        return [os.path.join("/workspace", NODE_ID), "/workspace"]
+        # DAG nodes share /workspace with upstream nodes. Falling back to the
+        # workspace root made upstream files look like this step's deliverable,
+        # so a bare text reply could end the run with an empty node directory
+        # (dag-f92f1254 signal-analysis-service).
+        return [os.path.join("/workspace", NODE_ID)]
     return ["/workspace"]
 
 
@@ -988,6 +1014,7 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
     all_output_parts: List[str] = []
     assistant_text_parts: List[str] = []
     turn = 0
+    deploy_nudges = 0
 
     print(f"   🔗 LLM endpoint: {completions_url}")
     print(f"   🤖 Model: {LLM_MODEL}")
@@ -1071,6 +1098,26 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
                 # Handle tool calls
                 tool_calls = message.get("tool_calls", [])
                 if not tool_calls:
+                    # Deploy-authorized nodes must promote the prepared package,
+                    # not just describe it. Nudge for the marker instead of
+                    # ending on a bare text reply.
+                    output_so_far = "".join(all_output_parts)
+                    if (
+                        REQUIRE_DEPLOYMENT_REQUEST
+                        and "DEPLOYMENT_REQUEST:" not in output_so_far
+                        and deploy_nudges < 2
+                    ):
+                        deploy_nudges += 1
+                        nudge = (
+                            "You have prepared the deployment package. Emit "
+                            "DEPLOYMENT_REQUEST:<app-name>:<port>:<entrypoint> now so "
+                            "TaskForge creates and starts the deployment. Do not finish "
+                            "with a plain text reply."
+                        )
+                        print(f"   ⚠ Deploy nudge: {nudge}")
+                        messages.append({"role": "user", "content": nudge})
+                        continue
+
                     # A bare text message ends the run ONLY when the step already
                     # has a deliverable (or deliverables aren't required).
                     # Otherwise nudge the agent to actually write its output so a

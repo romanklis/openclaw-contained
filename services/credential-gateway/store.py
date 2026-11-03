@@ -2,11 +2,14 @@
 
 Credential material never leaves this service. Two backends share one shape:
 
-    {name, kind: form|basic|bearer|header|cookie,
+    {name, kind: form|basic|bearer|header|cookie|imap,
      username?, password?, token?,
      header_name?, header_value?,       # kind=header
      cookie_name?, cookie_value?,        # kind=cookie
      login_url?, username_field?, password_field?,  # kind=form
+     host?, port?, tls?, allowed_folders?,           # kind=imap
+     max_messages?, max_body_bytes?, max_attachment_bytes?, max_message_bytes?,
+     preapproved_operations?,                        # kind=imap
      allowed_origins: [...], allowed_methods: [...]}
 
 The OpenBao backend is used when OPENBAO_ENABLED=true and OPENBAO_TOKEN is set;
@@ -140,9 +143,12 @@ class OpenBaoCredentialStore(CredentialStore):
     def delete(self, name: str) -> None:
         import httpx
 
-        url = f"{self._addr}/v1/secret/data/credentials/{name}"
+        # Delete KV metadata, not just the current data version. Deleting only
+        # /data leaves the key in LIST and makes the credentials page 500 on
+        # the next load.
+        url = f"{self._addr}/v1/secret/metadata/credentials/{name}"
         resp = httpx.delete(url, headers={"X-Vault-Token": self._token}, timeout=15)
-        if resp.status_code not in (200, 204):
+        if resp.status_code not in (200, 204, 404):
             raise RuntimeError(f"OpenBao delete failed HTTP {resp.status_code}: {resp.text[:200]}")
 
 

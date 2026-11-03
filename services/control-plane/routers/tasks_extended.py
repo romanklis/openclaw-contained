@@ -1,7 +1,7 @@
 """
 Extended task endpoints for execution tracking
 """
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import Response
 import mimetypes
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -408,13 +408,15 @@ async def create_task_output(
 @router.get("/{task_id}/outputs")
 async def get_task_outputs(
     task_id: str,
+    own: bool = Query(False),
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
-    """Get all iteration outputs for a task.
+    """Get iteration outputs for a task.
 
-    For Task Force coordinators this aggregates outputs from ALL
-    sub-tasks so the coordinator's detail page shows every
-    deliverable produced by its team members.
+    By default this aggregates outputs from ALL tasks in the same DAG so the
+    coordinator's detail page shows every deliverable produced by its team
+    members. Internal workflow logic must pass ``own=true`` so a fresh node task
+    never inherits a sibling task's iteration number (see dag-f92f1254).
     """
     # Check if this is a Task Force coordinator
     task_result = await db.execute(select(Task).where(Task.id == task_id))
@@ -424,7 +426,7 @@ async def get_task_outputs(
     # Map task_id → role label for UI display
     role_labels: Dict[str, str] = {}
 
-    if task and task.dag_id:
+    if not own and task and task.dag_id:
         sub_result = await db.execute(
             select(Task.id, Task.node_id)
             .where(Task.dag_id == task.dag_id, Task.id != task_id)
@@ -443,6 +445,7 @@ async def get_task_outputs(
     return {
         "task_id": task_id,
         "count": len(outputs),
+        "own": own,
         "is_dag": len(task_ids_to_query) > 1,
         "outputs": [
             {

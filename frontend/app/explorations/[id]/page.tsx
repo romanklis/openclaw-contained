@@ -323,10 +323,20 @@ export default function ExplorationChatPage() {
     if (!window.confirm('Finish this exploration? No further cycles will be planned.')) return
     try {
       const res = await fetch(`${API}/api/explorations/${session.id}/finish`, { method: 'POST' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any)?.detail || `HTTP ${res.status}`)
       await load(false)
       await loadSessions()
-      setCommandNotice('Exploration finished and locked.')
+      const deployment = (data as any)?.deployments?.[0]
+      if (deployment) {
+        setCommandNotice(
+          deployment.error
+            ? `Deployment failed: ${deployment.error}`
+            : `Deployment ${deployment.status}${deployment.url ? ` at ${deployment.url}` : ' (building…)'}`
+        )
+      } else {
+        setCommandNotice('Exploration finished and locked.')
+      }
     } catch (err: any) {
       setError(err.message)
     }

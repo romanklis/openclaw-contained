@@ -182,10 +182,20 @@ def find_recent_approved(agent: str, credential: str, origin: str, method: str,
     return newest
 
 
-def ensure_grant(grants: GrantStore, agent: str, credential: str, origin: str, method: str, reason: str) -> Grant:
+def ensure_grant(
+    grants: GrantStore,
+    agent: str,
+    credential: str,
+    origin: str,
+    method: str,
+    reason: str,
+    ttl_minutes: Optional[int] = None,
+    max_requests: Optional[int] = None,
+) -> Grant:
     """Return an active grant, minting from a previously approved request if one
     is still within TTL. If a decision is required, raise ApprovalRequired (the
     caller surfaces it to the agent; the Temporal workflow pauses for approval)."""
+    ttl = ttl_minutes or DEFAULT_TTL_MINUTES
     existing = grants.get(agent, credential, origin)
     if existing and existing.allow(method):
         existing.consume()
@@ -193,17 +203,30 @@ def ensure_grant(grants: GrantStore, agent: str, credential: str, origin: str, m
 
     # If a previous approval is still within TTL, reuse it — do not create or
     # block on a new decision.
-    recent = find_recent_approved(agent, credential, origin, method)
+    recent = find_recent_approved(agent, credential, origin, method, ttl_minutes=ttl)
     if recent is not None:
-        grant = grants.add(agent, credential, origin, recent.get("allowed_methods") or ["GET", "POST"],
-                           ttl_minutes=recent.get("ttl_minutes"))
+        grant = grants.add(
+            agent,
+            credential,
+            origin,
+            recent.get("allowed_methods") or ["GET", "POST"],
+            ttl_minutes=ttl,
+            max_requests=max_requests,
+        )
         grant.consume()
         return grant
 
     req = create_or_get_request(agent, credential, origin, method, reason)
     if req.get("status") == "approved":
         methods = req.get("allowed_methods") or ["GET", "POST"]
-        grant = grants.add(agent, credential, origin, methods, ttl_minutes=req.get("ttl_minutes"))
+        grant = grants.add(
+            agent,
+            credential,
+            origin,
+            methods,
+            ttl_minutes=ttl,
+            max_requests=max_requests,
+        )
         grant.consume()
         return grant
 

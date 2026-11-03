@@ -234,6 +234,57 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Agent images sync skipped: {exc}")
 
+    # Seed built-in skills that ship with the platform (read-only email tool).
+    # Idempotent: an existing (image_id, name) pair is left untouched.
+    try:
+        import json
+        import uuid
+        from pathlib import Path
+        from sqlalchemy import select
+        from models import AgentImage, SkillV2, SkillV2Source, SkillV2Status
+
+        skills_dir = Path(__file__).resolve().parent / "default_skills"
+        config_path = skills_dir / "email-imap.json"
+        if config_path.is_file():
+            config = json.loads(config_path.read_text())
+            driver_name = str(config.get("driver_file") or "email_imap.py")
+            driver_source = (skills_dir / driver_name).read_text()
+            async with async_session() as session:
+                seeded = 0
+                for image_id in config.get("image_ids") or []:
+                    if not await session.get(AgentImage, str(image_id)):
+                        continue
+                    existing = await session.execute(
+                        select(SkillV2).where(
+                            SkillV2.image_id == str(image_id),
+                            SkillV2.name == config.get("name"),
+                        )
+                    )
+                    if existing.scalar_one_or_none():
+                        continue
+                    session.add(
+                        SkillV2(
+                            id=f"skv2-{uuid.uuid4().hex[:8]}",
+                            image_id=str(image_id),
+                            name=str(config.get("name") or "Email IMAP (read-only)"),
+                            description=str(config.get("description") or ""),
+                            instructions=str(config.get("instructions") or ""),
+                            tags=list(config.get("tags") or []),
+                            source_type=SkillV2Source.MANUAL,
+                            status=SkillV2Status.ACTIVE,
+                            code_json={
+                                "files": {driver_name: driver_source},
+                                "entrypoint": driver_name,
+                            },
+                        )
+                    )
+                    seeded += 1
+                await session.commit()
+                if seeded:
+                    logger.info("Seeded %s default email skill(s)", seeded)
+    except Exception as exc:
+        logger.warning(f"Default skill seed skipped: {exc}")
+
     # Bootstrap the git-backed platform image catalog from the project sources.
     # Idempotent: existing definitions/versions are left untouched.
     if os.getenv("IMAGE_CATALOG_AUTO_IMPORT", "true").strip().lower() in ("1", "true", "yes", "on"):

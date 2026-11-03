@@ -203,6 +203,8 @@ services:
       - CONTROL_PLANE_URL=http://control-plane:8000
       - IMAGE_BUILDER_URL=http://openclaw-image-builder:8002
       - AGENT_IMAGES_DIR=/agent-images
+      - CREDENTIAL_GATEWAY_URL=${CREDENTIAL_GATEWAY_URL:-http://credential-gateway:8083}
+      - CREDENTIAL_GATEWAY_ADMIN_TOKEN=${CREDENTIAL_GATEWAY_ADMIN_TOKEN:-openclaw-admin}
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
       - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-insecure-dind}
       - RAG_TOOL_URL=${RAG_TOOL_URL:-http://docling-rag:8080}
@@ -276,6 +278,13 @@ services:
       - DEFAULT_GRANT_MAX_REQUESTS=20
       - APPROVAL_WAIT_MAX=300
       - CREDENTIAL_GATEWAY_ADMIN_TOKEN=${CREDENTIAL_GATEWAY_ADMIN_TOKEN:-openclaw-admin}
+      - MAIL_GRANT_TTL_MIN=${MAIL_GRANT_TTL_MIN:-1440}
+      - MAIL_GRANT_MAX_REQUESTS=${MAIL_GRANT_MAX_REQUESTS:-500}
+      - MAIL_READ_TIMEOUT_SECONDS=${MAIL_READ_TIMEOUT_SECONDS:-20}
+      - MAIL_MAX_MESSAGES=${MAIL_MAX_MESSAGES:-50}
+      - MAIL_MAX_BODY_BYTES=${MAIL_MAX_BODY_BYTES:-2097152}
+      - MAIL_MAX_ATTACHMENT_BYTES=${MAIL_MAX_ATTACHMENT_BYTES:-10485760}
+      - MAIL_MAX_MESSAGE_BYTES=${MAIL_MAX_MESSAGE_BYTES:-26214400}
     volumes:
       - ./config/credentials:/data/credentials
     depends_on:

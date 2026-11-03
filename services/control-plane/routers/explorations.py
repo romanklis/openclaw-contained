@@ -430,9 +430,9 @@ async def finish(session_id: str, db: AsyncSession = Depends(get_db)):
     session = await _session_or_404(session_id, db)
     if session.status in ("running", "awaiting_input"):
         raise HTTPException(status_code=400, detail="Cancel the running cycle before finishing")
-    await finish_session(session, db)
+    deployments = await finish_session(session, db)
     await db.refresh(session)
-    return _session_dict(session)
+    return {**_session_dict(session), "deployments": deployments}
 
 
 @router.post("/{session_id}/feedback")

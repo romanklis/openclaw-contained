@@ -34,7 +34,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Download the Camoufox browser bundle (used for stealth browser logins)
 RUN python -m camoufox fetch
 
-COPY app.py store.py approvals.py executor.py browser.py ./
+COPY app.py store.py approvals.py executor.py browser.py mail.py github_lease.py ./
 
 # The agent SDK is not installed here (it ships inside agent images); expose a copy for tests/reference.
 COPY sdk/agent_web /sdk/agent_web

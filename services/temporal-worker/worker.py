@@ -11,7 +11,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.client import Client
 from temporalio.worker import Worker
 from datetime import timedelta, datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Iterable, List, Optional
 import os
 
 logging.basicConfig(level=logging.INFO)
@@ -494,6 +494,7 @@ class AgentTaskWorkflow:
         deliverables_required: bool = True,
         max_agent_turns: int = 30,
         max_iterations: int = 50,
+        deploy_authorized: bool = False,
     ) -> Dict[str, Any]:
         """Execute agent task.
 
@@ -554,7 +555,19 @@ class AgentTaskWorkflow:
 
         # Step 2: Agent execution loop
         iteration = start_iteration
-        
+        if follow_up and start_iteration >= max_iterations:
+            # A continuation should always get one new attempt; without this
+            # the loop is a no-op when the task already used its budget.
+            max_iterations = start_iteration + 1
+            logger.info(
+                f"♻️  Continuation {task_id} at iteration {start_iteration} "
+                f">= budget; allowing one extra iteration (max={max_iterations})"
+            )
+        logger.info(
+            f"▶️  Agent loop | task={task_id} | start_iteration={start_iteration} | "
+            f"max_iterations={max_iterations}"
+        )
+
         while iteration < max_iterations:
             iteration += 1
             iteration_started_at = workflow.now()
@@ -601,7 +614,7 @@ class AgentTaskWorkflow:
             try:
                 result = await workflow.execute_child_workflow(
                     AgentStepWorkflow.run,
-                    args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns, self.current_image_digest],
+                    args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns, self.current_image_digest, deploy_authorized],
                     id=f"agent-step-{task_id}-iter-{iteration}",
                 )
             except Exception as child_exc:
@@ -1101,6 +1114,7 @@ class AgentStepWorkflow:
         deliverables_required: bool = True,
         max_agent_turns: int = 30,
         agent_image_digest: str = "",
+        deploy_authorized: bool = False,
     ) -> Dict[str, Any]:
         logger.info(
             f"🔬 AgentStepWorkflow | Task: {task_id} | Iteration: {iteration} | "
@@ -1110,7 +1124,7 @@ class AgentStepWorkflow:
         # 1. Launch the container (returns container_id + workspace info)
         launch_info = await workflow.execute_activity(
             start_agent_container,
-            args=[task_id, iteration, agent_image, llm_model, follow_up, deliverables_required, max_agent_turns, agent_image_digest],
+            args=[task_id, iteration, agent_image, llm_model, follow_up, deliverables_required, max_agent_turns, agent_image_digest, deploy_authorized],
             start_to_close_timeout=timedelta(minutes=5),
         )
 
@@ -1262,6 +1276,7 @@ async def start_agent_container(
     deliverables_required: bool = True,
     max_agent_turns: int = 30,
     agent_image_digest: str = "",
+    deploy_authorized: bool = False,
 ) -> Dict[str, Any]:
     """Launch the agent container (detached) and return container_id + workspace_dir.
 
@@ -1579,10 +1594,20 @@ async def start_agent_container(
             # Mirrors config.deliverable_gate.require_deliverables so the agent
             # loop refuses to end on a bare text reply before a deliverable exists.
             "DELIVERABLES_REQUIRED": "true" if deliverables_required else "false",
+            # Deploy-authorized nodes must emit DEPLOYMENT_REQUEST, not just
+            # describe a prepared deployment.
+            "REQUIRE_DEPLOYMENT_REQUEST": "true" if deploy_authorized else "false",
             # Dynamic turn budget (scaled by the number of upstream step outputs).
             "MAX_AGENT_TURNS": str(max(1, max_agent_turns)),
         }
 
+        # Repo/branch-scoped GitHub token for an authorized github_push node.
+        # The token lives only in this ephemeral container's environment.
+        _github_lease = await _github_push_lease(task_id)
+        if _github_lease:
+            agent_env["GITHUB_TOKEN"] = _github_lease["token"]
+            agent_env["GITHUB_REPOSITORY"] = _github_lease["repository"]
+            agent_env["GITHUB_BRANCH"] = _github_lease["branch"]
 
         # Only the workspace is a bind mount. Adapters are baked into the agent
         # images (see Dockerfile.openclaw) — do NOT bind-mount them at their
@@ -2340,6 +2365,16 @@ async def store_task_output(
         return {"error": str(e)}
 
 
+def _own_task_outputs(task_id: str, outputs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only outputs produced by this task (never a DAG sibling)."""
+    return [
+        output
+        for output in (outputs or [])
+        if str(output.get("source_task_id") or output.get("task_id") or "")
+        == str(task_id)
+    ]
+
+
 @activity.defn
 async def get_last_iteration(task_id: str) -> int:
     """Get the last iteration number for a task so continuations don't overlap."""
@@ -2348,14 +2383,24 @@ async def get_last_iteration(task_id: str) -> int:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
+            # own=true: the default /outputs response aggregates every task in
+            # the DAG. Using it here made a fresh node task start at a sibling's
+            # last iteration (dag-f92f1254).
+            resp = await client.get(
+                f"{control_plane_url}/api/tasks/{task_id}/outputs",
+                params={"own": "true"},
+            )
             if resp.status_code == 200:
                 data = resp.json()
-                outputs = data.get("outputs", [])
+                outputs = _own_task_outputs(task_id, data.get("outputs") or [])
                 if outputs:
-                    max_iter = max(o.get("iteration", 0) for o in outputs)
-                    logger.info(f"📊 Last iteration for {task_id}: {max_iter}")
+                    max_iter = max(int(o.get("iteration") or 0) for o in outputs)
+                    logger.info(
+                        f"📊 Last iteration for {task_id}: {max_iter} "
+                        f"(own_outputs={len(outputs)})"
+                    )
                     return max_iter
+                logger.info(f"📊 Last iteration for {task_id}: 0 (no own outputs)")
     except Exception as e:
         logger.warning(f"⚠️ Could not fetch last iteration: {e}")
 
@@ -3683,6 +3728,96 @@ async def patch_deployment(deployment_id: str, updates: Dict[str, Any]) -> Dict[
         return {"error": str(e)}
 
 
+async def _github_push_lease(task_id: str) -> Dict[str, Any]:
+    """Lease a repo/branch-scoped GitHub credential for one agent container.
+
+    Only DAG nodes with config.github_push.enabled get a lease. The gateway
+    validates the repository/branch allowlist; this helper never logs the token.
+    """
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    gateway_url = os.getenv("CREDENTIAL_GATEWAY_URL", "http://credential-gateway:8083")
+    admin_token = os.getenv("CREDENTIAL_GATEWAY_ADMIN_TOKEN", "openclaw-admin")
+    if not admin_token:
+        logger.warning("GitHub push lease skipped: no credential gateway admin token")
+        return {}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            task_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
+            if task_resp.status_code != 200:
+                return {}
+            task = task_resp.json() or {}
+            dag_id = task.get("dag_id")
+            node_id = task.get("node_id")
+            if not dag_id or not node_id:
+                return {}
+
+            nodes_resp = await client.get(
+                f"{control_plane_url}/api/dags/{dag_id}/nodes"
+            )
+            if nodes_resp.status_code != 200:
+                return {}
+            node_config: Dict[str, Any] = {}
+            for node in nodes_resp.json() or []:
+                if node.get("node_id") == node_id:
+                    node_config = node.get("config") or {}
+                    break
+
+            push_cfg = node_config.get("github_push") or {}
+            if not isinstance(push_cfg, dict) or not push_cfg.get("enabled"):
+                return {}
+            if push_cfg.get("authorized") is False:
+                logger.warning(
+                    f"GitHub push lease not authorized for task {task_id} node {node_id}"
+                )
+                return {}
+            repository = str(
+                push_cfg.get("repository") or push_cfg.get("repo") or ""
+            ).strip()
+            branch = str(push_cfg.get("branch") or "main").strip()
+            credential = str(push_cfg.get("credential") or "github").strip()
+            if not repository:
+                logger.warning(f"GitHub push enabled without repository for {task_id}")
+                return {}
+
+            lease_resp = await client.post(
+                f"{gateway_url}/v1/lease/github",
+                headers={"X-Admin-Token": admin_token},
+                json={
+                    "credential": credential,
+                    "repository": repository,
+                    "branch": branch,
+                    "task_id": task_id,
+                },
+            )
+            if lease_resp.status_code != 200:
+                logger.warning(
+                    f"GitHub push lease denied for task {task_id} "
+                    f"({repository}@{branch}): HTTP {lease_resp.status_code}"
+                )
+                return {}
+            lease = lease_resp.json() or {}
+            token = str(lease.get("password") or lease.get("token") or "")
+            if not token:
+                logger.warning(f"GitHub push lease returned no token for {task_id}")
+                return {}
+            logger.info(
+                f"🔑 GitHub push lease acquired | task={task_id} "
+                f"repo={lease.get('repository') or repository} "
+                f"branch={lease.get('branch') or branch}"
+            )
+            return {
+                "token": token,
+                "repository": lease.get("repository") or repository,
+                "branch": lease.get("branch") or branch,
+            }
+    except Exception as exc:
+        logger.warning(f"GitHub push lease failed for {task_id}: {exc}")
+        return {}
+
+
 @activity.defn
 async def check_deploy_authority(task_id: str) -> Dict[str, Any]:
     """Check whether a task (DAG node) is authorized to deploy.
@@ -4880,23 +5015,23 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
         task = resp.json()
         node_id = task.get("node_id") or ""
 
-        # Fetch the latest output
-        outputs_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
+        # Fetch the latest output. own=true keeps sibling DAG tasks out of the
+        # gate: a fresh node must never be judged by another node's output.
+        outputs_resp = await client.get(
+            f"{control_plane_url}/api/tasks/{task_id}/outputs",
+            params={"own": "true"},
+        )
         outputs_payload = outputs_resp.json() if outputs_resp.status_code == 200 else {}
         outputs = []
         if isinstance(outputs_payload, dict):
             outputs = outputs_payload.get("outputs", []) or []
         elif isinstance(outputs_payload, list):
             outputs = outputs_payload
-        # The /outputs endpoint aggregates sibling DAG tasks (and older runs);
-        # keep only THIS task's own iterations so the gate evaluates the right
-        # node's final output.
-        own_outputs = []
-        for o in outputs:
-            src = o.get("source_task_id") or o.get("task_id")
-            if src is None or str(src) == str(task_id):
-                own_outputs.append(o)
-        outputs = own_outputs
+        # Defensive filter for older/alternate endpoints that omit own mode.
+        outputs = _own_task_outputs(task_id, outputs)
+        logger.info(
+            f"📦 collect_node_output | task={task_id} | own_outputs={len(outputs)}"
+        )
 
         result = {
             "task_id": task_id,
@@ -5472,16 +5607,31 @@ class DAGNodeWorkflow:
 
         # Build the follow-up prompt from objective + input_data
         follow_up_parts = []
+        _gate_cfg = (config.get("deliverable_gate") or {}) if isinstance(config, dict) else {}
+        in_place = bool(
+            config.get("deliverable_mode") == "in_place"
+            or _gate_cfg.get("require_deliverables") is False
+        )
         # Deliverables-dir instruction FIRST so it is never truncated away by the
         # FOLLOW_UP env limit — agents must know exactly where to write outputs.
-        follow_up_parts.append(
-            f"--- Deliverables directory ---\n"
-            f"This step's deliverables directory is `/workspace/{node_id}/` — create it if needed. "
-            f"Write your FINAL deliverables (reports, parsed data files, code artifacts) there; only files in "
-            f"that directory are collected. Put intermediate/raw products (fetched HTML pages, caches, scratch) "
-            f"in `/tmp` or `/workspace/.cache/` — they are NOT collected. If the task fetches web data, save the "
-            f"raw pages outside the deliverables directory and place only the parsed/structured data inside it."
-        )
+        # In-place nodes edit existing files and must not be sent to a node dir.
+        if in_place:
+            follow_up_parts.append(
+                "--- In-place modification ---\n"
+                f"This step modifies existing files in the shared workspace. Do NOT create `/workspace/{node_id}/`. "
+                "Edit the target files in place, run the tests specified in the objective, fix failures, and "
+                "finish only when the suite passes. Report the exact command and result. Do not copy or rewrite "
+                "existing sources from scratch."
+            )
+        else:
+            follow_up_parts.append(
+                f"--- Deliverables directory ---\n"
+                f"This step's deliverables directory is `/workspace/{node_id}/` — create it if needed. "
+                f"Write your FINAL deliverables (reports, parsed data files, code artifacts) there; only files in "
+                f"that directory are collected. Put intermediate/raw products (fetched HTML pages, caches, scratch) "
+                f"in `/tmp` or `/workspace/.cache/` — they are NOT collected. If the task fetches web data, save the "
+                f"raw pages outside the deliverables directory and place only the parsed/structured data inside it."
+            )
         input_attachments = config.get("input_attachments") or []
         if isinstance(input_attachments, list) and input_attachments:
             follow_up_parts.append("--- Attached Reference Files (read-only) ---")
@@ -5507,11 +5657,18 @@ class DAGNodeWorkflow:
             follow_up_parts.append("--- Success Criteria ---")
             for criterion in success_criteria[:8]:
                 follow_up_parts.append(f"- {str(criterion)[:240]}")
-        follow_up_parts.append(
-            f"--- Turn budget ---\n"
-            f"You have up to {max_agent_turns} turns for this step. Write your deliverable(s) "
-            f"incrementally — do not spend the whole budget exploring."
-        )
+        if in_place:
+            follow_up_parts.append(
+                f"--- Turn budget ---\n"
+                f"You have up to {max_agent_turns} turns for this step. Verify and repair in place, "
+                f"run the tests, fix failures — do not spend the whole budget exploring."
+            )
+        else:
+            follow_up_parts.append(
+                f"--- Turn budget ---\n"
+                f"You have up to {max_agent_turns} turns for this step. Write your deliverable(s) "
+                f"incrementally — do not spend the whole budget exploring."
+            )
         thinking_budget = str(config.get("thinking_budget") or "").lower()
         if thinking_budget == "lean":
             follow_up_parts.append(
@@ -5604,8 +5761,12 @@ class DAGNodeWorkflow:
 
             # Deliverable requirement mirrors config.deliverable_gate so the
             # agent loop only enforces writing files when the gate expects them.
-            _gate_cfg = (config.get("deliverable_gate") or {}) if isinstance(config, dict) else {}
-            _deliverables_required = (_gate_cfg.get("enabled", True) is not False) and bool(_gate_cfg.get("require_deliverables", True))
+            # In-place nodes never require a node deliverables directory.
+            _deliverables_required = (
+                (_gate_cfg.get("enabled", True) is not False)
+                and bool(_gate_cfg.get("require_deliverables", True))
+                and not in_place
+            )
 
             await workflow.execute_activity(
                 persist_task_workflow_id,
@@ -5615,7 +5776,7 @@ class DAGNodeWorkflow:
 
             result = await workflow.execute_child_workflow(
                 AgentTaskWorkflow.run,
-                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations],
+                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations, bool(config.get("deploy_authorized"))],
                 id=child_workflow_id,
             )
 
@@ -6925,6 +7086,30 @@ class DeploymentBuildWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             )
             logger.info(f"✅ Trial image reused for deployment {deployment_id}: {image_tag}")
+            if deployment.get("auto_start"):
+                try:
+                    await workflow.execute_activity(
+                        start_deployment_container,
+                        args=[deployment_id],
+                        start_to_close_timeout=timedelta(minutes=5),
+                    )
+                    return {
+                        "status": "running",
+                        "image_tag": image_tag,
+                        "trial_passed": True,
+                        "auto_started": True,
+                        "deployment": result,
+                    }
+                except Exception as exc:
+                    await workflow.execute_activity(
+                        patch_deployment,
+                        args=[
+                            deployment_id,
+                            {"status": "failed", "error": f"Auto-start failed: {exc}"},
+                        ],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    return {"status": "failed", "error": f"Auto-start failed: {exc}"}
             return {
                 "status": "built",
                 "image_tag": image_tag,
@@ -6937,6 +7122,25 @@ class DeploymentBuildWorkflow:
             args=[deployment_id],
             start_to_close_timeout=timedelta(minutes=10),
         )
+
+        if deployment and deployment.get("auto_start"):
+            try:
+                await workflow.execute_activity(
+                    start_deployment_container,
+                    args=[deployment_id],
+                    start_to_close_timeout=timedelta(minutes=5),
+                )
+                return {"status": "running", "auto_started": True, "deployment": result}
+            except Exception as exc:
+                await workflow.execute_activity(
+                    patch_deployment,
+                    args=[
+                        deployment_id,
+                        {"status": "failed", "error": f"Auto-start failed: {exc}"},
+                    ],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                return {"status": "failed", "error": f"Auto-start failed: {exc}"}
 
         return result
 

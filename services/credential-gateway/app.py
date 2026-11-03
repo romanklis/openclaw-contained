@@ -13,12 +13,21 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
-from approvals import GrantStore, GrantError, ApprovalRequired
+from approvals import GrantStore, GrantError, ApprovalRequired, ensure_grant
 from browser import InteractiveLoginRequired, BrowserDriverError, resolve_album_urls
 from executor import ExecutionDenied, ExecutionUpstreamError, Executor, SessionStore
+from mail import (
+    MailError,
+    download_attachment as mail_download_attachment,
+    list_folders as mail_list_folders,
+    list_messages as mail_list_messages,
+    read_message as mail_read_message,
+)
+from github_lease import GitHubLeaseError, build_github_lease
 from store import build_store, CredentialNotFound
 
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000").rstrip("/")
@@ -27,7 +36,10 @@ ADMIN_TOKEN = os.getenv("CREDENTIAL_GATEWAY_ADMIN_TOKEN", "")
 
 SECRET_FIELDS = {"password", "token", "header_value", "cookie_value"}
 MASKED_FIELDS = {"name", "kind", "username", "login_url", "username_field", "password_field",
-                 "header_name", "cookie_name", "allowed_origins", "allowed_methods"}
+                 "header_name", "cookie_name", "allowed_origins", "allowed_methods",
+                 "host", "port", "tls", "allowed_folders", "max_messages",
+                 "max_body_bytes", "max_attachment_bytes", "max_message_bytes",
+                 "preapproved_operations", "provider", "repository", "branch"}
 
 
 def _masked(profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -84,11 +96,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Credential Gateway", version="0.1.0", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def _no_store_credentials(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith(("/v1/credentials", "/v1/lease")):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 @app.get("/v1/credentials")
 def list_credentials(request: Request):
     _admin(request)
     st = request.app.state.store
-    return [_masked(st.get(n)) for n in st.list_names()]
+    items = []
+    for name in st.list_names():
+        try:
+            items.append(_masked(st.get(name)))
+        except CredentialNotFound:
+            # A stale metadata key (data version deleted) must not break the
+            # whole credentials page.
+            continue
+    return items
 
 
 @app.post("/v1/credentials/{name}")
@@ -106,6 +135,18 @@ def upsert_credential(name: str, payload: Dict[str, Any], request: Request):
             continue  # blank secret field = keep existing
         merged[k] = v
     merged["name"] = name
+    if str(merged.get("provider") or "").strip().lower() == "github":
+        try:
+            build_github_lease(
+                merged,
+                str(merged.get("repository") or ""),
+                str(merged.get("branch") or "main"),
+            )
+        except GitHubLeaseError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "detail": exc.message},
+            )
     request.app.state.store.save(name, merged)
     return {"ok": True, "name": name}
 
@@ -285,6 +326,261 @@ def drop_session(session_id: str, request: Request):
     if not removed:
         raise HTTPException(status_code=404, detail="unknown session_id")
     return {"ok": True}
+
+
+def _mail_credential(request: Request, name: str) -> Dict[str, Any]:
+    try:
+        cred = request.app.state.store.get(name)
+    except CredentialNotFound:
+        raise HTTPException(status_code=404, detail=f"unknown credential '{name}'")
+    if str(cred.get("kind") or "").lower() != "imap":
+        raise MailError("MAIL_CONFIG", f"credential '{name}' is not kind=imap")
+    return cred
+
+
+def _mail_authorize(
+    request: Request,
+    agent: str,
+    name: str,
+    cred: Dict[str, Any],
+    folder: str,
+) -> None:
+    preapproved = {
+        str(item).upper()
+        for item in (cred.get("preapproved_operations") or [])
+        if str(item).strip()
+    }
+    if "READ" in preapproved:
+        return
+    host = str(cred.get("host") or "unknown")
+    origin = f"imap://{host}/{(folder or 'INBOX').strip()}"
+    ensure_grant(
+        request.app.state.grants,
+        agent,
+        name,
+        origin,
+        "READ",
+        f"Read mailbox '{name}' ({folder or 'INBOX'}, read-only)",
+        ttl_minutes=int(os.getenv("MAIL_GRANT_TTL_MIN", "1440")),
+        max_requests=int(os.getenv("MAIL_GRANT_MAX_REQUESTS", "500")),
+    )
+
+
+def _audit_mail(
+    agent: str,
+    credential: str,
+    operation: str,
+    folder: str = "",
+    uid: str = "",
+    size: int = 0,
+) -> None:
+    import logging
+
+    logging.getLogger("credential-gateway.mail").info(
+        "mail_access task=%s credential=%s operation=%s folder=%s uid=%s bytes=%s",
+        agent,
+        credential,
+        operation,
+        folder or "-",
+        uid or "-",
+        size,
+    )
+    try:
+        task_resp = httpx.get(f"{CONTROL_PLANE_URL}/api/tasks/{agent}", timeout=3)
+        if task_resp.status_code != 200:
+            return
+        task = task_resp.json() or {}
+        dag_id = task.get("dag_id")
+        node_id = task.get("node_id")
+        if not dag_id or not node_id:
+            return
+        httpx.post(
+            f"{CONTROL_PLANE_URL}/api/dags/{dag_id}/nodes/{node_id}/audit-events",
+            json={
+                "task_id": agent,
+                "event_type": "mail_read",
+                "severity": "info",
+                "message": f"Read mailbox '{credential}' via {operation}",
+                "event_data": {
+                    "credential": credential,
+                    "operation": operation,
+                    "folder": folder,
+                    "uid": uid,
+                    "bytes": size,
+                },
+            },
+            timeout=3,
+        )
+    except Exception:
+        logging.getLogger("credential-gateway.mail").debug(
+            "mail audit post failed", exc_info=True
+        )
+
+
+@app.get("/v1/mail/folders")
+def mail_folders(request: Request, credential: str = Query(...)):
+    agent = _agent(request)
+    cred = _mail_credential(request, credential)
+    _mail_authorize(request, agent, credential, cred, "INBOX")
+    folders = mail_list_folders(cred)
+    _audit_mail(agent, credential, "folders")
+    return {"credential": credential, "folders": folders}
+
+
+@app.get("/v1/mail/messages")
+def mail_messages(
+    request: Request,
+    credential: str = Query(...),
+    folder: str = Query("INBOX"),
+    from_addr: str = Query("", alias="from"),
+    subject: str = Query(""),
+    text: str = Query(""),
+    since: str = Query(""),
+    before: str = Query(""),
+    unseen: bool = Query(False),
+    limit: int = Query(20, ge=1, le=200),
+):
+    agent = _agent(request)
+    cred = _mail_credential(request, credential)
+    _mail_authorize(request, agent, credential, cred, folder)
+    messages = mail_list_messages(
+        cred,
+        folder=folder,
+        from_addr=from_addr,
+        subject=subject,
+        text=text,
+        since=since,
+        before=before,
+        unseen=unseen,
+        limit=limit,
+    )
+    _audit_mail(agent, credential, "list", folder=folder, size=len(messages))
+    return {"credential": credential, "folder": folder, "messages": messages}
+
+
+@app.get("/v1/mail/messages/{uid}")
+def mail_message(
+    uid: str,
+    request: Request,
+    credential: str = Query(...),
+    folder: str = Query("INBOX"),
+):
+    agent = _agent(request)
+    cred = _mail_credential(request, credential)
+    _mail_authorize(request, agent, credential, cred, folder)
+    message = mail_read_message(cred, uid, folder=folder)
+    _audit_mail(
+        agent,
+        credential,
+        "read",
+        folder=folder,
+        uid=uid,
+        size=len(message.get("text") or ""),
+    )
+    return {"credential": credential, "message": message}
+
+
+@app.get("/v1/mail/messages/{uid}/attachments/{part}")
+def mail_attachment(
+    uid: str,
+    part: str,
+    request: Request,
+    credential: str = Query(...),
+    folder: str = Query("INBOX"),
+):
+    agent = _agent(request)
+    cred = _mail_credential(request, credential)
+    _mail_authorize(request, agent, credential, cred, folder)
+    attachment = mail_download_attachment(cred, uid, part, folder=folder)
+    _audit_mail(
+        agent,
+        credential,
+        "attachment",
+        folder=folder,
+        uid=uid,
+        size=attachment["size"],
+    )
+    filename = str(attachment["filename"]).replace('"', "").replace("\r", "").replace("\n", "")
+    return Response(
+        content=attachment["content"],
+        media_type=attachment["content_type"] or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename or "attachment"}"',
+            "X-Mail-Folder": folder,
+            "X-Mail-Uid": str(uid),
+            "X-Mail-Part": str(part),
+        },
+    )
+
+
+@app.exception_handler(ApprovalRequired)
+async def _approval_required_handler(request: Request, exc: ApprovalRequired):
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "awaiting_approval",
+            "request_id": exc.request_id,
+            "credential": exc.credential,
+            "origin": exc.origin,
+            "method": exc.method,
+            "detail": "This mailbox needs human approval. Approve it on the Approvals page; the workflow will resume and retry automatically.",
+        },
+    )
+
+
+@app.exception_handler(MailError)
+async def _mail_error_handler(request: Request, exc: MailError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "code": exc.code, "detail": exc.message},
+    )
+
+
+class GitHubLeaseRequest(BaseModel):
+    credential: str = "github"
+    repository: str
+    branch: str = "main"
+    task_id: Optional[str] = None
+
+
+@app.post("/v1/lease/github")
+def lease_github(payload: GitHubLeaseRequest, request: Request):
+    """Worker-only: lease a GitHub credential for one repo/branch.
+
+    The agent never calls this endpoint. The worker uses the admin token,
+    verifies the node's github_push config, and injects the returned token into
+    that one ephemeral agent container as GITHUB_TOKEN.
+    """
+    _admin(request)
+    try:
+        profile = request.app.state.store.get(payload.credential)
+    except CredentialNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown credential '{payload.credential}'",
+        )
+    try:
+        lease = build_github_lease(
+            profile,
+            payload.repository,
+            payload.branch or "main",
+        )
+    except GitHubLeaseError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "detail": exc.message},
+        )
+
+    import logging
+
+    logging.getLogger("credential-gateway.github").info(
+        "github_lease task=%s credential=%s repo=%s branch=%s",
+        payload.task_id or "-",
+        payload.credential,
+        lease["repository"],
+        lease["branch"],
+    )
+    return lease
 
 
 if __name__ == "__main__":

@@ -3,11 +3,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import { API } from '../lib/api'
 
-const KINDS = ['basic', 'form', 'bearer', 'header', 'cookie']
+const KINDS = ['basic', 'form', 'bearer', 'header', 'cookie', 'github']
 
 interface Credential {
   name: string
   kind?: string
+  provider?: string
+  repository?: string
+  branch?: string
   username?: string
   login_url?: string
   header_name?: string
@@ -37,11 +40,15 @@ export default function CredentialsPage() {
   useEffect(() => { load() }, [load])
 
   const startEdit = (c: Credential) => {
+    const isGithub = c.provider === 'github'
     setEditing(c.name)
     setForm({
       name: c.name,
-      kind: c.kind || 'basic',
-      username: c.username || '',
+      kind: isGithub ? 'github' : (c.kind || 'basic'),
+      provider: c.provider || '',
+      repository: c.repository || '',
+      branch: c.branch || 'main',
+      username: c.username || (isGithub ? 'x-access-token' : ''),
       password: '',
       token: '',
       header_name: c.header_name || '',
@@ -56,24 +63,71 @@ export default function CredentialsPage() {
     })
   }
 
+  const changeKind = (kind: string) => {
+    if (kind === 'github') {
+      setForm({
+        ...form,
+        kind,
+        name: form.name || 'github',
+        provider: 'github',
+        repository: form.repository || 'romanklis/fake-video-detection',
+        branch: form.branch || 'main',
+        username: form.username || 'x-access-token',
+        allowed_origins: 'https://github.com',
+        allowed_methods: 'PUSH',
+      })
+    } else {
+      setForm({
+        ...form,
+        kind,
+        provider: '',
+        allowed_origins: form.allowed_origins || '',
+        allowed_methods: form.allowed_methods || 'GET, POST',
+      })
+    }
+  }
+
   const submit = async () => {
     const name = (form.name || '').trim()
     if (!name) { alert('Name is required'); return }
-    const payload: any = {
-      kind: form.kind,
-      username: form.username?.trim() || undefined,
-      password: form.password || undefined,
-      token: form.token || undefined,
-      header_name: form.header_name?.trim() || undefined,
-      header_value: form.header_value || undefined,
-      cookie_name: form.cookie_name?.trim() || undefined,
-      cookie_value: form.cookie_value || undefined,
-      login_url: form.login_url?.trim() || undefined,
-      username_field: form.username_field?.trim() || 'username',
-      password_field: form.password_field?.trim() || 'password',
-      allowed_origins: (form.allowed_origins || '').split(',').map((s: string) => s.trim()).filter(Boolean),
-      allowed_methods: (form.allowed_methods || 'GET, POST').split(',').map((s: string) => s.trim().toUpperCase()).filter(Boolean),
+    const isGithub = form.kind === 'github'
+    const repository = (form.repository || '').trim()
+    if (isGithub) {
+      if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+        alert('Repository must look like owner/repo')
+        return
+      }
+      if (!editing && !form.token) {
+        alert('GitHub token is required')
+        return
+      }
     }
+    const payload: any = isGithub
+      ? {
+          kind: 'bearer',
+          provider: 'github',
+          repository,
+          branch: (form.branch || 'main').trim() || 'main',
+          username: (form.username || 'x-access-token').trim() || 'x-access-token',
+          token: form.token || undefined,
+          allowed_origins: ['https://github.com'],
+          allowed_methods: ['PUSH'],
+        }
+      : {
+          kind: form.kind,
+          username: form.username?.trim() || undefined,
+          password: form.password || undefined,
+          token: form.token || undefined,
+          header_name: form.header_name?.trim() || undefined,
+          header_value: form.header_value || undefined,
+          cookie_name: form.cookie_name?.trim() || undefined,
+          cookie_value: form.cookie_value || undefined,
+          login_url: form.login_url?.trim() || undefined,
+          username_field: form.username_field?.trim() || 'username',
+          password_field: form.password_field?.trim() || 'password',
+          allowed_origins: (form.allowed_origins || '').split(',').map((s: string) => s.trim()).filter(Boolean),
+          allowed_methods: (form.allowed_methods || 'GET, POST').split(',').map((s: string) => s.trim().toUpperCase()).filter(Boolean),
+        }
     try {
       const res = await fetch(`${API}/api/credentials/${encodeURIComponent(name)}`, {
         method: 'POST',
@@ -135,6 +189,7 @@ export default function CredentialsPage() {
     basic: 'HTTP Basic — username + password',
     form: 'Login form — username + password, posts to login_url',
     bearer: 'Authorization: Bearer <token>',
+    github: 'GitHub push — repo/branch-scoped PAT, injected only into authorized push nodes',
     header: 'Custom header (header_name: header_value)',
     cookie: 'Cookie injected per request',
   }
@@ -169,7 +224,7 @@ export default function CredentialsPage() {
             <select
               className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white"
               value={form.kind || 'basic'}
-              onChange={(e) => setForm({ ...form, kind: e.target.value })}
+              onChange={(e) => changeKind(e.target.value)}
             >
               {KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
             </select>
@@ -218,6 +273,39 @@ export default function CredentialsPage() {
                 value={form.token || ''} onChange={(e) => setForm({ ...form, token: e.target.value })} />
             </label>
           )}
+          {form.kind === 'github' && (
+            <>
+              <label className="block">
+                <span className="text-gray-400">Repository (owner/repo)</span>
+                <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white"
+                  value={form.repository || ''} onChange={(e) => setForm({ ...form, repository: e.target.value })}
+                  placeholder="romanklis/fake-video-detection" />
+              </label>
+              <label className="block">
+                <span className="text-gray-400">Branch</span>
+                <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white"
+                  value={form.branch || 'main'} onChange={(e) => setForm({ ...form, branch: e.target.value })}
+                  placeholder="main" />
+              </label>
+              <label className="block">
+                <span className="text-gray-400">Username</span>
+                <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white"
+                  value={form.username || 'x-access-token'} onChange={(e) => setForm({ ...form, username: e.target.value })}
+                  placeholder="x-access-token" />
+              </label>
+              <label className="block">
+                <span className="text-gray-400">PAT {editing && '(leave blank to keep)'}</span>
+                <input type="password" autoComplete="new-password"
+                  className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white"
+                  value={form.token || ''} onChange={(e) => setForm({ ...form, token: e.target.value })}
+                  placeholder="github_pat_…" />
+              </label>
+              <p className="col-span-2 text-[10px] text-gray-600">
+                The token needs Contents: read/write. It is sent once to the credential gateway
+                and stored in OpenBao; this page only shows a masked token afterwards.
+              </p>
+            </>
+          )}
           {form.kind === 'header' && (
             <>
               <label className="block">
@@ -247,18 +335,22 @@ export default function CredentialsPage() {
               </label>
             </>
           )}
-          <label className="block">
-            <span className="text-gray-400">Allowed origins (comma separated; empty = any)</span>
-            <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white font-mono"
-              value={form.allowed_origins || ''} onChange={(e) => setForm({ ...form, allowed_origins: e.target.value })}
-              placeholder="https://example.com" />
-          </label>
-          <label className="block">
-            <span className="text-gray-400">Allowed methods</span>
-            <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white font-mono"
-              value={form.allowed_methods || ''} onChange={(e) => setForm({ ...form, allowed_methods: e.target.value })}
-              placeholder="GET, POST" />
-          </label>
+          {form.kind !== 'github' && (
+            <>
+              <label className="block">
+                <span className="text-gray-400">Allowed origins (comma separated; empty = any)</span>
+                <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white font-mono"
+                  value={form.allowed_origins || ''} onChange={(e) => setForm({ ...form, allowed_origins: e.target.value })}
+                  placeholder="https://example.com" />
+              </label>
+              <label className="block">
+                <span className="text-gray-400">Allowed methods</span>
+                <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-white font-mono"
+                  value={form.allowed_methods || ''} onChange={(e) => setForm({ ...form, allowed_methods: e.target.value })}
+                  placeholder="GET, POST" />
+              </label>
+            </>
+          )}
         </div>
 
         <div className="flex gap-2 mt-4">
@@ -282,6 +374,7 @@ export default function CredentialsPage() {
               <tr className="text-left text-gray-500 border-b border-[#232333]">
                 <th className="py-2 pr-3">Name</th>
                 <th className="py-2 pr-3">Type</th>
+                <th className="py-2 pr-3">Scope</th>
                 <th className="py-2 pr-3">Secrets</th>
                 <th className="py-2 pr-3">Methods</th>
                 <th className="py-2 pr-3">Origins</th>
@@ -292,7 +385,10 @@ export default function CredentialsPage() {
               {creds.map((c) => (
                 <tr key={c.name} className="border-b border-[#1a1a2a] last:border-0">
                   <td className="py-2 pr-3 font-mono text-white">{c.name}</td>
-                  <td className="py-2 pr-3 text-gray-300">{c.kind}</td>
+                  <td className="py-2 pr-3 text-gray-300">{c.provider === 'github' ? 'github' : c.kind}</td>
+                  <td className="py-2 pr-3 text-gray-400">
+                    {c.provider === 'github' ? `${c.repository || '—'}@${c.branch || 'main'}` : '—'}
+                  </td>
                   <td className="py-2 pr-3 text-gray-400">
                     {c.has_password ? '🔑 password ' : ''}
                     {c.has_token ? '🔑 token ' : ''}

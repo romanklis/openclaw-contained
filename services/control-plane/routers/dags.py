@@ -1672,6 +1672,18 @@ async def patch_dag(dag_id: str, payload: dict, db: AsyncSession = Depends(get_d
             # Fallback: parse without timezone, assume UTC
             dag.completed_at = datetime.fromisoformat(completed_at_str.split('.')[0])
     await db.commit()
+
+    if dag.status == DAGStatus.COMPLETED and getattr(dag, "exploration_session_id", None):
+        try:
+            from deployment_service import ensure_cycle_deployment
+
+            await ensure_cycle_deployment(dag, db)
+        except Exception as exc:
+            logger.warning(
+                "Could not create exploration deployment for DAG %s: %s",
+                dag.id,
+                exc,
+            )
     return {"ok": True}
 
 

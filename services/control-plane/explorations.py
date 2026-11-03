@@ -680,6 +680,18 @@ async def reconcile_session(session: ExplorationSession, db: AsyncSession) -> Ex
             session.status = "awaiting_feedback"
             if status in ("completed",):
                 cycle.status = "completed"
+                # Backfill the pending deployment for cycles finalized before
+                # this hook existed (and keep it idempotent afterwards).
+                try:
+                    from deployment_service import ensure_cycle_deployment
+
+                    await ensure_cycle_deployment(dag, db)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not ensure deployment for cycle %s: %s",
+                        cycle.id,
+                        exc,
+                    )
             elif status in ("failed",):
                 cycle.status = "failed"
             elif status in ("cancelled",):
@@ -963,7 +975,82 @@ async def build_chat_context(session: ExplorationSession, db: AsyncSession) -> l
     return [{"role": "system", "content": system}] + history
 
 
-async def finish_session(session: ExplorationSession, db: AsyncSession) -> None:
+async def finish_session(session: ExplorationSession, db: AsyncSession) -> list[dict]:
+    """Finish an exploration and start its prepared deployment, if any.
+
+    A completed cycle creates a pending deployment from the deploy node's
+    deployment.json. Finalizing is the human approval step: approve it, then
+    build/trial and start it.
+    """
+    started: list[dict] = []
+    try:
+        from deployment_service import (
+            active_deployments_for_dag,
+            approve_deployment_record,
+            ensure_cycle_deployment,
+            pending_deployments_for_dag,
+        )
+
+        cycle_result = await db.execute(
+            select(ExplorationCycle)
+            .where(ExplorationCycle.session_id == session.id)
+            .order_by(ExplorationCycle.cycle_number.desc())
+            .limit(1)
+        )
+        cycle = cycle_result.scalars().first()
+        if cycle:
+            dag = await db.get(MasterDAG, cycle.dag_id)
+            if dag:
+                await ensure_cycle_deployment(dag, db)
+                for deployment in await pending_deployments_for_dag(dag.id, db):
+                    try:
+                        deployment = await approve_deployment_record(
+                            deployment, db, auto_start=True
+                        )
+                        started.append(
+                            {
+                                "id": deployment.id,
+                                "name": deployment.name,
+                                "status": str(
+                                    getattr(deployment.status, "value", deployment.status)
+                                ),
+                                "url": deployment.url,
+                            }
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not start deployment %s for cycle %s: %s",
+                            deployment.id,
+                            cycle.id,
+                            exc,
+                        )
+                        started.append(
+                            {
+                                "id": deployment.id,
+                                "name": deployment.name,
+                                "status": "error",
+                                "error": str(exc),
+                            }
+                        )
+                if not started:
+                    # The prepared deployment may already have been approved /
+                    # started (e.g. before finalize was clicked). Report the
+                    # active deployment instead of showing a bare finish.
+                    for deployment in await active_deployments_for_dag(dag.id, db):
+                        started.append(
+                            {
+                                "id": deployment.id,
+                                "name": deployment.name,
+                                "status": str(
+                                    getattr(deployment.status, "value", deployment.status)
+                                ),
+                                "url": deployment.url,
+                            }
+                        )
+    except Exception as exc:
+        logger.warning("Could not start exploration deployment: %s", exc)
+
     session.status = "finished"
     session.last_activity_at = datetime.utcnow()
     await db.commit()
+    return started
