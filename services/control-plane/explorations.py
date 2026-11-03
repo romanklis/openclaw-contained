@@ -18,9 +18,11 @@ from models import (
     ExplorationMessage,
     DAGStatus,
     ExplorationSession,
+    ImageVersion,
     MasterDAG,
     NodeStatus,
     RequestStatus,
+    Task,
     TaskOutput,
     AgentTurn,
     LlmUsage,
@@ -183,6 +185,141 @@ def _agent_model(session: ExplorationSession) -> str:
     return session.model or _planning_defaults().get("agent_model") or "deepseek-v4-flash"
 
 
+def _normalize_image_ref(image: str | None) -> str:
+    ref = (image or "").strip()
+    if ref.startswith("localhost:5000/"):
+        return "registry:5000/" + ref[len("localhost:5000/"):]
+    return ref
+
+
+def _is_base_like_image(image: str) -> bool:
+    ref = _normalize_image_ref(image)
+    if "capability" in ref:
+        return False
+    tag = ref.rsplit(":", 1)[-1] if ":" in ref else ref
+    return tag in {"openclaw", "base", "latest", "stable"}
+
+
+async def _previous_cycle_image(
+    session: ExplorationSession,
+    db: AsyncSession,
+    before_cycle_number: int,
+) -> tuple[int | None, str]:
+    """Return the richest image produced by an earlier finalized cycle.
+
+    Exploration cycles already share the workspace (deliverables are visible), but
+    a new cycle used to be planned on the bare base image, losing the packages
+    built in the previous cycle. Mirror revise_dag: inherit a completed node's
+    task image, preferring a catalog capability image with the most packages.
+    """
+    cycles_result = await db.execute(
+        select(ExplorationCycle)
+        .where(
+            ExplorationCycle.session_id == session.id,
+            ExplorationCycle.cycle_number < before_cycle_number,
+        )
+        .order_by(ExplorationCycle.cycle_number.desc())
+    )
+    cycles = list(cycles_result.scalars().all())
+    if not cycles:
+        return None, ""
+
+    dag_ids = [cycle.dag_id for cycle in cycles if cycle.dag_id]
+    dags: dict[str, MasterDAG] = {}
+    if dag_ids:
+        dags_result = await db.execute(select(MasterDAG).where(MasterDAG.id.in_(dag_ids)))
+        dags = {dag.id: dag for dag in dags_result.scalars().all()}
+
+    try:
+        from explorations_deploy import detect_cycle_deployables
+
+        deployables = await detect_cycle_deployables(session, db)
+    except Exception as exc:
+        logger.debug("Could not inspect deployable images for inheritance: %s", exc)
+        deployables = []
+
+    for cycle in cycles:
+        cycle_dag = dags.get(cycle.dag_id)
+        dag_status = str(
+            getattr(cycle_dag.status, "value", cycle_dag.status) if cycle_dag else ""
+        ).lower()
+        if dag_status != "completed":
+            continue
+        nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == cycle.dag_id))
+        nodes = list(nodes_result.scalars().all())
+        if not nodes:
+            continue
+
+        task_ids = [node.task_id for node in nodes if node.task_id]
+        tasks: dict[str, Task] = {}
+        if task_ids:
+            task_result = await db.execute(select(Task).where(Task.id.in_(task_ids)))
+            tasks = {task.id: task for task in task_result.scalars().all()}
+
+        candidates: list[tuple[str, float]] = []
+        for node in nodes:
+            status = str(getattr(node.status, "value", node.status) or "").lower()
+            task = tasks.get(node.task_id) if node.task_id else None
+            if status != "completed" and (not task or str(getattr(task.status, "value", task.status)).lower() != "completed"):
+                continue
+            task_image = _normalize_image_ref(task.current_image if task else "")
+            config_image = _normalize_image_ref((node.config or {}).get("last_built_image"))
+            images = [candidate for candidate in (task_image, config_image) if candidate]
+            if not images:
+                continue
+            # A continuation task often keeps its initial base image in
+            # Task.current_image; the node config carries the inherited/built
+            # image. Prefer the non-base candidate.
+            image = next(
+                (candidate for candidate in images if not _is_base_like_image(candidate)),
+                images[0],
+            )
+            completed = node.completed_at or (task.completed_at if task else None)
+            candidates.append((image, completed.timestamp() if completed else 0.0))
+
+        for app in deployables:
+            if app.cycle_number == cycle.cycle_number and app.agent_image:
+                candidates.append((_normalize_image_ref(app.agent_image), 0.0))
+
+        if not candidates:
+            continue
+
+        image_refs = sorted({image for image, _ in candidates if image})
+        versions_by_tag: dict[str, ImageVersion] = {}
+        if image_refs:
+            versions_result = await db.execute(
+                select(ImageVersion).where(ImageVersion.image_tag.in_(image_refs))
+            )
+            versions_by_tag = {
+                _normalize_image_ref(version.image_tag): version
+                for version in versions_result.scalars().all()
+            }
+
+        def rank(candidate: tuple[str, float]) -> tuple[int, int, float, int]:
+            image, completed_at = candidate
+            version = versions_by_tag.get(image)
+            is_capability = bool(
+                version
+                and (
+                    str(version.definition_id or "").startswith("capability")
+                    or "/capability-" in image
+                )
+            )
+            capability_count = len(version.capabilities or []) if version else 0
+            return (
+                0 if _is_base_like_image(image) else 1,
+                1 if is_capability else 0,
+                capability_count,
+                completed_at,
+            )
+
+        best_image, _ = max(candidates, key=rank)
+        if best_image:
+            return cycle.cycle_number, best_image
+
+    return None, ""
+
+
 async def _create_cycle_dag(
     session: ExplorationSession,
     objective: str,
@@ -191,6 +328,8 @@ async def _create_cycle_dag(
     files: Optional[Iterable[Any]] = None,
     skill_ids: Optional[list[str]] = None,
     attachments: Optional[list[dict]] = None,
+    inherited_image: str = "",
+    inherited_cycle: Optional[int] = None,
 ) -> MasterDAG:
     from routers.dags import (  # local import to avoid router import cycles
         _normalize_interactive_nodes,
@@ -208,6 +347,7 @@ async def _create_cycle_dag(
         objective,
         _planning_model(),
         db,
+        base_image=inherited_image or None,
         skill_ids=skill_ids,
         agent_model=agent_model,
         thinking_budget=thinking_budget,
@@ -215,6 +355,15 @@ async def _create_cycle_dag(
     )
     usage_entries = dag_json.pop("_llm_usage", [])
     dag_json = _normalize_interactive_nodes(dag_json)
+    if inherited_image:
+        dag_json["inherited_image"] = inherited_image
+        dag_json["inherited_from_cycle"] = inherited_cycle
+        logger.info(
+            "Cycle %s inherits runtime image %s from cycle %s",
+            cycle_number,
+            inherited_image,
+            inherited_cycle,
+        )
     await _resolve_node_capabilities(dag_json, db)
     dag_json = _apply_execution_budgets(dag_json, thinking_budget, quality_budget)
     if attachments:
@@ -374,6 +523,8 @@ def _proposal_message(
             "thinking_budget": session.thinking_budget or "standard",
             "quality_budget": session.quality_budget or "standard",
             "objective": dag.objective,
+            "inherited_image": (dag.dag_json or {}).get("inherited_image"),
+            "inherited_from_cycle": (dag.dag_json or {}).get("inherited_from_cycle"),
             "nodes": [
                 {
                     "node_id": node.get("node_id"),
@@ -630,6 +781,17 @@ async def _exploration_state_lines(
                 f"entrypoint={deployment.entrypoint or 'none'} port={deployment.port or 'none'}"
                 + (f" error={error}" if error else "")
             )
+
+    try:
+        inherited_cycle, inherited_image = await _previous_cycle_image(
+            session, db, (session.current_cycle or 0) + 1
+        )
+        if inherited_image:
+            lines.append(
+                f"Inherited runtime image: {inherited_image} (cycle {inherited_cycle})"
+            )
+    except Exception as exc:
+        logger.debug("Could not determine inherited runtime image: %s", exc)
     return lines
 
 
@@ -680,6 +842,11 @@ async def plan_next_cycle(
 
     context_parts.extend(await _exploration_state_lines(session, cycles, db))
     next_cycle = (current.cycle_number + 1) if current else 1
+    inherited_cycle, inherited_image = await _previous_cycle_image(session, db, next_cycle)
+    if inherited_image:
+        context_parts.append(
+            f"Inherited runtime image: {inherited_image} (cycle {inherited_cycle})"
+        )
     objective = (
         f"{session.objective}\n\n"
         "EXPLORATION REPLANNING CONTEXT:\n"
@@ -692,7 +859,14 @@ async def plan_next_cycle(
         "on the next advance; the user will review and run it."
     )
 
-    dag = await _create_cycle_dag(session, objective, next_cycle, db)
+    dag = await _create_cycle_dag(
+        session,
+        objective,
+        next_cycle,
+        db,
+        inherited_image=inherited_image,
+        inherited_cycle=inherited_cycle,
+    )
     cycle = ExplorationCycle(
         id=_gen_cycle_id(),
         session_id=session.id,

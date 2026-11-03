@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 import yaml
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import capability_resolver as resolver
@@ -48,6 +48,7 @@ from models import (
     ImageVersionSBOM,
     NodeEnvironment,
     RequestStatus,
+    Task,
 )
 
 logger = logging.getLogger(__name__)
@@ -343,11 +344,40 @@ def commit_bundle_sync(
         commit = _git(["rev-parse", "HEAD"], cwd=work).strip()
         safe_version = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(version)).strip(".-") or "1.0.0"
         tag = f"v{safe_version}"
-        _git(["tag", "-f", tag], cwd=work)
+        # Image tags are identity, not pointers: never move an existing tag to a
+        # different bundle (that silently turns a cache hit into the wrong image).
+        tag_exists = subprocess.run(
+            ["git", "--git-dir", str(repo), "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}"],
+            capture_output=True,
+        ).returncode == 0
+        if tag_exists:
+            tag = f"{tag}-{commit[:6]}"
+        _git(["tag", tag], cwd=work)
         remotes = _git(["remote"], cwd=work).split()
         if "origin" not in remotes:
             _git(["remote", "add", "origin", str(repo)], cwd=work)
-        _git(["push", "-q", "origin", "HEAD:refs/heads/main", "--tags"], cwd=work)
+
+        # Push only this commit and its tag (never --tags: an unrelated stale
+        # tag makes the whole push fail). Retry a lost non-fast-forward race by
+        # fetching and rebasing onto main.
+        for attempt in range(3):
+            try:
+                _git(["push", "-q", "origin", "HEAD:refs/heads/main"], cwd=work)
+                _git(["push", "-q", "origin", tag], cwd=work)
+                break
+            except subprocess.CalledProcessError:
+                if attempt == 2:
+                    raise
+                _git(["fetch", "-q", "origin", "main"], cwd=work)
+                try:
+                    _git(["rebase", "-q", "origin/main"], cwd=work)
+                except subprocess.CalledProcessError:
+                    subprocess.run(
+                        ["git", "rebase", "--abort"], cwd=work, capture_output=True
+                    )
+                    raise
+                subprocess.run(["git", "tag", "-d", tag], cwd=work, capture_output=True)
+                _git(["tag", tag], cwd=work)
 
     return {
         "commit": commit,
@@ -459,6 +489,14 @@ async def create_version_from_bundle(
     if not version:
         version = datetime.now(timezone.utc).strftime("%Y.%m.%d-%H%M%S")
 
+    # Serialize commits per definition repository. Fingerprint-level locking is
+    # not enough: two different capability sets for the same repo still race
+    # clone -> commit -> push and one loses with a non-fast-forward error.
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:repo))"),
+        {"repo": f"catalog-repo:{definition.id}"},
+    )
+
     committed = await commit_bundle(
         definition.id, files, version=version, message=message, author=created_by
     )
@@ -479,6 +517,7 @@ async def create_version_from_bundle(
         adapter_sha,
         runner_sha,
         capabilities,
+        base_image=lint.get("from") or image_yaml.get("base_image", ""),
     )
 
     version_id = f"imgv-{uuid.uuid4().hex[:8]}"
@@ -500,7 +539,7 @@ async def create_version_from_bundle(
         runtime_description=image_yaml.get("runtime", definition.description or ""),
         capability_fingerprint=fingerprint,
         capabilities=capabilities,
-        image_tag=image_yaml.get("tag", f"openclaw-agent:{definition.id}"),
+        image_tag=image_yaml.get("tag") or f"{definition.id}:{version}",
         parent_version_id=parent_version_id,
         status=status,
         source_available=True,
@@ -528,6 +567,7 @@ async def create_version_from_bundle(
                 image_version.adapter_sha or "",
                 image_version.runner_sha or "",
                 capabilities,
+                base_image=image_version.base_image or "",
             )
 
     db.add(image_version)
@@ -813,6 +853,7 @@ async def ingest_build_result(
         version.adapter_sha or "",
         version.runner_sha or "",
         capabilities,
+        base_image=version.base_image or "",
     )
 
     added = _capability_delta(parent_caps, capabilities)
@@ -856,6 +897,58 @@ async def ingest_build_result(
             image_tag=version.image_tag,
             image_digest=version.image_digest,
         )
+
+    # Publish task-scoped capability builds to the task record and the live
+    # workflow. Without this, an approval/build performed outside the workflow
+    # leaves AgentTaskWorkflow.current_image pointing at the pre-build image.
+    if build and build.task_id and version.image_tag:
+        task = await db.get(Task, build.task_id)
+        if task:
+            task.current_image = version.image_tag
+            resource = ""
+            if build.capability_request_id:
+                cap_request = await db.get(CapabilityRequest, build.capability_request_id)
+                if cap_request:
+                    resource = cap_request.resource_name or ""
+            payload = {
+                "image_tag": version.image_tag,
+                "image_digest": version.image_digest or "",
+                "version_id": version.id,
+                "build_id": build.build_id or "",
+                "capability_request_id": build.capability_request_id,
+                "resource": resource,
+            }
+            workflow_ids = []
+            if task.workflow_id:
+                workflow_ids.append(task.workflow_id)
+            if task.dag_id and task.node_id:
+                workflow_ids.append(f"agent-task-{task.dag_id}-{task.node_id}")
+            try:
+                from temporal_client import get_temporal_client
+
+                client = await get_temporal_client()
+                for workflow_id in dict.fromkeys(workflow_ids):
+                    try:
+                        handle = client.get_workflow_handle(workflow_id)
+                        await handle.signal("capability_image_ready", payload)
+                        logger.info(
+                            "Signaled capability_image_ready to %s for task %s (%s)",
+                            workflow_id,
+                            task.id,
+                            version.image_tag,
+                        )
+                    except Exception as signal_exc:
+                        logger.warning(
+                            "Could not signal capability_image_ready to %s: %s",
+                            workflow_id,
+                            signal_exc,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "Could not connect to Temporal to publish capability image for %s: %s",
+                    task.id,
+                    exc,
+                )
 
     await db.flush()
     return {
@@ -1617,6 +1710,11 @@ async def resolve_planner_capabilities(dag_json: dict, db: AsyncSession) -> None
         base = str(config.get("base_image") or "").strip()
         if not base:
             continue
+        if "/" in base and ":" in base:
+            # Concrete inherited image (e.g. a previous cycle's capability
+            # image). Do not replace it with the definition's stable alias.
+            config["resolved_image"] = base
+            continue
         try:
             resolved_base = await resolve_base_alias(db, base)
         except Exception as exc:
@@ -1650,22 +1748,21 @@ async def resolve_planner_capabilities(dag_json: dict, db: AsyncSession) -> None
         spec = spec_from_required(
             required,
             runtime_family=config.get("runtime_family") or config.get("base_image") or "openclaw",
-            base_image=config.get("base_image", ""),
+            base_image=config.get("resolved_image") or config.get("base_image", ""),
             adapter_type=config.get("adapter_type", ""),
         )
         if not spec:
             continue
         try:
-            resolved = await ensure_capability_version(
-                db,
-                spec,
-                definition_id=(required or {}).get("definition_id"),
-                base_image=config.get("base_image", ""),
-            )
+            # Plan-time resolution must not create an unbuilt draft version:
+            # drafts are invisible to find_reusable() and accumulate as
+            # near-duplicate commits. Pin a ready image if one exists; otherwise
+            # let the runtime build path create, build, and persist the image.
+            resolved = await resolve_spec(db, spec)
             config["capability_resolution"] = {
                 "fingerprint": resolved.get("fingerprint") or spec["fingerprint"],
                 "reused": bool(resolved.get("reused")),
-                "reason": resolved.get("reason"),
+                "reason": resolved.get("reason") or "deferred_to_runtime",
                 "version_id": resolved.get("version_id"),
                 "definition_id": resolved.get("definition_id"),
                 "image_tag": resolved.get("image_tag"),
@@ -1675,6 +1772,9 @@ async def resolve_planner_capabilities(dag_json: dict, db: AsyncSession) -> None
                 if not resolved_image.startswith(("registry:5000/", "localhost:5000/")):
                     resolved_image = f"registry:5000/{resolved_image}"
                 config["resolved_image"] = resolved_image
+            else:
+                config["capability_resolution"]["reused"] = False
+                config["capability_resolution"]["reason"] = "deferred_to_runtime"
             config["resolved_runtime"] = (
                 resolved.get("runtime_family")
                 or config.get("runtime_family")
@@ -1701,6 +1801,14 @@ async def ensure_capability_version(
     resolved = await resolve_spec(db, spec)
     if resolved.get("reused"):
         return resolved
+
+    # Serialize capability-version creation per fingerprint. Without this,
+    # concurrent nodes requesting the same package set each create a separate
+    # draft/version (and force the same tag).
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:fingerprint))"),
+        {"fingerprint": spec["fingerprint"]},
+    )
 
     # A pending/draft version with the same fingerprint should be built, not
     # duplicated. The image-builder will consume this version_id.
@@ -1768,7 +1876,10 @@ async def ensure_capability_version(
         "Dockerfile": dockerfile.encode(),
         "image.yaml": image_yaml.encode(),
     }
-    version = spec["fingerprint"][:12]
+    # Unique, immutable version identity. Reusing fingerprint[:12] as the
+    # version/tag lets a later build silently rebind an existing tag to a
+    # different bundle (observed: a49839a54de2 produced two different images).
+    version = f"{spec['fingerprint'][:8]}-{uuid.uuid4().hex[:8]}"
     image_version, lint = await create_version_from_bundle(
         db,
         definition,

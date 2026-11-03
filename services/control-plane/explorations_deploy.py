@@ -2,7 +2,7 @@
 import json
 import os
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -14,7 +14,10 @@ from models import (
     ExplorationCycle,
     ExplorationMessage,
     ExplorationSession,
+    ImageVersion,
+    MasterDAG,
     Task,
+    TaskOutput,
 )
 
 APP_FILES = {
@@ -46,6 +49,7 @@ class DeployableApp:
     name: str
     source_node: Optional[str] = None
     agent_image: Optional[str] = None
+    required_packages: list[str] = field(default_factory=list)
     existing_deployment: Optional[dict[str, Any]] = None
 
 
@@ -143,9 +147,11 @@ def _detect_app(root: str, workspace_files: list[str], deliverable: str) -> Opti
     framework = None
     entrypoint = ""
     port = 5000
+    required_packages: list[str] = []
 
     if base == "manage.py" or "DJANGO_SETTINGS_MODULE" in text:
         framework = "Django"
+        required_packages = ["pip:django"]
         port = 8000
         entrypoint = f"python {rel} runserver 0.0.0.0:{port}"
     elif base == "package.json":
@@ -216,6 +222,12 @@ def _detect_app(root: str, workspace_files: list[str], deliverable: str) -> Opti
             entrypoint = f"node {rel}"
     if not framework:
         return None
+    if framework == "Flask":
+        required_packages = ["pip:flask"]
+    elif framework == "FastAPI":
+        required_packages = ["pip:fastapi"]
+    elif framework == "Django":
+        required_packages = ["pip:django"]
     return DeployableApp(
         cycle_number=0,
         dag_id="",
@@ -225,7 +237,167 @@ def _detect_app(root: str, workspace_files: list[str], deliverable: str) -> Opti
         entrypoint=entrypoint,
         port=port,
         name=rel.split("/")[-1],
+        required_packages=required_packages,
     )
+
+
+def _normalize_image_ref(image: Optional[str]) -> str:
+    ref = (image or "").strip()
+    if ref.startswith("localhost:5000/"):
+        return "registry:5000/" + ref[len("localhost:5000/"):]
+    return ref
+
+
+def _is_concrete_image(image: Optional[str]) -> bool:
+    ref = _normalize_image_ref(image)
+    return bool(ref and "/" in ref and ":" in ref)
+
+
+def _is_base_like_image(image: Optional[str]) -> bool:
+    ref = _normalize_image_ref(image)
+    if not ref:
+        return True
+    if "capability" in ref:
+        return False
+    tag = ref.rsplit(":", 1)[-1] if ":" in ref else ref
+    return tag in {"openclaw", "base", "latest", "stable"}
+
+
+async def _cycle_deploy_image(
+    dag_id: str,
+    db: AsyncSession,
+    required_packages: Optional[list[str]] = None,
+) -> str:
+    """Return the best image the cycle's agents actually developed/ran on.
+
+    Regular DAG deployments use the live workflow's current_image. Exploration
+    deployments have no live workflow, so reconstruct it from the node config,
+    task outputs, and catalog capability images. Prefer an image whose catalog
+    capabilities cover the app framework over a plain task commit.
+    """
+    required = list(required_packages or [])
+    dag = await db.get(MasterDAG, dag_id) if dag_id else None
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    nodes = list(nodes_result.scalars().all())
+    task_ids = [node.task_id for node in nodes if node.task_id]
+
+    tasks: dict[str, Task] = {}
+    outputs: list[TaskOutput] = []
+    if task_ids:
+        task_result = await db.execute(select(Task).where(Task.id.in_(task_ids)))
+        tasks = {task.id: task for task in task_result.scalars().all()}
+        output_result = await db.execute(
+            select(TaskOutput).where(TaskOutput.task_id.in_(task_ids))
+        )
+        outputs = list(output_result.scalars().all())
+
+    candidates: list[tuple[str, float, bool]] = []
+
+    def add(image: Optional[str], timestamp: Any, coverage: bool = False) -> None:
+        ref = _normalize_image_ref(image)
+        if not ref:
+            return
+        ts = timestamp.timestamp() if getattr(timestamp, "timestamp", None) else 0.0
+        candidates.append((ref, ts, coverage))
+
+    for node in nodes:
+        config = node.config or {}
+        for key in ("last_built_image", "resolved_image"):
+            add(config.get(key), node.completed_at)
+        task = tasks.get(node.task_id) if node.task_id else None
+        if task:
+            add(task.current_image, node.completed_at or task.completed_at)
+
+    for output in outputs:
+        add(output.image_used, output.created_at)
+
+    # A capability image built shortly before/while this cycle ran is usually
+    # the best base: it has the framework packages that a plain task commit may
+    # not. Restrict to the recent window so unrelated old images are ignored.
+    if required:
+        window_start = (
+            dag.started_at.timestamp() - 86400
+            if dag and getattr(dag, "started_at", None)
+            else 0.0
+        )
+        versions_result = await db.execute(
+            select(ImageVersion)
+            .where(
+                ImageVersion.definition_id.like("capability-%"),
+                ImageVersion.status == "ready",
+            )
+            .order_by(ImageVersion.created_at.desc())
+            .limit(500)
+        )
+        for version in versions_result.scalars().all():
+            if not version.image_tag:
+                continue
+            if (
+                version.created_at
+                and version.created_at.timestamp() < window_start
+            ):
+                continue
+            caps = {
+                f"{cap.get('manager')}:{cap.get('name')}"
+                for cap in (version.capabilities or [])
+                if isinstance(cap, dict) and cap.get("manager") and cap.get("name")
+            }
+            if all(package in caps for package in required):
+                add(version.image_tag, version.created_at, coverage=True)
+
+    if not candidates:
+        return ""
+
+    def rank(candidate: tuple[str, float, bool]) -> tuple[int, int, float]:
+        image, timestamp, coverage = candidate
+        return (
+            1 if coverage else 0,
+            0 if _is_base_like_image(image) else 1,
+            timestamp,
+        )
+
+    return max(candidates, key=rank)[0]
+
+
+async def resolve_task_deploy_image(
+    task_id: str,
+    db: AsyncSession,
+    agent_image: Optional[str] = None,
+    required_packages: Optional[list[str]] = None,
+    entrypoint: str = "",
+) -> str:
+    """Resolve the image a deployment should start FROM.
+
+    Keep a concrete non-base image supplied by the caller. Otherwise use the
+    cycle's developed image, then the task's own non-base image. This is the
+    server-side guard for stale/absent DeployDialog values.
+    """
+    task = await db.get(Task, task_id) if task_id else None
+    provided = _normalize_image_ref(agent_image)
+    if _is_concrete_image(provided) and not _is_base_like_image(provided):
+        return provided
+
+    if not required_packages:
+        ep = (entrypoint or "").lower()
+        if "manage.py" in ep:
+            required_packages = ["pip:django"]
+        elif "main.py" in ep or "asgi.py" in ep:
+            required_packages = ["pip:fastapi"]
+        elif ".py" in ep:
+            required_packages = ["pip:flask"]
+
+    if task and task.dag_id:
+        image = await _cycle_deploy_image(task.dag_id, db, required_packages)
+        if image:
+            return image
+
+    if task:
+        task_image = _normalize_image_ref(task.current_image)
+        if _is_concrete_image(task_image) and not _is_base_like_image(task_image):
+            return task_image
+
+    return provided or (_normalize_image_ref(task.current_image) if task else "")
 
 
 async def detect_cycle_deployables(session: ExplorationSession, db: AsyncSession) -> list[DeployableApp]:
@@ -308,13 +480,21 @@ async def detect_cycle_deployables(session: ExplorationSession, db: AsyncSession
         canonical.append(group[0])
 
     deployables: list[DeployableApp] = []
+    image_cache: dict[tuple[str, tuple[str, ...]], str] = {}
     for candidate in canonical:
         if not candidate.task_id:
             continue
-        task_result = await db.execute(select(Task).where(Task.id == candidate.task_id))
-        task = task_result.scalar_one_or_none()
-        if task:
-            candidate.agent_image = task.current_image
+        cache_key = (candidate.dag_id, tuple(candidate.required_packages))
+        if cache_key not in image_cache:
+            image_cache[cache_key] = await _cycle_deploy_image(
+                candidate.dag_id, db, candidate.required_packages
+            )
+        candidate.agent_image = image_cache[cache_key] or None
+        if not candidate.agent_image:
+            task_result = await db.execute(select(Task).where(Task.id == candidate.task_id))
+            task = task_result.scalar_one_or_none()
+            if task:
+                candidate.agent_image = task.current_image
         deployment_result = await db.execute(
             select(Deployment)
             .where(Deployment.task_id == candidate.task_id)

@@ -798,6 +798,8 @@ async def list_builds(
     definition_id: Optional[str] = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     trigger_type: Optional[str] = None,
+    task_id: Optional[str] = None,
+    capability_request_id: Optional[int] = None,
     limit: int = 100,
     db: AsyncSession = Depends(get_db),
 ):
@@ -808,6 +810,10 @@ async def list_builds(
         query = query.where(ImageBuild.status == status_filter)
     if trigger_type:
         query = query.where(ImageBuild.trigger_type == trigger_type)
+    if task_id:
+        query = query.where(ImageBuild.task_id == task_id)
+    if capability_request_id is not None:
+        query = query.where(ImageBuild.capability_request_id == capability_request_id)
     query = query.order_by(ImageBuild.created_at.desc()).limit(max(1, min(limit, 500)))
     result = await db.execute(query)
     return [_build_dict(b) for b in result.scalars().all()]
@@ -1083,6 +1089,7 @@ async def resolve(
                 requested_by="agent",
                 status="succeeded" if result.get("reused") else "pending",
                 image_tag=result.get("image_tag", "") if result.get("reused") else "",
+                image_digest=result.get("image_digest", "") if result.get("reused") else "",
                 logs="Reused existing image" if result.get("reused") else "",
             )
             result["build_record_id"] = build.id

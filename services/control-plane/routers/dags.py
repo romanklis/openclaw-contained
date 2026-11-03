@@ -594,9 +594,14 @@ async def start_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
             status_code=400,
             detail=f"DAG is in '{dag.status.value}' state, must be 'ready', 'failed', 'cancelled', or 'completed' to start"
         )
-    if dag.status in (DAGStatus.COMPLETED, DAGStatus.CANCELLED):
+    if dag.status in (DAGStatus.FAILED, DAGStatus.COMPLETED, DAGStatus.CANCELLED):
+        # A failed DAG must also be reset; otherwise DAGWorkflow sees the old
+        # failed/skipped nodes and immediately fails again. Use retry-from for
+        # a partial resume.
         nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
-        for node in nodes_result.scalars().all():
+        nodes = list(nodes_result.scalars().all())
+        await _release_task_workflow_ids([node.task_id for node in nodes], db)
+        for node in nodes:
             node.status = NodeStatus.PENDING
             node.output_data = None
             node.task_id = None
@@ -2573,6 +2578,11 @@ async def retry_dag_from_node(dag_id: str, node_id: str, db: AsyncSession = Depe
     rerun = {node_id}
     rerun.update(_compute_descendants(node_id, all_nodes))
 
+    await _release_task_workflow_ids(
+        [node.task_id for node in all_nodes if node.node_id in rerun],
+        db,
+    )
+
     for node in all_nodes:
         if node.node_id in rerun:
             node.status = NodeStatus.PENDING
@@ -2590,6 +2600,61 @@ async def retry_dag_from_node(dag_id: str, node_id: str, db: AsyncSession = Depe
     await db.commit()
     await db.refresh(dag)
     return await _start_dag(dag, db)
+
+
+@router.post("/{dag_id}/nodes/{node_id}/built-image")
+async def persist_node_built_image(
+    dag_id: str,
+    node_id: str,
+    body: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist the enriched image built by a node for later retries/loop-backs.
+
+    AgentTaskWorkflow state is local to one Temporal run. A DAG retry or loop
+    re-entry creates a fresh node task, so the built image must live on the
+    node definition to be inherited.
+    """
+    image_tag = str(body.get("image_tag") or "").strip()
+    if not image_tag:
+        raise HTTPException(status_code=400, detail="image_tag is required")
+
+    node_result = await db.execute(
+        select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id)
+    )
+    node = node_result.scalars().first()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    persisted = {
+        "last_built_image": image_tag,
+        "resolved_image": image_tag,
+    }
+    if body.get("image_digest"):
+        persisted["last_image_digest"] = str(body["image_digest"])
+    if body.get("version_id"):
+        persisted["last_image_version_id"] = str(body["version_id"])
+    if body.get("build_id"):
+        persisted["last_build_id"] = str(body["build_id"])
+
+    node_config = dict(node.config or {})
+    node_config.update(persisted)
+    node.config = node_config
+
+    dag = await db.get(MasterDAG, dag_id)
+    if dag and isinstance(dag.dag_json, dict):
+        dag_json = deepcopy(dag.dag_json)
+        for node_def in dag_json.get("nodes", []):
+            if node_def.get("node_id") == node_id:
+                cfg = dict(node_def.get("config") or {})
+                cfg.update(persisted)
+                node_def["config"] = cfg
+                break
+        dag.dag_json = dag_json
+
+    await db.commit()
+    logger.info(f"Persisted built image for {dag_id}/{node_id}: {image_tag}")
+    return {"dag_id": dag_id, "node_id": node_id, "image_tag": image_tag}
 
 
 @router.post("/{dag_id}/refine", response_model=DAGDetail)
@@ -2959,8 +3024,78 @@ async def _get_dag_or_404(dag_id: str, db: AsyncSession) -> MasterDAG:
     return dag
 
 
+async def _refresh_capability_errors(dag: MasterDAG, db: AsyncSession) -> None:
+    """Re-resolve nodes whose earlier capability resolution failed.
+
+    A concurrent catalog push (non-fast-forward ``git push``) used to leave
+    ``capability_resolution.error`` on a node. That error was then replayed on
+    every retry, pinning the node to the base image. Re-resolve at start time
+    instead (the new planner path defers builds to runtime).
+    """
+    dag_json = dag.dag_json or {}
+    nodes = dag_json.get("nodes", []) or []
+    errored = [
+        node
+        for node in nodes
+        if isinstance(node, dict)
+        and "error" in ((node.get("config") or {}).get("capability_resolution") or {})
+    ]
+    if not errored:
+        return
+
+    logger.info(
+        "Re-resolving capability errors for %s node(s) in DAG %s",
+        len(errored),
+        dag.id,
+    )
+    await _resolve_node_capabilities(dag_json, db)
+    # Reassign a new object so SQLAlchemy's JSON change tracking persists it.
+    dag.dag_json = deepcopy(dag_json)
+
+    config_by_node = {
+        node.get("node_id"): node.get("config")
+        for node in nodes
+        if isinstance(node, dict) and node.get("node_id")
+    }
+    node_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag.id))
+    for node in node_result.scalars().all():
+        config = config_by_node.get(node.node_id)
+        if config is not None:
+            node.config = dict(config)
+    await db.commit()
+
+
+async def _release_task_workflow_ids(task_ids: list[str], db: AsyncSession) -> None:
+    """Clear workflow ids on tasks that are about to be re-run.
+
+    ``tasks.workflow_id`` is unique, but a retry creates a new task for the same
+    node with the same deterministic workflow id. Leaving the old row's
+    workflow_id set makes the new task's persist_task_workflow_id fail with a
+    duplicate-key error.
+    """
+    ids = [task_id for task_id in task_ids if task_id]
+    if not ids:
+        return
+    result = await db.execute(select(Task).where(Task.id.in_(ids)))
+    for task in result.scalars().all():
+        task.workflow_id = None
+        task.workflow_run_id = None
+
+
 async def _start_dag(dag: MasterDAG, db: AsyncSession) -> dict:
     """Start a DAG workflow and return the updated DAG detail."""
+    await _refresh_capability_errors(dag, db)
+
+    # Refuse to start when the worker is not heartbeating. Without this a stale
+    # worker (bind-mounted code, old activity signatures) accepts workflow tasks
+    # but fails every activity dispatch, and the DAG appears to hang.
+    import worker_registry
+
+    try:
+        await worker_registry.wait_for_worker()
+    except worker_registry.WorkerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     workflow_id = await start_dag_workflow(dag.id)
     dag.workflow_id = workflow_id
     dag.status = DAGStatus.RUNNING

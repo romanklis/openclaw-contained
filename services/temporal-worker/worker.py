@@ -2,6 +2,7 @@
 Temporal Worker - Executes workflows and activities
 """
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
@@ -93,6 +94,32 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return dt
     except Exception:
         return None
+
+
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _valid_image_digest(value: Any) -> str:
+    digest = str(value or "").strip()
+    return digest if _DIGEST_RE.match(digest) else ""
+
+
+def _registry_image_ref(image: str) -> str:
+    """Return the canonical registry-network reference for an image tag."""
+    ref = (image or "").strip().replace("localhost:5000/", "registry:5000/")
+    if ref and not ref.startswith("registry:5000/"):
+        ref = f"registry:5000/{ref}"
+    return ref
+
+
+def _to_int_or_none(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 
 # =============================================================================
 # Agent Sandbox Configuration
@@ -196,6 +223,12 @@ class AgentTaskWorkflow:
         self.capability_approved = False
         self._handled_credential_ids = set()  # credential requests already waited on
         self.current_image = "localhost:5000/openclaw-agent:openclaw"  # Track current agent image (default)
+        self.current_image_digest = ""  # Immutable digest for current_image when known
+        self._last_image_version_id = ""  # Catalog ImageVersion backing current_image
+        self._last_build_id = ""  # Image-builder build id backing current_image
+        self._last_capability_request_id = None  # Capability request that produced current_image
+        self._capability_image = None  # capability_image_ready signal payload
+        self._pending_capability_request_id = ""  # Request this workflow is waiting on
         self.llm_model = "gemma3:4b"  # Track LLM model
         self.follow_up = ""  # Follow-up instructions for continuation
         self._capability_feedback = ""  # one-shot feedback after a build (cleared after use)
@@ -204,6 +237,149 @@ class AgentTaskWorkflow:
         self._approved_capabilities = set()  # Track already-approved resource names to prevent loops
         self._handled_capability_ids = set()  # Capability requests already applied
         self._pending_metrics = {}  # waits recorded for the next iteration output
+
+    def _adopt_capability_image(
+        self,
+        payload: Any,
+        *,
+        resource: str = "",
+        request_id: Any = None,
+    ) -> bool:
+        """Adopt an already-built capability image into the workflow state.
+
+        Returns True when the payload describes an image this iteration can use.
+        The workflow must never claim a capability is installed unless this
+        succeeds or a build just produced the image.
+        """
+        if not isinstance(payload, dict):
+            return False
+        image_tag = str(payload.get("image_tag") or "").strip()
+        if not image_tag:
+            return False
+        payload_request = payload.get("capability_request_id")
+        if request_id and payload_request and str(payload_request) != str(request_id):
+            return False
+        payload_resource = str(payload.get("resource") or payload.get("resource_name") or "").strip()
+        if resource and payload_resource and payload_resource != resource:
+            return False
+        self.current_image = image_tag
+        self.current_image_digest = _valid_image_digest(payload.get("image_digest"))
+        self._last_image_version_id = str(
+            payload.get("version_id") or payload.get("image_version_id") or ""
+        )
+        self._last_build_id = str(payload.get("build_id") or "")
+        if payload_request:
+            self._last_capability_request_id = payload_request
+        elif request_id:
+            self._last_capability_request_id = request_id
+        logger.info(
+            f"CAPABILITY_IMAGE_SELECTED | image={self.current_image} | "
+            f"digest={self.current_image_digest or '-'} | "
+            f"version={self._last_image_version_id or '-'} | "
+            f"build={self._last_build_id or '-'} | request={self._last_capability_request_id or '-'}"
+        )
+        return True
+
+    async def _ensure_capability_image(
+        self,
+        task_id: str,
+        capability: Dict[str, Any],
+        resource_name: str,
+        request_id: str,
+    ) -> tuple[bool, str]:
+        """Adopt a ready image for an approved capability, or build one now.
+
+        This is the single path that may declare a capability "installed".
+        An approval row alone is not enough: there must be a built image whose
+        tag/digest the next iteration will actually start from.
+        """
+        # 1. Image pushed by an out-of-band build (orphan/sibling) and delivered
+        #    through the capability_image_ready signal.
+        if self._capability_image and self._adopt_capability_image(
+            self._capability_image, resource=resource_name, request_id=request_id or None
+        ):
+            self._capability_image = None
+            return True, ""
+
+        # 2. A build for this exact capability request already succeeded.
+        ready = await workflow.execute_activity(
+            get_ready_capability_image,
+            args=[task_id, request_id or None],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        if ready.get("image_tag") and self._adopt_capability_image(
+            ready, resource=resource_name, request_id=request_id or None
+        ):
+            return True, ""
+
+        # 3. No usable image yet: build it through the catalog/legacy builder.
+        await workflow.execute_activity(
+            update_task_status,
+            args=[task_id, "building_image"],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        await workflow.execute_activity(
+            add_to_supply_chain,
+            args=[task_id, capability, []],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        await workflow.execute_activity(
+            reload_supply_chain,
+            args=[],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        _image_build_started = workflow.now()
+        build_result = await workflow.execute_activity(
+            build_agent_image,
+            args=[task_id, capability, self.current_image],
+            start_to_close_timeout=timedelta(minutes=10),
+        )
+        self._pending_metrics["image_build_wait_ms"] = max(
+            0, int((workflow.now() - _image_build_started).total_seconds() * 1000)
+        )
+        if build_result.get("denied"):
+            await workflow.execute_activity(
+                update_task_status,
+                args=[task_id, "running"],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            return False, build_result.get("feedback", "")
+        new_image = build_result.get("image") or self.current_image
+        if not new_image:
+            await workflow.execute_activity(
+                update_task_status,
+                args=[task_id, "running"],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            return False, "Capability build returned no image"
+        self.current_image = new_image
+        self.current_image_digest = _valid_image_digest(build_result.get("digest"))
+        self._last_build_id = str(build_result.get("build_id") or "")
+        self._last_image_version_id = str(build_result.get("version_id") or "")
+        if request_id:
+            self._last_capability_request_id = request_id
+        logger.info(
+            f"CAPABILITY_IMAGE_SELECTED | task={task_id} | image={self.current_image} | "
+            f"digest={self.current_image_digest or '-'} | "
+            f"version={self._last_image_version_id or '-'} | "
+            f"build={self._last_build_id or '-'} | request={request_id or '-'}"
+        )
+        await workflow.execute_activity(
+            update_task_status,
+            args=[task_id, "running"],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        await workflow.execute_activity(
+            update_task_policy,
+            args=[task_id, capability, new_image],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        await workflow.execute_activity(
+            dismiss_pending_capabilities,
+            args=[task_id],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        return True, build_result.get("feedback", "")
 
     async def _resolve_capability_state(
         self,
@@ -340,10 +516,21 @@ class AgentTaskWorkflow:
         # Use the provided base image for both first-run and continuation
         if current_image:
             self.current_image = current_image
+            self.current_image_digest = _valid_image_digest(current_image.split("@", 1)[1] if "@" in current_image else "")
             if follow_up:
                 logger.info(f"♻️  CONTINUATION workflow for task {task_id} | image={current_image} | follow_up={follow_up[:120]}...")
             else:
                 logger.info(f"Starting workflow for task {task_id} with model {llm_model}, base image {current_image}")
+            if current_image != "localhost:5000/openclaw-agent:openclaw":
+                # Keep the task record in sync with the image this run actually
+                # uses. Without this, continuation tasks keep the initial base
+                # image in Task.current_image and deployment/UI paths see a
+                # stale image.
+                await workflow.execute_activity(
+                    persist_task_image,
+                    args=[task_id, current_image],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
         else:
             logger.info(f"Starting workflow for task {task_id} with model {llm_model} (default openclaw image)")
         
@@ -386,7 +573,18 @@ class AgentTaskWorkflow:
                 start_to_close_timeout=timedelta(seconds=15),
             )
 
-            logger.info(f"Task {task_id} iteration {iteration} with image {self.current_image}")
+            logger.info(
+                f"Task {task_id} iteration {iteration} with image {self.current_image} "
+                f"(digest={self.current_image_digest or '-'}, "
+                f"version={self._last_image_version_id or '-'})"
+            )
+            logger.info(
+                f"CAPABILITY_IMAGE_SELECTED | task={task_id} | iteration={iteration} | "
+                f"image={self.current_image} | digest={self.current_image_digest or '-'} | "
+                f"version={self._last_image_version_id or '-'} | "
+                f"build={self._last_build_id or '-'} | "
+                f"request={self._last_capability_request_id or '-'}"
+            )
             
             # Execute agent step as a child workflow so every LLM turn
             # inside it is visible as a separate activity in Temporal UI.
@@ -403,7 +601,7 @@ class AgentTaskWorkflow:
             try:
                 result = await workflow.execute_child_workflow(
                     AgentStepWorkflow.run,
-                    args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns],
+                    args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns, self.current_image_digest],
                     id=f"agent-step-{task_id}-iter-{iteration}",
                 )
             except Exception as child_exc:
@@ -433,9 +631,16 @@ class AgentTaskWorkflow:
             _committed = result.get("committed_image")
             if _committed:
                 self.current_image = _committed
+                self.current_image_digest = ""
+                self._last_image_version_id = ""
+                self._last_build_id = ""
                 logger.info(f"📸 DAG image updated from commit: {_committed}")
 
             result.update(pending_metrics)
+            result["image_digest"] = self.current_image_digest
+            result["image_version_id"] = self._last_image_version_id
+            result["build_id"] = self._last_build_id
+            result["capability_request_id"] = self._last_capability_request_id
             result["started_at"] = iteration_started_at.isoformat()
             result["finished_at"] = workflow.now().isoformat()
             try:
@@ -535,6 +740,7 @@ class AgentTaskWorkflow:
                         feedback_lines = [
                             "TRIAL DEPLOYMENT FAILED.",
                             f"Phase: {trial_phase}",
+                            f"Base image: {deployment.get('agent_image') or 'unknown'}",
                             f"Error: {trial_error[:500]}",
                         ]
                         if trial_logs:
@@ -622,11 +828,34 @@ class AgentTaskWorkflow:
                 )
                 if request_id:
                     self._handled_capability_ids.add(request_id)
-                if resource_name:
+                # An approval row is not proof the image was built. Adopt a
+                # ready build or build now, otherwise the next iteration keeps
+                # running the pre-approval image while being told the package
+                # is installed.
+                ok, supply_chain_feedback = await self._ensure_capability_image(
+                    task_id, capability, resource_name, request_id
+                )
+                if resource_name and ok:
                     self._approved_capabilities.add(resource_name)
+                if not ok:
                     self._capability_feedback = (
                         "--- SYSTEM NOTICE ---\n"
-                        f"Capability '{resource_name}' is approved and installed. "
+                        f"Capability '{resource_name or 'requested tool'}' was approved but its "
+                        "image could not be prepared. Do not assume it is installed; retry the "
+                        "capability request or use an alternative approach.\n"
+                        "--- END NOTICE ---"
+                    )
+                elif supply_chain_feedback:
+                    logger.warning(f"🚫 Supply-chain feedback for agent: {supply_chain_feedback[:200]}")
+                    self._capability_feedback = (
+                        "--- SYSTEM NOTICE ---\n"
+                        + supply_chain_feedback
+                        + "\n--- END NOTICE ---"
+                    )
+                else:
+                    self._capability_feedback = (
+                        "--- SYSTEM NOTICE ---\n"
+                        f"Capability '{resource_name or 'requested tool'}' is approved and installed. "
                         "Use it now; do not re-request it.\n"
                         "--- END NOTICE ---"
                     )
@@ -660,17 +889,27 @@ class AgentTaskWorkflow:
                         break
                     continue
 
+                created_request_id = ""
                 if capability_state.get("should_create_request"):
-                    await workflow.execute_activity(
+                    created = await workflow.execute_activity(
                         create_capability_request,
                         args=[task_id, capability],
                         start_to_close_timeout=timedelta(seconds=30),
                     )
+                    if isinstance(created, dict) and created.get("id") is not None:
+                        created_request_id = str(created["id"])
+                        # This workflow owns this request from now on; the
+                        # resolved-row branch must not re-handle it as an
+                        # out-of-band approval.
+                        self._handled_capability_ids.add(created_request_id)
 
                 # Reset signal flags before waiting (prevents stale signals
                 # from a prior iteration from immediately satisfying the wait)
                 self.approval_received = False
                 self.capability_approved = False
+                self._pending_capability_request_id = str(
+                    capability_state.get("request_id") or created_request_id
+                )
                 _capability_wait_started = workflow.now()
 
                 # Update status: waiting for human approval
@@ -690,76 +929,37 @@ class AgentTaskWorkflow:
                     0, int((workflow.now() - _capability_wait_started).total_seconds() * 1000)
                 )
                 if self.capability_approved:
-                    # Update status: building new agent image
-                    await workflow.execute_activity(
-                        update_task_status,
-                        args=[task_id, "building_image"],
-                        start_to_close_timeout=timedelta(seconds=15),
+                    ok, supply_chain_feedback = await self._ensure_capability_image(
+                        task_id,
+                        capability,
+                        resource_name,
+                        str(capability_state.get("request_id") or created_request_id),
                     )
-
-                    await workflow.execute_activity(
-                        add_to_supply_chain,
-                        args=[task_id, capability, []],
-                        start_to_close_timeout=timedelta(seconds=30),
-                    )
-
-                    await workflow.execute_activity(
-                        reload_supply_chain,
-                        args=[],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
-
-                    _image_build_started = workflow.now()
-                    build_result = await workflow.execute_activity(
-                        build_agent_image,
-                        args=[task_id, capability, self.current_image],
-                        start_to_close_timeout=timedelta(minutes=10)
-                    )
-                    self._pending_metrics["image_build_wait_ms"] = max(
-                        0, int((workflow.now() - _image_build_started).total_seconds() * 1000)
-                    )
-
-                    new_image = build_result.get("image", self.current_image)
-                    supply_chain_feedback = build_result.get("feedback", "")
-                    self.current_image = new_image
-                    logger.info(f"Updated task image to {new_image}")
-
-                    # Update status: back to running after build
-                    await workflow.execute_activity(
-                        update_task_status,
-                        args=[task_id, "running"],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
-
-                    if resource_name:
+                    if not ok:
+                        self._capability_feedback = (
+                            "--- SYSTEM NOTICE ---\n"
+                            f"Capability '{resource_name or 'requested tool'}' was approved but its "
+                            "image could not be prepared. Do not assume it is installed; retry the "
+                            "capability request or use an alternative approach.\n"
+                            "--- END NOTICE ---"
+                        )
+                    elif resource_name:
                         self._approved_capabilities.add(resource_name)
 
-                    if supply_chain_feedback:
+                    if ok and supply_chain_feedback:
                         logger.warning(f"🚫 Supply-chain feedback for agent: {supply_chain_feedback[:200]}")
                         self._capability_feedback = (
                             "--- SYSTEM NOTICE ---\n"
                             + supply_chain_feedback
                             + "\n--- END NOTICE ---"
                         )
-                    else:
+                    elif ok:
                         self._capability_feedback = (
                             "--- SYSTEM NOTICE ---\n"
                             f"Capability '{resource_name or 'requested tool'}' is approved and installed. "
                             "Use it now; do not re-request it.\n"
                             "--- END NOTICE ---"
                         )
-
-                    await workflow.execute_activity(
-                        update_task_policy,
-                        args=[task_id, capability, new_image],
-                        start_to_close_timeout=timedelta(seconds=30)
-                    )
-
-                    await workflow.execute_activity(
-                        dismiss_pending_capabilities,
-                        args=[task_id],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
 
                     logger.info(f"Task {task_id} resumed with new capability")
                 else:
@@ -780,7 +980,8 @@ class AgentTaskWorkflow:
 
                 self.approval_received = False
                 self.capability_approved = False
-                request_id = str(capability_state.get("request_id") or "")
+                self._pending_capability_request_id = ""
+                request_id = str(capability_state.get("request_id") or created_request_id)
                 if request_id:
                     self._handled_capability_ids.add(request_id)
 
@@ -828,6 +1029,9 @@ class AgentTaskWorkflow:
         # Expose the (possibly capability-enriched) image so parent
         # DAGNodeWorkflow / DAGWorkflow can propagate it to later nodes.
         final_result["current_image"] = self.current_image
+        final_result["current_image_digest"] = self.current_image_digest
+        final_result["image_version_id"] = self._last_image_version_id
+        final_result["build_id"] = self._last_build_id
         return final_result
     
     @workflow.signal
@@ -835,6 +1039,38 @@ class AgentTaskWorkflow:
         """Signal to approve/deny capability"""
         self.approval_received = True
         self.capability_approved = approved
+
+    @workflow.signal
+    async def approve_capability_for(self, payload: Dict[str, Any]):
+        """Approve a specific capability request (used for sibling propagation).
+
+        Unlike ``approve_capability`` this cannot accidentally satisfy a wait
+        for a different request.
+        """
+        if not isinstance(payload, dict):
+            return
+        request_id = str(payload.get("capability_request_id") or "")
+        if (
+            request_id
+            and self._pending_capability_request_id
+            and request_id != self._pending_capability_request_id
+        ):
+            logger.info(
+                f"Ignoring approval for request {request_id}; "
+                f"workflow is waiting on {self._pending_capability_request_id}"
+            )
+            return
+        self.approval_received = True
+        self.capability_approved = bool(payload.get("approved", True))
+
+    @workflow.signal
+    async def capability_image_ready(self, payload: Dict[str, Any]):
+        """Receive an image built outside this workflow (orphan/sibling build).
+
+        The next capability reconciliation adopts it instead of rebuilding, so
+        iteration N+1 starts from the image that actually contains the package.
+        """
+        self._capability_image = payload if isinstance(payload, dict) else {}
 
 
 # =============================================================================
@@ -864,16 +1100,17 @@ class AgentStepWorkflow:
         dag_id: str = "",
         deliverables_required: bool = True,
         max_agent_turns: int = 30,
+        agent_image_digest: str = "",
     ) -> Dict[str, Any]:
         logger.info(
             f"🔬 AgentStepWorkflow | Task: {task_id} | Iteration: {iteration} | "
-            f"Image: {agent_image} | Model: {llm_model}"
+            f"Image: {agent_image} | Digest: {agent_image_digest or '-'} | Model: {llm_model}"
         )
 
         # 1. Launch the container (returns container_id + workspace info)
         launch_info = await workflow.execute_activity(
             start_agent_container,
-            args=[task_id, iteration, agent_image, llm_model, follow_up, deliverables_required, max_agent_turns],
+            args=[task_id, iteration, agent_image, llm_model, follow_up, deliverables_required, max_agent_turns, agent_image_digest],
             start_to_close_timeout=timedelta(minutes=5),
         )
 
@@ -1024,6 +1261,7 @@ async def start_agent_container(
     follow_up: str = "",
     deliverables_required: bool = True,
     max_agent_turns: int = 30,
+    agent_image_digest: str = "",
 ) -> Dict[str, Any]:
     """Launch the agent container (detached) and return container_id + workspace_dir.
 
@@ -1031,7 +1269,10 @@ async def start_agent_container(
     image resolution, workspace setup, environment, and ``docker run``.
     The container is started in detached mode so control returns immediately.
     """
-    logger.info(f"🚀 START_CONTAINER | Task: {task_id} | Iter: {iteration} | Image: {agent_image} | Model: {llm_model}")
+    logger.info(
+        f"🚀 START_CONTAINER | Task: {task_id} | Iter: {iteration} | "
+        f"Image: {agent_image} | Digest: {agent_image_digest or '-'} | Model: {llm_model}"
+    )
 
     import docker
 
@@ -1040,49 +1281,30 @@ async def start_agent_container(
 
         # --- resolve image ---
         # Determine the canonical registry tag for pulling.
-        agent_image_pull = agent_image.replace("localhost:5000/", "registry:5000/")
-        if not agent_image_pull.startswith("registry:5000/"):
-            agent_image_pull = f"registry:5000/{agent_image_pull}"
-
-        # Always pull base images (tags without -v suffix) so we pick up
-        # rebuilds immediately.  Versioned images (task-xxx-v2) are immutable
-        # and safe to use from cache.
+        agent_image_pull = _registry_image_ref(agent_image)
+        digest = _valid_image_digest(agent_image_digest)
         tag_part = agent_image_pull.rsplit(":", 1)[-1] if ":" in agent_image_pull else ""
-        is_versioned = bool(re.search(r'-v\d+$', tag_part))
+        is_versioned = bool(re.search(r"-v\d+$", tag_part))
 
-        if not is_versioned:
-            # Base / mutable tag — always pull latest from registry
+        if digest:
+            # Prefer the immutable digest of the image that was actually built.
+            pinned = f"{agent_image_pull.split('@', 1)[0]}@{digest}"
             try:
-                logger.info(f"📥 Pulling latest {agent_image_pull} (mutable tag)")
-                docker_client.images.pull(agent_image_pull)
-                agent_image = agent_image_pull
-            except Exception as pull_err:
-                logger.warning(f"⚠️  Pull failed ({pull_err}), falling back to local cache")
-                # Fall back to whatever is locally available
-                for variant in [agent_image_pull, agent_image,
-                                agent_image.replace("localhost:5000/", ""),
-                                agent_image.replace("registry:5000/", "")]:
-                    try:
-                        docker_client.images.get(variant)
-                        agent_image = variant
-                        break
-                    except docker.errors.ImageNotFound:
-                        continue
-        else:
-            # Versioned / immutable tag — use cache, pull only if missing
+                await asyncio.to_thread(docker_client.images.get, pinned)
+                logger.info(f"✅ Immutable image found locally: {pinned}")
+            except docker.errors.ImageNotFound:
+                logger.info(f"📥 Pulling immutable image {pinned}")
+                await asyncio.wait_for(
+                    asyncio.to_thread(docker_client.images.pull, pinned),
+                    timeout=300,
+                )
+            agent_image = pinned
+        elif is_versioned:
+            # Versioned / immutable task tag — use cache, pull only if missing.
             image_found = False
-            image_variants = [
-                agent_image,
-                agent_image_pull,
-                agent_image.replace("localhost:5000/", ""),
-                agent_image.replace("registry:5000/", ""),
-            ]
-            seen = set()
-            image_variants = [v for v in image_variants if v not in seen and not seen.add(v)]
-
-            for variant in image_variants:
+            for variant in dict.fromkeys([agent_image, agent_image_pull]):
                 try:
-                    docker_client.images.get(variant)
+                    await asyncio.to_thread(docker_client.images.get, variant)
                     logger.info(f"✅ Image found locally as: {variant}")
                     agent_image = variant
                     image_found = True
@@ -1092,8 +1314,20 @@ async def start_agent_container(
 
             if not image_found:
                 logger.info(f"📥 Pulling {agent_image_pull}")
-                docker_client.images.pull(agent_image_pull)
+                await asyncio.wait_for(
+                    asyncio.to_thread(docker_client.images.pull, agent_image_pull),
+                    timeout=300,
+                )
                 agent_image = agent_image_pull
+        else:
+            # Mutable/catalog tag — always pull. Falling back to a local image
+            # with the same name silently runs the pre-rebuild image.
+            logger.info(f"📥 Pulling {agent_image_pull} (mutable tag)")
+            await asyncio.wait_for(
+                asyncio.to_thread(docker_client.images.pull, agent_image_pull),
+                timeout=300,
+            )
+            agent_image = agent_image_pull
 
         # --- workspace ---
         workspaces_root = "/workspaces"
@@ -1357,6 +1591,11 @@ async def start_agent_container(
         # makes any later `docker build FROM` the committed DAG image fail with
         # "cannot mount volume over existing file", breaking capability rebuilds.
         _agent_volumes = {workspace_dir: {"bind": "/workspace", "mode": "rw"}}
+        # Adapters are baked into the agent images (Dockerfile.openclaw).
+        # Never bind-mount them at their image paths: docker commit records the
+        # mount as a VOLUME, and later `docker build FROM` that commit fails
+        # with "cannot mount volume over existing file". Adapter source changes
+        # therefore require rebuilding the openclaw base image.
 
         container_kwargs = dict(
             image=agent_image,
@@ -1383,7 +1622,10 @@ async def start_agent_container(
 
         logger.info(f"🚀 Launching container (detached) with sandbox mode: {AGENT_SANDBOX_MODE} ...")
         try:
-            container = docker_client.containers.run(**container_kwargs)
+            container = await asyncio.wait_for(
+                asyncio.to_thread(docker_client.containers.run, **container_kwargs),
+                timeout=300,
+            )
         except docker.errors.APIError as api_err:
             if "unknown or invalid runtime name: runsc" in str(api_err):
                 logger.error(
@@ -1439,6 +1681,8 @@ async def poll_agent_turns(
     silent_polls = 0
     max_silent_polls = 40  # ~40 * 3s = 2 minutes of no new turns
     for _ in range(max_polls):
+        if activity.is_cancelled():
+            raise asyncio.CancelledError()
         activity.heartbeat(f"turns_seen={turns_seen + len(new_turns)}")
 
         # Check for new interactions from the LLM router
@@ -2067,6 +2311,10 @@ async def store_task_output(
         "llm_response_preview": compact_summary[:500],
         "model_used": model_used,
         "image_used": image_used,
+        "image_digest": result.get("image_digest") or "",
+        "image_version_id": result.get("image_version_id") or "",
+        "build_id": result.get("build_id") or "",
+        "capability_request_id": _to_int_or_none(result.get("capability_request_id")),
         "duration_ms": duration_ms,
         "turn_count": result.get("turn_count", 0),
         "started_at": result.get("started_at"),
@@ -2997,6 +3245,9 @@ async def build_agent_image(
                                f"Denied: {[d.get('name') for d in supply_chain_denied]}")
                 return {
                     "image": current_image,
+                    "digest": "",
+                    "build_id": "",
+                    "version_id": "",
                     "feedback": supply_chain_feedback,
                     "denied": supply_chain_denied,
                 }
@@ -3011,6 +3262,8 @@ async def build_agent_image(
             waited = 0
             
             while waited < max_wait:
+                if activity.is_cancelled():
+                    raise asyncio.CancelledError()
                 await asyncio.sleep(poll_interval)
                 waited += poll_interval
                 
@@ -3027,6 +3280,13 @@ async def build_agent_image(
                     logger.info(f"   └─ Dockerfile saved to: agent-images/{task_id}/")
                     return {
                         "image": image_tag,
+                        "digest": status.get("digest") or "",
+                        "build_id": build_id,
+                        "version_id": (
+                            result.get("version_id")
+                            or result.get("reused_from")
+                            or ""
+                        ),
                         "feedback": supply_chain_feedback,
                         "denied": supply_chain_denied,
                     }
@@ -3048,6 +3308,31 @@ async def build_agent_image(
             f"Error: {str(e)[:500]}",
             non_retryable=True,
         ) from e
+
+
+@activity.defn
+async def persist_task_image(task_id: str, image: str) -> Dict[str, Any]:
+    """Persist the actual runtime image on the task record."""
+    import httpx
+
+    if not image:
+        return {"updated": False}
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(
+                f"{control_plane_url}/api/tasks/{task_id}/image",
+                json={"current_image": image},
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"persist_task_image: unexpected status {resp.status_code} for {task_id}"
+                )
+                return {"updated": False}
+            return {"updated": True}
+    except Exception as exc:
+        logger.warning(f"persist_task_image failed for {task_id}: {exc}")
+        return {"updated": False}
 
 
 @activity.defn
@@ -3079,6 +3364,63 @@ async def update_task_policy(
         logger.error(f"❌ Failed to persist image for task {task_id}: {e}")
 
     return {"updated": True, "new_image": new_image}
+
+
+@activity.defn
+async def get_ready_capability_image(
+    task_id: str,
+    capability_request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a succeeded capability build for this task/request, if any.
+
+    This bridges builds started by the control plane (orphan/sibling approval)
+    into the live workflow so iteration N+1 does not rebuild or, worse, keep the
+    pre-approval image.
+    """
+    import httpx
+
+    if not capability_request_id:
+        # Without a request id there is no way to prove an existing build
+        # matches this capability; force a fresh build instead.
+        return {}
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{control_plane_url}/api/image-catalog/builds",
+                params={
+                    "task_id": task_id,
+                    "capability_request_id": str(capability_request_id),
+                    "status": "succeeded",
+                    "limit": 5,
+                },
+            )
+            if resp.status_code != 200:
+                return {}
+            builds = resp.json()
+    except Exception as exc:
+        logger.warning(f"Could not look up ready capability image for {task_id}: {exc}")
+        return {}
+
+    for build in builds or []:
+        if not isinstance(build, dict):
+            continue
+        image_tag = str(build.get("image_tag") or "").strip()
+        if not image_tag:
+            continue
+        logger.info(
+            f"CAPABILITY_IMAGE_ADOPTED | task={task_id} | request={capability_request_id} | "
+            f"image={image_tag} | build={build.get('build_id') or '-'}"
+        )
+        return {
+            "image_tag": image_tag,
+            "image_digest": build.get("image_digest") or "",
+            "version_id": build.get("version_id") or "",
+            "build_id": build.get("build_id") or "",
+            "capability_request_id": capability_request_id,
+        }
+    return {}
 
 
 @activity.defn
@@ -3637,7 +3979,10 @@ async def trial_deploy(
     container = None
     image_tag = None
 
-    logger.info(f"🧪 TRIAL_DEPLOY | Task: {task_id} | Port: {port} | Entrypoint: {entrypoint}")
+    logger.info(
+        f"🧪 TRIAL_DEPLOY | Task: {task_id} | Port: {port} | "
+        f"Entrypoint: {entrypoint} | Base image: {deployment.get('agent_image') or 'unknown'}"
+    )
 
     try:
         # Phase 1: Build the deployment image via image-builder
@@ -4173,13 +4518,9 @@ async def create_node_task(
 
     task_id = f"task-{uuid.uuid4().hex[:8]}"
 
-    # Control-plane /api/tasks expects a base_image key (e.g. "browser", "openclaw"), not a full image URL.
-    if base_image_override:
-        base_image = base_image_override.strip()
-    else:
-        base_image = (agent_image or "openclaw").strip()
-        if "/" in base_image and ":" in base_image:
-            base_image = base_image.rsplit(":", 1)[-1]
+    # Prefer the concrete image the node will actually run. The control plane
+    # preserves full refs and expands short keys such as "openclaw".
+    base_image = (base_image_override or agent_image or "openclaw").strip()
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"{control_plane_url}/api/tasks",
@@ -4198,6 +4539,50 @@ async def create_node_task(
             raise ApplicationError(f"Failed to create task for node {node_id}: {resp.status_code} {resp.text}")
         data = resp.json()
         return data.get("id", task_id)
+
+
+@activity.defn
+async def persist_node_image(
+    dag_id: str,
+    node_id: str,
+    image_tag: str,
+    image_digest: str = "",
+    version_id: str = "",
+    build_id: str = "",
+) -> Dict[str, Any]:
+    """Persist the enriched image on the DAG node config for later retries.
+
+    AgentTaskWorkflow state is process-local to a Temporal run. A DAG retry or
+    loop-back starts a fresh node workflow, so the only durable way to inherit
+    the rebuilt image is to write it back into the DAG node definition.
+    """
+    import httpx
+
+    if not image_tag:
+        return {"updated": False}
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{control_plane_url}/api/dags/{dag_id}/nodes/{node_id}/built-image",
+                json={
+                    "image_tag": image_tag,
+                    "image_digest": image_digest or "",
+                    "version_id": version_id or "",
+                    "build_id": build_id or "",
+                },
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"Could not persist node image for {dag_id}/{node_id}: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+                return {"updated": False}
+            return resp.json()
+    except Exception as exc:
+        logger.warning(f"Could not persist node image for {dag_id}/{node_id}: {exc}")
+        return {"updated": False}
 
 
 def _extract_acquisition_log(agent_logs: str) -> List[Dict[str, Any]]:
@@ -5005,17 +5390,21 @@ class DAGNodeWorkflow:
         workspace_id = params.get("workspace_id", "")
         node_type = str(params.get("node_type") or config.get("type") or "agent").lower()
 
-        # Prefer the DAG-inherited enriched image over the static base_image
-        # from the node config.  dag_image is injected by DAGWorkflow when a
-        # previous wave already built capabilities.
+        # Prefer the image this node last built (persisted across retries and
+        # loop-backs), then the DAG-inherited enriched image, then the static
+        # plan-time pin. Never start from a stale base when a richer image for
+        # this node already exists.
         agent_image = (
-            config.get("dag_image")
+            config.get("last_built_image")
+            or config.get("dag_image")
             or config.get("resolved_image")
             or config.get("base_image", "openclaw")
         )
         if "/" not in agent_image:
             agent_image = f"localhost:5000/openclaw-agent:{agent_image}"
-        if config.get("dag_image"):
+        if config.get("last_built_image"):
+            logger.info(f"🔗 DAGNodeWorkflow | Node {node_id} resuming from built image: {agent_image}")
+        elif config.get("dag_image"):
             logger.info(f"🔗 DAGNodeWorkflow | Node {node_id} inheriting DAG image: {agent_image}")
         llm_model = config.get("llm_model", "gemini-flash-lite-latest")
 
@@ -5176,7 +5565,6 @@ class DAGNodeWorkflow:
                     agent_image,
                     llm_model,
                     workspace_id,
-                    config.get("resolved_runtime") or "",
                 ],
                 start_to_close_timeout=timedelta(seconds=30),
             )
@@ -5229,6 +5617,21 @@ class DAGNodeWorkflow:
                 AgentTaskWorkflow.run,
                 args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations],
                 id=child_workflow_id,
+            )
+
+            # Persist the enriched image on the node so a later retry/loop-back
+            # starts from it instead of the plan-time base image.
+            await workflow.execute_activity(
+                persist_node_image,
+                args=[
+                    dag_id,
+                    node_id,
+                    result.get("current_image", ""),
+                    result.get("current_image_digest", ""),
+                    result.get("image_version_id", ""),
+                    result.get("build_id", ""),
+                ],
+                start_to_close_timeout=timedelta(seconds=15),
             )
 
             # Collect full output
@@ -5937,8 +6340,22 @@ class DAGWorkflow:
 
         # Track the richest capability-enriched image across waves so
         # downstream nodes inherit installed packages and file-system
-        # state instead of starting from the bare base image.
+        # state instead of starting from the bare base image. On resume,
+        # seed it from images persisted by nodes in an earlier DAG run.
         dag_current_image = ""
+        _seed_rank = {"completed": 3, "running": 2, "failed": 1}
+        _seed_best = 0
+        for _n in nodes_list:
+            _cfg = _n.get("config") or {}
+            _persisted = str(_cfg.get("last_built_image") or "").strip()
+            if not _persisted:
+                continue
+            _rank = _seed_rank.get(str(_n.get("status") or "").lower(), 0)
+            if _rank and _rank >= _seed_best:
+                _seed_best = _rank
+                dag_current_image = _persisted
+        if dag_current_image:
+            logger.info(f"🔗 DAG image seeded from persisted node state: {dag_current_image}")
 
         while wave < max_waves:
             wave += 1
@@ -6456,7 +6873,10 @@ class DeploymentBuildWorkflow:
                 error = trial.get("error", "Trial deployment failed")
                 phase = trial.get("phase") or "unknown"
                 logs = (trial.get("logs") or "")[:1000]
-                detail = f"Trial preflight failed ({phase}): {error}"
+                detail = (
+                    f"Trial preflight failed ({phase}) using base image "
+                    f"{deployment.get('agent_image') or 'unknown'}: {error}"
+                )
                 if logs:
                     detail = f"{detail}\n{logs}"
                 await workflow.execute_activity(
@@ -6551,6 +6971,44 @@ class DeploymentRunWorkflow:
 # Worker
 # =============================================================================
 
+def _worker_code_revision() -> str:
+    """Hash the worker source so the control plane can detect a stale process.
+
+    The compose file bind-mounts worker.py into the container. Editing that file
+    does not reload a running Python process: workflow code can be re-imported
+    from disk by the Temporal sandbox while activity signatures remain from the
+    process start, which produced the dag-90e1501e
+    "start_agent_container() takes from 2 to 7 positional arguments" failure.
+    """
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:16]
+    except Exception:
+        return "unknown"
+
+
+async def _worker_heartbeat_loop(revision: str, worker_id: str, activity_count: int):
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{control_plane_url}/api/workers/heartbeat",
+                    json={
+                        "worker_id": worker_id,
+                        "revision": revision,
+                        "task_queue": TASK_QUEUE,
+                        "activity_count": activity_count,
+                        "pid": os.getpid(),
+                    },
+                )
+        except Exception as exc:
+            logger.warning(f"Worker heartbeat failed: {exc}")
+        await asyncio.sleep(10)
+
+
 async def main():
     """Main worker entry point"""
     
@@ -6558,13 +7016,14 @@ async def main():
     
     # Connect to Temporal
     client = await Client.connect(TEMPORAL_HOST)
-    
-    # Create worker
-    worker = Worker(
-        client,
-        task_queue=TASK_QUEUE,
-        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, DAGWorkflow, DAGNodeWorkflow],
-        activities=[
+
+    revision = _worker_code_revision()
+    worker_id = f"{os.getenv('HOSTNAME', 'worker')}:{os.getpid()}"
+    logger.info(
+        f"Worker code revision {revision} | worker_id={worker_id} | queue={TASK_QUEUE}"
+    )
+
+    activities = [
             initialize_task,
             start_agent_container,
             poll_agent_turns,
@@ -6600,6 +7059,9 @@ async def main():
             post_node_audit_event,
             post_node_structured_output,
             create_node_task,
+            persist_node_image,
+            persist_task_image,
+            get_ready_capability_image,
             collect_node_output,
             evaluate_node_gate,
             evaluate_edge_condition,
@@ -6607,17 +7069,39 @@ async def main():
             persist_task_workflow_id,
             update_task_status,
             create_user_request,
-        ],
-        # Limit concurrency to avoid OOM on constrained hosts: only a few
-        # activities (agent containers, LLM/gate calls) run at once.
-        # Configurable via env.
-        max_concurrent_activities=int(os.getenv("MAX_CONCURRENT_ACTIVITIES", "4")),
+    ]
+
+    # Build workflows and activities from the same loaded module. A bind-mounted
+    # worker.py change requires a process restart; the heartbeat + DAG start
+    # guard make a stale process visible instead of silently mis-dispatching.
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_ACTIVITIES", "12"))
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, DAGWorkflow, DAGNodeWorkflow],
+        activities=activities,
+        # Keep enough slots for DAG fan-out plus long-running agent activities.
+        # A small fixed pool (4) starves every new node when a few activities
+        # are slow. Configurable via env.
+        max_concurrent_activities=max_concurrent,
     )
     
-    logger.info(f"Worker starting on task queue: {TASK_QUEUE}")
+    logger.info(
+        f"Worker starting on task queue: {TASK_QUEUE} | revision={revision} | "
+        f"activities={len(activities)} | max_concurrent={max_concurrent}"
+    )
     
-    # Run worker
-    await worker.run()
+    heartbeat_task = asyncio.create_task(
+        _worker_heartbeat_loop(revision, worker_id, len(activities))
+    )
+    try:
+        await worker.run()
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

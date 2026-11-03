@@ -31,6 +31,7 @@ from database import get_db
 from models import MasterDAG, DAGNode, DAGStatus, NodeStatus, Skill, TaskOutput, CapabilityRequest, RequestStatus
 from planner import plan_dag, is_gemini_lite_model
 from temporal_client import start_dag_workflow
+import worker_registry
 from config import settings
 from workflow_groups import ensure_workflow_group
 
@@ -553,6 +554,11 @@ async def _stream_dag_execution(
     # Start DAG
     yield _sse_chunk("🚀 **Starting DAG execution...**\n\n")
     try:
+        await worker_registry.wait_for_worker()
+    except worker_registry.WorkerUnavailable as exc:
+        yield _sse_chunk(f"\n❌ **Worker unavailable:** {exc}\n")
+        return
+    try:
         workflow_id = await start_dag_workflow(dag.id)
         dag.workflow_id = workflow_id
         dag.status = DAGStatus.RUNNING
@@ -839,6 +845,10 @@ async def _blocking_dag_execution(
         ))
     await db.commit()
 
+    try:
+        await worker_registry.wait_for_worker()
+    except worker_registry.WorkerUnavailable as exc:
+        return _non_streaming_response(f"Worker unavailable: {exc}")
     try:
         workflow_id = await start_dag_workflow(dag.id)
         dag.workflow_id = workflow_id

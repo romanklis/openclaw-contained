@@ -941,6 +941,30 @@ def _step_deliverables_exist() -> bool:
     return False
 
 
+def _normalised_lines(text: str) -> List[str]:
+    normalised = (text or "").replace("\\n", "\n").replace("\\r", "\n")
+    return [line.strip().strip("`*_ ").strip() for line in normalised.splitlines()]
+
+
+def _has_capability_marker(text: str) -> bool:
+    """True only for a real, line-anchored CAPABILITY_REQUEST marker.
+
+    Prose such as "I should emit CAPABILITY_REQUEST:pip/flask and stop" must not
+    terminate the agent loop: doing so produced a completed task with no
+    deliverables and capability_requested=false.
+    """
+    for line in _normalised_lines(text):
+        if line.startswith("CAPABILITY_REQUEST:"):
+            return bool(re.match(r"CAPABILITY_REQUEST:\w+:[^:]+:.+", line))
+    return False
+
+
+def _has_deployment_marker(text: str) -> bool:
+    return any(
+        line.startswith("DEPLOYMENT_REQUEST:") for line in _normalised_lines(text)
+    )
+
+
 def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
     """Run a native agentic tool-use loop against the LLM router.
 
@@ -1038,8 +1062,9 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
                     all_output_parts.append(content)
                     assistant_text_parts.append(content)
 
-                    # Check for capability/deployment markers in text
-                    if "CAPABILITY_REQUEST:" in content or "DEPLOYMENT_REQUEST:" in content:
+                    # Check for capability/deployment markers in text. Only a
+                    # line-anchored, fully-formed marker may stop the loop.
+                    if _has_capability_marker(content) or _has_deployment_marker(content):
                         print(f"   ⚡ Marker detected in assistant text, stopping loop")
                         break
 
@@ -1158,13 +1183,14 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]
     shared-library scans) are removed: they produced false positives that
     blocked workflows on bogus approvals.
     """
-    normalised = output.replace("\\n", "\n").replace("\\r", "\r")
-
     all_packages: List[str] = []
     all_reasons: List[str] = []
     cap_type_found: Optional[str] = None
 
-    for m in re.finditer(r"CAPABILITY_REQUEST:(\w+):([^:\n]+):(.+)", normalised):
+    for line in _normalised_lines(output):
+        m = re.match(r"CAPABILITY_REQUEST:(\w+):([^:]+):(.+)", line)
+        if not m:
+            continue
         packages_raw = m.group(2).strip()
         if re.fullmatch(r"<[^>]+>", packages_raw):
             continue
@@ -1530,7 +1556,7 @@ def main():
     # didn't emit a DEPLOYMENT_REQUEST marker, scan workspace for a runnable
     # web app and auto-generate the deployment request.
     # Skip if agent emitted a CAPABILITY_REQUEST — deps aren't installed yet.
-    has_capability_request = "CAPABILITY_REQUEST:" in output
+    has_capability_request = _has_capability_marker(output)
     if exit_code == 0 and not deploy and not has_capability_request:
         task_text = (prompt + " " + (follow_up or "")).lower()
         deploy_keywords = ["deploy", "deployment", "containerize", "containerised",

@@ -21,6 +21,7 @@ from routers import blocks as blocks_router
 from routers import image_catalog as image_catalog_router
 from routers import workflows as workflows_router
 from routers import explorations as explorations_router
+from routers import workers as workers_router
 from database import engine, Base, async_session
 from workflow_groups import backfill_workflow_groups
 from config import settings
@@ -121,6 +122,10 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS approval_wait_ms INTEGER DEFAULT 0"))
         await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS image_build_wait_ms INTEGER DEFAULT 0"))
         await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS iteration_reason VARCHAR"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS image_digest VARCHAR"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS image_version_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS build_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS capability_request_id INTEGER"))
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS dag_user_requests (
                 id SERIAL PRIMARY KEY,
@@ -293,6 +298,7 @@ app.include_router(projects_router.router, prefix="/api/projects", tags=["projec
 app.include_router(credentials_router.router)
 app.include_router(credential_management_router.router)
 app.include_router(blocks_router.router)
+app.include_router(workers_router.router, prefix="/api/workers", tags=["workers"])
 
 
 @app.get("/health")

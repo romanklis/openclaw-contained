@@ -13,6 +13,7 @@ import os
 logger = logging.getLogger(__name__)
 
 from database import get_db
+from explorations_deploy import resolve_task_deploy_image
 from models import Deployment, DeploymentStatus, Task
 from schemas import (
     DeploymentRequestCreate,
@@ -39,13 +40,24 @@ async def create_deployment(
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {data.task_id} not found")
 
+    resolved_image = await resolve_task_deploy_image(
+        data.task_id, db, data.agent_image, entrypoint=data.entrypoint
+    )
+    if resolved_image and resolved_image != data.agent_image:
+        logger.info(
+            "Deployment image resolved for task %s: %s -> %s",
+            data.task_id,
+            data.agent_image or "none",
+            resolved_image,
+        )
+
     deployment = Deployment(
         id=f"deploy-{str(uuid.uuid4())[:8]}",
         name=data.name,
         task_id=data.task_id,
         entrypoint=data.entrypoint,
         port=data.port,
-        agent_image=data.agent_image,
+        agent_image=resolved_image or data.agent_image,
         trial_required=data.trial_required,
         status=DeploymentStatus.PENDING_APPROVAL,
     )
@@ -102,7 +114,7 @@ async def update_deployment(
     if not deployment:
         raise HTTPException(status_code=404, detail=f"Deployment {deployment_id} not found")
 
-    allowed = {"image_tag", "status", "container_id", "host_port", "url", "error", "entrypoint", "port"}
+    allowed = {"image_tag", "agent_image", "status", "container_id", "host_port", "url", "error", "entrypoint", "port"}
     for key, value in updates.items():
         if key in allowed:
             if key == "status":
@@ -150,6 +162,18 @@ async def approve_deployment(
         await db.commit()
         await db.refresh(deployment)
         return deployment
+
+    resolved_image = await resolve_task_deploy_image(
+        deployment.task_id, db, deployment.agent_image, entrypoint=deployment.entrypoint or ""
+    )
+    if resolved_image and resolved_image != deployment.agent_image:
+        logger.info(
+            "Resolved deployment %s image: %s -> %s",
+            deployment.id,
+            deployment.agent_image or "none",
+            resolved_image,
+        )
+        deployment.agent_image = resolved_image
 
     deployment.status = DeploymentStatus.APPROVED
     deployment.approved_at = datetime.utcnow()

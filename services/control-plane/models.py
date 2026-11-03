@@ -241,6 +241,10 @@ class TaskOutput(Base):
     llm_response_preview = Column(Text)  # Preview from LLM router log
     model_used = Column(String)
     image_used = Column(String)
+    image_digest = Column(String)
+    image_version_id = Column(String)
+    build_id = Column(String)
+    capability_request_id = Column(Integer)
     duration_ms = Column(Integer)
     turn_count = Column(Integer, default=0)
     started_at = Column(DateTime)

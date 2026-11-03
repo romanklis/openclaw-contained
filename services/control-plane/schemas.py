@@ -46,8 +46,14 @@ class TaskCreate(BaseModel):
 
     @property
     def effective_base_image_tag(self) -> str:
-        """Return the full registry image tag for the selected base image."""
-        key = self.base_image or "openclaw"
+        """Return the full registry image tag for the selected base image.
+
+        A full ref (e.g. an inherited capability or task image) is preserved;
+        a short key such as ``openclaw`` is expanded.
+        """
+        key = (self.base_image or "openclaw").strip()
+        if "/" in key and ":" in key:
+            return key
         return f"localhost:5000/openclaw-agent:{key}"
 
 
@@ -190,6 +196,10 @@ class TaskOutputCreate(BaseModel):
     llm_response_preview: Optional[str] = None
     model_used: Optional[str] = None
     image_used: Optional[str] = None
+    image_digest: Optional[str] = None
+    image_version_id: Optional[str] = None
+    build_id: Optional[str] = None
+    capability_request_id: Optional[int] = None
     duration_ms: Optional[int] = None
     turn_count: Optional[int] = 0
     started_at: Optional[datetime] = None
@@ -215,6 +225,10 @@ class TaskOutputResponse(BaseModel):
     llm_response_preview: Optional[str]
     model_used: Optional[str]
     image_used: Optional[str]
+    image_digest: Optional[str] = None
+    image_version_id: Optional[str] = None
+    build_id: Optional[str] = None
+    capability_request_id: Optional[int] = None
     duration_ms: Optional[int]
     turn_count: Optional[int] = 0
     started_at: Optional[datetime] = None
