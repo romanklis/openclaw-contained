@@ -7,6 +7,7 @@ import logging
 import re
 import uuid
 from temporalio import workflow, activity
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.client import Client
 from temporalio.worker import Worker
@@ -52,18 +53,37 @@ def is_gemini_lite_model(model: str) -> bool:
     return "gemini" in normalized and "lite" in normalized
 
 
-def _parse_capability_request_marker(text: str) -> Optional[Dict[str, str]]:
-    """Parse CAPABILITY_REQUEST marker text into a capability payload.
+_CAPABILITY_PACKAGE_RE = re.compile(r"[A-Za-z0-9@][A-Za-z0-9._+@/=-]*")
 
-    Expected format:
-    CAPABILITY_REQUEST:<type>:<resource>:<justification>
-    """
+
+def _valid_capability_resource(resource: str) -> bool:
+    """Reject prompt placeholders and malformed package references."""
+    for raw_pkg in (resource or "").split(","):
+        pkg = raw_pkg.strip()
+        if not pkg or "<" in pkg or ">" in pkg:
+            return False
+        if pkg.lower() in ("type/pkg", "type/package", "package_name", "pkg", "reason"):
+            return False
+        if "/" in pkg:
+            prefix, _, name = pkg.partition("/")
+            if prefix.strip().lower() not in ("pip", "npm", "apt", "auto"):
+                return False
+        else:
+            name = pkg
+        if not _CAPABILITY_PACKAGE_RE.fullmatch(name.strip()):
+            return False
+    return True
+
+
+def _parse_capability_request_marker(text: str) -> Optional[Dict[str, str]]:
+    """Parse a valid CAPABILITY_REQUEST marker into a capability payload."""
     if not isinstance(text, str):
         return None
     marker_line = ""
     for line in text.splitlines():
-        if "CAPABILITY_REQUEST:" in line:
-            marker_line = line.strip()
+        stripped = line.strip()
+        if stripped.startswith("CAPABILITY_REQUEST:"):
+            marker_line = stripped
             break
     if not marker_line:
         return None
@@ -73,6 +93,8 @@ def _parse_capability_request_marker(text: str) -> Optional[Dict[str, str]]:
         return None
     cap_type = (parts[0] or "tool_install").strip() or "tool_install"
     resource = (parts[1] or "").strip()
+    if not _valid_capability_resource(resource):
+        return None
     justification = (parts[2] if len(parts) > 2 else "Requested by agent").strip()
     return {
         "type": cap_type,
@@ -214,6 +236,34 @@ def get_docker_client():
 # Workflows
 # =============================================================================
 
+def _iteration_failure_signature(result: Dict[str, Any]) -> str:
+    """Return a stable signature for a non-completed iteration."""
+    text = str(result.get("error") or "").strip()
+    if not text:
+        text = str(result.get("agent_logs") or "").strip()[-800:]
+    text = re.sub(r"\d{4}-\d{2}-\d{2}[T ][0-9:.+Z-]+", "<time>", text)
+    text = re.sub(r"\b\d{2}:\d{2}:\d{2}\b", "<time>", text)
+    return text[:600]
+
+
+def _build_iteration_handoff(result: Dict[str, Any], iteration: int) -> str:
+    """Build a bounded continuation prompt for the next agent iteration."""
+    error = str(result.get("error") or "").strip()
+    logs = str(result.get("agent_logs") or "").strip()
+    detail = (error or logs)[-1200:]
+    return (
+        f"PREVIOUS ITERATION {iteration} DID NOT COMPLETE.\n"
+        "The /workspace filesystem is persistent: files and dependencies from "
+        "prior iterations are still present. Do not re-clone, re-download, or "
+        "restart discovery; continue from the current files and only do the "
+        "unfinished work.\n"
+        f"Previous blocker:\n{detail}\n"
+        "If the previous attempt timed out, run the long command with "
+        "exec timeout_seconds=900 (for example the full test suite) or split "
+        "the suite; do not use background jobs for CPU-bound work."
+    )
+
+
 @workflow.defn
 class AgentTaskWorkflow:
     """Main workflow for agent task execution"""
@@ -237,6 +287,9 @@ class AgentTaskWorkflow:
         self._approved_capabilities = set()  # Track already-approved resource names to prevent loops
         self._handled_capability_ids = set()  # Capability requests already applied
         self._pending_metrics = {}  # waits recorded for the next iteration output
+        self._iteration_follow_up = ""  # handoff from the previous failed iteration
+        self._last_failure_signature = ""  # normalized failure signature
+        self._same_failure_count = 0  # consecutive identical failures
 
     def _adopt_capability_image(
         self,
@@ -604,6 +657,11 @@ class AgentTaskWorkflow:
             # If there's pending capability feedback, inject it into this
             # iteration's follow_up and clear it (one-shot).
             iter_follow_up = self.follow_up
+            if self._iteration_follow_up:
+                iter_follow_up = (
+                    self._iteration_follow_up
+                    + ("\n\n" + iter_follow_up if iter_follow_up else "")
+                )
             if self._capability_feedback:
                 iter_follow_up = (
                     (iter_follow_up + "\n\n" if iter_follow_up else "")
@@ -673,6 +731,56 @@ class AgentTaskWorkflow:
                 )
             except Exception:
                 pass  # Non-critical — don't fail the workflow if output storage fails
+
+            if not result.get("completed"):
+                signature = _iteration_failure_signature(result)
+                if signature and signature == self._last_failure_signature:
+                    self._same_failure_count += 1
+                elif signature:
+                    self._last_failure_signature = signature
+                    self._same_failure_count = 1
+                else:
+                    self._last_failure_signature = ""
+                    self._same_failure_count = 0
+                self._iteration_follow_up = _build_iteration_handoff(result, iteration)
+                logger.warning(
+                    "ITERATION_STAGNATION | task=%s | iteration=%s | count=%s | signature=%s",
+                    task_id,
+                    iteration,
+                    self._same_failure_count,
+                    signature[:160],
+                )
+                if self._same_failure_count >= 3:
+                    logger.error(
+                        "STOPPING task %s after %s identical failures: %s",
+                        task_id,
+                        self._same_failure_count,
+                        signature[:300],
+                    )
+                    await workflow.execute_activity(
+                        finalize_task,
+                        args=[task_id, "failed"],
+                        start_to_close_timeout=timedelta(minutes=5),
+                    )
+                    return {
+                        "status": "failed",
+                        "error": (
+                            "Stopped after repeated identical failure: "
+                            + signature[:500]
+                        ),
+                        "iteration": iteration,
+                    }
+                if self._same_failure_count == 2:
+                    self._iteration_follow_up += (
+                        "\n\nWARNING: the previous two attempts failed with the "
+                        "same blocker. Change strategy now; do not repeat the same "
+                        "command. If the long command is the issue, use "
+                        "timeout_seconds=900 and continue from the current workspace."
+                    )
+            else:
+                self._iteration_follow_up = ""
+                self._last_failure_signature = ""
+                self._same_failure_count = 0
 
             # Check if agent hard-failed (container crash, exit non-zero, etc.)
             if result.get("agent_failed"):
@@ -1542,6 +1650,15 @@ async def start_agent_container(
             else os.getenv("CREDENTIAL_GATEWAY_URL", "http://credential-gateway:8083")
         )
 
+        # --- Agent sandbox discovery ---
+        # Agent containers run on DinD's bridge, so inject the Compose IP.
+        sandbox_ip = os.getenv("SANDBOX_IP", "") or _resolve("sandbox", fallback="")
+        sandbox_url_for_agent = (
+            f"http://{sandbox_ip}:8080"
+            if sandbox_ip
+            else os.getenv("SANDBOX_URL", "http://sandbox:8080")
+        )
+
         # Session ID: DAG-scoped by node_id so memory persists across
         # retries for the same DAG node.  For standalone tasks we
         # fall back to the task_id.
@@ -1571,6 +1688,10 @@ async def start_agent_container(
             "CONTROL_PLANE_URL": cp_url_for_agent,
             "LLM_ROUTER_URL": llm_router_url,
             "OLLAMA_URL": os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"),
+            # Dedicated agent sandbox API (build/run/test isolated solution
+            # containers). Agents authenticate as task:<TASK_ID>.
+            "SANDBOX_URL": sandbox_url_for_agent,
+            "SANDBOX_API_URL": sandbox_url_for_agent,
             # External RAG tool (docling-rag) so agents can query uploaded docs.
             "RAG_TOOL_URL": rag_url_for_agent,
             "RAG_API_KEY": os.getenv("RAG_API_KEY", "my-local-secret-key"),
@@ -1583,7 +1704,7 @@ async def start_agent_container(
             "TASK_DESCRIPTION": task_description[:2000],
             "AGENT_IMAGE": agent_image,
             "AGENT_DOCKERFILE": agent_dockerfile[:4000],
-            "FOLLOW_UP": follow_up[:2000],
+            "FOLLOW_UP": follow_up[:4000],
             # .skills is the AGENT-visible mount path (/workspace/.skills); the
             # files are written to the worker-side /workspaces/{id}/.skills.
             "PYTHONPATH": ("/workspace/.skills:/opt/openclaw") if skill_code_dir else "/opt/openclaw",
@@ -1608,6 +1729,21 @@ async def start_agent_container(
             agent_env["GITHUB_TOKEN"] = _github_lease["token"]
             agent_env["GITHUB_REPOSITORY"] = _github_lease["repository"]
             agent_env["GITHUB_BRANCH"] = _github_lease["branch"]
+            agent_env["REPO_DIR"] = _github_lease.get("repo_dir") or "/workspace/repo"
+            agent_env["GIT_TERMINAL_PROMPT"] = "0"
+            askpass_dir = os.path.join(workspace_dir, ".cache")
+            os.makedirs(askpass_dir, exist_ok=True)
+            askpass_path = os.path.join(askpass_dir, "git-askpass.sh")
+            with open(askpass_path, "w") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "case \"$1\" in\n"
+                    "  *Username*) printf '%s\\n' \"x-access-token\" ;;\n"
+                    "  *) printf '%s\\n' \"$GITHUB_TOKEN\" ;;\n"
+                    "esac\n"
+                )
+            os.chmod(askpass_path, 0o755)
+            agent_env["GIT_ASKPASS"] = "/workspace/.cache/git-askpass.sh"
 
         # Only the workspace is a bind mount. Adapters are baked into the agent
         # images (see Dockerfile.openclaw) — do NOT bind-mount them at their
@@ -1924,6 +2060,47 @@ def _compact_agent_result_for_temporal(
     return result
 
 
+def _scrub_git_credentials(workspace_dir: str) -> int:
+    """Remove embedded GitHub credentials from persisted git metadata."""
+    import re as _re
+
+    root = workspace_dir or ""
+    if not root or not os.path.isdir(root):
+        return 0
+    scrubbed = 0
+    candidates = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > 8:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in ("node_modules", ".venv", "venv", "__pycache__", ".pytest_cache")
+        ]
+        if ".git" in dirnames:
+            for name in ("config", "credentials"):
+                candidates.append(os.path.join(dirpath, ".git", name))
+        for name in (".git-credentials", ".netrc"):
+            candidates.append(os.path.join(dirpath, name))
+    pattern = _re.compile(r"https://[^/\s@]+@github\.com", _re.IGNORECASE)
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", errors="replace") as fh:
+                text = fh.read()
+            updated = pattern.sub("https://github.com", text)
+            if updated != text:
+                with open(path, "w") as fh:
+                    fh.write(updated)
+                scrubbed += 1
+        except OSError:
+            continue
+    return scrubbed
+
+
 @activity.defn
 async def collect_agent_result(
     task_id: str,
@@ -1968,6 +2145,9 @@ async def collect_agent_result(
         # so the next node inherits the full file-system state.
         if dag_id:
             try:
+                scrubbed = _scrub_git_credentials(workspace_dir)
+                if scrubbed:
+                    logger.info(f"🔐 Scrubbed embedded git credentials from {scrubbed} workspace file(s)")
                 short_task = task_id[:8]
                 commit_tag = f"dag-{dag_id[:8]}-{short_task}"
                 repo = "registry:5000/openclaw-agent"
@@ -3728,11 +3908,25 @@ async def patch_deployment(deployment_id: str, updates: Dict[str, Any]) -> Dict[
         return {"error": str(e)}
 
 
+def _node_needs_repo_access(node_config: Dict[str, Any], description: str) -> bool:
+    if not isinstance(node_config, dict):
+        return False
+    if node_config.get("github_push") or node_config.get("github_access"):
+        return True
+    capabilities = node_config.get("required_capabilities") or {}
+    binaries = {str(x).lower() for x in (capabilities.get("binaries") or [])}
+    categories = {str(x).lower() for x in (capabilities.get("categories") or [])}
+    text = (description or "").lower()
+    signals = ("clone", "checkout", "check out", "git pull", "git fetch", "repository", "repo ")
+    return bool("git" in binaries or "git" in categories or any(s in text for s in signals))
+
+
 async def _github_push_lease(task_id: str) -> Dict[str, Any]:
     """Lease a repo/branch-scoped GitHub credential for one agent container.
 
-    Only DAG nodes with config.github_push.enabled get a lease. The gateway
-    validates the repository/branch allowlist; this helper never logs the token.
+    The publishing node and every upstream node that needs the checkout share
+    the same DAG-level repository/branch scope. The gateway validates the
+    allowlist; this helper never logs the token.
     """
     import httpx
 
@@ -3740,7 +3934,7 @@ async def _github_push_lease(task_id: str) -> Dict[str, Any]:
     gateway_url = os.getenv("CREDENTIAL_GATEWAY_URL", "http://credential-gateway:8083")
     admin_token = os.getenv("CREDENTIAL_GATEWAY_ADMIN_TOKEN", "openclaw-admin")
     if not admin_token:
-        logger.warning("GitHub push lease skipped: no credential gateway admin token")
+        logger.warning("GitHub lease skipped: no credential gateway admin token")
         return {}
 
     try:
@@ -3759,29 +3953,67 @@ async def _github_push_lease(task_id: str) -> Dict[str, Any]:
             )
             if nodes_resp.status_code != 200:
                 return {}
+            nodes = nodes_resp.json() or []
             node_config: Dict[str, Any] = {}
-            for node in nodes_resp.json() or []:
+            node_description = ""
+            for node in nodes:
                 if node.get("node_id") == node_id:
                     node_config = node.get("config") or {}
+                    node_description = str(node.get("description") or "")
                     break
 
-            push_cfg = node_config.get("github_push") or {}
-            if not isinstance(push_cfg, dict) or not push_cfg.get("enabled"):
-                return {}
-            if push_cfg.get("authorized") is False:
-                logger.warning(
-                    f"GitHub push lease not authorized for task {task_id} node {node_id}"
-                )
-                return {}
-            repository = str(
-                push_cfg.get("repository") or push_cfg.get("repo") or ""
-            ).strip()
-            branch = str(push_cfg.get("branch") or "main").strip()
-            credential = str(push_cfg.get("credential") or "github").strip()
-            if not repository:
-                logger.warning(f"GitHub push enabled without repository for {task_id}")
+            push_scopes: Dict[tuple, Dict[str, Any]] = {}
+            for node in nodes:
+                config = node.get("config") or {}
+                push_cfg = config.get("github_push") or {}
+                if not isinstance(push_cfg, dict) or not push_cfg.get("enabled"):
+                    continue
+                if push_cfg.get("authorized") is False:
+                    continue
+                repo = str(push_cfg.get("repository") or push_cfg.get("repo") or "").strip()
+                branch = str(push_cfg.get("branch") or "main").strip()
+                if repo:
+                    push_scopes[(repo.lower(), branch)] = {
+                        "repository": repo,
+                        "branch": branch,
+                        "credential": str(push_cfg.get("credential") or "github").strip(),
+                    }
+
+            current_push = node_config.get("github_push") or {}
+            current_access = node_config.get("github_access") or {}
+            scope: Dict[str, Any] = {}
+            if isinstance(current_push, dict) and current_push.get("enabled"):
+                if current_push.get("authorized") is False:
+                    logger.warning(
+                        f"GitHub lease not authorized for task {task_id} node {node_id}"
+                    )
+                    return {}
+                repo = str(current_push.get("repository") or current_push.get("repo") or "").strip()
+                if repo:
+                    scope = {
+                        "repository": repo,
+                        "branch": str(current_push.get("branch") or "main").strip(),
+                        "credential": str(current_push.get("credential") or "github").strip(),
+                    }
+            elif isinstance(current_access, dict) and current_access.get("repository"):
+                scope = {
+                    "repository": str(current_access.get("repository")).strip(),
+                    "branch": str(current_access.get("branch") or "main").strip(),
+                    "credential": str(current_access.get("credential") or "github").strip(),
+                }
+            elif _node_needs_repo_access(node_config, node_description) and len(push_scopes) == 1:
+                scope = next(iter(push_scopes.values()))
+
+            if not scope:
+                if _node_needs_repo_access(node_config, node_description):
+                    logger.warning(
+                        f"GitHub lease skipped for task {task_id}: no unambiguous DAG repository scope"
+                    )
                 return {}
 
+            repository = scope["repository"]
+            branch = scope.get("branch") or "main"
+            credential = scope.get("credential") or "github"
             lease_resp = await client.post(
                 f"{gateway_url}/v1/lease/github",
                 headers={"X-Admin-Token": admin_token},
@@ -3794,17 +4026,17 @@ async def _github_push_lease(task_id: str) -> Dict[str, Any]:
             )
             if lease_resp.status_code != 200:
                 logger.warning(
-                    f"GitHub push lease denied for task {task_id} "
+                    f"GitHub lease denied for task {task_id} "
                     f"({repository}@{branch}): HTTP {lease_resp.status_code}"
                 )
                 return {}
             lease = lease_resp.json() or {}
             token = str(lease.get("password") or lease.get("token") or "")
             if not token:
-                logger.warning(f"GitHub push lease returned no token for {task_id}")
+                logger.warning(f"GitHub lease returned no token for {task_id}")
                 return {}
             logger.info(
-                f"🔑 GitHub push lease acquired | task={task_id} "
+                f"🔑 GitHub lease acquired | task={task_id} "
                 f"repo={lease.get('repository') or repository} "
                 f"branch={lease.get('branch') or branch}"
             )
@@ -3812,9 +4044,10 @@ async def _github_push_lease(task_id: str) -> Dict[str, Any]:
                 "token": token,
                 "repository": lease.get("repository") or repository,
                 "branch": lease.get("branch") or branch,
+                "repo_dir": str(node_config.get("repo_dir") or "/workspace/repo"),
             }
     except Exception as exc:
-        logger.warning(f"GitHub push lease failed for {task_id}: {exc}")
+        logger.warning(f"GitHub lease failed for {task_id}: {exc}")
         return {}
 
 
@@ -5305,6 +5538,76 @@ async def _deep_review_gate_fallback(
     }
 
 
+def _normalize_repo_reference(value: str) -> str:
+    ref = (value or "").strip()
+    ref = re.sub(r"^[a-z]+://", "", ref, flags=re.IGNORECASE)
+    ref = ref.split("@", 1)[-1] if "@" in ref else ref
+    ref = ref.replace("github.com:", "github.com/").replace("github.com/", "", 1)
+    if ref.lower().endswith(".git"):
+        ref = ref[:-4]
+    return ref.strip("/").lower()
+
+
+def _find_repo_checkout(workspace_id: str, repository: str, root: Optional[str] = None) -> Dict[str, Any]:
+    """Find a matching checkout without exposing credentials from .git/config."""
+    import subprocess
+
+    root = root or os.path.join("/workspaces", workspace_id or "")
+    wanted = _normalize_repo_reference(repository)
+    if not workspace_id or not os.path.isdir(root):
+        return {"ok": False, "error": "workspace_missing"}
+    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
+    for dirpath, dirnames, _filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > 8:
+            dirnames[:] = []
+            continue
+        if ".git" in dirnames:
+            git_dir = os.path.join(dirpath, ".git")
+            config_path = os.path.join(git_dir, "config")
+            try:
+                with open(config_path, "r", errors="replace") as fh:
+                    config_text = fh.read()
+            except OSError:
+                config_text = ""
+            remotes = re.findall(r"^\s*url\s*=\s*(\S+)\s*$", config_text, re.MULTILINE)
+            matched = next(
+                (remote for remote in remotes if _normalize_repo_reference(remote) == wanted),
+                "",
+            )
+            if not matched:
+                dirnames.remove(".git")
+                continue
+            head = ""
+            try:
+                head = subprocess.run(
+                    ["git", "-C", dirpath, "rev-parse", "--verify", "HEAD"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+            except Exception:
+                pass
+            if not head:
+                try:
+                    with open(os.path.join(git_dir, "HEAD"), "r", errors="replace") as fh:
+                        head = fh.read().strip()
+                except OSError:
+                    pass
+            return {
+                "ok": bool(head),
+                "checkout": dirpath,
+                "head": head,
+                "error": "" if head else "checkout_has_no_head",
+            }
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+    return {"ok": False, "error": f"no_checkout_for_{wanted}"}
+
+
+@activity.defn
+async def verify_repo_checkout(workspace_id: str, repository: str) -> Dict[str, Any]:
+    return _find_repo_checkout(workspace_id, repository)
+
+
 @activity.defn
 async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Evaluate node output quality gate.
@@ -5491,6 +5794,39 @@ async def persist_task_workflow_id(task_id: str, workflow_id: str) -> bool:
 # DAG Workflows
 # =============================================================================
 
+@activity.defn
+async def run_dag_plan_activity(dag_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Ask the control plane to plan a pre-created PLANNING DAG."""
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    async with httpx.AsyncClient(timeout=900.0) as client:
+        response = await client.post(
+            f"{control_plane_url}/api/dags/{dag_id}/plan",
+            json=payload,
+        )
+        if response.status_code >= 400:
+            raise ApplicationError(
+                f"DAG planning request failed: HTTP {response.status_code}: {response.text[:300]}",
+                non_retryable=False,
+            )
+        return response.json()
+
+
+@workflow.defn
+class DAGPlanningWorkflow:
+    """Durable background planning for POST /api/dags/with-files."""
+
+    @workflow.run
+    async def run(self, dag_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await workflow.execute_activity(
+            run_dag_plan_activity,
+            args=[dag_id, payload],
+            start_to_close_timeout=timedelta(minutes=15),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+
+
 @workflow.defn
 class DAGNodeWorkflow:
     """Execute a single DAG node.
@@ -5650,6 +5986,17 @@ class DAGNodeWorkflow:
                 "and visible to all steps. Read them as needed; do not modify them. Files "
                 "produced by earlier steps appear in the input data below."
             )
+        repo_access = config.get("github_access") or config.get("github_push")
+        if isinstance(repo_access, dict) and repo_access.get("repository"):
+            repo_dir = str(config.get("repo_dir") or "/workspace/repo")
+            follow_up_parts.append(
+                "--- Repository access ---\n"
+                f"Repository: {repo_access.get('repository')} (branch {repo_access.get('branch') or 'main'}).\n"
+                f"Use the shared checkout directory `{repo_dir}`. When a checkout is needed, use "
+                f"`git clone https://github.com/{repo_access.get('repository')}.git {repo_dir}`; "
+                "the platform provides GITHUB_TOKEN/GIT_ASKPASS. Never put the token in a URL, "
+                "git config, a file, or a deliverable."
+            )
         if node_objective:
             follow_up_parts.append("--- Step Objective ---")
             follow_up_parts.append(node_objective)
@@ -5801,6 +6148,42 @@ class DAGNodeWorkflow:
                 args=[task_id],
                 start_to_close_timeout=timedelta(seconds=30),
             )
+
+            repo_cfg = config.get("github_access") or config.get("github_push") or {}
+            repo_required = str((repo_cfg or {}).get("repository") or "").strip()
+            if repo_required:
+                repo_check = await workflow.execute_activity(
+                    verify_repo_checkout,
+                    args=[workspace_id, repo_required],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                output["repo_checkout"] = repo_check
+                if not repo_check.get("ok"):
+                    reason = (
+                        "repo_checkout_missing: "
+                        + str(repo_check.get("error") or "no matching checkout")
+                    )
+                    output["gate_failure"] = reason
+                    logger.error(
+                        f"🛑 REPO_CHECKOUT_MISSING | DAG={dag_id} | node={node_id} | "
+                        f"repo={repo_required} | {repo_check.get('error')}"
+                    )
+                    await workflow.execute_activity(
+                        update_node_status,
+                        args=[dag_id, node_id, "failed", output],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    await workflow.execute_activity(
+                        post_dag_progress,
+                        args=[dag_id, f"❌ Node '{node_id}' failed: no checkout for {repo_required}"],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    return {
+                        "status": "failed",
+                        "error": reason,
+                        "node_id": node_id,
+                        "output": output,
+                    }
 
             # Surface that the task finished and the gate is being evaluated,
             # so a gate that is queued (e.g. worker concurrency contention) does
@@ -7229,6 +7612,7 @@ async def main():
 
     activities = [
             initialize_task,
+            run_dag_plan_activity,
             start_agent_container,
             poll_agent_turns,
             collect_agent_result,
@@ -7267,6 +7651,7 @@ async def main():
             persist_task_image,
             get_ready_capability_image,
             collect_node_output,
+            verify_repo_checkout,
             evaluate_node_gate,
             evaluate_edge_condition,
             finalize_dag,
@@ -7282,7 +7667,7 @@ async def main():
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, DAGWorkflow, DAGNodeWorkflow],
+        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, DAGWorkflow, DAGNodeWorkflow, DAGPlanningWorkflow],
         activities=activities,
         # Keep enough slots for DAG fan-out plus long-running agent activities.
         # A small fixed pool (4) starves every new node when a few activities

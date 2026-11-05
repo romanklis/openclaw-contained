@@ -1,0 +1,8 @@
+{
+  "name": "github-push",
+  "image_id": "openclaw",
+  "description": "Commit a tested project and push it to GitHub with a task-scoped GITHUB_TOKEN: one-shot credential helper, no token in remote/config, remote verification, and a token-redacted report.",
+  "tags": ["git", "github", "delivery"],
+  "source_type": "manual",
+  "files": ["github-push.md"]
+}

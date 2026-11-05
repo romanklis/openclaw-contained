@@ -9,6 +9,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +26,7 @@ from explorations import (
     reconcile_session,
 )
 from explorations_deploy import detect_cycle_deployables
+from workflow_promotion import PromotionError, promote_exploration_cycle
 from models import (
     DAGNode,
     DagUserRequest,
@@ -118,6 +120,8 @@ def _cycle_dict(cycle: ExplorationCycle) -> dict[str, Any]:
         "status": cycle.status,
         "feedback": cycle.feedback,
         "finalized_at": cycle.finalized_at.isoformat() if cycle.finalized_at else None,
+        "promoted_dag_id": getattr(cycle, "promoted_dag_id", None),
+        "promoted_at": cycle.promoted_at.isoformat() if getattr(cycle, "promoted_at", None) else None,
         "created_at": cycle.created_at.isoformat() if cycle.created_at else None,
     }
 
@@ -423,6 +427,60 @@ async def update_session(session_id: str, body: dict, db: AsyncSession = Depends
     await db.commit()
     await db.refresh(session)
     return _session_dict(session)
+
+
+class PromoteCycleRequest(BaseModel):
+    title: Optional[str] = None
+    project_id: Optional[str] = None
+    workspace_mode: str = "continue"
+    auto_start: bool = False
+    force: bool = False
+
+
+@router.post("/{session_id}/cycles/{cycle_id}/promote", status_code=201)
+async def promote_cycle(
+    session_id: str,
+    cycle_id: str,
+    body: PromoteCycleRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Promote a completed exploration cycle into a normal experiment group."""
+    session = await _session_or_404(session_id, db)
+    cycle_result = await db.execute(
+        select(ExplorationCycle).where(
+            ExplorationCycle.id == cycle_id,
+            ExplorationCycle.session_id == session.id,
+        )
+    )
+    cycle = cycle_result.scalar_one_or_none()
+    if not cycle:
+        raise HTTPException(status_code=404, detail="Exploration cycle not found")
+
+    try:
+        result = await promote_exploration_cycle(
+            session,
+            cycle,
+            db=db,
+            title=body.title,
+            project_id=body.project_id,
+            workspace_mode=body.workspace_mode,
+            force=body.force,
+        )
+    except PromotionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+    if body.auto_start and result.get("created"):
+        try:
+            from routers.dags import _start_dag
+
+            dag = await db.get(MasterDAG, result["dag_id"])
+            if dag:
+                await _start_dag(dag, db)
+                result["auto_started"] = True
+        except Exception as exc:
+            result["auto_start_error"] = str(exc)
+
+    return result
 
 
 @router.post("/{session_id}/finish")

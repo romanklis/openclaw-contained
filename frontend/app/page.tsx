@@ -219,7 +219,9 @@ export default function LaunchpadPage() {
       formData.append('auto_start', 'false')
       if (model) formData.append('llm_model', model)
       if (selectedSkillIds.length > 0) formData.append('skill_ids', JSON.stringify(selectedSkillIds))
-      if (activeProject) formData.append('project_id', activeProject)
+      if (activeProject && activeProject !== '__general__') {
+        formData.append('project_id', activeProject)
+      }
       attachments.forEach((file) => formData.append('files', file))
       const res = await fetch(`${API}/api/dags/with-files`, { method: 'POST', body: formData })
       const data = await res.json().catch(() => ({}))

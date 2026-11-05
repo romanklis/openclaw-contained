@@ -9,7 +9,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import MasterDAG, WorkflowGroup
+from models import MasterDAG, Project, WorkflowGroup
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,21 @@ def normalize_project_id(project_id: Optional[str]) -> Optional[str]:
     if not project_id or project_id == "__general__":
         return None
     return project_id
+
+
+async def resolve_project_id(
+    project_id: Optional[str], db: AsyncSession
+) -> Optional[str]:
+    """Normalize the UI sentinel and drop project IDs that no longer exist."""
+    normalized = normalize_project_id(project_id)
+    if normalized is None:
+        return None
+    if await db.get(Project, normalized):
+        return normalized
+    logger.warning(
+        "Unknown project_id %r; creating the DAG as unassigned", normalized
+    )
+    return None
 
 
 def objective_key(objective: str) -> str:

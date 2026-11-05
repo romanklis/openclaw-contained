@@ -89,6 +89,12 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS workflow_group_id VARCHAR"))
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS exploration_session_id VARCHAR"))
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS exploration_cycle INTEGER"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS promoted_from_session_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS promoted_from_cycle_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS promoted_from_dag_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE exploration_cycles ADD COLUMN IF NOT EXISTS promoted_dag_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE exploration_cycles ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMP"))
         await conn.execute(text("ALTER TABLE workflow_groups ADD COLUMN IF NOT EXISTS title_source VARCHAR DEFAULT 'derived'"))
         await conn.execute(text("ALTER TABLE workflow_groups ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'experiment'"))
         await conn.execute(text("""
@@ -99,6 +105,8 @@ async def lifespan(app: FastAPI):
             )
         """))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_master_dags_workflow_group_id ON master_dags (workflow_group_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_master_dags_promoted_from_cycle_id ON master_dags (promoted_from_cycle_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_master_dags_promoted_from_session_id ON master_dags (promoted_from_session_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_groups_project_objective ON workflow_groups (project_id, objective_key)"))
         await conn.execute(text("ALTER TABLE skills_v2 ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
         # Interactive steps: decision / input node type on DAG nodes

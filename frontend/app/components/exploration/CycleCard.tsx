@@ -14,6 +14,8 @@ interface CycleCardProps {
   onPreview: (dagId: string, path: string) => void
   onRetry: (dagId: string, nodeId?: string, status?: string) => void
   onFinish?: () => void
+  onPromote?: () => void
+  promotedDagId?: string | null
   sessionStatus?: string
   deployable?: DeployableApp | null
   onDeploy?: (candidate: DeployableApp) => void
@@ -105,6 +107,8 @@ export default function CycleCard({
   onPreview,
   onRetry,
   onFinish,
+  onPromote,
+  promotedDagId,
   sessionStatus,
   deployable,
   onDeploy,
@@ -188,6 +192,15 @@ export default function CycleCard({
               ⭳ ZIP
             </a>
           )}
+          {promotedDagId ? (
+            <Link href={`/dags/${promotedDagId}`} className="text-emerald-300 hover:text-emerald-200" title="Open the promoted experiment">
+              🧪 Promoted
+            </Link>
+          ) : meta.status === 'completed' && onPromote ? (
+            <button onClick={onPromote} className="text-indigo-300 hover:text-indigo-200" title="Promote this cycle to a normal experiment">
+              🧪 Promote
+            </button>
+          ) : null}
           <Link href={`/dags/${meta.dag_id}`} className="text-gray-400 hover:text-gray-200">👁 View DAG</Link>
           <button
             onClick={() => onViewChange(view === 'collapsed' ? 'summary' : view === 'summary' ? 'full' : 'summary')}

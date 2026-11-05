@@ -369,12 +369,14 @@ _GITHUB_PUSH_SIGNALS = (
 
 
 def _normalize_github_push(dag_json: dict) -> dict:
-    """Mark nodes that publish code to GitHub with a repo/branch scope.
+    """Mark publish and upstream repository-access nodes.
 
-    The worker only injects GITHUB_TOKEN for these nodes; the token itself is
-    leased from the credential gateway, never planned or written into the DAG.
+    The worker leases a repository/branch-scoped GitHub credential for every
+    node that needs the checkout, not only the publishing node. The token itself
+    is never planned or written into the DAG.
     """
-    for node in dag_json.get("nodes", []):
+    nodes = dag_json.get("nodes", [])
+    for node in nodes:
         config = node.setdefault("config", {})
         if config.get("github_push"):
             continue
@@ -391,7 +393,7 @@ def _normalize_github_push(dag_json: dict) -> dict:
         match = _GITHUB_URL_RE.search(description)
         if not match:
             continue
-        repository = match.group(1).strip("/")
+        repository = match.group(1).strip("/").rstrip(".,);")
         branch_match = re.search(r"\bbranch\s+([A-Za-z0-9_./-]+)", description)
         branch = branch_match.group(1) if branch_match else "main"
         config["github_push"] = {
@@ -401,6 +403,71 @@ def _normalize_github_push(dag_json: dict) -> dict:
             "credential": "github",
             "require_approval": True,
         }
+
+    push_scopes = set()
+    for node in nodes:
+        push_cfg = (node.get("config") or {}).get("github_push") or {}
+        if not isinstance(push_cfg, dict) or not push_cfg.get("enabled"):
+            continue
+        repository = str(push_cfg.get("repository") or "").strip("/").lower()
+        if repository:
+            push_scopes.add((repository, str(push_cfg.get("branch") or "main").strip()))
+    if len(push_scopes) != 1:
+        return dag_json
+    repository, branch = next(iter(push_scopes))
+    if not repository:
+        return dag_json
+
+    parents: dict[str, set[str]] = {}
+    for edge in dag_json.get("edges", []):
+        source = str(edge.get("from_node") or edge.get("from") or "")
+        target = str(edge.get("to_node") or edge.get("to") or "")
+        if source and target:
+            parents.setdefault(target, set()).add(source)
+    push_nodes = {
+        str(node.get("node_id") or "")
+        for node in nodes
+        if (node.get("config") or {}).get("github_push", {}).get("enabled")
+    }
+    ancestors: set[str] = set()
+    stack = list(push_nodes)
+    while stack:
+        current = stack.pop()
+        for parent in parents.get(current, set()):
+            if parent not in ancestors:
+                ancestors.add(parent)
+                stack.append(parent)
+
+    repo_signals = (
+        "clone", "checkout", "check out", "git pull", "git fetch",
+        "repository", "repo ", "repository's",
+    )
+    for node in nodes:
+        config = node.setdefault("config", {})
+        if config.get("github_push") or config.get("github_access"):
+            continue
+        node_id = str(node.get("node_id") or "")
+        if node_id not in ancestors:
+            continue
+        description = " ".join(
+            str(value or "")
+            for value in (node.get("description"), config.get("node_objective"), config.get("objective"))
+        ).lower()
+        capabilities = config.get("required_capabilities") or {}
+        binaries = {str(x).lower() for x in (capabilities.get("binaries") or [])}
+        categories = {str(x).lower() for x in (capabilities.get("categories") or [])}
+        if not (
+            any(signal in description for signal in repo_signals)
+            or "git" in binaries
+            or "git" in categories
+        ):
+            continue
+        config["github_access"] = {
+            "repository": repository,
+            "branch": branch,
+            "credential": "github",
+        }
+        config.setdefault("repo_dir", "/workspace/repo")
     return dag_json
 
 
@@ -541,7 +608,7 @@ Default — executes in an isolated container using the selected base_image + sk
 12. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
 13. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
 14. IN-PLACE MODIFICATION: If a node edits existing files in the shared workspace (e.g. "reuse existing assets", "edit app/main.py", "copy ... into an existing app", "fix ... in <path>", "no rewrite"), set config.deliverable_mode="in_place", config.deliverable_gate.require_deliverables=false, and config.deliverable_gate.require_real_sources=false. Do not ask such a node to write a separate deliverables directory; it must modify the target files, run the specified tests, and report the exact result.
-15. GITHUB PUSH: If a node pushes/publishes code to GitHub or creates a pull request, set config.github_push={"enabled":true,"repository":"owner/repo","branch":"main","credential":"github","require_approval":true}. Never put a token, PAT, or credential in the node description, prompt, files, or git remote URL; the platform injects it only for this node.
+15. GITHUB ACCESS: If a node pushes/publishes code to GitHub or creates a pull request, set config.github_push={{"enabled":true,"repository":"owner/repo","branch":"main","credential":"github","require_approval":true}}. If the DAG clones, checks out, or tests that same repository in earlier nodes, also set config.github_access={{"repository":"owner/repo","branch":"main","credential":"github"}} on those nodes and config.repo_dir="/workspace/repo"; the worker leases the repo/branch-scoped credential for every such node. Never put a token, PAT, or credential in the node description, prompt, files, or git remote URL.
 """
 
 

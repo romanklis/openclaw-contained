@@ -1,0 +1,6 @@
+name: github-programming-push
+description: Build a tested Python CLI and push it to GitHub with a task-scoped token
+dags:
+  - config/dags/github-programming-push.dag.json
+skills:
+  - config/skills/github-push.md

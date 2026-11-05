@@ -29,7 +29,12 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
     # CORS
-    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost"]
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://localhost",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1",
+    ]
     
     # Workspaces
     WORKSPACE_ROOT: str = "/workspaces"

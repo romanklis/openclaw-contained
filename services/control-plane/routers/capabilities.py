@@ -9,6 +9,7 @@ from datetime import datetime
 import uuid
 import logging
 import os
+import re
 
 from temporalio.client import Client
 
@@ -25,6 +26,27 @@ from schemas import (
 router = APIRouter()
 
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal:7233")
+
+_CAPABILITY_PACKAGE_RE = re.compile(r"[A-Za-z0-9@][A-Za-z0-9._+@/=-]*")
+
+
+def _valid_capability_resource(resource: str) -> bool:
+    """Reject prompt placeholders before they can create an image build."""
+    for raw_pkg in (resource or "").split(","):
+        pkg = raw_pkg.strip()
+        if not pkg or "<" in pkg or ">" in pkg:
+            return False
+        if pkg.lower() in ("type/pkg", "type/package", "package_name", "pkg", "reason"):
+            return False
+        if "/" in pkg:
+            prefix, _, name = pkg.partition("/")
+            if prefix.strip().lower() not in ("pip", "npm", "apt", "auto"):
+                return False
+        else:
+            name = pkg
+        if not _CAPABILITY_PACKAGE_RE.fullmatch(name.strip()):
+            return False
+    return True
 
 
 async def get_temporal_client():
@@ -113,7 +135,16 @@ async def create_capability_request(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Task {request_data.task_id} not found"
         )
-    
+
+    if not _valid_capability_resource(request_data.resource_name):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Invalid capability resource. Use actual package names such as "
+                "pip/fastapi, not template placeholders like <type>/<pkg>."
+            ),
+        )
+
     # Create request
     capability_request = CapabilityRequest(
         task_id=request_data.task_id,

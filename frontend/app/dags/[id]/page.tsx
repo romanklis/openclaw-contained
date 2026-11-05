@@ -66,6 +66,10 @@ interface DAGDetail {
   workflow_group_id?: string | null
   exploration_session_id?: string | null
   exploration_cycle?: number | null
+  promoted_from_session_id?: string | null
+  promoted_from_cycle_id?: string | null
+  promoted_from_dag_id?: string | null
+  promoted_at?: string | null
   input_attachments?: DAGAttachment[]
 }
 
@@ -418,14 +422,14 @@ export default function DAGDetailPage() {
     }
   }
 
-  // Auto-refresh while running, and fetch once more when status changes from running
+  // Auto-refresh while planning/running, and fetch once more on status change.
   useEffect(() => {
-    if (dag?.status === 'running') {
+    if (dag?.status === 'running' || dag?.status === 'planning') {
       const interval = setInterval(fetchDag, 4000)
       return () => clearInterval(interval)
     }
-    // When status changes from running -> completed/failed, do one final fetch
-    if (dag && dag.status !== 'running') {
+    // When the status changes to ready/completed/failed, do one final fetch.
+    if (dag && dag.status !== 'running' && dag.status !== 'planning') {
       fetchDag()
     }
   }, [dag?.status, fetchDag])
@@ -1817,6 +1821,28 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
               >
                 {showFullObjective ? 'Show less' : 'Show full objective'}
               </button>
+            )}
+            {dag.promoted_from_session_id && (
+              <div className="mt-2 flex flex-wrap items-center gap-2 rounded border border-indigo-800/40 bg-indigo-950/20 px-2 py-1 text-[11px] text-indigo-200">
+                <span>🧪 Promoted experiment</span>
+                <Link
+                  href={`/explorations/${dag.promoted_from_session_id}`}
+                  className="text-indigo-300 hover:text-indigo-200 underline-offset-2 hover:underline"
+                >
+                  source exploration
+                </Link>
+                {dag.promoted_from_cycle_id && (
+                  <span className="text-indigo-300/70">source cycle {dag.promoted_from_cycle_id}</span>
+                )}
+                {dag.promoted_from_dag_id && (
+                  <Link
+                    href={`/dags/${dag.promoted_from_dag_id}`}
+                    className="text-indigo-300 hover:text-indigo-200 underline-offset-2 hover:underline"
+                  >
+                    source DAG
+                  </Link>
+                )}
+              </div>
             )}
           </div>
         </div>

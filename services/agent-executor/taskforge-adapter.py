@@ -48,6 +48,7 @@ RUNTIME_DESCRIPTION_OVERRIDE = os.getenv("OPENCLAW_RUNTIME_DESCRIPTION")
 
 MAX_TURNS = int(os.getenv("MAX_AGENT_TURNS", "30"))
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "60"))
+MAX_TOOL_TIMEOUT = int(os.getenv("MAX_TOOL_TIMEOUT", "900"))
 
 # Agent context-management mode (set from the LLM Providers page via
 # AGENT_CONTEXT_MODE env):
@@ -581,7 +582,7 @@ If any of these errors occur, emit a CAPABILITY_REQUEST and **STOP immediately**
 
 Format — always include the package type prefix (`pip/`, `npm/`, `apt/`, or `auto/`):
 ```
-CAPABILITY_REQUEST:tool_install:<type>/<package_name>:<detailed reason why this package is needed>
+CAPABILITY_REQUEST:tool_install:pip/fastapi:<detailed reason why this package is needed>
 ```
 
 Where `<type>` is one of:
@@ -634,6 +635,7 @@ The system will build a deployment image and the user can start/stop it.
 - Runtime: {IMAGE_TYPE}
 - Workspace: `/workspace` (files here are collected as deliverables)
 - Deliverables: {('write final outputs to your node deliverables directory (e.g. /workspace/<node_id>/, given in the task prompt); intermediates/raw fetched HTML to /tmp or /workspace/.cache/' if DELIVERABLES_REQUIRED else 'in-place modification: deliverables are NOT required; edit the target files in /workspace in place, run the specified tests, and report the exact result. Do NOT create a node deliverables directory.')}
+- Long commands: `exec` accepts `timeout_seconds` (default 60, max 900). Use 900 for a full test suite or long build; do not use background jobs for CPU-bound work.
 """
 
     with open(os.path.join(workspace, "AGENTS.md"), "w") as f:
@@ -699,6 +701,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to execute"},
+                    "timeout_seconds": {"type": "integer", "description": "Optional timeout for this command (default 60, max 900). Use 900 for full test suites or long builds."},
                 },
                 "required": ["command"],
             },
@@ -741,6 +744,7 @@ TOOLS = [
 
 def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
     """Execute a tool call and return the result as a string."""
+    exec_timeout = TOOL_TIMEOUT
     try:
         if name == "write":
             path = arguments["path"]
@@ -762,6 +766,11 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
 
         elif name == "exec":
             command = arguments["command"]
+            try:
+                requested_timeout = int(arguments.get("timeout_seconds", TOOL_TIMEOUT))
+            except (TypeError, ValueError):
+                requested_timeout = TOOL_TIMEOUT
+            exec_timeout = max(10, min(MAX_TOOL_TIMEOUT, requested_timeout))
             # Launch in a new session so we can kill the entire process tree
             # (prevents orphaned grandchildren like servers from hanging)
             proc = subprocess.Popen(
@@ -774,7 +783,7 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
                 start_new_session=True,
             )
             try:
-                stdout, stderr = proc.communicate(timeout=TOOL_TIMEOUT)
+                stdout, stderr = proc.communicate(timeout=exec_timeout)
             except subprocess.TimeoutExpired:
                 _kill_tree(proc)
                 stdout, stderr = proc.communicate(timeout=5)
@@ -784,7 +793,7 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
                 if stderr:
                     output += ("\n" if output else "") + stderr
                 return (output[:49000] +
-                        f"\nERROR: Command timed out after {TOOL_TIMEOUT}s"
+                        f"\nERROR: Command timed out after {exec_timeout}s"
                         " (process tree killed)")
             finally:
                 # Always clean up any lingering children
@@ -863,7 +872,7 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             return f"ERROR: Unknown tool '{name}'"
 
     except subprocess.TimeoutExpired:
-        return f"ERROR: Command timed out after {TOOL_TIMEOUT}s"
+        return f"ERROR: Command timed out after {exec_timeout}s"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -897,9 +906,9 @@ def build_system_prompt() -> str:
             "You have these tools: write, read, exec, edit, wait.",
             "- write: Create/overwrite a file",
             "- read: Read a file's content",
-            "- exec: Run a shell command (use to test your code!)",
+            "- exec: Run a shell command (use to test your code!). Pass timeout_seconds for long suites/builds (default 60, max 900); use 900 for a full test suite.",
             "- edit: Replace a string in a file",
-            "- wait: Block until a shell condition is true (use for long external jobs, e.g. async indexing/search). No LLM turns are spent while waiting.",
+            "- wait: Block until a shell condition is true (use for long external jobs, e.g. async indexing/search). No LLM turns are spent while waiting. Do NOT use background jobs for CPU-bound work; use exec timeout_seconds instead.",
             "",
             "IMPORTANT RULES:",
             "1. Always write code to /workspace",
@@ -907,7 +916,7 @@ def build_system_prompt() -> str:
             "3. If the skill instructions include a complete, ready-to-run script, COPY it into "
             + ("your deliverables directory" if DELIVERABLES_REQUIRED else "the target app location in /workspace")
             + " and EXECUTE it. Only modify it if it errors or the deliverable is wrong — do NOT rewrite or re-derive a working script from scratch; re-discovering what the skill already encodes is wasteful.",
-            "4. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:<type>/<pkg>:<reason> and STOP (type is pip, npm, apt, or auto)",
+            "4. If you get ModuleNotFoundError, 'command not found', or 'error while loading shared libraries', emit: CAPABILITY_REQUEST:tool_install:pip/fastapi:<reason> and STOP (type is pip, npm, apt, or auto; use actual package names and never copy the angle-bracket placeholders)",
             "5. For web apps, emit: DEPLOYMENT_REQUEST:<name>:<port>:<entrypoint>",
             "6. Do NOT try pip install or apt-get — they will fail",
             "",
@@ -972,17 +981,55 @@ def _normalised_lines(text: str) -> List[str]:
     return [line.strip().strip("`*_ ").strip() for line in normalised.splitlines()]
 
 
+_CAPABILITY_PACKAGE_RE = re.compile(r"[A-Za-z0-9@][A-Za-z0-9._+@/=-]*")
+
+
+def _valid_capability_resource(resource: str) -> bool:
+    """Reject prompt placeholders and malformed package references."""
+    for raw_pkg in (resource or "").split(","):
+        pkg = raw_pkg.strip()
+        if not pkg or "<" in pkg or ">" in pkg:
+            return False
+        lowered = pkg.lower()
+        if lowered in ("type/pkg", "type/package", "package_name", "pkg", "reason"):
+            return False
+        if "/" in pkg:
+            prefix, _, name = pkg.partition("/")
+            if prefix.strip().lower() not in ("pip", "npm", "apt", "auto"):
+                return False
+        else:
+            name = pkg
+        if not _CAPABILITY_PACKAGE_RE.fullmatch(name.strip()):
+            return False
+    return True
+
+
+def _capability_marker_line(text: str, valid: bool = True) -> bool:
+    for line in _normalised_lines(text):
+        if not line.startswith("CAPABILITY_REQUEST:"):
+            continue
+        match = re.match(r"CAPABILITY_REQUEST:\w+:([^:]+):.+", line)
+        if not match:
+            continue
+        is_valid = _valid_capability_resource(match.group(1).strip())
+        if is_valid == valid:
+            return True
+    return False
+
+
 def _has_capability_marker(text: str) -> bool:
     """True only for a real, line-anchored CAPABILITY_REQUEST marker.
 
     Prose such as "I should emit CAPABILITY_REQUEST:pip/flask and stop" must not
     terminate the agent loop: doing so produced a completed task with no
-    deliverables and capability_requested=false.
+    deliverables and capability_requested=false. Literal prompt placeholders
+    such as ``<type>/<pkg>`` are also rejected.
     """
-    for line in _normalised_lines(text):
-        if line.startswith("CAPABILITY_REQUEST:"):
-            return bool(re.match(r"CAPABILITY_REQUEST:\w+:[^:]+:.+", line))
-    return False
+    return _capability_marker_line(text, valid=True)
+
+
+def _has_invalid_capability_marker(text: str) -> bool:
+    return _capability_marker_line(text, valid=False)
 
 
 def _has_deployment_marker(text: str) -> bool:
@@ -1090,10 +1137,24 @@ def invoke_native_agent(prompt: str) -> Tuple[str, int, str]:
                     assistant_text_parts.append(content)
 
                     # Check for capability/deployment markers in text. Only a
-                    # line-anchored, fully-formed marker may stop the loop.
-                    if _has_capability_marker(content) or _has_deployment_marker(content):
-                        print(f"   ⚡ Marker detected in assistant text, stopping loop")
+                    # line-anchored, valid marker may stop the loop.
+                    if _has_deployment_marker(content):
+                        print(f"   ⚡ Deployment marker detected in assistant text, stopping loop")
                         break
+                    if _has_capability_marker(content):
+                        print(f"   ⚡ Capability marker detected in assistant text, stopping loop")
+                        break
+                    if _has_invalid_capability_marker(content):
+                        print(f"   ⚠ Invalid CAPABILITY_REQUEST marker; asking agent to correct it")
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Invalid CAPABILITY_REQUEST. Use the actual package manager/package "
+                                "names, for example CAPABILITY_REQUEST:tool_install:pip/fastapi:"
+                                "<reason>. Do not copy the template placeholders <type>/<pkg>."
+                            ),
+                        })
+                        continue
 
                 # Handle tool calls
                 tool_calls = message.get("tool_calls", [])
@@ -1239,7 +1300,7 @@ def parse_capability_request(output: str) -> Optional[Tuple[str, List[str], str]
         if not m:
             continue
         packages_raw = m.group(2).strip()
-        if re.fullmatch(r"<[^>]+>", packages_raw):
+        if not _valid_capability_resource(packages_raw):
             continue
         cap_type_found = m.group(1)
         for p in packages_raw.split(","):

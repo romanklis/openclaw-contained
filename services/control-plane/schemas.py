@@ -586,6 +586,15 @@ class DAGManualCreate(BaseModel):
     project_id: Optional[str] = None
 
 
+class DAGPlanRequest(BaseModel):
+    objective: str
+    planning_model: str
+    base_image: Optional[str] = None
+    skill_ids: Optional[List[str]] = None
+    agent_model: Optional[str] = None
+    attachments: List[Dict[str, Any]] = []
+
+
 class TemplateParam(BaseModel):
     """An input parameter of a locked DAG template (the function signature)."""
     key: str
@@ -655,6 +664,10 @@ class DAGResponse(BaseModel):
     workflow_group_id: Optional[str] = None
     exploration_session_id: Optional[str] = None
     exploration_cycle: Optional[int] = None
+    promoted_from_session_id: Optional[str] = None
+    promoted_from_cycle_id: Optional[str] = None
+    promoted_from_dag_id: Optional[str] = None
+    promoted_at: Optional[datetime] = None
     archived: bool = False
     project_id: Optional[str] = None
 

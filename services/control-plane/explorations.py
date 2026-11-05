@@ -29,7 +29,7 @@ from models import (
     WorkflowGroup,
 )
 from planner import plan_dag
-from workflow_groups import ensure_workflow_group
+from workflow_groups import ensure_workflow_group, resolve_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -446,8 +446,7 @@ async def create_exploration_session(
 ) -> tuple[ExplorationSession, MasterDAG, ExplorationCycle]:
     thinking_budget = normalize_thinking_budget(thinking_budget)
     quality_budget = normalize_quality_budget(quality_budget)
-    if project_id == "__general__":
-        project_id = None
+    project_id = await resolve_project_id(project_id, db)
     group = await ensure_workflow_group(
         objective,
         project_id,
