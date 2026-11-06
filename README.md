@@ -532,6 +532,26 @@ change when WSL restarts.
 
 ---
 
+## Testing
+
+The deterministic key-flow suite covers exploration creation, locking a DAG as
+a parameterized template, workflow-group usage/history, template instantiation,
+task-to-Block promotion, and Block-node composition. It runs against a
+disposable `openclaw_test` Postgres database and mocks the planner/LLM edges.
+
+```bash
+make test-key-flows
+```
+
+The optional live smoke exercises a deterministic Block and the lock/template
+path through the real worker and Temporal stack. It uses no LLM:
+
+```bash
+make smoke-block
+```
+
+---
+
 ## Author
 
 **Roman Pawel Klis, Dr. sc. ETH Zurich**

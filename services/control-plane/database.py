@@ -1,6 +1,7 @@
 """
 Database connection and session management
 """
+import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from config import settings
@@ -9,7 +10,7 @@ from models import Base
 # Create async engine
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=True,
+    echo=os.getenv("SQLALCHEMY_ECHO", "1").lower() in ("1", "true", "yes"),
     future=True
 )
 
