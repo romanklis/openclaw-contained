@@ -9,17 +9,28 @@ skills and agent images **under a project namespace** so examples stay isolated.
 
 ```
 examples/
-├── _shared/example.sh       # example tooling (up/down/status/list)
-├── banking-architecture/    # bank landscape showcase (mock bank API → approved report)
-└── docling-rag/             # external RAG tool showcase (PDF ingest → search → approved report)
+├── _shared/example.sh           # example tooling (up/down/status/list)
+├── banking-architecture/        # bank landscape showcase (mock bank API → approved report)
+├── docling-rag/                 # external RAG tool showcase (PDF ingest → search → approved report)
+├── dropbox-upload/              # credentialed web upload showcase
+├── google-photos-album/         # browser + CDN download showcase
+└── github-programming-push/     # build a tested CLI and push it to GitHub
 ```
+
+## Showcases
+
+- [Docling RAG](docling-rag/README.md)
+- [Banking Architecture](banking-architecture/README.md)
+- [GitHub Programming & Push](github-programming-push/README.md) — an agent
+  writes and tests a Python CLI, pushes it to GitHub with a task-scoped token,
+  and verifies the remote tree.
 
 ## Per-example structure
 
 ```
 examples/<name>/
 ├── example.yaml            # manifest: name, description, infra, dags, skills, seed
-├── docker-compose.yml      # EXTRA infrastructure only (joins the platform network)
+├── docker-compose.yml      # OPTIONAL extra infrastructure (joins the platform network)
 ├── infra/                  # infra source: mock services, Dockerfiles, sql
 ├── config/
 │   ├── dags/               # dag_json files → locked DAG templates
@@ -42,6 +53,10 @@ make example-up NAME=banking-architecture
 # tear down only the example infra (platform stays up)
 make example-down NAME=banking-architecture
 ```
+
+Examples without a `docker-compose.yml` (for example
+`github-programming-push`) skip the infrastructure step and only import their
+DAG templates and skills.
 
 ## Example manifest (`example.yaml`)
 

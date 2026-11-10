@@ -1,11 +1,11 @@
 /**
  * Centralized API base URL.
  *
- * Uses the NEXT_PUBLIC_API_URL environment variable when set (e.g. in
- * docker-compose) and falls back to localhost:8000 for local development.
+ * Defaults to the same origin so the Next.js server can proxy /api/* to the
+ * control plane. Set NEXT_PUBLIC_API_URL only when a direct cross-origin API
+ * URL is explicitly required.
  */
-export const API =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export const API = process.env.NEXT_PUBLIC_API_URL || "";
 
 /**
  * API Gateway base URL.

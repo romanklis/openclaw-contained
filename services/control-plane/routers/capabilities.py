@@ -9,6 +9,7 @@ from datetime import datetime
 import uuid
 import logging
 import os
+import re
 
 from temporalio.client import Client
 
@@ -25,6 +26,27 @@ from schemas import (
 router = APIRouter()
 
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal:7233")
+
+_CAPABILITY_PACKAGE_RE = re.compile(r"[A-Za-z0-9@][A-Za-z0-9._+@/=-]*")
+
+
+def _valid_capability_resource(resource: str) -> bool:
+    """Reject prompt placeholders before they can create an image build."""
+    for raw_pkg in (resource or "").split(","):
+        pkg = raw_pkg.strip()
+        if not pkg or "<" in pkg or ">" in pkg:
+            return False
+        if pkg.lower() in ("type/pkg", "type/package", "package_name", "pkg", "reason"):
+            return False
+        if "/" in pkg:
+            prefix, _, name = pkg.partition("/")
+            if prefix.strip().lower() not in ("pip", "npm", "apt", "auto"):
+                return False
+        else:
+            name = pkg
+        if not _CAPABILITY_PACKAGE_RE.fullmatch(name.strip()):
+            return False
+    return True
 
 
 async def get_temporal_client():
@@ -113,7 +135,16 @@ async def create_capability_request(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Task {request_data.task_id} not found"
         )
-    
+
+    if not _valid_capability_resource(request_data.resource_name):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Invalid capability resource. Use actual package names such as "
+                "pip/fastapi, not template placeholders like <type>/<pkg>."
+            ),
+        )
+
     # Create request
     capability_request = CapabilityRequest(
         task_id=request_data.task_id,
@@ -295,28 +326,57 @@ async def review_capability_request(
         siblings = siblings_result.scalars().all()
         for sibling in siblings:
             try:
-                # Create a matching capability request for each sibling
-                # so their AgentTaskWorkflow can find it
-                sib_cap = CapabilityRequest(
-                    task_id=sibling.id,
-                    capability_type=capability_request.capability_type,
-                    resource_name=capability_request.resource_name,
-                    justification=f"Propagated from sibling {task.id}: {capability_request.justification}",
-                    details=capability_request.details,
-                    status=RequestStatus.APPROVED,
-                    reviewed_at=datetime.utcnow(),
-                    decided_at=datetime.utcnow(),
-                    reviewed_by="system (task-force-propagation)",
-                    decision_notes=f"Auto-approved: same Task Force as {task.id}",
+                # Prefer the sibling's own pending request: that is the id its
+                # AgentTaskWorkflow is actually waiting on. Creating a second
+                # approved row would not wake a workflow blocked in
+                # wait_condition for its existing request.
+                pending_sib_resp = await db.execute(
+                    select(CapabilityRequest)
+                    .where(
+                        CapabilityRequest.task_id == sibling.id,
+                        CapabilityRequest.status == RequestStatus.PENDING,
+                    )
+                    .order_by(CapabilityRequest.requested_at.desc())
+                    .limit(1)
                 )
-                db.add(sib_cap)
+                sib_cap = pending_sib_resp.scalars().first()
+                if sib_cap and (sib_cap.resource_name or "") != (
+                    capability_request.resource_name or ""
+                ):
+                    # Do not approve an unrelated pending request just because
+                    # it belongs to a sibling task.
+                    sib_cap = None
+                if sib_cap:
+                    sib_cap.status = RequestStatus.APPROVED
+                    sib_cap.reviewed_at = datetime.utcnow()
+                    sib_cap.decided_at = sib_cap.reviewed_at
+                    sib_cap.reviewed_by = "system (task-force-propagation)"
+                    sib_cap.decision_notes = f"Auto-approved: same Task Force as {task.id}"
+                else:
+                    sib_cap = CapabilityRequest(
+                        task_id=sibling.id,
+                        capability_type=capability_request.capability_type,
+                        resource_name=capability_request.resource_name,
+                        justification=f"Propagated from sibling {task.id}: {capability_request.justification}",
+                        details=capability_request.details,
+                        status=RequestStatus.APPROVED,
+                        reviewed_at=datetime.utcnow(),
+                        decided_at=datetime.utcnow(),
+                        reviewed_by="system (task-force-propagation)",
+                        decision_notes=f"Auto-approved: same Task Force as {task.id}",
+                    )
+                    db.add(sib_cap)
+                await db.flush()
 
                 if sibling.workflow_id:
                     sib_handle = temporal_client.get_workflow_handle(sibling.workflow_id)
-                    await sib_handle.signal("approve_capability", True)
+                    await sib_handle.signal(
+                        "approve_capability_for",
+                        {"capability_request_id": sib_cap.id, "approved": True},
+                    )
                     logger.info(
                         f"Propagated cap approval to sibling {sibling.id} "
-                        f"(workflow {sibling.workflow_id})"
+                        f"(workflow {sibling.workflow_id}, request {sib_cap.id})"
                     )
             except Exception as sib_err:
                 logger.warning(

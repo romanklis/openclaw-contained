@@ -4,7 +4,7 @@
 .PHONY: help up down build restart stop logs logs-service ps health clean \
 		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 build-banking build-ann2snn catalog-sync seed-images build-all-images \
 		docker-clean-dag docker-clean-dag-dry-run dind-images dind-clean dind-prune \
-		examples example-up example-down test-ollama set-ollama-url
+		examples example-up example-down test-ollama set-ollama-url test-key-flows smoke-block
 
 MODEL ?= kev:0.8b-q8_0
 
@@ -69,6 +69,12 @@ restart: ## Restart all services
 
 build: ## Build all service Docker images (control-plane, image-builder, worker, frontend)
 	docker-compose build
+
+test-key-flows: ## Run deterministic key-flow API/DB tests
+	@bash scripts/test-key-flows.sh
+
+smoke-block: ## Live LLM-free block + template smoke test
+	@python3 scripts/smoke-block-dag.py
 
 test-ollama: ## Detect and verify a reachable Ollama (WSL2/Windows-aware)
 	@bash scripts/test-ollama-connection.sh --model $(MODEL)

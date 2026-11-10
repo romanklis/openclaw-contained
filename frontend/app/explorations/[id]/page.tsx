@@ -28,6 +28,7 @@ import {
   budgetLabel,
   explorationStatus,
   type DeployableApp,
+  type ExplorationCycle,
   type ExplorationDetail,
   type ExplorationMessage,
   type ExplorationRequest,
@@ -69,6 +70,13 @@ export default function ExplorationChatPage() {
   const [fileEntries, setFileEntries] = useState<{ path: string; size: number }[]>([])
   const [deployables, setDeployables] = useState<DeployableApp[]>([])
   const [deployCandidate, setDeployCandidate] = useState<DeployableApp | null>(null)
+  const [promoteCycle, setPromoteCycle] = useState<ExplorationCycle | null>(null)
+  const [promoteTitle, setPromoteTitle] = useState('')
+  const [promoteProject, setPromoteProject] = useState('')
+  const [promoteWorkspaceMode, setPromoteWorkspaceMode] = useState<'continue' | 'fresh'>('continue')
+  const [promoteAutoStart, setPromoteAutoStart] = useState(false)
+  const [promoting, setPromoting] = useState(false)
+  const [promoteError, setPromoteError] = useState<string | null>(null)
   const [tokenTotal, setTokenTotal] = useState<number | null>(null)
   const treeCache = useRef<Map<string, any[]>>(new Map())
   const dagOrderCache = useRef<Map<string, string[]>>(new Map())
@@ -323,12 +331,66 @@ export default function ExplorationChatPage() {
     if (!window.confirm('Finish this exploration? No further cycles will be planned.')) return
     try {
       const res = await fetch(`${API}/api/explorations/${session.id}/finish`, { method: 'POST' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any)?.detail || `HTTP ${res.status}`)
       await load(false)
       await loadSessions()
-      setCommandNotice('Exploration finished and locked.')
+      const deployment = (data as any)?.deployments?.[0]
+      if (deployment) {
+        setCommandNotice(
+          deployment.error
+            ? `Deployment failed: ${deployment.error}`
+            : `Deployment ${deployment.status}${deployment.url ? ` at ${deployment.url}` : ' (building…)'}`
+        )
+      } else {
+        setCommandNotice('Exploration finished and locked.')
+      }
     } catch (err: any) {
       setError(err.message)
+    }
+  }
+
+  const openPromote = (cycle: ExplorationCycle) => {
+    if (!session) return
+    setPromoteCycle(cycle)
+    setPromoteTitle(`${session.title} — Experiment ${cycle.cycle_number}`)
+    setPromoteProject(session.project_id || '')
+    setPromoteWorkspaceMode('continue')
+    setPromoteAutoStart(false)
+    setPromoteError(null)
+  }
+
+  const submitPromote = async () => {
+    if (!session || !promoteCycle) return
+    setPromoting(true)
+    setPromoteError(null)
+    try {
+      const res = await fetch(
+        `${API}/api/explorations/${session.id}/cycles/${promoteCycle.id}/promote`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: promoteTitle.trim() || null,
+            project_id: promoteProject.trim() || null,
+            workspace_mode: promoteWorkspaceMode,
+            auto_start: promoteAutoStart,
+            force: false,
+          }),
+        },
+      )
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any)?.detail || `HTTP ${res.status}`)
+      await load(false)
+      setPromoteCycle(null)
+      setCommandNotice(
+        `Experiment ${data.dag_id} created${data.workflow_group_title ? ` (${data.workflow_group_title})` : ''}.`,
+      )
+      window.location.href = `/dags/${data.dag_id}`
+    } catch (err: any) {
+      setPromoteError(err.message)
+    } finally {
+      setPromoting(false)
     }
   }
 
@@ -820,6 +882,7 @@ export default function ExplorationChatPage() {
                   if (item.type === 'message') return renderMessage(item.message)
                   if (item.type === 'cycle') {
                     const meta = item.message.metadata || {}
+                    const cycle = detail.cycles.find((entry) => entry.cycle_number === item.number)
                     return (
                       <CycleCard
                         key={item.message.id}
@@ -831,6 +894,8 @@ export default function ExplorationChatPage() {
                         onPreview={openPreview}
                         onRetry={retryCycle}
                         onFinish={finish}
+                        onPromote={cycle ? () => openPromote(cycle) : undefined}
+                        promotedDagId={cycle?.promoted_dag_id || null}
                         sessionStatus={session.status}
                         deployable={deployables.find((candidate) => candidate.cycle_number === item.number) || null}
                         onDeploy={(candidate) => setDeployCandidate(candidate)}
@@ -872,6 +937,15 @@ export default function ExplorationChatPage() {
                     <button onClick={focusComposer} className="rounded border border-gray-700 px-2 py-0.5 text-gray-300 hover:border-gray-500">
                       ↔ Give feedback
                     </button>
+                    {latestCycle.promoted_dag_id ? (
+                      <Link href={`/dags/${latestCycle.promoted_dag_id}`} className="rounded border border-emerald-700/40 px-2 py-0.5 text-emerald-300 hover:border-emerald-500">
+                        🧪 Promoted experiment
+                      </Link>
+                    ) : latestCycle.status === 'completed' ? (
+                      <button onClick={() => openPromote(latestCycle)} className="rounded border border-indigo-700/50 px-2 py-0.5 text-indigo-300 hover:border-indigo-500">
+                        🧪 Promote to experiment
+                      </button>
+                    ) : null}
                   </div>
                 )}
                 {streamingText && (
@@ -901,6 +975,106 @@ export default function ExplorationChatPage() {
           onClose={() => { setDeployCandidate(null); void fetchDeployables() }}
           onDeployed={() => { void fetchDeployables() }}
         />
+      )}
+
+      {promoteCycle && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={() => !promoting && setPromoteCycle(null)}>
+          <div className="w-full max-w-lg rounded-xl border border-gray-700 bg-[#111218] p-5 shadow-2xl" onClick={(event) => event.stopPropagation()}>
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-white">Promote cycle {promoteCycle.cycle_number} to experiment</h2>
+                <p className="mt-1 text-[11px] text-gray-500">
+                  Creates a new experiment workflow group. The exploration cycle is not modified.
+                </p>
+              </div>
+              <button onClick={() => setPromoteCycle(null)} disabled={promoting} className="text-gray-500 hover:text-gray-300">✕</button>
+            </div>
+
+            <div className="space-y-3">
+              <label className="block">
+                <span className="text-[11px] text-gray-400">Experiment title</span>
+                <input
+                  className="mt-1 w-full rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-sm text-white"
+                  value={promoteTitle}
+                  onChange={(event) => setPromoteTitle(event.target.value)}
+                />
+              </label>
+              <label className="block">
+                <span className="text-[11px] text-gray-400">Project (optional)</span>
+                <input
+                  className="mt-1 w-full rounded border border-gray-700 bg-gray-900 px-2 py-1.5 text-sm text-white"
+                  value={promoteProject}
+                  onChange={(event) => setPromoteProject(event.target.value)}
+                  placeholder="__general__"
+                />
+              </label>
+
+              <div>
+                <div className="text-[11px] text-gray-400">Workspace and image</div>
+                <label className="mt-2 flex cursor-pointer items-start gap-2 rounded border border-gray-800 p-2">
+                  <input
+                    type="radio"
+                    checked={promoteWorkspaceMode === 'continue'}
+                    onChange={() => setPromoteWorkspaceMode('continue')}
+                    className="mt-0.5"
+                  />
+                  <span className="text-[11px] text-gray-300">
+                    <span className="font-medium text-white">Continue from this cycle</span>
+                    <span className="block text-gray-500">
+                      Reuses the cycle workspace and last built image. Files and installed packages are preserved.
+                    </span>
+                  </span>
+                </label>
+                <label className="mt-2 flex cursor-pointer items-start gap-2 rounded border border-gray-800 p-2">
+                  <input
+                    type="radio"
+                    checked={promoteWorkspaceMode === 'fresh'}
+                    onChange={() => setPromoteWorkspaceMode('fresh')}
+                    className="mt-0.5"
+                  />
+                  <span className="text-[11px] text-gray-300">
+                    <span className="font-medium text-white">Fresh workspace</span>
+                    <span className="block text-gray-500">
+                      Starts with an empty workspace. The image and node configuration are preserved; attachments are copied.
+                    </span>
+                  </span>
+                </label>
+              </div>
+
+              <label className="flex items-center gap-2 text-[11px] text-gray-300">
+                <input
+                  type="checkbox"
+                  checked={promoteAutoStart}
+                  onChange={(event) => setPromoteAutoStart(event.target.checked)}
+                />
+                Start the experiment immediately
+              </label>
+
+              {promoteError && (
+                <div className="rounded border border-red-800/50 bg-red-950/20 px-2 py-1.5 text-[11px] text-red-300">
+                  {promoteError}
+                </div>
+              )}
+            </div>
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                onClick={() => setPromoteCycle(null)}
+                disabled={promoting}
+                className="rounded border border-gray-700 px-3 py-1.5 text-xs text-gray-300 hover:border-gray-500"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={submitPromote}
+                disabled={promoting}
+                className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-50"
+              >
+                {promoting ? 'Creating…' : 'Create experiment'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {filesOpen && (

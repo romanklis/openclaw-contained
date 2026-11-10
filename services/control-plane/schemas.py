@@ -46,8 +46,14 @@ class TaskCreate(BaseModel):
 
     @property
     def effective_base_image_tag(self) -> str:
-        """Return the full registry image tag for the selected base image."""
-        key = self.base_image or "openclaw"
+        """Return the full registry image tag for the selected base image.
+
+        A full ref (e.g. an inherited capability or task image) is preserved;
+        a short key such as ``openclaw`` is expanded.
+        """
+        key = (self.base_image or "openclaw").strip()
+        if "/" in key and ":" in key:
+            return key
         return f"localhost:5000/openclaw-agent:{key}"
 
 
@@ -190,6 +196,10 @@ class TaskOutputCreate(BaseModel):
     llm_response_preview: Optional[str] = None
     model_used: Optional[str] = None
     image_used: Optional[str] = None
+    image_digest: Optional[str] = None
+    image_version_id: Optional[str] = None
+    build_id: Optional[str] = None
+    capability_request_id: Optional[int] = None
     duration_ms: Optional[int] = None
     turn_count: Optional[int] = 0
     started_at: Optional[datetime] = None
@@ -215,6 +225,10 @@ class TaskOutputResponse(BaseModel):
     llm_response_preview: Optional[str]
     model_used: Optional[str]
     image_used: Optional[str]
+    image_digest: Optional[str] = None
+    image_version_id: Optional[str] = None
+    build_id: Optional[str] = None
+    capability_request_id: Optional[int] = None
     duration_ms: Optional[int]
     turn_count: Optional[int] = 0
     started_at: Optional[datetime] = None
@@ -572,6 +586,15 @@ class DAGManualCreate(BaseModel):
     project_id: Optional[str] = None
 
 
+class DAGPlanRequest(BaseModel):
+    objective: str
+    planning_model: str
+    base_image: Optional[str] = None
+    skill_ids: Optional[List[str]] = None
+    agent_model: Optional[str] = None
+    attachments: List[Dict[str, Any]] = []
+
+
 class TemplateParam(BaseModel):
     """An input parameter of a locked DAG template (the function signature)."""
     key: str
@@ -641,6 +664,10 @@ class DAGResponse(BaseModel):
     workflow_group_id: Optional[str] = None
     exploration_session_id: Optional[str] = None
     exploration_cycle: Optional[int] = None
+    promoted_from_session_id: Optional[str] = None
+    promoted_from_cycle_id: Optional[str] = None
+    promoted_from_dag_id: Optional[str] = None
+    promoted_at: Optional[datetime] = None
     archived: bool = False
     project_id: Optional[str] = None
 

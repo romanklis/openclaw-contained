@@ -23,7 +23,7 @@ secure secret store.
 ```json
 {
   "name": "example-basic",
-  "kind": "basic | form | bearer | header | cookie",
+  "kind": "basic | form | bearer | header | cookie | imap",
   "username": "…",            // form/basic
   "password": "…",            // form/basic
   "token": "…",               // bearer
@@ -52,3 +52,32 @@ unless listed.
 For the OpenBao backend (see `.env.example` `OPENBAO_ENABLED`), store each
 credential in KV v2 at `secret/data/credentials/<name>` with the same top-level
 fields.
+
+## Read-only IMAP mailbox
+
+Agents can read a dedicated mailbox through the credential gateway. The password
+stays in OpenBao; the agent only references the credential name. Use a dedicated
+service mailbox and an app password, never a personal account password.
+
+```json
+{
+  "name": "taskforge-mail",
+  "kind": "imap",
+  "host": "mail.company.com",
+  "port": 993,
+  "tls": true,
+  "username": "taskforge@company.com",
+  "password": "…",
+  "allowed_folders": ["INBOX"],
+  "max_messages": 50,
+  "max_body_bytes": 2097152,
+  "max_attachment_bytes": 10485760,
+  "preapproved_operations": ["READ"]
+}
+```
+
+`preapproved_operations: ["READ"]` skips per-task approval prompts for this
+dedicated, read-only mailbox; every access is still audited. Remove it to require
+human approval on the Approvals page. The connector never sends, deletes, moves,
+copies, or marks messages as read (`select(..., readonly=True)` and
+`BODY.PEEK[...]`).

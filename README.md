@@ -300,6 +300,7 @@ Every agent image build automatically generates an SBOM in both **SPDX JSON** an
 | **docker-dind** | 9100-9120 | Docker-in-Docker for agent and deployment containers |
 | **registry** | *(internal)* | Docker Registry v2 for built agent images |
 | **api-gateway** | 8080 | OpenAI-compatible chat completions gateway (SSE streaming) |
+| **sandbox** | 8090 | Agent build/run/test sandbox on a dedicated Docker host (jobs + service gateway) |
 | **open-webui** | 3001 | Chat UI wired to the API Gateway |
 | **redis** | *(internal)* | Session store for API Gateway |
 
@@ -366,9 +367,8 @@ Configure providers via the UI at http://localhost:3000/llm-providers or via env
 ## Examples & Showcases
 
 Self-contained, project-scoped showcases live under [`examples/`](examples/README.md).
-Each brings up its own infrastructure on the platform network and imports its DAG
-templates, skills and seed data under a project namespace, without touching core
-files:
+Each imports its DAG templates, skills and optional infrastructure under a
+project namespace, without touching core files:
 
 - **[Docling RAG](examples/docling-rag/README.md)** — TaskForge drives an *external*
   RAG service end-to-end: a PDF served by `sample-docs` is ingested and indexed by
@@ -378,6 +378,10 @@ files:
   (draw.io, two pages: system architecture + swimlane RAG workflow).
 - **[Banking Architecture](examples/banking-architecture/README.md)** — agents query
   a mock bank API/database and produce an approved account/transaction report.
+- **[GitHub Programming & Push](examples/github-programming-push/README.md)** — an
+  agent builds and tests a Python CLI, then commits and pushes it to GitHub with
+  a repo-scoped, task-scoped token. Includes frontend and CLI token setup and
+  verifies the remote tree without exposing the credential.
 
 ```bash
 make examples                    # list all examples
@@ -415,6 +419,7 @@ services/
 ├── image-builder/      # Docker image builder + supply-chain validation + SBOM
 ├── temporal-worker/    # Temporal workflows & activities
 ├── api-gateway/        # OpenAI-compatible gateway + agent profiles
+├── sandbox/            # Agent-facing build/run/test sandbox (dedicated dind)
 └── agent-executor/     # Code that runs INSIDE agent containers
 
 frontend/               # Next.js 14 dashboard (6 routes)
@@ -524,6 +529,26 @@ When TaskForge runs in WSL2 and Ollama runs on the Windows host:
 `host.docker.internal` points at the WSL VM, not Windows, so it will not reach
 Ollama on the Windows host. Prefer the Windows LAN IP; the WSL gateway IP can
 change when WSL restarts.
+
+---
+
+## Testing
+
+The deterministic key-flow suite covers exploration creation, locking a DAG as
+a parameterized template, workflow-group usage/history, template instantiation,
+task-to-Block promotion, and Block-node composition. It runs against a
+disposable `openclaw_test` Postgres database and mocks the planner/LLM edges.
+
+```bash
+make test-key-flows
+```
+
+The optional live smoke exercises a deterministic Block and the lock/template
+path through the real worker and Temporal stack. It uses no LLM:
+
+```bash
+make smoke-block
+```
 
 ---
 

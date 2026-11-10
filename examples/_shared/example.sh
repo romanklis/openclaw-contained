@@ -55,8 +55,12 @@ case "$cmd" in
     name="${1:?NAME required}"
     dir="$EXAMPLES/$name"
     [ -f "$dir/example.yaml" ] || { echo "no example '$name'"; exit 1; }
-    echo "==> Starting infra for $name"
-    docker-compose -f "$dir/docker-compose.yml" up -d
+    if [ -f "$dir/docker-compose.yml" ]; then
+      echo "==> Starting infra for $name"
+      docker-compose -f "$dir/docker-compose.yml" up -d
+    else
+      echo "==> No extra infrastructure for $name"
+    fi
     # Build any example-specific agent images declared in example.yaml: build: [banking]
     builds=$(sed -n 's/^build: *\[\(.*\)\].*/\1/p' "$dir/example.yaml" | tr ',' ' ')
     for b in $builds; do
@@ -76,12 +80,20 @@ case "$cmd" in
   down)
     name="${1:?NAME required}"
     dir="$EXAMPLES/$name"
-    docker-compose -f "$dir/docker-compose.yml" down
+    if [ -f "$dir/docker-compose.yml" ]; then
+      docker-compose -f "$dir/docker-compose.yml" down
+    else
+      echo "==> No extra infrastructure for $name"
+    fi
     ;;
   status)
     name="${1:?NAME required}"
     dir="$EXAMPLES/$name"
-    docker-compose -f "$dir/docker-compose.yml" ps
+    if [ -f "$dir/docker-compose.yml" ]; then
+      docker-compose -f "$dir/docker-compose.yml" ps
+    else
+      echo "==> No extra infrastructure for $name"
+    fi
     ;;
   *) usage ;;
 esac

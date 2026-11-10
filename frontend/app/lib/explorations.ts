@@ -24,6 +24,8 @@ export interface ExplorationCycle {
   status: string
   feedback: string | null
   finalized_at: string | null
+  promoted_dag_id?: string | null
+  promoted_at?: string | null
   created_at: string | null
 }
 

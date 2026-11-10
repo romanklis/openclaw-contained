@@ -28,13 +28,27 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const [activeProject, setActiveProjectState] = useState<string>('')
 
   useEffect(() => {
+    let saved = ''
     try {
-      const saved = window.localStorage.getItem(STORAGE_KEY)
+      saved = window.localStorage.getItem(STORAGE_KEY) || ''
       if (saved) setActiveProjectState(saved)
     } catch { /* ignore */ }
     fetch(`${API}/api/projects`)
       .then((r) => r.json())
-      .then((data: Project[]) => setProjects(Array.isArray(data) ? data : []))
+      .then((data: Project[]) => {
+        const list = Array.isArray(data) ? data : []
+        setProjects(list)
+        if (
+          saved &&
+          saved !== '__general__' &&
+          !list.some((project) => project.id === saved)
+        ) {
+          setActiveProjectState('')
+          try {
+            window.localStorage.removeItem(STORAGE_KEY)
+          } catch { /* ignore */ }
+        }
+      })
       .catch(() => {})
   }, [])
 

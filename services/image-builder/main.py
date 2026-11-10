@@ -310,6 +310,8 @@ class BuildResponse(BaseModel):
     supply_chain_feedback: Optional[str] = None
     reused: Optional[bool] = None
     reused_from: Optional[str] = None
+    version_id: Optional[str] = None
+    digest: Optional[str] = None
 
 
 class BuildStatus(BaseModel):
@@ -1311,10 +1313,12 @@ async def build_image_task(
         logger.info(f"Pushing image to {registry_tag}")
         push_logs = docker_client.images.push(registry_tag)
         
-        # Update build status
+        # Update build status. Only a registry manifest digest is safe to pin
+        # with repo@sha256:...; image.id is an image-config id, not pullable.
+        registry_digest = await asyncio.to_thread(_registry_manifest_digest, registry_tag)
         builds[build_id].status = "success"
         builds[build_id].image_tag = registry_tag
-        builds[build_id].digest = image.id
+        builds[build_id].digest = registry_digest or ""
         
         logger.info(f"Build {build_id} completed successfully")
 
@@ -1471,6 +1475,38 @@ def _registry_ref(tag: str) -> str:
     return f"{REGISTRY_URL}/{tag}"
 
 
+def _registry_manifest_digest(registry_tag: str) -> str:
+    """Return the registry manifest digest for a pushed tag (or "")."""
+    ref = (registry_tag or "").strip()
+    if not ref:
+        return ""
+    if "://" in ref:
+        ref = ref.split("://", 1)[1]
+    registry = REGISTRY_URL.replace("http://", "").replace("https://", "").rstrip("/")
+    if ref.startswith(f"{registry}/"):
+        ref = ref[len(registry) + 1:]
+    if "/" not in ref or ":" not in ref.rsplit("/", 1)[-1]:
+        return ""
+    repo, tag = ref.rsplit(":", 1)
+    try:
+        resp = httpx.get(
+            f"http://{registry}/v2/{repo}/manifests/{tag}",
+            headers={
+                "Accept": (
+                    "application/vnd.docker.distribution.manifest.v2+json,"
+                    "application/vnd.oci.image.manifest.v1+json,"
+                    "application/vnd.docker.distribution.manifest.list.v2+json"
+                )
+            },
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.headers.get("Docker-Content-Digest", "") or ""
+    except Exception as exc:
+        logger.warning(f"Could not read registry digest for {ref}: {exc}")
+    return ""
+
+
 async def _resolve_catalog_capabilities(
     image_type: str,
     capabilities: List[BuildCapability],
@@ -1507,7 +1543,11 @@ async def _resolve_catalog_capabilities(
             resp.raise_for_status()
             return resp.json()
     except Exception as exc:
-        logger.warning(f"Catalog resolve unavailable — falling back to legacy build: {exc}")
+        logger.error(
+            "Catalog resolve unavailable for task %s — falling back to legacy build: %s",
+            task_id or "-",
+            exc,
+        )
         return None
 
 
@@ -1568,32 +1608,45 @@ async def build_catalog_image_task(
             builds[build_id].logs = "".join(log_output)
             image.tag(registry_tag)
             docker_client.images.push(registry_tag)
+            registry_digest = await asyncio.to_thread(_registry_manifest_digest, registry_tag)
             builds[build_id].status = "success"
             builds[build_id].image_tag = registry_tag
-            builds[build_id].digest = image.id
+            # Only a registry manifest digest is pullable as repo@sha256:...
+            builds[build_id].digest = registry_digest or ""
 
-        # Register capabilities from an SBOM; failure is non-fatal.
+        # Register capabilities from an SBOM; SBOM failure is non-fatal, but
+        # catalog registration failure is fatal: an unregistered build is
+        # invisible to reuse and must not be reported as usable.
         sbom = None
         try:
             sbom = await asyncio.to_thread(_generate_sbom_trivy, registry_tag, "cyclonedx")
         except Exception as sbom_err:
             logger.warning(f"Catalog SBOM generation failed (non-fatal): {sbom_err}")
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    f"{CONTROL_PLANE_URL}/api/image-catalog/versions/{version_id}/build-result",
-                    json={
-                        "image_digest": image.id,
-                        "image_tag": registry_tag,
-                        "sbom": sbom,
-                        "build_id": build_id,
-                        "logs": builds[build_id].logs or "",
-                    },
-                )
-                if resp.status_code >= 400:
-                    logger.warning(f"Catalog build-result failed: {resp.status_code} {resp.text[:300]}")
-        except Exception as reg_err:
-            logger.warning(f"Could not register catalog build result: {reg_err}")
+
+        last_reg_err = ""
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        f"{CONTROL_PLANE_URL}/api/image-catalog/versions/{version_id}/build-result",
+                        json={
+                            "image_digest": registry_digest or image.id,
+                            "image_tag": registry_tag,
+                            "sbom": sbom,
+                            "build_id": build_id,
+                            "logs": builds[build_id].logs or "",
+                        },
+                    )
+                    if resp.status_code < 400:
+                        last_reg_err = ""
+                        break
+                    last_reg_err = f"{resp.status_code} {resp.text[:300]}"
+            except Exception as reg_err:
+                last_reg_err = str(reg_err)
+            if attempt < 2:
+                await asyncio.sleep(2)
+        if last_reg_err:
+            raise RuntimeError(f"Catalog build-result registration failed: {last_reg_err}")
 
         logger.info(f"Catalog build {build_id} completed: {registry_tag}")
     except Exception as exc:
@@ -1753,6 +1806,7 @@ async def build_image(
         if catalog:
             if catalog.get("reused"):
                 reused_tag = _registry_ref(catalog.get("image_tag"))
+                reused_digest = await asyncio.to_thread(_registry_manifest_digest, reused_tag)
                 logger.info(
                     f"♻️ Reusing catalog image {reused_tag} for {request.task_id} "
                     f"(version={catalog.get('version_id')}, reason={catalog.get('reason')})"
@@ -1761,7 +1815,7 @@ async def build_image(
                     build_id=build_id,
                     status="success",
                     image_tag=reused_tag,
-                    digest=catalog.get("image_digest"),
+                    digest=reused_digest or "",
                     reused=True,
                 )
                 return BuildResponse(
@@ -1774,6 +1828,8 @@ async def build_image(
                     supply_chain_feedback=supply_chain_feedback if supply_chain_feedback else None,
                     reused=True,
                     reused_from=catalog.get("version_id"),
+                    version_id=catalog.get("version_id"),
+                    digest=reused_digest or "",
                 )
             if catalog.get("version_id"):
                 catalog_version = catalog.get("version") or "0"
@@ -1801,6 +1857,7 @@ async def build_image(
                     supply_chain_denied=supply_chain_denied,
                     supply_chain_feedback=supply_chain_feedback if supply_chain_feedback else None,
                     reused=False,
+                    version_id=catalog.get("version_id"),
                 )
 
     # Generate Dockerfile (with approved capabilities only)

@@ -203,11 +203,14 @@ services:
       - CONTROL_PLANE_URL=http://control-plane:8000
       - IMAGE_BUILDER_URL=http://openclaw-image-builder:8002
       - AGENT_IMAGES_DIR=/agent-images
+      - CREDENTIAL_GATEWAY_URL=${CREDENTIAL_GATEWAY_URL:-http://credential-gateway:8083}
+      - CREDENTIAL_GATEWAY_ADMIN_TOKEN=${CREDENTIAL_GATEWAY_ADMIN_TOKEN:-openclaw-admin}
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
       - AGENT_SANDBOX_MODE=${AGENT_SANDBOX_MODE:-insecure-dind}
+      - SANDBOX_URL=${SANDBOX_URL:-http://sandbox:8080}
       - RAG_TOOL_URL=${RAG_TOOL_URL:-http://docling-rag:8080}
       - RAG_API_KEY=${RAG_API_KEYS:-my-local-secret-key}
-      - MAX_CONCURRENT_ACTIVITIES=${MAX_CONCURRENT_ACTIVITIES:-4}
+      - MAX_CONCURRENT_ACTIVITIES=${MAX_CONCURRENT_ACTIVITIES:-12}
     depends_on:
       temporal:
         condition: service_healthy
@@ -234,8 +237,9 @@ services:
       dockerfile: Dockerfile
     container_name: openclaw-frontend
     environment:
-      - NEXT_PUBLIC_API_URL=${API_URL:-http://localhost:8000}
+      - NEXT_PUBLIC_API_URL=${API_URL:-}
       - NEXT_PUBLIC_API_GATEWAY_URL=${API_GATEWAY_URL:-http://localhost:8080}
+      - CONTROL_PLANE_INTERNAL_URL=${CONTROL_PLANE_INTERNAL_URL:-http://control-plane:8000}
     depends_on:
       - control-plane
     ports:
@@ -276,6 +280,13 @@ services:
       - DEFAULT_GRANT_MAX_REQUESTS=20
       - APPROVAL_WAIT_MAX=300
       - CREDENTIAL_GATEWAY_ADMIN_TOKEN=${CREDENTIAL_GATEWAY_ADMIN_TOKEN:-openclaw-admin}
+      - MAIL_GRANT_TTL_MIN=${MAIL_GRANT_TTL_MIN:-1440}
+      - MAIL_GRANT_MAX_REQUESTS=${MAIL_GRANT_MAX_REQUESTS:-500}
+      - MAIL_READ_TIMEOUT_SECONDS=${MAIL_READ_TIMEOUT_SECONDS:-20}
+      - MAIL_MAX_MESSAGES=${MAIL_MAX_MESSAGES:-50}
+      - MAIL_MAX_BODY_BYTES=${MAIL_MAX_BODY_BYTES:-2097152}
+      - MAIL_MAX_ATTACHMENT_BYTES=${MAIL_MAX_ATTACHMENT_BYTES:-10485760}
+      - MAIL_MAX_MESSAGE_BYTES=${MAIL_MAX_MESSAGE_BYTES:-26214400}
     volumes:
       - ./config/credentials:/data/credentials
     depends_on:
@@ -446,6 +457,51 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # =============================================================================
+  # AGENT SANDBOX — dedicated Docker host, isolated from the platform dind
+  # =============================================================================
+  sandbox-dind:
+    image: docker:27-dind
+    container_name: openclaw-sandbox-dind
+    privileged: true
+    environment:
+      - DOCKER_TLS_CERTDIR=
+    command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--tls=false", "--insecure-registry=registry:5000"]
+    volumes:
+      - sandbox-dind-data:/var/lib/docker
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
+  sandbox:
+    build:
+      context: ./services/sandbox
+      dockerfile: Dockerfile
+    container_name: openclaw-sandbox
+    environment:
+      - SANDBOX_DOCKER_HOST=tcp://sandbox-dind:2375
+      - SANDBOX_DIND_HOST=sandbox-dind
+      - CONTROL_PLANE_URL=http://control-plane:8000
+      - SANDBOX_ADMIN_TOKEN=${SANDBOX_ADMIN_TOKEN:-sandbox-admin}
+      - SANDBOX_PUBLIC_URL=${SANDBOX_PUBLIC_URL:-http://localhost:8090}
+      - SANDBOX_DATA_DIR=/data
+      - SANDBOX_MAX_JOBS=${SANDBOX_MAX_JOBS:-2}
+    volumes:
+      - sandbox-data:/data
+    ports:
+      - "8090:8080"
+    depends_on:
+      - sandbox-dind
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/v1/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - openclaw-network
+    restart: unless-stopped
+
 # =============================================================================
 # NETWORKS
 # =============================================================================
@@ -465,3 +521,5 @@ volumes:
   docker-data:
   open-webui-data:
   bao-data:
+  sandbox-dind-data:
+  sandbox-data:

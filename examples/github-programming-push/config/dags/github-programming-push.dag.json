@@ -1,0 +1,66 @@
+{
+  "objective": "Build, test, and publish a small Python CLI called textstats to GitHub. The build node writes the program and tests; the push node commits the project, pushes it with the task-scoped GITHUB_TOKEN, and verifies the remote tree.",
+  "default_image": "openclaw",
+  "default_llm": "deepseek-v4-flash",
+  "nodes": [
+    {
+      "node_id": "build-solution",
+      "node_type": "agent",
+      "description": "Build a tested stdlib-only Python CLI called textstats with pytest tests, README, and sample input.",
+      "depends_on": [],
+      "config": {
+        "base_image": "openclaw",
+        "llm_model": "deepseek-v4-flash",
+        "timeout_minutes": 25,
+        "deploy_authorized": false,
+        "deliverable_gate": {
+          "enabled": true,
+          "require_deliverables": true,
+          "require_real_sources": false
+        },
+        "success_criteria": [
+          "The textstats package, CLI, pyproject.toml, README, .gitignore, sample input and tests exist under /workspace/build-solution/textstats/",
+          "python -m pytest -q passes",
+          "No network access or deployment is required"
+        ],
+        "node_objective": "Create a small, production-quality Python CLI named textstats under /workspace/build-solution/textstats/ and prove it works with pytest.\n\nRequirements:\n1. Package layout:\n   - textstats/__init__.py: expose count_words(text), count_lines(text), count_characters(text), top_words(text, n=5). top_words is case-insensitive, strips punctuation, ignores empty tokens, and returns a list of {word, count} sorted by count desc then word.\n   - textstats/cli.py: argparse CLI. Accept an optional input file; if omitted read stdin. Flags: --top N (default 5), --json (emit one JSON object). Print a clear plain-text summary by default.\n   - pyproject.toml: project metadata and pytest configuration.\n   - README.md: purpose, usage examples for a file and stdin, and the test command.\n   - .gitignore: .venv/, __pycache__/, *.pyc, .pytest_cache/, .env, dist/, build/.\n   - examples/sample.txt: a short deterministic sample paragraph.\n   - tests/test_textstats.py: pytest tests for counts, case-insensitive top words, stdin/file CLI behavior, --json output, and a missing-file error. Use only the standard library in the package.\n2. Run `python -m pytest -q` from /workspace/build-solution/textstats/ and fix all failures. Do not stop until the suite passes.\n3. Write /workspace/build-solution/build_report.md with the file list, the exact test command, and the pass/fail summary. Never include secrets or tokens.\n4. Do not deploy anything, do not call the network, and do not create a git repository in this node. The next node owns git and GitHub."
+      },
+      "input_mapping": {}
+    },
+    {
+      "node_id": "push-to-github",
+      "node_type": "agent",
+      "description": "Commit the tested textstats project and push it to GitHub, then verify the remote tree.",
+      "depends_on": [
+        "build-solution"
+      ],
+      "config": {
+        "base_image": "openclaw",
+        "llm_model": "deepseek-v4-flash",
+        "timeout_minutes": 20,
+        "deploy_authorized": false,
+        "github_push": {
+          "enabled": true,
+          "authorized": true,
+          "repository": "YOUR_GITHUB_OWNER/taskforge-textstats",
+          "branch": "main",
+          "credential": "github-textstats",
+          "require_approval": true
+        },
+        "selected_skill_name": "github-push",
+        "deliverable_gate": {
+          "enabled": true,
+          "require_deliverables": true,
+          "require_real_sources": false
+        },
+        "success_criteria": [
+          "The remote branch contains textstats/, tests/, README.md, pyproject.toml, .gitignore and examples/sample.txt",
+          "GIT_PUSH_REPORT.md records the repo, branch, commit SHA, file list/count and verification output",
+          "No token or authenticated URL is present in the report, workspace or git config"
+        ],
+        "node_objective": "Publish the tested textstats project to GitHub and verify the remote.\n\nTARGET_REPO = YOUR_GITHUB_OWNER/taskforge-textstats\nTARGET_BRANCH = main\n\nThe platform injects GITHUB_TOKEN only into this authorized push node. Use the `github-push` skill.\n\nSteps:\n1. Verify GITHUB_TOKEN is set without printing it. If it is missing, STOP and report: BLOCKER: GITHUB_TOKEN not injected for this node.\n2. Copy /workspace/build-solution/textstats/ to /tmp/textstats-repo/ (exclude .git, .venv, __pycache__, .pytest_cache). Do not copy build_report.md into the repository.\n3. In /tmp/textstats-repo: git init -b main (or init + checkout -b main), git config user.email agent@taskforge.local, git config user.name 'TaskForge Agent', ensure .gitignore, git add -A, git commit -m 'Add tested textstats Python CLI'.\n4. Push to https://github.com/TARGET_REPO.git on TARGET_BRANCH using a one-shot credential helper; never put the token in the remote URL or .git/config:\n   GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f' push -u origin HEAD:TARGET_BRANCH\n   If the remote is non-empty, clone it to /tmp/textstats-remote, fetch, merge/rebase without force, copy the project in, and push again. Never force-push.\n5. Verify: git ls-remote origin refs/heads/TARGET_BRANCH, git fetch origin TARGET_BRANCH, then git ls-tree -r --name-only FETCH_HEAD. Confirm textstats/__init__.py, textstats/cli.py, tests/test_textstats.py, README.md, pyproject.toml, .gitignore and examples/sample.txt are present.\n6. Write /workspace/push-to-github/GIT_PUSH_REPORT.md with: repo, branch, commit SHA, file list/count, verification commands/results, and any errors. Redact any token or authenticated URL. Do not include GITHUB_TOKEN anywhere.\n7. On 401/403, stop and report the HTTP status and the likely cause (token lacks Contents write or repo mismatch). Do not retry with inline credentials.\n\nLeave the local .git/config free of credential helpers and token-bearing remotes; use the one-shot helper only for the push command."
+      },
+      "input_mapping": {}
+    }
+  ]
+}

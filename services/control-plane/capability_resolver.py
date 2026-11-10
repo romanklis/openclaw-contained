@@ -139,7 +139,7 @@ def make_spec(
         "packages": normalized,
     }
     spec["fingerprint"] = capability_fingerprint(
-        fam, adapter_type, adapter_sha, runner_sha, normalized
+        fam, adapter_type, adapter_sha, runner_sha, normalized, base_image=spec["base_image"]
     )
     return spec
 
@@ -150,6 +150,7 @@ def capability_fingerprint(
     adapter_sha: str,
     runner_sha: str,
     packages: List[dict],
+    base_image: str = "",
 ) -> str:
     payload = {
         "runtime_family": (runtime_family or "").strip().lower(),
@@ -157,6 +158,7 @@ def capability_fingerprint(
         "adapter_type": (adapter_type or "").strip().lower(),
         "adapter_sha": adapter_sha or "",
         "runner_sha": runner_sha or "",
+        "base_image": (base_image or "").strip(),
         "packages": sorted(
             (p.get("manager", ""), p.get("name", ""), p.get("version", ""))
             for p in (packages or [])
@@ -210,6 +212,15 @@ def _compatible(version: ImageVersion, spec: dict) -> bool:
         return False
     if spec.get("adapter_type") and (version.adapter_type or "").strip().lower() != spec["adapter_type"]:
         return False
+    # Do not reuse an image built on a different concrete base: the package
+    # set may match while the file-system state the node depends on does not.
+    requested_base = (spec.get("base_image") or "").strip()
+    candidate_base = (version.base_image or "").strip()
+    if "/" in requested_base and "/" in candidate_base:
+        if requested_base.replace("localhost:5000/", "registry:5000/") != candidate_base.replace(
+            "localhost:5000/", "registry:5000/"
+        ):
+            return False
     return True
 
 

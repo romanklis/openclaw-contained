@@ -3,7 +3,7 @@ Database models
 """
 from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum as SQLEnum, ForeignKey, Text, Boolean, UniqueConstraint, Float
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, validates
 from sqlalchemy.sql import func
 import enum
 from datetime import datetime
@@ -241,6 +241,10 @@ class TaskOutput(Base):
     llm_response_preview = Column(Text)  # Preview from LLM router log
     model_used = Column(String)
     image_used = Column(String)
+    image_digest = Column(String)
+    image_version_id = Column(String)
+    build_id = Column(String)
+    capability_request_id = Column(Integer)
     duration_ms = Column(Integer)
     turn_count = Column(Integer, default=0)
     started_at = Column(DateTime)
@@ -517,10 +521,19 @@ class MasterDAG(Base):
     workflow_group_id = Column(String, ForeignKey("workflow_groups.id"), nullable=True, index=True)
     exploration_session_id = Column(String, nullable=True, index=True)
     exploration_cycle = Column(Integer, nullable=True)
+    # Lineage for DAGs promoted out of an exploration cycle into a normal experiment.
+    promoted_from_session_id = Column(String, nullable=True, index=True)
+    promoted_from_cycle_id = Column(String, nullable=True, index=True)
+    promoted_from_dag_id = Column(String, nullable=True, index=True)
+    promoted_at = Column(DateTime)
     project_id = Column(String, ForeignKey("projects.id"), nullable=True, index=True)  # project namespace
 
     # Archiving: hides the DAG from the default list (soft delete), keeps data.
     archived = Column(Boolean, default=False, nullable=False)
+
+    @validates("project_id")
+    def _normalize_project_id(self, _key: str, value):
+        return None if value in ("", "__general__") else value
 
     # Relationships
     nodes = relationship("DAGNode", back_populates="dag", cascade="all, delete-orphan")
@@ -1077,6 +1090,8 @@ class ExplorationCycle(Base):
     feedback = Column(Text, nullable=True)
     source_feedback = Column(Text, nullable=True)
     finalized_at = Column(DateTime, nullable=True)
+    promoted_dag_id = Column(String, nullable=True)
+    promoted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
 

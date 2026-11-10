@@ -2,15 +2,17 @@
 Temporal Worker - Executes workflows and activities
 """
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
 from temporalio import workflow, activity
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.client import Client
 from temporalio.worker import Worker
 from datetime import timedelta, datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Iterable, List, Optional
 import os
 
 logging.basicConfig(level=logging.INFO)
@@ -51,18 +53,37 @@ def is_gemini_lite_model(model: str) -> bool:
     return "gemini" in normalized and "lite" in normalized
 
 
-def _parse_capability_request_marker(text: str) -> Optional[Dict[str, str]]:
-    """Parse CAPABILITY_REQUEST marker text into a capability payload.
+_CAPABILITY_PACKAGE_RE = re.compile(r"[A-Za-z0-9@][A-Za-z0-9._+@/=-]*")
 
-    Expected format:
-    CAPABILITY_REQUEST:<type>:<resource>:<justification>
-    """
+
+def _valid_capability_resource(resource: str) -> bool:
+    """Reject prompt placeholders and malformed package references."""
+    for raw_pkg in (resource or "").split(","):
+        pkg = raw_pkg.strip()
+        if not pkg or "<" in pkg or ">" in pkg:
+            return False
+        if pkg.lower() in ("type/pkg", "type/package", "package_name", "pkg", "reason"):
+            return False
+        if "/" in pkg:
+            prefix, _, name = pkg.partition("/")
+            if prefix.strip().lower() not in ("pip", "npm", "apt", "auto"):
+                return False
+        else:
+            name = pkg
+        if not _CAPABILITY_PACKAGE_RE.fullmatch(name.strip()):
+            return False
+    return True
+
+
+def _parse_capability_request_marker(text: str) -> Optional[Dict[str, str]]:
+    """Parse a valid CAPABILITY_REQUEST marker into a capability payload."""
     if not isinstance(text, str):
         return None
     marker_line = ""
     for line in text.splitlines():
-        if "CAPABILITY_REQUEST:" in line:
-            marker_line = line.strip()
+        stripped = line.strip()
+        if stripped.startswith("CAPABILITY_REQUEST:"):
+            marker_line = stripped
             break
     if not marker_line:
         return None
@@ -72,6 +93,8 @@ def _parse_capability_request_marker(text: str) -> Optional[Dict[str, str]]:
         return None
     cap_type = (parts[0] or "tool_install").strip() or "tool_install"
     resource = (parts[1] or "").strip()
+    if not _valid_capability_resource(resource):
+        return None
     justification = (parts[2] if len(parts) > 2 else "Requested by agent").strip()
     return {
         "type": cap_type,
@@ -93,6 +116,32 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return dt
     except Exception:
         return None
+
+
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _valid_image_digest(value: Any) -> str:
+    digest = str(value or "").strip()
+    return digest if _DIGEST_RE.match(digest) else ""
+
+
+def _registry_image_ref(image: str) -> str:
+    """Return the canonical registry-network reference for an image tag."""
+    ref = (image or "").strip().replace("localhost:5000/", "registry:5000/")
+    if ref and not ref.startswith("registry:5000/"):
+        ref = f"registry:5000/{ref}"
+    return ref
+
+
+def _to_int_or_none(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 
 # =============================================================================
 # Agent Sandbox Configuration
@@ -187,6 +236,34 @@ def get_docker_client():
 # Workflows
 # =============================================================================
 
+def _iteration_failure_signature(result: Dict[str, Any]) -> str:
+    """Return a stable signature for a non-completed iteration."""
+    text = str(result.get("error") or "").strip()
+    if not text:
+        text = str(result.get("agent_logs") or "").strip()[-800:]
+    text = re.sub(r"\d{4}-\d{2}-\d{2}[T ][0-9:.+Z-]+", "<time>", text)
+    text = re.sub(r"\b\d{2}:\d{2}:\d{2}\b", "<time>", text)
+    return text[:600]
+
+
+def _build_iteration_handoff(result: Dict[str, Any], iteration: int) -> str:
+    """Build a bounded continuation prompt for the next agent iteration."""
+    error = str(result.get("error") or "").strip()
+    logs = str(result.get("agent_logs") or "").strip()
+    detail = (error or logs)[-1200:]
+    return (
+        f"PREVIOUS ITERATION {iteration} DID NOT COMPLETE.\n"
+        "The /workspace filesystem is persistent: files and dependencies from "
+        "prior iterations are still present. Do not re-clone, re-download, or "
+        "restart discovery; continue from the current files and only do the "
+        "unfinished work.\n"
+        f"Previous blocker:\n{detail}\n"
+        "If the previous attempt timed out, run the long command with "
+        "exec timeout_seconds=900 (for example the full test suite) or split "
+        "the suite; do not use background jobs for CPU-bound work."
+    )
+
+
 @workflow.defn
 class AgentTaskWorkflow:
     """Main workflow for agent task execution"""
@@ -196,6 +273,12 @@ class AgentTaskWorkflow:
         self.capability_approved = False
         self._handled_credential_ids = set()  # credential requests already waited on
         self.current_image = "localhost:5000/openclaw-agent:openclaw"  # Track current agent image (default)
+        self.current_image_digest = ""  # Immutable digest for current_image when known
+        self._last_image_version_id = ""  # Catalog ImageVersion backing current_image
+        self._last_build_id = ""  # Image-builder build id backing current_image
+        self._last_capability_request_id = None  # Capability request that produced current_image
+        self._capability_image = None  # capability_image_ready signal payload
+        self._pending_capability_request_id = ""  # Request this workflow is waiting on
         self.llm_model = "gemma3:4b"  # Track LLM model
         self.follow_up = ""  # Follow-up instructions for continuation
         self._capability_feedback = ""  # one-shot feedback after a build (cleared after use)
@@ -204,6 +287,152 @@ class AgentTaskWorkflow:
         self._approved_capabilities = set()  # Track already-approved resource names to prevent loops
         self._handled_capability_ids = set()  # Capability requests already applied
         self._pending_metrics = {}  # waits recorded for the next iteration output
+        self._iteration_follow_up = ""  # handoff from the previous failed iteration
+        self._last_failure_signature = ""  # normalized failure signature
+        self._same_failure_count = 0  # consecutive identical failures
+
+    def _adopt_capability_image(
+        self,
+        payload: Any,
+        *,
+        resource: str = "",
+        request_id: Any = None,
+    ) -> bool:
+        """Adopt an already-built capability image into the workflow state.
+
+        Returns True when the payload describes an image this iteration can use.
+        The workflow must never claim a capability is installed unless this
+        succeeds or a build just produced the image.
+        """
+        if not isinstance(payload, dict):
+            return False
+        image_tag = str(payload.get("image_tag") or "").strip()
+        if not image_tag:
+            return False
+        payload_request = payload.get("capability_request_id")
+        if request_id and payload_request and str(payload_request) != str(request_id):
+            return False
+        payload_resource = str(payload.get("resource") or payload.get("resource_name") or "").strip()
+        if resource and payload_resource and payload_resource != resource:
+            return False
+        self.current_image = image_tag
+        self.current_image_digest = _valid_image_digest(payload.get("image_digest"))
+        self._last_image_version_id = str(
+            payload.get("version_id") or payload.get("image_version_id") or ""
+        )
+        self._last_build_id = str(payload.get("build_id") or "")
+        if payload_request:
+            self._last_capability_request_id = payload_request
+        elif request_id:
+            self._last_capability_request_id = request_id
+        logger.info(
+            f"CAPABILITY_IMAGE_SELECTED | image={self.current_image} | "
+            f"digest={self.current_image_digest or '-'} | "
+            f"version={self._last_image_version_id or '-'} | "
+            f"build={self._last_build_id or '-'} | request={self._last_capability_request_id or '-'}"
+        )
+        return True
+
+    async def _ensure_capability_image(
+        self,
+        task_id: str,
+        capability: Dict[str, Any],
+        resource_name: str,
+        request_id: str,
+    ) -> tuple[bool, str]:
+        """Adopt a ready image for an approved capability, or build one now.
+
+        This is the single path that may declare a capability "installed".
+        An approval row alone is not enough: there must be a built image whose
+        tag/digest the next iteration will actually start from.
+        """
+        # 1. Image pushed by an out-of-band build (orphan/sibling) and delivered
+        #    through the capability_image_ready signal.
+        if self._capability_image and self._adopt_capability_image(
+            self._capability_image, resource=resource_name, request_id=request_id or None
+        ):
+            self._capability_image = None
+            return True, ""
+
+        # 2. A build for this exact capability request already succeeded.
+        ready = await workflow.execute_activity(
+            get_ready_capability_image,
+            args=[task_id, request_id or None],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        if ready.get("image_tag") and self._adopt_capability_image(
+            ready, resource=resource_name, request_id=request_id or None
+        ):
+            return True, ""
+
+        # 3. No usable image yet: build it through the catalog/legacy builder.
+        await workflow.execute_activity(
+            update_task_status,
+            args=[task_id, "building_image"],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        await workflow.execute_activity(
+            add_to_supply_chain,
+            args=[task_id, capability, []],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        await workflow.execute_activity(
+            reload_supply_chain,
+            args=[],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        _image_build_started = workflow.now()
+        build_result = await workflow.execute_activity(
+            build_agent_image,
+            args=[task_id, capability, self.current_image],
+            start_to_close_timeout=timedelta(minutes=10),
+        )
+        self._pending_metrics["image_build_wait_ms"] = max(
+            0, int((workflow.now() - _image_build_started).total_seconds() * 1000)
+        )
+        if build_result.get("denied"):
+            await workflow.execute_activity(
+                update_task_status,
+                args=[task_id, "running"],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            return False, build_result.get("feedback", "")
+        new_image = build_result.get("image") or self.current_image
+        if not new_image:
+            await workflow.execute_activity(
+                update_task_status,
+                args=[task_id, "running"],
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+            return False, "Capability build returned no image"
+        self.current_image = new_image
+        self.current_image_digest = _valid_image_digest(build_result.get("digest"))
+        self._last_build_id = str(build_result.get("build_id") or "")
+        self._last_image_version_id = str(build_result.get("version_id") or "")
+        if request_id:
+            self._last_capability_request_id = request_id
+        logger.info(
+            f"CAPABILITY_IMAGE_SELECTED | task={task_id} | image={self.current_image} | "
+            f"digest={self.current_image_digest or '-'} | "
+            f"version={self._last_image_version_id or '-'} | "
+            f"build={self._last_build_id or '-'} | request={request_id or '-'}"
+        )
+        await workflow.execute_activity(
+            update_task_status,
+            args=[task_id, "running"],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        await workflow.execute_activity(
+            update_task_policy,
+            args=[task_id, capability, new_image],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        await workflow.execute_activity(
+            dismiss_pending_capabilities,
+            args=[task_id],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        return True, build_result.get("feedback", "")
 
     async def _resolve_capability_state(
         self,
@@ -318,6 +547,7 @@ class AgentTaskWorkflow:
         deliverables_required: bool = True,
         max_agent_turns: int = 30,
         max_iterations: int = 50,
+        deploy_authorized: bool = False,
     ) -> Dict[str, Any]:
         """Execute agent task.
 
@@ -340,10 +570,21 @@ class AgentTaskWorkflow:
         # Use the provided base image for both first-run and continuation
         if current_image:
             self.current_image = current_image
+            self.current_image_digest = _valid_image_digest(current_image.split("@", 1)[1] if "@" in current_image else "")
             if follow_up:
                 logger.info(f"♻️  CONTINUATION workflow for task {task_id} | image={current_image} | follow_up={follow_up[:120]}...")
             else:
                 logger.info(f"Starting workflow for task {task_id} with model {llm_model}, base image {current_image}")
+            if current_image != "localhost:5000/openclaw-agent:openclaw":
+                # Keep the task record in sync with the image this run actually
+                # uses. Without this, continuation tasks keep the initial base
+                # image in Task.current_image and deployment/UI paths see a
+                # stale image.
+                await workflow.execute_activity(
+                    persist_task_image,
+                    args=[task_id, current_image],
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
         else:
             logger.info(f"Starting workflow for task {task_id} with model {llm_model} (default openclaw image)")
         
@@ -367,7 +608,19 @@ class AgentTaskWorkflow:
 
         # Step 2: Agent execution loop
         iteration = start_iteration
-        
+        if follow_up and start_iteration >= max_iterations:
+            # A continuation should always get one new attempt; without this
+            # the loop is a no-op when the task already used its budget.
+            max_iterations = start_iteration + 1
+            logger.info(
+                f"♻️  Continuation {task_id} at iteration {start_iteration} "
+                f">= budget; allowing one extra iteration (max={max_iterations})"
+            )
+        logger.info(
+            f"▶️  Agent loop | task={task_id} | start_iteration={start_iteration} | "
+            f"max_iterations={max_iterations}"
+        )
+
         while iteration < max_iterations:
             iteration += 1
             iteration_started_at = workflow.now()
@@ -386,13 +639,29 @@ class AgentTaskWorkflow:
                 start_to_close_timeout=timedelta(seconds=15),
             )
 
-            logger.info(f"Task {task_id} iteration {iteration} with image {self.current_image}")
+            logger.info(
+                f"Task {task_id} iteration {iteration} with image {self.current_image} "
+                f"(digest={self.current_image_digest or '-'}, "
+                f"version={self._last_image_version_id or '-'})"
+            )
+            logger.info(
+                f"CAPABILITY_IMAGE_SELECTED | task={task_id} | iteration={iteration} | "
+                f"image={self.current_image} | digest={self.current_image_digest or '-'} | "
+                f"version={self._last_image_version_id or '-'} | "
+                f"build={self._last_build_id or '-'} | "
+                f"request={self._last_capability_request_id or '-'}"
+            )
             
             # Execute agent step as a child workflow so every LLM turn
             # inside it is visible as a separate activity in Temporal UI.
             # If there's pending capability feedback, inject it into this
             # iteration's follow_up and clear it (one-shot).
             iter_follow_up = self.follow_up
+            if self._iteration_follow_up:
+                iter_follow_up = (
+                    self._iteration_follow_up
+                    + ("\n\n" + iter_follow_up if iter_follow_up else "")
+                )
             if self._capability_feedback:
                 iter_follow_up = (
                     (iter_follow_up + "\n\n" if iter_follow_up else "")
@@ -403,7 +672,7 @@ class AgentTaskWorkflow:
             try:
                 result = await workflow.execute_child_workflow(
                     AgentStepWorkflow.run,
-                    args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns],
+                    args=[task_id, iteration, self.current_image, self.llm_model, iter_follow_up, self.dag_id, deliverables_required, max_agent_turns, self.current_image_digest, deploy_authorized],
                     id=f"agent-step-{task_id}-iter-{iteration}",
                 )
             except Exception as child_exc:
@@ -433,9 +702,16 @@ class AgentTaskWorkflow:
             _committed = result.get("committed_image")
             if _committed:
                 self.current_image = _committed
+                self.current_image_digest = ""
+                self._last_image_version_id = ""
+                self._last_build_id = ""
                 logger.info(f"📸 DAG image updated from commit: {_committed}")
 
             result.update(pending_metrics)
+            result["image_digest"] = self.current_image_digest
+            result["image_version_id"] = self._last_image_version_id
+            result["build_id"] = self._last_build_id
+            result["capability_request_id"] = self._last_capability_request_id
             result["started_at"] = iteration_started_at.isoformat()
             result["finished_at"] = workflow.now().isoformat()
             try:
@@ -455,6 +731,56 @@ class AgentTaskWorkflow:
                 )
             except Exception:
                 pass  # Non-critical — don't fail the workflow if output storage fails
+
+            if not result.get("completed"):
+                signature = _iteration_failure_signature(result)
+                if signature and signature == self._last_failure_signature:
+                    self._same_failure_count += 1
+                elif signature:
+                    self._last_failure_signature = signature
+                    self._same_failure_count = 1
+                else:
+                    self._last_failure_signature = ""
+                    self._same_failure_count = 0
+                self._iteration_follow_up = _build_iteration_handoff(result, iteration)
+                logger.warning(
+                    "ITERATION_STAGNATION | task=%s | iteration=%s | count=%s | signature=%s",
+                    task_id,
+                    iteration,
+                    self._same_failure_count,
+                    signature[:160],
+                )
+                if self._same_failure_count >= 3:
+                    logger.error(
+                        "STOPPING task %s after %s identical failures: %s",
+                        task_id,
+                        self._same_failure_count,
+                        signature[:300],
+                    )
+                    await workflow.execute_activity(
+                        finalize_task,
+                        args=[task_id, "failed"],
+                        start_to_close_timeout=timedelta(minutes=5),
+                    )
+                    return {
+                        "status": "failed",
+                        "error": (
+                            "Stopped after repeated identical failure: "
+                            + signature[:500]
+                        ),
+                        "iteration": iteration,
+                    }
+                if self._same_failure_count == 2:
+                    self._iteration_follow_up += (
+                        "\n\nWARNING: the previous two attempts failed with the "
+                        "same blocker. Change strategy now; do not repeat the same "
+                        "command. If the long command is the issue, use "
+                        "timeout_seconds=900 and continue from the current workspace."
+                    )
+            else:
+                self._iteration_follow_up = ""
+                self._last_failure_signature = ""
+                self._same_failure_count = 0
 
             # Check if agent hard-failed (container crash, exit non-zero, etc.)
             if result.get("agent_failed"):
@@ -535,6 +861,7 @@ class AgentTaskWorkflow:
                         feedback_lines = [
                             "TRIAL DEPLOYMENT FAILED.",
                             f"Phase: {trial_phase}",
+                            f"Base image: {deployment.get('agent_image') or 'unknown'}",
                             f"Error: {trial_error[:500]}",
                         ]
                         if trial_logs:
@@ -622,11 +949,34 @@ class AgentTaskWorkflow:
                 )
                 if request_id:
                     self._handled_capability_ids.add(request_id)
-                if resource_name:
+                # An approval row is not proof the image was built. Adopt a
+                # ready build or build now, otherwise the next iteration keeps
+                # running the pre-approval image while being told the package
+                # is installed.
+                ok, supply_chain_feedback = await self._ensure_capability_image(
+                    task_id, capability, resource_name, request_id
+                )
+                if resource_name and ok:
                     self._approved_capabilities.add(resource_name)
+                if not ok:
                     self._capability_feedback = (
                         "--- SYSTEM NOTICE ---\n"
-                        f"Capability '{resource_name}' is approved and installed. "
+                        f"Capability '{resource_name or 'requested tool'}' was approved but its "
+                        "image could not be prepared. Do not assume it is installed; retry the "
+                        "capability request or use an alternative approach.\n"
+                        "--- END NOTICE ---"
+                    )
+                elif supply_chain_feedback:
+                    logger.warning(f"🚫 Supply-chain feedback for agent: {supply_chain_feedback[:200]}")
+                    self._capability_feedback = (
+                        "--- SYSTEM NOTICE ---\n"
+                        + supply_chain_feedback
+                        + "\n--- END NOTICE ---"
+                    )
+                else:
+                    self._capability_feedback = (
+                        "--- SYSTEM NOTICE ---\n"
+                        f"Capability '{resource_name or 'requested tool'}' is approved and installed. "
                         "Use it now; do not re-request it.\n"
                         "--- END NOTICE ---"
                     )
@@ -660,17 +1010,27 @@ class AgentTaskWorkflow:
                         break
                     continue
 
+                created_request_id = ""
                 if capability_state.get("should_create_request"):
-                    await workflow.execute_activity(
+                    created = await workflow.execute_activity(
                         create_capability_request,
                         args=[task_id, capability],
                         start_to_close_timeout=timedelta(seconds=30),
                     )
+                    if isinstance(created, dict) and created.get("id") is not None:
+                        created_request_id = str(created["id"])
+                        # This workflow owns this request from now on; the
+                        # resolved-row branch must not re-handle it as an
+                        # out-of-band approval.
+                        self._handled_capability_ids.add(created_request_id)
 
                 # Reset signal flags before waiting (prevents stale signals
                 # from a prior iteration from immediately satisfying the wait)
                 self.approval_received = False
                 self.capability_approved = False
+                self._pending_capability_request_id = str(
+                    capability_state.get("request_id") or created_request_id
+                )
                 _capability_wait_started = workflow.now()
 
                 # Update status: waiting for human approval
@@ -690,76 +1050,37 @@ class AgentTaskWorkflow:
                     0, int((workflow.now() - _capability_wait_started).total_seconds() * 1000)
                 )
                 if self.capability_approved:
-                    # Update status: building new agent image
-                    await workflow.execute_activity(
-                        update_task_status,
-                        args=[task_id, "building_image"],
-                        start_to_close_timeout=timedelta(seconds=15),
+                    ok, supply_chain_feedback = await self._ensure_capability_image(
+                        task_id,
+                        capability,
+                        resource_name,
+                        str(capability_state.get("request_id") or created_request_id),
                     )
-
-                    await workflow.execute_activity(
-                        add_to_supply_chain,
-                        args=[task_id, capability, []],
-                        start_to_close_timeout=timedelta(seconds=30),
-                    )
-
-                    await workflow.execute_activity(
-                        reload_supply_chain,
-                        args=[],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
-
-                    _image_build_started = workflow.now()
-                    build_result = await workflow.execute_activity(
-                        build_agent_image,
-                        args=[task_id, capability, self.current_image],
-                        start_to_close_timeout=timedelta(minutes=10)
-                    )
-                    self._pending_metrics["image_build_wait_ms"] = max(
-                        0, int((workflow.now() - _image_build_started).total_seconds() * 1000)
-                    )
-
-                    new_image = build_result.get("image", self.current_image)
-                    supply_chain_feedback = build_result.get("feedback", "")
-                    self.current_image = new_image
-                    logger.info(f"Updated task image to {new_image}")
-
-                    # Update status: back to running after build
-                    await workflow.execute_activity(
-                        update_task_status,
-                        args=[task_id, "running"],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
-
-                    if resource_name:
+                    if not ok:
+                        self._capability_feedback = (
+                            "--- SYSTEM NOTICE ---\n"
+                            f"Capability '{resource_name or 'requested tool'}' was approved but its "
+                            "image could not be prepared. Do not assume it is installed; retry the "
+                            "capability request or use an alternative approach.\n"
+                            "--- END NOTICE ---"
+                        )
+                    elif resource_name:
                         self._approved_capabilities.add(resource_name)
 
-                    if supply_chain_feedback:
+                    if ok and supply_chain_feedback:
                         logger.warning(f"🚫 Supply-chain feedback for agent: {supply_chain_feedback[:200]}")
                         self._capability_feedback = (
                             "--- SYSTEM NOTICE ---\n"
                             + supply_chain_feedback
                             + "\n--- END NOTICE ---"
                         )
-                    else:
+                    elif ok:
                         self._capability_feedback = (
                             "--- SYSTEM NOTICE ---\n"
                             f"Capability '{resource_name or 'requested tool'}' is approved and installed. "
                             "Use it now; do not re-request it.\n"
                             "--- END NOTICE ---"
                         )
-
-                    await workflow.execute_activity(
-                        update_task_policy,
-                        args=[task_id, capability, new_image],
-                        start_to_close_timeout=timedelta(seconds=30)
-                    )
-
-                    await workflow.execute_activity(
-                        dismiss_pending_capabilities,
-                        args=[task_id],
-                        start_to_close_timeout=timedelta(seconds=15),
-                    )
 
                     logger.info(f"Task {task_id} resumed with new capability")
                 else:
@@ -780,7 +1101,8 @@ class AgentTaskWorkflow:
 
                 self.approval_received = False
                 self.capability_approved = False
-                request_id = str(capability_state.get("request_id") or "")
+                self._pending_capability_request_id = ""
+                request_id = str(capability_state.get("request_id") or created_request_id)
                 if request_id:
                     self._handled_capability_ids.add(request_id)
 
@@ -828,6 +1150,9 @@ class AgentTaskWorkflow:
         # Expose the (possibly capability-enriched) image so parent
         # DAGNodeWorkflow / DAGWorkflow can propagate it to later nodes.
         final_result["current_image"] = self.current_image
+        final_result["current_image_digest"] = self.current_image_digest
+        final_result["image_version_id"] = self._last_image_version_id
+        final_result["build_id"] = self._last_build_id
         return final_result
     
     @workflow.signal
@@ -835,6 +1160,38 @@ class AgentTaskWorkflow:
         """Signal to approve/deny capability"""
         self.approval_received = True
         self.capability_approved = approved
+
+    @workflow.signal
+    async def approve_capability_for(self, payload: Dict[str, Any]):
+        """Approve a specific capability request (used for sibling propagation).
+
+        Unlike ``approve_capability`` this cannot accidentally satisfy a wait
+        for a different request.
+        """
+        if not isinstance(payload, dict):
+            return
+        request_id = str(payload.get("capability_request_id") or "")
+        if (
+            request_id
+            and self._pending_capability_request_id
+            and request_id != self._pending_capability_request_id
+        ):
+            logger.info(
+                f"Ignoring approval for request {request_id}; "
+                f"workflow is waiting on {self._pending_capability_request_id}"
+            )
+            return
+        self.approval_received = True
+        self.capability_approved = bool(payload.get("approved", True))
+
+    @workflow.signal
+    async def capability_image_ready(self, payload: Dict[str, Any]):
+        """Receive an image built outside this workflow (orphan/sibling build).
+
+        The next capability reconciliation adopts it instead of rebuilding, so
+        iteration N+1 starts from the image that actually contains the package.
+        """
+        self._capability_image = payload if isinstance(payload, dict) else {}
 
 
 # =============================================================================
@@ -864,16 +1221,18 @@ class AgentStepWorkflow:
         dag_id: str = "",
         deliverables_required: bool = True,
         max_agent_turns: int = 30,
+        agent_image_digest: str = "",
+        deploy_authorized: bool = False,
     ) -> Dict[str, Any]:
         logger.info(
             f"🔬 AgentStepWorkflow | Task: {task_id} | Iteration: {iteration} | "
-            f"Image: {agent_image} | Model: {llm_model}"
+            f"Image: {agent_image} | Digest: {agent_image_digest or '-'} | Model: {llm_model}"
         )
 
         # 1. Launch the container (returns container_id + workspace info)
         launch_info = await workflow.execute_activity(
             start_agent_container,
-            args=[task_id, iteration, agent_image, llm_model, follow_up, deliverables_required, max_agent_turns],
+            args=[task_id, iteration, agent_image, llm_model, follow_up, deliverables_required, max_agent_turns, agent_image_digest, deploy_authorized],
             start_to_close_timeout=timedelta(minutes=5),
         )
 
@@ -1024,6 +1383,8 @@ async def start_agent_container(
     follow_up: str = "",
     deliverables_required: bool = True,
     max_agent_turns: int = 30,
+    agent_image_digest: str = "",
+    deploy_authorized: bool = False,
 ) -> Dict[str, Any]:
     """Launch the agent container (detached) and return container_id + workspace_dir.
 
@@ -1031,7 +1392,10 @@ async def start_agent_container(
     image resolution, workspace setup, environment, and ``docker run``.
     The container is started in detached mode so control returns immediately.
     """
-    logger.info(f"🚀 START_CONTAINER | Task: {task_id} | Iter: {iteration} | Image: {agent_image} | Model: {llm_model}")
+    logger.info(
+        f"🚀 START_CONTAINER | Task: {task_id} | Iter: {iteration} | "
+        f"Image: {agent_image} | Digest: {agent_image_digest or '-'} | Model: {llm_model}"
+    )
 
     import docker
 
@@ -1040,49 +1404,30 @@ async def start_agent_container(
 
         # --- resolve image ---
         # Determine the canonical registry tag for pulling.
-        agent_image_pull = agent_image.replace("localhost:5000/", "registry:5000/")
-        if not agent_image_pull.startswith("registry:5000/"):
-            agent_image_pull = f"registry:5000/{agent_image_pull}"
-
-        # Always pull base images (tags without -v suffix) so we pick up
-        # rebuilds immediately.  Versioned images (task-xxx-v2) are immutable
-        # and safe to use from cache.
+        agent_image_pull = _registry_image_ref(agent_image)
+        digest = _valid_image_digest(agent_image_digest)
         tag_part = agent_image_pull.rsplit(":", 1)[-1] if ":" in agent_image_pull else ""
-        is_versioned = bool(re.search(r'-v\d+$', tag_part))
+        is_versioned = bool(re.search(r"-v\d+$", tag_part))
 
-        if not is_versioned:
-            # Base / mutable tag — always pull latest from registry
+        if digest:
+            # Prefer the immutable digest of the image that was actually built.
+            pinned = f"{agent_image_pull.split('@', 1)[0]}@{digest}"
             try:
-                logger.info(f"📥 Pulling latest {agent_image_pull} (mutable tag)")
-                docker_client.images.pull(agent_image_pull)
-                agent_image = agent_image_pull
-            except Exception as pull_err:
-                logger.warning(f"⚠️  Pull failed ({pull_err}), falling back to local cache")
-                # Fall back to whatever is locally available
-                for variant in [agent_image_pull, agent_image,
-                                agent_image.replace("localhost:5000/", ""),
-                                agent_image.replace("registry:5000/", "")]:
-                    try:
-                        docker_client.images.get(variant)
-                        agent_image = variant
-                        break
-                    except docker.errors.ImageNotFound:
-                        continue
-        else:
-            # Versioned / immutable tag — use cache, pull only if missing
+                await asyncio.to_thread(docker_client.images.get, pinned)
+                logger.info(f"✅ Immutable image found locally: {pinned}")
+            except docker.errors.ImageNotFound:
+                logger.info(f"📥 Pulling immutable image {pinned}")
+                await asyncio.wait_for(
+                    asyncio.to_thread(docker_client.images.pull, pinned),
+                    timeout=300,
+                )
+            agent_image = pinned
+        elif is_versioned:
+            # Versioned / immutable task tag — use cache, pull only if missing.
             image_found = False
-            image_variants = [
-                agent_image,
-                agent_image_pull,
-                agent_image.replace("localhost:5000/", ""),
-                agent_image.replace("registry:5000/", ""),
-            ]
-            seen = set()
-            image_variants = [v for v in image_variants if v not in seen and not seen.add(v)]
-
-            for variant in image_variants:
+            for variant in dict.fromkeys([agent_image, agent_image_pull]):
                 try:
-                    docker_client.images.get(variant)
+                    await asyncio.to_thread(docker_client.images.get, variant)
                     logger.info(f"✅ Image found locally as: {variant}")
                     agent_image = variant
                     image_found = True
@@ -1092,8 +1437,20 @@ async def start_agent_container(
 
             if not image_found:
                 logger.info(f"📥 Pulling {agent_image_pull}")
-                docker_client.images.pull(agent_image_pull)
+                await asyncio.wait_for(
+                    asyncio.to_thread(docker_client.images.pull, agent_image_pull),
+                    timeout=300,
+                )
                 agent_image = agent_image_pull
+        else:
+            # Mutable/catalog tag — always pull. Falling back to a local image
+            # with the same name silently runs the pre-rebuild image.
+            logger.info(f"📥 Pulling {agent_image_pull} (mutable tag)")
+            await asyncio.wait_for(
+                asyncio.to_thread(docker_client.images.pull, agent_image_pull),
+                timeout=300,
+            )
+            agent_image = agent_image_pull
 
         # --- workspace ---
         workspaces_root = "/workspaces"
@@ -1293,6 +1650,15 @@ async def start_agent_container(
             else os.getenv("CREDENTIAL_GATEWAY_URL", "http://credential-gateway:8083")
         )
 
+        # --- Agent sandbox discovery ---
+        # Agent containers run on DinD's bridge, so inject the Compose IP.
+        sandbox_ip = os.getenv("SANDBOX_IP", "") or _resolve("sandbox", fallback="")
+        sandbox_url_for_agent = (
+            f"http://{sandbox_ip}:8080"
+            if sandbox_ip
+            else os.getenv("SANDBOX_URL", "http://sandbox:8080")
+        )
+
         # Session ID: DAG-scoped by node_id so memory persists across
         # retries for the same DAG node.  For standalone tasks we
         # fall back to the task_id.
@@ -1322,6 +1688,10 @@ async def start_agent_container(
             "CONTROL_PLANE_URL": cp_url_for_agent,
             "LLM_ROUTER_URL": llm_router_url,
             "OLLAMA_URL": os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"),
+            # Dedicated agent sandbox API (build/run/test isolated solution
+            # containers). Agents authenticate as task:<TASK_ID>.
+            "SANDBOX_URL": sandbox_url_for_agent,
+            "SANDBOX_API_URL": sandbox_url_for_agent,
             # External RAG tool (docling-rag) so agents can query uploaded docs.
             "RAG_TOOL_URL": rag_url_for_agent,
             "RAG_API_KEY": os.getenv("RAG_API_KEY", "my-local-secret-key"),
@@ -1334,7 +1704,7 @@ async def start_agent_container(
             "TASK_DESCRIPTION": task_description[:2000],
             "AGENT_IMAGE": agent_image,
             "AGENT_DOCKERFILE": agent_dockerfile[:4000],
-            "FOLLOW_UP": follow_up[:2000],
+            "FOLLOW_UP": follow_up[:4000],
             # .skills is the AGENT-visible mount path (/workspace/.skills); the
             # files are written to the worker-side /workspaces/{id}/.skills.
             "PYTHONPATH": ("/workspace/.skills:/opt/openclaw") if skill_code_dir else "/opt/openclaw",
@@ -1345,10 +1715,35 @@ async def start_agent_container(
             # Mirrors config.deliverable_gate.require_deliverables so the agent
             # loop refuses to end on a bare text reply before a deliverable exists.
             "DELIVERABLES_REQUIRED": "true" if deliverables_required else "false",
+            # Deploy-authorized nodes must emit DEPLOYMENT_REQUEST, not just
+            # describe a prepared deployment.
+            "REQUIRE_DEPLOYMENT_REQUEST": "true" if deploy_authorized else "false",
             # Dynamic turn budget (scaled by the number of upstream step outputs).
             "MAX_AGENT_TURNS": str(max(1, max_agent_turns)),
         }
 
+        # Repo/branch-scoped GitHub token for an authorized github_push node.
+        # The token lives only in this ephemeral container's environment.
+        _github_lease = await _github_push_lease(task_id)
+        if _github_lease:
+            agent_env["GITHUB_TOKEN"] = _github_lease["token"]
+            agent_env["GITHUB_REPOSITORY"] = _github_lease["repository"]
+            agent_env["GITHUB_BRANCH"] = _github_lease["branch"]
+            agent_env["REPO_DIR"] = _github_lease.get("repo_dir") or "/workspace/repo"
+            agent_env["GIT_TERMINAL_PROMPT"] = "0"
+            askpass_dir = os.path.join(workspace_dir, ".cache")
+            os.makedirs(askpass_dir, exist_ok=True)
+            askpass_path = os.path.join(askpass_dir, "git-askpass.sh")
+            with open(askpass_path, "w") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    "case \"$1\" in\n"
+                    "  *Username*) printf '%s\\n' \"x-access-token\" ;;\n"
+                    "  *) printf '%s\\n' \"$GITHUB_TOKEN\" ;;\n"
+                    "esac\n"
+                )
+            os.chmod(askpass_path, 0o755)
+            agent_env["GIT_ASKPASS"] = "/workspace/.cache/git-askpass.sh"
 
         # Only the workspace is a bind mount. Adapters are baked into the agent
         # images (see Dockerfile.openclaw) — do NOT bind-mount them at their
@@ -1357,6 +1752,11 @@ async def start_agent_container(
         # makes any later `docker build FROM` the committed DAG image fail with
         # "cannot mount volume over existing file", breaking capability rebuilds.
         _agent_volumes = {workspace_dir: {"bind": "/workspace", "mode": "rw"}}
+        # Adapters are baked into the agent images (Dockerfile.openclaw).
+        # Never bind-mount them at their image paths: docker commit records the
+        # mount as a VOLUME, and later `docker build FROM` that commit fails
+        # with "cannot mount volume over existing file". Adapter source changes
+        # therefore require rebuilding the openclaw base image.
 
         container_kwargs = dict(
             image=agent_image,
@@ -1383,7 +1783,10 @@ async def start_agent_container(
 
         logger.info(f"🚀 Launching container (detached) with sandbox mode: {AGENT_SANDBOX_MODE} ...")
         try:
-            container = docker_client.containers.run(**container_kwargs)
+            container = await asyncio.wait_for(
+                asyncio.to_thread(docker_client.containers.run, **container_kwargs),
+                timeout=300,
+            )
         except docker.errors.APIError as api_err:
             if "unknown or invalid runtime name: runsc" in str(api_err):
                 logger.error(
@@ -1439,6 +1842,8 @@ async def poll_agent_turns(
     silent_polls = 0
     max_silent_polls = 40  # ~40 * 3s = 2 minutes of no new turns
     for _ in range(max_polls):
+        if activity.is_cancelled():
+            raise asyncio.CancelledError()
         activity.heartbeat(f"turns_seen={turns_seen + len(new_turns)}")
 
         # Check for new interactions from the LLM router
@@ -1655,6 +2060,47 @@ def _compact_agent_result_for_temporal(
     return result
 
 
+def _scrub_git_credentials(workspace_dir: str) -> int:
+    """Remove embedded GitHub credentials from persisted git metadata."""
+    import re as _re
+
+    root = workspace_dir or ""
+    if not root or not os.path.isdir(root):
+        return 0
+    scrubbed = 0
+    candidates = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > 8:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in ("node_modules", ".venv", "venv", "__pycache__", ".pytest_cache")
+        ]
+        if ".git" in dirnames:
+            for name in ("config", "credentials"):
+                candidates.append(os.path.join(dirpath, ".git", name))
+        for name in (".git-credentials", ".netrc"):
+            candidates.append(os.path.join(dirpath, name))
+    pattern = _re.compile(r"https://[^/\s@]+@github\.com", _re.IGNORECASE)
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", errors="replace") as fh:
+                text = fh.read()
+            updated = pattern.sub("https://github.com", text)
+            if updated != text:
+                with open(path, "w") as fh:
+                    fh.write(updated)
+                scrubbed += 1
+        except OSError:
+            continue
+    return scrubbed
+
+
 @activity.defn
 async def collect_agent_result(
     task_id: str,
@@ -1699,6 +2145,9 @@ async def collect_agent_result(
         # so the next node inherits the full file-system state.
         if dag_id:
             try:
+                scrubbed = _scrub_git_credentials(workspace_dir)
+                if scrubbed:
+                    logger.info(f"🔐 Scrubbed embedded git credentials from {scrubbed} workspace file(s)")
                 short_task = task_id[:8]
                 commit_tag = f"dag-{dag_id[:8]}-{short_task}"
                 repo = "registry:5000/openclaw-agent"
@@ -2067,6 +2516,10 @@ async def store_task_output(
         "llm_response_preview": compact_summary[:500],
         "model_used": model_used,
         "image_used": image_used,
+        "image_digest": result.get("image_digest") or "",
+        "image_version_id": result.get("image_version_id") or "",
+        "build_id": result.get("build_id") or "",
+        "capability_request_id": _to_int_or_none(result.get("capability_request_id")),
         "duration_ms": duration_ms,
         "turn_count": result.get("turn_count", 0),
         "started_at": result.get("started_at"),
@@ -2092,6 +2545,16 @@ async def store_task_output(
         return {"error": str(e)}
 
 
+def _own_task_outputs(task_id: str, outputs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only outputs produced by this task (never a DAG sibling)."""
+    return [
+        output
+        for output in (outputs or [])
+        if str(output.get("source_task_id") or output.get("task_id") or "")
+        == str(task_id)
+    ]
+
+
 @activity.defn
 async def get_last_iteration(task_id: str) -> int:
     """Get the last iteration number for a task so continuations don't overlap."""
@@ -2100,14 +2563,24 @@ async def get_last_iteration(task_id: str) -> int:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
+            # own=true: the default /outputs response aggregates every task in
+            # the DAG. Using it here made a fresh node task start at a sibling's
+            # last iteration (dag-f92f1254).
+            resp = await client.get(
+                f"{control_plane_url}/api/tasks/{task_id}/outputs",
+                params={"own": "true"},
+            )
             if resp.status_code == 200:
                 data = resp.json()
-                outputs = data.get("outputs", [])
+                outputs = _own_task_outputs(task_id, data.get("outputs") or [])
                 if outputs:
-                    max_iter = max(o.get("iteration", 0) for o in outputs)
-                    logger.info(f"📊 Last iteration for {task_id}: {max_iter}")
+                    max_iter = max(int(o.get("iteration") or 0) for o in outputs)
+                    logger.info(
+                        f"📊 Last iteration for {task_id}: {max_iter} "
+                        f"(own_outputs={len(outputs)})"
+                    )
                     return max_iter
+                logger.info(f"📊 Last iteration for {task_id}: 0 (no own outputs)")
     except Exception as e:
         logger.warning(f"⚠️ Could not fetch last iteration: {e}")
 
@@ -2997,6 +3470,9 @@ async def build_agent_image(
                                f"Denied: {[d.get('name') for d in supply_chain_denied]}")
                 return {
                     "image": current_image,
+                    "digest": "",
+                    "build_id": "",
+                    "version_id": "",
                     "feedback": supply_chain_feedback,
                     "denied": supply_chain_denied,
                 }
@@ -3011,6 +3487,8 @@ async def build_agent_image(
             waited = 0
             
             while waited < max_wait:
+                if activity.is_cancelled():
+                    raise asyncio.CancelledError()
                 await asyncio.sleep(poll_interval)
                 waited += poll_interval
                 
@@ -3027,6 +3505,13 @@ async def build_agent_image(
                     logger.info(f"   └─ Dockerfile saved to: agent-images/{task_id}/")
                     return {
                         "image": image_tag,
+                        "digest": status.get("digest") or "",
+                        "build_id": build_id,
+                        "version_id": (
+                            result.get("version_id")
+                            or result.get("reused_from")
+                            or ""
+                        ),
                         "feedback": supply_chain_feedback,
                         "denied": supply_chain_denied,
                     }
@@ -3048,6 +3533,31 @@ async def build_agent_image(
             f"Error: {str(e)[:500]}",
             non_retryable=True,
         ) from e
+
+
+@activity.defn
+async def persist_task_image(task_id: str, image: str) -> Dict[str, Any]:
+    """Persist the actual runtime image on the task record."""
+    import httpx
+
+    if not image:
+        return {"updated": False}
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(
+                f"{control_plane_url}/api/tasks/{task_id}/image",
+                json={"current_image": image},
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"persist_task_image: unexpected status {resp.status_code} for {task_id}"
+                )
+                return {"updated": False}
+            return {"updated": True}
+    except Exception as exc:
+        logger.warning(f"persist_task_image failed for {task_id}: {exc}")
+        return {"updated": False}
 
 
 @activity.defn
@@ -3079,6 +3589,63 @@ async def update_task_policy(
         logger.error(f"❌ Failed to persist image for task {task_id}: {e}")
 
     return {"updated": True, "new_image": new_image}
+
+
+@activity.defn
+async def get_ready_capability_image(
+    task_id: str,
+    capability_request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a succeeded capability build for this task/request, if any.
+
+    This bridges builds started by the control plane (orphan/sibling approval)
+    into the live workflow so iteration N+1 does not rebuild or, worse, keep the
+    pre-approval image.
+    """
+    import httpx
+
+    if not capability_request_id:
+        # Without a request id there is no way to prove an existing build
+        # matches this capability; force a fresh build instead.
+        return {}
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{control_plane_url}/api/image-catalog/builds",
+                params={
+                    "task_id": task_id,
+                    "capability_request_id": str(capability_request_id),
+                    "status": "succeeded",
+                    "limit": 5,
+                },
+            )
+            if resp.status_code != 200:
+                return {}
+            builds = resp.json()
+    except Exception as exc:
+        logger.warning(f"Could not look up ready capability image for {task_id}: {exc}")
+        return {}
+
+    for build in builds or []:
+        if not isinstance(build, dict):
+            continue
+        image_tag = str(build.get("image_tag") or "").strip()
+        if not image_tag:
+            continue
+        logger.info(
+            f"CAPABILITY_IMAGE_ADOPTED | task={task_id} | request={capability_request_id} | "
+            f"image={image_tag} | build={build.get('build_id') or '-'}"
+        )
+        return {
+            "image_tag": image_tag,
+            "image_digest": build.get("image_digest") or "",
+            "version_id": build.get("version_id") or "",
+            "build_id": build.get("build_id") or "",
+            "capability_request_id": capability_request_id,
+        }
+    return {}
 
 
 @activity.defn
@@ -3339,6 +3906,149 @@ async def patch_deployment(deployment_id: str, updates: Dict[str, Any]) -> Dict[
     except Exception as e:
         logger.error(f"❌ Failed to patch deployment {deployment_id}: {e}")
         return {"error": str(e)}
+
+
+def _node_needs_repo_access(node_config: Dict[str, Any], description: str) -> bool:
+    if not isinstance(node_config, dict):
+        return False
+    if node_config.get("github_push") or node_config.get("github_access"):
+        return True
+    capabilities = node_config.get("required_capabilities") or {}
+    binaries = {str(x).lower() for x in (capabilities.get("binaries") or [])}
+    categories = {str(x).lower() for x in (capabilities.get("categories") or [])}
+    text = (description or "").lower()
+    signals = ("clone", "checkout", "check out", "git pull", "git fetch", "repository", "repo ")
+    return bool("git" in binaries or "git" in categories or any(s in text for s in signals))
+
+
+async def _github_push_lease(task_id: str) -> Dict[str, Any]:
+    """Lease a repo/branch-scoped GitHub credential for one agent container.
+
+    The publishing node and every upstream node that needs the checkout share
+    the same DAG-level repository/branch scope. The gateway validates the
+    allowlist; this helper never logs the token.
+    """
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    gateway_url = os.getenv("CREDENTIAL_GATEWAY_URL", "http://credential-gateway:8083")
+    admin_token = os.getenv("CREDENTIAL_GATEWAY_ADMIN_TOKEN", "openclaw-admin")
+    if not admin_token:
+        logger.warning("GitHub lease skipped: no credential gateway admin token")
+        return {}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            task_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}")
+            if task_resp.status_code != 200:
+                return {}
+            task = task_resp.json() or {}
+            dag_id = task.get("dag_id")
+            node_id = task.get("node_id")
+            if not dag_id or not node_id:
+                return {}
+
+            nodes_resp = await client.get(
+                f"{control_plane_url}/api/dags/{dag_id}/nodes"
+            )
+            if nodes_resp.status_code != 200:
+                return {}
+            nodes = nodes_resp.json() or []
+            node_config: Dict[str, Any] = {}
+            node_description = ""
+            for node in nodes:
+                if node.get("node_id") == node_id:
+                    node_config = node.get("config") or {}
+                    node_description = str(node.get("description") or "")
+                    break
+
+            push_scopes: Dict[tuple, Dict[str, Any]] = {}
+            for node in nodes:
+                config = node.get("config") or {}
+                push_cfg = config.get("github_push") or {}
+                if not isinstance(push_cfg, dict) or not push_cfg.get("enabled"):
+                    continue
+                if push_cfg.get("authorized") is False:
+                    continue
+                repo = str(push_cfg.get("repository") or push_cfg.get("repo") or "").strip()
+                branch = str(push_cfg.get("branch") or "main").strip()
+                if repo:
+                    push_scopes[(repo.lower(), branch)] = {
+                        "repository": repo,
+                        "branch": branch,
+                        "credential": str(push_cfg.get("credential") or "github").strip(),
+                    }
+
+            current_push = node_config.get("github_push") or {}
+            current_access = node_config.get("github_access") or {}
+            scope: Dict[str, Any] = {}
+            if isinstance(current_push, dict) and current_push.get("enabled"):
+                if current_push.get("authorized") is False:
+                    logger.warning(
+                        f"GitHub lease not authorized for task {task_id} node {node_id}"
+                    )
+                    return {}
+                repo = str(current_push.get("repository") or current_push.get("repo") or "").strip()
+                if repo:
+                    scope = {
+                        "repository": repo,
+                        "branch": str(current_push.get("branch") or "main").strip(),
+                        "credential": str(current_push.get("credential") or "github").strip(),
+                    }
+            elif isinstance(current_access, dict) and current_access.get("repository"):
+                scope = {
+                    "repository": str(current_access.get("repository")).strip(),
+                    "branch": str(current_access.get("branch") or "main").strip(),
+                    "credential": str(current_access.get("credential") or "github").strip(),
+                }
+            elif _node_needs_repo_access(node_config, node_description) and len(push_scopes) == 1:
+                scope = next(iter(push_scopes.values()))
+
+            if not scope:
+                if _node_needs_repo_access(node_config, node_description):
+                    logger.warning(
+                        f"GitHub lease skipped for task {task_id}: no unambiguous DAG repository scope"
+                    )
+                return {}
+
+            repository = scope["repository"]
+            branch = scope.get("branch") or "main"
+            credential = scope.get("credential") or "github"
+            lease_resp = await client.post(
+                f"{gateway_url}/v1/lease/github",
+                headers={"X-Admin-Token": admin_token},
+                json={
+                    "credential": credential,
+                    "repository": repository,
+                    "branch": branch,
+                    "task_id": task_id,
+                },
+            )
+            if lease_resp.status_code != 200:
+                logger.warning(
+                    f"GitHub lease denied for task {task_id} "
+                    f"({repository}@{branch}): HTTP {lease_resp.status_code}"
+                )
+                return {}
+            lease = lease_resp.json() or {}
+            token = str(lease.get("password") or lease.get("token") or "")
+            if not token:
+                logger.warning(f"GitHub lease returned no token for {task_id}")
+                return {}
+            logger.info(
+                f"🔑 GitHub lease acquired | task={task_id} "
+                f"repo={lease.get('repository') or repository} "
+                f"branch={lease.get('branch') or branch}"
+            )
+            return {
+                "token": token,
+                "repository": lease.get("repository") or repository,
+                "branch": lease.get("branch") or branch,
+                "repo_dir": str(node_config.get("repo_dir") or "/workspace/repo"),
+            }
+    except Exception as exc:
+        logger.warning(f"GitHub lease failed for {task_id}: {exc}")
+        return {}
 
 
 @activity.defn
@@ -3637,7 +4347,10 @@ async def trial_deploy(
     container = None
     image_tag = None
 
-    logger.info(f"🧪 TRIAL_DEPLOY | Task: {task_id} | Port: {port} | Entrypoint: {entrypoint}")
+    logger.info(
+        f"🧪 TRIAL_DEPLOY | Task: {task_id} | Port: {port} | "
+        f"Entrypoint: {entrypoint} | Base image: {deployment.get('agent_image') or 'unknown'}"
+    )
 
     try:
         # Phase 1: Build the deployment image via image-builder
@@ -4173,13 +4886,9 @@ async def create_node_task(
 
     task_id = f"task-{uuid.uuid4().hex[:8]}"
 
-    # Control-plane /api/tasks expects a base_image key (e.g. "browser", "openclaw"), not a full image URL.
-    if base_image_override:
-        base_image = base_image_override.strip()
-    else:
-        base_image = (agent_image or "openclaw").strip()
-        if "/" in base_image and ":" in base_image:
-            base_image = base_image.rsplit(":", 1)[-1]
+    # Prefer the concrete image the node will actually run. The control plane
+    # preserves full refs and expands short keys such as "openclaw".
+    base_image = (base_image_override or agent_image or "openclaw").strip()
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"{control_plane_url}/api/tasks",
@@ -4198,6 +4907,50 @@ async def create_node_task(
             raise ApplicationError(f"Failed to create task for node {node_id}: {resp.status_code} {resp.text}")
         data = resp.json()
         return data.get("id", task_id)
+
+
+@activity.defn
+async def persist_node_image(
+    dag_id: str,
+    node_id: str,
+    image_tag: str,
+    image_digest: str = "",
+    version_id: str = "",
+    build_id: str = "",
+) -> Dict[str, Any]:
+    """Persist the enriched image on the DAG node config for later retries.
+
+    AgentTaskWorkflow state is process-local to a Temporal run. A DAG retry or
+    loop-back starts a fresh node workflow, so the only durable way to inherit
+    the rebuilt image is to write it back into the DAG node definition.
+    """
+    import httpx
+
+    if not image_tag:
+        return {"updated": False}
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{control_plane_url}/api/dags/{dag_id}/nodes/{node_id}/built-image",
+                json={
+                    "image_tag": image_tag,
+                    "image_digest": image_digest or "",
+                    "version_id": version_id or "",
+                    "build_id": build_id or "",
+                },
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"Could not persist node image for {dag_id}/{node_id}: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+                return {"updated": False}
+            return resp.json()
+    except Exception as exc:
+        logger.warning(f"Could not persist node image for {dag_id}/{node_id}: {exc}")
+        return {"updated": False}
 
 
 def _extract_acquisition_log(agent_logs: str) -> List[Dict[str, Any]]:
@@ -4495,23 +5248,23 @@ async def collect_node_output(task_id: str) -> Dict[str, Any]:
         task = resp.json()
         node_id = task.get("node_id") or ""
 
-        # Fetch the latest output
-        outputs_resp = await client.get(f"{control_plane_url}/api/tasks/{task_id}/outputs")
+        # Fetch the latest output. own=true keeps sibling DAG tasks out of the
+        # gate: a fresh node must never be judged by another node's output.
+        outputs_resp = await client.get(
+            f"{control_plane_url}/api/tasks/{task_id}/outputs",
+            params={"own": "true"},
+        )
         outputs_payload = outputs_resp.json() if outputs_resp.status_code == 200 else {}
         outputs = []
         if isinstance(outputs_payload, dict):
             outputs = outputs_payload.get("outputs", []) or []
         elif isinstance(outputs_payload, list):
             outputs = outputs_payload
-        # The /outputs endpoint aggregates sibling DAG tasks (and older runs);
-        # keep only THIS task's own iterations so the gate evaluates the right
-        # node's final output.
-        own_outputs = []
-        for o in outputs:
-            src = o.get("source_task_id") or o.get("task_id")
-            if src is None or str(src) == str(task_id):
-                own_outputs.append(o)
-        outputs = own_outputs
+        # Defensive filter for older/alternate endpoints that omit own mode.
+        outputs = _own_task_outputs(task_id, outputs)
+        logger.info(
+            f"📦 collect_node_output | task={task_id} | own_outputs={len(outputs)}"
+        )
 
         result = {
             "task_id": task_id,
@@ -4785,6 +5538,76 @@ async def _deep_review_gate_fallback(
     }
 
 
+def _normalize_repo_reference(value: str) -> str:
+    ref = (value or "").strip()
+    ref = re.sub(r"^[a-z]+://", "", ref, flags=re.IGNORECASE)
+    ref = ref.split("@", 1)[-1] if "@" in ref else ref
+    ref = ref.replace("github.com:", "github.com/").replace("github.com/", "", 1)
+    if ref.lower().endswith(".git"):
+        ref = ref[:-4]
+    return ref.strip("/").lower()
+
+
+def _find_repo_checkout(workspace_id: str, repository: str, root: Optional[str] = None) -> Dict[str, Any]:
+    """Find a matching checkout without exposing credentials from .git/config."""
+    import subprocess
+
+    root = root or os.path.join("/workspaces", workspace_id or "")
+    wanted = _normalize_repo_reference(repository)
+    if not workspace_id or not os.path.isdir(root):
+        return {"ok": False, "error": "workspace_missing"}
+    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
+    for dirpath, dirnames, _filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > 8:
+            dirnames[:] = []
+            continue
+        if ".git" in dirnames:
+            git_dir = os.path.join(dirpath, ".git")
+            config_path = os.path.join(git_dir, "config")
+            try:
+                with open(config_path, "r", errors="replace") as fh:
+                    config_text = fh.read()
+            except OSError:
+                config_text = ""
+            remotes = re.findall(r"^\s*url\s*=\s*(\S+)\s*$", config_text, re.MULTILINE)
+            matched = next(
+                (remote for remote in remotes if _normalize_repo_reference(remote) == wanted),
+                "",
+            )
+            if not matched:
+                dirnames.remove(".git")
+                continue
+            head = ""
+            try:
+                head = subprocess.run(
+                    ["git", "-C", dirpath, "rev-parse", "--verify", "HEAD"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+            except Exception:
+                pass
+            if not head:
+                try:
+                    with open(os.path.join(git_dir, "HEAD"), "r", errors="replace") as fh:
+                        head = fh.read().strip()
+                except OSError:
+                    pass
+            return {
+                "ok": bool(head),
+                "checkout": dirpath,
+                "head": head,
+                "error": "" if head else "checkout_has_no_head",
+            }
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+    return {"ok": False, "error": f"no_checkout_for_{wanted}"}
+
+
+@activity.defn
+async def verify_repo_checkout(workspace_id: str, repository: str) -> Dict[str, Any]:
+    return _find_repo_checkout(workspace_id, repository)
+
+
 @activity.defn
 async def evaluate_node_gate(task_id: str, output: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Evaluate node output quality gate.
@@ -4971,6 +5794,39 @@ async def persist_task_workflow_id(task_id: str, workflow_id: str) -> bool:
 # DAG Workflows
 # =============================================================================
 
+@activity.defn
+async def run_dag_plan_activity(dag_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Ask the control plane to plan a pre-created PLANNING DAG."""
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    async with httpx.AsyncClient(timeout=900.0) as client:
+        response = await client.post(
+            f"{control_plane_url}/api/dags/{dag_id}/plan",
+            json=payload,
+        )
+        if response.status_code >= 400:
+            raise ApplicationError(
+                f"DAG planning request failed: HTTP {response.status_code}: {response.text[:300]}",
+                non_retryable=False,
+            )
+        return response.json()
+
+
+@workflow.defn
+class DAGPlanningWorkflow:
+    """Durable background planning for POST /api/dags/with-files."""
+
+    @workflow.run
+    async def run(self, dag_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await workflow.execute_activity(
+            run_dag_plan_activity,
+            args=[dag_id, payload],
+            start_to_close_timeout=timedelta(minutes=15),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+
+
 @workflow.defn
 class DAGNodeWorkflow:
     """Execute a single DAG node.
@@ -5005,17 +5861,21 @@ class DAGNodeWorkflow:
         workspace_id = params.get("workspace_id", "")
         node_type = str(params.get("node_type") or config.get("type") or "agent").lower()
 
-        # Prefer the DAG-inherited enriched image over the static base_image
-        # from the node config.  dag_image is injected by DAGWorkflow when a
-        # previous wave already built capabilities.
+        # Prefer the image this node last built (persisted across retries and
+        # loop-backs), then the DAG-inherited enriched image, then the static
+        # plan-time pin. Never start from a stale base when a richer image for
+        # this node already exists.
         agent_image = (
-            config.get("dag_image")
+            config.get("last_built_image")
+            or config.get("dag_image")
             or config.get("resolved_image")
             or config.get("base_image", "openclaw")
         )
         if "/" not in agent_image:
             agent_image = f"localhost:5000/openclaw-agent:{agent_image}"
-        if config.get("dag_image"):
+        if config.get("last_built_image"):
+            logger.info(f"🔗 DAGNodeWorkflow | Node {node_id} resuming from built image: {agent_image}")
+        elif config.get("dag_image"):
             logger.info(f"🔗 DAGNodeWorkflow | Node {node_id} inheriting DAG image: {agent_image}")
         llm_model = config.get("llm_model", "gemini-flash-lite-latest")
 
@@ -5083,16 +5943,31 @@ class DAGNodeWorkflow:
 
         # Build the follow-up prompt from objective + input_data
         follow_up_parts = []
+        _gate_cfg = (config.get("deliverable_gate") or {}) if isinstance(config, dict) else {}
+        in_place = bool(
+            config.get("deliverable_mode") == "in_place"
+            or _gate_cfg.get("require_deliverables") is False
+        )
         # Deliverables-dir instruction FIRST so it is never truncated away by the
         # FOLLOW_UP env limit — agents must know exactly where to write outputs.
-        follow_up_parts.append(
-            f"--- Deliverables directory ---\n"
-            f"This step's deliverables directory is `/workspace/{node_id}/` — create it if needed. "
-            f"Write your FINAL deliverables (reports, parsed data files, code artifacts) there; only files in "
-            f"that directory are collected. Put intermediate/raw products (fetched HTML pages, caches, scratch) "
-            f"in `/tmp` or `/workspace/.cache/` — they are NOT collected. If the task fetches web data, save the "
-            f"raw pages outside the deliverables directory and place only the parsed/structured data inside it."
-        )
+        # In-place nodes edit existing files and must not be sent to a node dir.
+        if in_place:
+            follow_up_parts.append(
+                "--- In-place modification ---\n"
+                f"This step modifies existing files in the shared workspace. Do NOT create `/workspace/{node_id}/`. "
+                "Edit the target files in place, run the tests specified in the objective, fix failures, and "
+                "finish only when the suite passes. Report the exact command and result. Do not copy or rewrite "
+                "existing sources from scratch."
+            )
+        else:
+            follow_up_parts.append(
+                f"--- Deliverables directory ---\n"
+                f"This step's deliverables directory is `/workspace/{node_id}/` — create it if needed. "
+                f"Write your FINAL deliverables (reports, parsed data files, code artifacts) there; only files in "
+                f"that directory are collected. Put intermediate/raw products (fetched HTML pages, caches, scratch) "
+                f"in `/tmp` or `/workspace/.cache/` — they are NOT collected. If the task fetches web data, save the "
+                f"raw pages outside the deliverables directory and place only the parsed/structured data inside it."
+            )
         input_attachments = config.get("input_attachments") or []
         if isinstance(input_attachments, list) and input_attachments:
             follow_up_parts.append("--- Attached Reference Files (read-only) ---")
@@ -5111,6 +5986,17 @@ class DAGNodeWorkflow:
                 "and visible to all steps. Read them as needed; do not modify them. Files "
                 "produced by earlier steps appear in the input data below."
             )
+        repo_access = config.get("github_access") or config.get("github_push")
+        if isinstance(repo_access, dict) and repo_access.get("repository"):
+            repo_dir = str(config.get("repo_dir") or "/workspace/repo")
+            follow_up_parts.append(
+                "--- Repository access ---\n"
+                f"Repository: {repo_access.get('repository')} (branch {repo_access.get('branch') or 'main'}).\n"
+                f"Use the shared checkout directory `{repo_dir}`. When a checkout is needed, use "
+                f"`git clone https://github.com/{repo_access.get('repository')}.git {repo_dir}`; "
+                "the platform provides GITHUB_TOKEN/GIT_ASKPASS. Never put the token in a URL, "
+                "git config, a file, or a deliverable."
+            )
         if node_objective:
             follow_up_parts.append("--- Step Objective ---")
             follow_up_parts.append(node_objective)
@@ -5118,11 +6004,18 @@ class DAGNodeWorkflow:
             follow_up_parts.append("--- Success Criteria ---")
             for criterion in success_criteria[:8]:
                 follow_up_parts.append(f"- {str(criterion)[:240]}")
-        follow_up_parts.append(
-            f"--- Turn budget ---\n"
-            f"You have up to {max_agent_turns} turns for this step. Write your deliverable(s) "
-            f"incrementally — do not spend the whole budget exploring."
-        )
+        if in_place:
+            follow_up_parts.append(
+                f"--- Turn budget ---\n"
+                f"You have up to {max_agent_turns} turns for this step. Verify and repair in place, "
+                f"run the tests, fix failures — do not spend the whole budget exploring."
+            )
+        else:
+            follow_up_parts.append(
+                f"--- Turn budget ---\n"
+                f"You have up to {max_agent_turns} turns for this step. Write your deliverable(s) "
+                f"incrementally — do not spend the whole budget exploring."
+            )
         thinking_budget = str(config.get("thinking_budget") or "").lower()
         if thinking_budget == "lean":
             follow_up_parts.append(
@@ -5176,7 +6069,6 @@ class DAGNodeWorkflow:
                     agent_image,
                     llm_model,
                     workspace_id,
-                    config.get("resolved_runtime") or "",
                 ],
                 start_to_close_timeout=timedelta(seconds=30),
             )
@@ -5216,8 +6108,12 @@ class DAGNodeWorkflow:
 
             # Deliverable requirement mirrors config.deliverable_gate so the
             # agent loop only enforces writing files when the gate expects them.
-            _gate_cfg = (config.get("deliverable_gate") or {}) if isinstance(config, dict) else {}
-            _deliverables_required = (_gate_cfg.get("enabled", True) is not False) and bool(_gate_cfg.get("require_deliverables", True))
+            # In-place nodes never require a node deliverables directory.
+            _deliverables_required = (
+                (_gate_cfg.get("enabled", True) is not False)
+                and bool(_gate_cfg.get("require_deliverables", True))
+                and not in_place
+            )
 
             await workflow.execute_activity(
                 persist_task_workflow_id,
@@ -5227,8 +6123,23 @@ class DAGNodeWorkflow:
 
             result = await workflow.execute_child_workflow(
                 AgentTaskWorkflow.run,
-                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations],
+                args=[task_id, llm_model, agent_image, follow_up, dag_id, _deliverables_required, max_agent_turns, max_iterations, bool(config.get("deploy_authorized"))],
                 id=child_workflow_id,
+            )
+
+            # Persist the enriched image on the node so a later retry/loop-back
+            # starts from it instead of the plan-time base image.
+            await workflow.execute_activity(
+                persist_node_image,
+                args=[
+                    dag_id,
+                    node_id,
+                    result.get("current_image", ""),
+                    result.get("current_image_digest", ""),
+                    result.get("image_version_id", ""),
+                    result.get("build_id", ""),
+                ],
+                start_to_close_timeout=timedelta(seconds=15),
             )
 
             # Collect full output
@@ -5237,6 +6148,42 @@ class DAGNodeWorkflow:
                 args=[task_id],
                 start_to_close_timeout=timedelta(seconds=30),
             )
+
+            repo_cfg = config.get("github_access") or config.get("github_push") or {}
+            repo_required = str((repo_cfg or {}).get("repository") or "").strip()
+            if repo_required:
+                repo_check = await workflow.execute_activity(
+                    verify_repo_checkout,
+                    args=[workspace_id, repo_required],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                output["repo_checkout"] = repo_check
+                if not repo_check.get("ok"):
+                    reason = (
+                        "repo_checkout_missing: "
+                        + str(repo_check.get("error") or "no matching checkout")
+                    )
+                    output["gate_failure"] = reason
+                    logger.error(
+                        f"🛑 REPO_CHECKOUT_MISSING | DAG={dag_id} | node={node_id} | "
+                        f"repo={repo_required} | {repo_check.get('error')}"
+                    )
+                    await workflow.execute_activity(
+                        update_node_status,
+                        args=[dag_id, node_id, "failed", output],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    await workflow.execute_activity(
+                        post_dag_progress,
+                        args=[dag_id, f"❌ Node '{node_id}' failed: no checkout for {repo_required}"],
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    return {
+                        "status": "failed",
+                        "error": reason,
+                        "node_id": node_id,
+                        "output": output,
+                    }
 
             # Surface that the task finished and the gate is being evaluated,
             # so a gate that is queued (e.g. worker concurrency contention) does
@@ -5937,8 +6884,22 @@ class DAGWorkflow:
 
         # Track the richest capability-enriched image across waves so
         # downstream nodes inherit installed packages and file-system
-        # state instead of starting from the bare base image.
+        # state instead of starting from the bare base image. On resume,
+        # seed it from images persisted by nodes in an earlier DAG run.
         dag_current_image = ""
+        _seed_rank = {"completed": 3, "running": 2, "failed": 1}
+        _seed_best = 0
+        for _n in nodes_list:
+            _cfg = _n.get("config") or {}
+            _persisted = str(_cfg.get("last_built_image") or "").strip()
+            if not _persisted:
+                continue
+            _rank = _seed_rank.get(str(_n.get("status") or "").lower(), 0)
+            if _rank and _rank >= _seed_best:
+                _seed_best = _rank
+                dag_current_image = _persisted
+        if dag_current_image:
+            logger.info(f"🔗 DAG image seeded from persisted node state: {dag_current_image}")
 
         while wave < max_waves:
             wave += 1
@@ -6456,7 +7417,10 @@ class DeploymentBuildWorkflow:
                 error = trial.get("error", "Trial deployment failed")
                 phase = trial.get("phase") or "unknown"
                 logs = (trial.get("logs") or "")[:1000]
-                detail = f"Trial preflight failed ({phase}): {error}"
+                detail = (
+                    f"Trial preflight failed ({phase}) using base image "
+                    f"{deployment.get('agent_image') or 'unknown'}: {error}"
+                )
                 if logs:
                     detail = f"{detail}\n{logs}"
                 await workflow.execute_activity(
@@ -6505,6 +7469,30 @@ class DeploymentBuildWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             )
             logger.info(f"✅ Trial image reused for deployment {deployment_id}: {image_tag}")
+            if deployment.get("auto_start"):
+                try:
+                    await workflow.execute_activity(
+                        start_deployment_container,
+                        args=[deployment_id],
+                        start_to_close_timeout=timedelta(minutes=5),
+                    )
+                    return {
+                        "status": "running",
+                        "image_tag": image_tag,
+                        "trial_passed": True,
+                        "auto_started": True,
+                        "deployment": result,
+                    }
+                except Exception as exc:
+                    await workflow.execute_activity(
+                        patch_deployment,
+                        args=[
+                            deployment_id,
+                            {"status": "failed", "error": f"Auto-start failed: {exc}"},
+                        ],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    return {"status": "failed", "error": f"Auto-start failed: {exc}"}
             return {
                 "status": "built",
                 "image_tag": image_tag,
@@ -6517,6 +7505,25 @@ class DeploymentBuildWorkflow:
             args=[deployment_id],
             start_to_close_timeout=timedelta(minutes=10),
         )
+
+        if deployment and deployment.get("auto_start"):
+            try:
+                await workflow.execute_activity(
+                    start_deployment_container,
+                    args=[deployment_id],
+                    start_to_close_timeout=timedelta(minutes=5),
+                )
+                return {"status": "running", "auto_started": True, "deployment": result}
+            except Exception as exc:
+                await workflow.execute_activity(
+                    patch_deployment,
+                    args=[
+                        deployment_id,
+                        {"status": "failed", "error": f"Auto-start failed: {exc}"},
+                    ],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                return {"status": "failed", "error": f"Auto-start failed: {exc}"}
 
         return result
 
@@ -6551,6 +7558,44 @@ class DeploymentRunWorkflow:
 # Worker
 # =============================================================================
 
+def _worker_code_revision() -> str:
+    """Hash the worker source so the control plane can detect a stale process.
+
+    The compose file bind-mounts worker.py into the container. Editing that file
+    does not reload a running Python process: workflow code can be re-imported
+    from disk by the Temporal sandbox while activity signatures remain from the
+    process start, which produced the dag-90e1501e
+    "start_agent_container() takes from 2 to 7 positional arguments" failure.
+    """
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:16]
+    except Exception:
+        return "unknown"
+
+
+async def _worker_heartbeat_loop(revision: str, worker_id: str, activity_count: int):
+    import httpx
+
+    control_plane_url = os.getenv("CONTROL_PLANE_URL", "http://control-plane:8000")
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{control_plane_url}/api/workers/heartbeat",
+                    json={
+                        "worker_id": worker_id,
+                        "revision": revision,
+                        "task_queue": TASK_QUEUE,
+                        "activity_count": activity_count,
+                        "pid": os.getpid(),
+                    },
+                )
+        except Exception as exc:
+            logger.warning(f"Worker heartbeat failed: {exc}")
+        await asyncio.sleep(10)
+
+
 async def main():
     """Main worker entry point"""
     
@@ -6558,14 +7603,16 @@ async def main():
     
     # Connect to Temporal
     client = await Client.connect(TEMPORAL_HOST)
-    
-    # Create worker
-    worker = Worker(
-        client,
-        task_queue=TASK_QUEUE,
-        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, DAGWorkflow, DAGNodeWorkflow],
-        activities=[
+
+    revision = _worker_code_revision()
+    worker_id = f"{os.getenv('HOSTNAME', 'worker')}:{os.getpid()}"
+    logger.info(
+        f"Worker code revision {revision} | worker_id={worker_id} | queue={TASK_QUEUE}"
+    )
+
+    activities = [
             initialize_task,
+            run_dag_plan_activity,
             start_agent_container,
             poll_agent_turns,
             collect_agent_result,
@@ -6600,24 +7647,50 @@ async def main():
             post_node_audit_event,
             post_node_structured_output,
             create_node_task,
+            persist_node_image,
+            persist_task_image,
+            get_ready_capability_image,
             collect_node_output,
+            verify_repo_checkout,
             evaluate_node_gate,
             evaluate_edge_condition,
             finalize_dag,
             persist_task_workflow_id,
             update_task_status,
             create_user_request,
-        ],
-        # Limit concurrency to avoid OOM on constrained hosts: only a few
-        # activities (agent containers, LLM/gate calls) run at once.
-        # Configurable via env.
-        max_concurrent_activities=int(os.getenv("MAX_CONCURRENT_ACTIVITIES", "4")),
+    ]
+
+    # Build workflows and activities from the same loaded module. A bind-mounted
+    # worker.py change requires a process restart; the heartbeat + DAG start
+    # guard make a stale process visible instead of silently mis-dispatching.
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_ACTIVITIES", "12"))
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[AgentTaskWorkflow, AgentStepWorkflow, DeploymentBuildWorkflow, DeploymentRunWorkflow, DAGWorkflow, DAGNodeWorkflow, DAGPlanningWorkflow],
+        activities=activities,
+        # Keep enough slots for DAG fan-out plus long-running agent activities.
+        # A small fixed pool (4) starves every new node when a few activities
+        # are slow. Configurable via env.
+        max_concurrent_activities=max_concurrent,
     )
     
-    logger.info(f"Worker starting on task queue: {TASK_QUEUE}")
+    logger.info(
+        f"Worker starting on task queue: {TASK_QUEUE} | revision={revision} | "
+        f"activities={len(activities)} | max_concurrent={max_concurrent}"
+    )
     
-    # Run worker
-    await worker.run()
+    heartbeat_task = asyncio.create_task(
+        _worker_heartbeat_loop(revision, worker_id, len(activities))
+    )
+    try:
+        await worker.run()
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

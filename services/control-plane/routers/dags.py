@@ -6,7 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, status, Body, File, Form,
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from database import get_db
-from workflow_groups import ensure_workflow_group, cleanup_empty_group
+from workflow_groups import (
+    ensure_workflow_group,
+    cleanup_empty_group,
+    resolve_project_id,
+)
 from models import (
     MasterDAG,
     WorkflowGroup,
@@ -18,6 +22,7 @@ from models import (
     DAGNodeStateSnapshot,
     DAGNodeAuditEvent,
     DAGNodeOutput,
+    ExplorationCycle,
     SkillV2,
     TemplateSkill,
     TemplateSkillStatus,
@@ -34,6 +39,7 @@ from schemas import (
     DAGNodeCreate,
     DAGRevise,
     DAGRefine,
+    DAGPlanRequest,
     DAGNodeEnhanceRequest,
     DAGNodePatch,
     DAGNodeStateSnapshotCreate,
@@ -202,6 +208,71 @@ async def _resolve_node_capabilities(dag_json: dict, db: AsyncSession) -> None:
         logger.warning("Base/capability image resolution failed: %s", exc)
 
 
+async def _persist_planned_dag(
+    dag: MasterDAG,
+    dag_json: dict,
+    attachments: Optional[List[dict]],
+    db: AsyncSession,
+    *,
+    auto_start: bool = False,
+):
+    """Normalize, persist nodes, and finalize a planner result."""
+    dag_json = _normalize_interactive_nodes(dag_json)
+    await _resolve_node_capabilities(dag_json, db)
+    if attachments:
+        dag_json["input_attachments"] = attachments
+        for node_def in dag_json.get("nodes", []):
+            node_def.setdefault("config", {})["input_attachments"] = attachments
+    dag.dag_json = dag_json
+    dag.status = DAGStatus.READY
+
+    nodes = []
+    for node_def in dag_json.get("nodes", []):
+        node_config = dict(node_def.get("config") or {})
+        skill_id, selected_skill_v2_id, skill_selection_reason = _normalize_node_skill_fields(
+            node_def, node_config
+        )
+        node_def["skill_id"] = skill_id
+        if selected_skill_v2_id:
+            node_def.setdefault("config", {})["selected_skill_v2_id"] = selected_skill_v2_id
+        if skill_selection_reason:
+            node_def.setdefault("config", {})["skill_selection_reason"] = skill_selection_reason
+        node = DAGNode(
+            dag_id=dag.id,
+            node_id=node_def["node_id"],
+            skill_id=skill_id,
+            skill_step_index=node_def.get("skill_step_index"),
+            description=node_def.get("description"),
+            status=NodeStatus.PENDING,
+            depends_on=node_def.get("depends_on", []),
+            config=node_config,
+            input_mapping=node_def.get("input_mapping", {}),
+            selected_skill_v2_id=selected_skill_v2_id,
+            skill_selection_reason=skill_selection_reason,
+            node_type=node_def.get("node_type", "agent")
+            if node_def.get("node_type", "agent") in ("agent", "decision", "input", "block")
+            else "agent",
+        )
+        db.add(node)
+        nodes.append(node)
+
+        if selected_skill_v2_id:
+            db.add(
+                SkillSelectionEvent(
+                    skill_id=selected_skill_v2_id,
+                    dag_id=dag.id,
+                    node_id=node_def["node_id"],
+                    selection_reason=skill_selection_reason,
+                )
+            )
+
+    await db.commit()
+    await db.refresh(dag)
+    if auto_start:
+        return await _start_dag(dag, db)
+    return _build_dag_detail(dag, nodes)
+
+
 async def _create_dag_impl(
     objective: str,
     *,
@@ -212,8 +283,10 @@ async def _create_dag_impl(
     project_id: Optional[str],
     files: Optional[List[UploadFile]],
     db: AsyncSession,
+    async_planning: bool = False,
 ):
     """Plan and persist a DAG, optionally saving attached reference files first."""
+    project_id = await resolve_project_id(project_id, db)
     dag_id = _gen_dag_id()
     workspace_id = _gen_workspace_id(dag_id)
 
@@ -274,6 +347,34 @@ async def _create_dag_impl(
     if attachments:
         planner_objective = f"{objective}\n\n{attachments_block(attachments)}"
 
+    if async_planning:
+        try:
+            from temporal_client import get_temporal_client
+
+            client = await get_temporal_client()
+            await client.start_workflow(
+                "DAGPlanningWorkflow",
+                args=[
+                    dag.id,
+                    {
+                        "objective": planner_objective,
+                        "planning_model": planning_model,
+                        "base_image": base_image,
+                        "skill_ids": skill_ids,
+                        "agent_model": agent_model,
+                        "attachments": attachments,
+                    },
+                ],
+                id=f"dag-plan-{dag.id}",
+                task_queue="openclaw-tasks",
+            )
+        except Exception as exc:
+            dag.status = DAGStatus.FAILED
+            dag.dag_json = {"error": f"Failed to start planning: {exc}"}
+            await db.commit()
+            raise HTTPException(status_code=500, detail=f"Failed to start planning: {exc}")
+        return _build_dag_detail(dag, [])
+
     # Run the planner
     try:
         dag_json = await plan_dag(
@@ -295,60 +396,38 @@ async def _create_dag_impl(
         await db.commit()
         raise HTTPException(status_code=500, detail=f"Planning failed: {e}")
 
-    # Store DAG JSON and create node records
-    dag_json = _normalize_interactive_nodes(dag_json)
-    await _resolve_node_capabilities(dag_json, db)
-    if attachments:
-        dag_json["input_attachments"] = attachments
-        for node_def in dag_json.get("nodes", []):
-            node_def.setdefault("config", {})["input_attachments"] = attachments
-    dag.dag_json = dag_json
-    dag.status = DAGStatus.READY
+    return await _persist_planned_dag(
+        dag, dag_json, attachments, db, auto_start=auto_start
+    )
 
-    nodes = []
-    for node_def in dag_json.get("nodes", []):
-        node_config = dict(node_def.get("config") or {})
-        skill_id, selected_skill_v2_id, skill_selection_reason = _normalize_node_skill_fields(node_def, node_config)
-        node_def["skill_id"] = skill_id
-        if selected_skill_v2_id:
-            node_def.setdefault("config", {})["selected_skill_v2_id"] = selected_skill_v2_id
-        if skill_selection_reason:
-            node_def.setdefault("config", {})["skill_selection_reason"] = skill_selection_reason
-        node = DAGNode(
-            dag_id=dag_id,
-            node_id=node_def["node_id"],
-            skill_id=skill_id,
-            skill_step_index=node_def.get("skill_step_index"),
-            description=node_def.get("description"),
-            status=NodeStatus.PENDING,
-            depends_on=node_def.get("depends_on", []),
-            config=node_config,
-            input_mapping=node_def.get("input_mapping", {}),
-            selected_skill_v2_id=selected_skill_v2_id,
-            skill_selection_reason=skill_selection_reason,
-            node_type=node_def.get("node_type", "agent")
-            if node_def.get("node_type", "agent") in ("agent", "decision", "input", "block")
-            else "agent",
+
+@router.post("/{dag_id}/plan")
+async def plan_dag_async(
+    dag_id: str,
+    body: DAGPlanRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Internal: run the planner for an already-created PLANNING DAG."""
+    dag = await _get_dag_or_404(dag_id, db)
+    if dag.status != DAGStatus.PLANNING:
+        return {"status": str(getattr(dag.status, "value", dag.status)), "dag_id": dag.id}
+    try:
+        dag_json = await plan_dag(
+            body.objective,
+            body.planning_model,
+            db,
+            base_image=body.base_image,
+            skill_ids=body.skill_ids,
+            agent_model=body.agent_model or dag.llm_model,
         )
-        db.add(node)
-        nodes.append(node)
+    except Exception as exc:
+        dag.status = DAGStatus.FAILED
+        dag.dag_json = {"error": f"Planning failed: {exc}"}
+        await db.commit()
+        return {"status": "failed", "error": str(exc), "dag_id": dag.id}
 
-        # Emit selection event for tracking
-        if selected_skill_v2_id:
-            event = SkillSelectionEvent(
-                skill_id=selected_skill_v2_id,
-                dag_id=dag_id,
-                node_id=node_def["node_id"],
-                selection_reason=skill_selection_reason,
-            )
-            db.add(event)
-
-    await db.commit()
-    await db.refresh(dag)
-    if auto_start:
-        return await _start_dag(dag, db)
-
-    return _build_dag_detail(dag, nodes)
+    await _persist_planned_dag(dag, dag_json, body.attachments, db)
+    return {"status": "ready", "dag_id": dag.id}
 
 
 @router.post("", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
@@ -398,12 +477,14 @@ async def create_dag_with_files(
         project_id=project_id or None,
         files=files or [],
         db=db,
+        async_planning=True,
     )
 
 
 @router.post("/manual", response_model=DAGDetail, status_code=status.HTTP_201_CREATED)
 async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(get_db)):
     """Create a DAG with an explicit node graph (skip planner)."""
+    project_id = await resolve_project_id(data.project_id, db)
     dag_id = _gen_dag_id()
     workspace_id = _gen_workspace_id(dag_id)
 
@@ -422,7 +503,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
         raise HTTPException(status_code=422, detail={"errors": errors})
 
     workflow_group = await ensure_workflow_group(
-        data.objective, data.project_id, db, llm_model=data.default_llm
+        data.objective, project_id, db, llm_model=data.default_llm
     )
     dag = MasterDAG(
         id=dag_id,
@@ -431,7 +512,7 @@ async def create_dag_manual(data: DAGManualCreate, db: AsyncSession = Depends(ge
         dag_json=dag_json,
         workspace_id=workspace_id,
         llm_model=data.default_llm,
-        project_id=data.project_id,
+        project_id=project_id,
         workflow_group_id=workflow_group.id,
     )
     db.add(dag)
@@ -594,9 +675,14 @@ async def start_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
             status_code=400,
             detail=f"DAG is in '{dag.status.value}' state, must be 'ready', 'failed', 'cancelled', or 'completed' to start"
         )
-    if dag.status in (DAGStatus.COMPLETED, DAGStatus.CANCELLED):
+    if dag.status in (DAGStatus.FAILED, DAGStatus.COMPLETED, DAGStatus.CANCELLED):
+        # A failed DAG must also be reset; otherwise DAGWorkflow sees the old
+        # failed/skipped nodes and immediately fails again. Use retry-from for
+        # a partial resume.
         nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
-        for node in nodes_result.scalars().all():
+        nodes = list(nodes_result.scalars().all())
+        await _release_task_workflow_ids([node.task_id for node in nodes], db)
+        for node in nodes:
             node.status = NodeStatus.PENDING
             node.output_data = None
             node.task_id = None
@@ -712,6 +798,17 @@ async def delete_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Cannot delete an exploration cycle DAG; finish or replan the exploration")
 
     workspace_path = f"/workspaces/{dag.workspace_id}"
+    # Promoted experiments can share the exploration workspace. Never delete a
+    # directory that another DAG still references.
+    shared_workspace_result = await db.execute(
+        select(MasterDAG.id)
+        .where(
+            MasterDAG.workspace_id == dag.workspace_id,
+            MasterDAG.id != dag_id,
+        )
+        .limit(1)
+    )
+    shared_workspace = shared_workspace_result.scalar_one_or_none() is not None
 
     # Task-scoped children first (need task ids before deleting the tasks).
     task_ids_result = await db.execute(select(Task.id).where(Task.dag_id == dag_id))
@@ -730,15 +827,24 @@ async def delete_dag(dag_id: str, db: AsyncSession = Depends(get_db)):
     if task_ids:
         await db.execute(delete(Task).where(Task.dag_id == dag_id))
     await db.execute(delete(DAGNode).where(DAGNode.dag_id == dag_id))
+    if getattr(dag, "promoted_from_cycle_id", None):
+        cycle = await db.get(ExplorationCycle, dag.promoted_from_cycle_id)
+        if cycle and cycle.promoted_dag_id == dag_id:
+            cycle.promoted_dag_id = None
+            cycle.promoted_at = None
     workflow_group_id = dag.workflow_group_id
     await db.delete(dag)
     await db.commit()
     await cleanup_empty_group(workflow_group_id, db)
     await db.commit()
 
-    # Best-effort workspace cleanup.
+    # Best-effort workspace cleanup; skip shared workspaces.
     try:
-        if os.path.isdir(workspace_path):
+        if shared_workspace:
+            logger.info(
+                f"Keeping shared workspace {workspace_path} (used by another DAG)"
+            )
+        elif os.path.isdir(workspace_path):
             shutil.rmtree(workspace_path, ignore_errors=True)
             logger.info(f"Removed workspace {workspace_path}")
     except Exception as exc:
@@ -1667,6 +1773,18 @@ async def patch_dag(dag_id: str, payload: dict, db: AsyncSession = Depends(get_d
             # Fallback: parse without timezone, assume UTC
             dag.completed_at = datetime.fromisoformat(completed_at_str.split('.')[0])
     await db.commit()
+
+    if dag.status == DAGStatus.COMPLETED and getattr(dag, "exploration_session_id", None):
+        try:
+            from deployment_service import ensure_cycle_deployment
+
+            await ensure_cycle_deployment(dag, db)
+        except Exception as exc:
+            logger.warning(
+                "Could not create exploration deployment for DAG %s: %s",
+                dag.id,
+                exc,
+            )
     return {"ok": True}
 
 
@@ -2573,6 +2691,11 @@ async def retry_dag_from_node(dag_id: str, node_id: str, db: AsyncSession = Depe
     rerun = {node_id}
     rerun.update(_compute_descendants(node_id, all_nodes))
 
+    await _release_task_workflow_ids(
+        [node.task_id for node in all_nodes if node.node_id in rerun],
+        db,
+    )
+
     for node in all_nodes:
         if node.node_id in rerun:
             node.status = NodeStatus.PENDING
@@ -2590,6 +2713,61 @@ async def retry_dag_from_node(dag_id: str, node_id: str, db: AsyncSession = Depe
     await db.commit()
     await db.refresh(dag)
     return await _start_dag(dag, db)
+
+
+@router.post("/{dag_id}/nodes/{node_id}/built-image")
+async def persist_node_built_image(
+    dag_id: str,
+    node_id: str,
+    body: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist the enriched image built by a node for later retries/loop-backs.
+
+    AgentTaskWorkflow state is local to one Temporal run. A DAG retry or loop
+    re-entry creates a fresh node task, so the built image must live on the
+    node definition to be inherited.
+    """
+    image_tag = str(body.get("image_tag") or "").strip()
+    if not image_tag:
+        raise HTTPException(status_code=400, detail="image_tag is required")
+
+    node_result = await db.execute(
+        select(DAGNode).where(DAGNode.dag_id == dag_id, DAGNode.node_id == node_id)
+    )
+    node = node_result.scalars().first()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    persisted = {
+        "last_built_image": image_tag,
+        "resolved_image": image_tag,
+    }
+    if body.get("image_digest"):
+        persisted["last_image_digest"] = str(body["image_digest"])
+    if body.get("version_id"):
+        persisted["last_image_version_id"] = str(body["version_id"])
+    if body.get("build_id"):
+        persisted["last_build_id"] = str(body["build_id"])
+
+    node_config = dict(node.config or {})
+    node_config.update(persisted)
+    node.config = node_config
+
+    dag = await db.get(MasterDAG, dag_id)
+    if dag and isinstance(dag.dag_json, dict):
+        dag_json = deepcopy(dag.dag_json)
+        for node_def in dag_json.get("nodes", []):
+            if node_def.get("node_id") == node_id:
+                cfg = dict(node_def.get("config") or {})
+                cfg.update(persisted)
+                node_def["config"] = cfg
+                break
+        dag.dag_json = dag_json
+
+    await db.commit()
+    logger.info(f"Persisted built image for {dag_id}/{node_id}: {image_tag}")
+    return {"dag_id": dag_id, "node_id": node_id, "image_tag": image_tag}
 
 
 @router.post("/{dag_id}/refine", response_model=DAGDetail)
@@ -2959,8 +3137,78 @@ async def _get_dag_or_404(dag_id: str, db: AsyncSession) -> MasterDAG:
     return dag
 
 
+async def _refresh_capability_errors(dag: MasterDAG, db: AsyncSession) -> None:
+    """Re-resolve nodes whose earlier capability resolution failed.
+
+    A concurrent catalog push (non-fast-forward ``git push``) used to leave
+    ``capability_resolution.error`` on a node. That error was then replayed on
+    every retry, pinning the node to the base image. Re-resolve at start time
+    instead (the new planner path defers builds to runtime).
+    """
+    dag_json = dag.dag_json or {}
+    nodes = dag_json.get("nodes", []) or []
+    errored = [
+        node
+        for node in nodes
+        if isinstance(node, dict)
+        and "error" in ((node.get("config") or {}).get("capability_resolution") or {})
+    ]
+    if not errored:
+        return
+
+    logger.info(
+        "Re-resolving capability errors for %s node(s) in DAG %s",
+        len(errored),
+        dag.id,
+    )
+    await _resolve_node_capabilities(dag_json, db)
+    # Reassign a new object so SQLAlchemy's JSON change tracking persists it.
+    dag.dag_json = deepcopy(dag_json)
+
+    config_by_node = {
+        node.get("node_id"): node.get("config")
+        for node in nodes
+        if isinstance(node, dict) and node.get("node_id")
+    }
+    node_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag.id))
+    for node in node_result.scalars().all():
+        config = config_by_node.get(node.node_id)
+        if config is not None:
+            node.config = dict(config)
+    await db.commit()
+
+
+async def _release_task_workflow_ids(task_ids: list[str], db: AsyncSession) -> None:
+    """Clear workflow ids on tasks that are about to be re-run.
+
+    ``tasks.workflow_id`` is unique, but a retry creates a new task for the same
+    node with the same deterministic workflow id. Leaving the old row's
+    workflow_id set makes the new task's persist_task_workflow_id fail with a
+    duplicate-key error.
+    """
+    ids = [task_id for task_id in task_ids if task_id]
+    if not ids:
+        return
+    result = await db.execute(select(Task).where(Task.id.in_(ids)))
+    for task in result.scalars().all():
+        task.workflow_id = None
+        task.workflow_run_id = None
+
+
 async def _start_dag(dag: MasterDAG, db: AsyncSession) -> dict:
     """Start a DAG workflow and return the updated DAG detail."""
+    await _refresh_capability_errors(dag, db)
+
+    # Refuse to start when the worker is not heartbeating. Without this a stale
+    # worker (bind-mounted code, old activity signatures) accepts workflow tasks
+    # but fails every activity dispatch, and the DAG appears to hang.
+    import worker_registry
+
+    try:
+        await worker_registry.wait_for_worker()
+    except worker_registry.WorkerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     workflow_id = await start_dag_workflow(dag.id)
     dag.workflow_id = workflow_id
     dag.status = DAGStatus.RUNNING
@@ -2993,6 +3241,10 @@ def _build_dag_detail(dag: MasterDAG, nodes: list) -> dict:
         "workflow_group_id": getattr(dag, "workflow_group_id", None),
         "exploration_session_id": getattr(dag, "exploration_session_id", None),
         "exploration_cycle": getattr(dag, "exploration_cycle", None),
+        "promoted_from_session_id": getattr(dag, "promoted_from_session_id", None),
+        "promoted_from_cycle_id": getattr(dag, "promoted_from_cycle_id", None),
+        "promoted_from_dag_id": getattr(dag, "promoted_from_dag_id", None),
+        "promoted_at": getattr(dag, "promoted_at", None),
         "archived": bool(getattr(dag, "archived", False)),
         "project_id": getattr(dag, "project_id", None),
         "dag_json": dag.dag_json,

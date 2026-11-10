@@ -21,6 +21,7 @@ from routers import blocks as blocks_router
 from routers import image_catalog as image_catalog_router
 from routers import workflows as workflows_router
 from routers import explorations as explorations_router
+from routers import workers as workers_router
 from database import engine, Base, async_session
 from workflow_groups import backfill_workflow_groups
 from config import settings
@@ -88,6 +89,12 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS workflow_group_id VARCHAR"))
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS exploration_session_id VARCHAR"))
         await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS exploration_cycle INTEGER"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS promoted_from_session_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS promoted_from_cycle_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS promoted_from_dag_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE master_dags ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE exploration_cycles ADD COLUMN IF NOT EXISTS promoted_dag_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE exploration_cycles ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMP"))
         await conn.execute(text("ALTER TABLE workflow_groups ADD COLUMN IF NOT EXISTS title_source VARCHAR DEFAULT 'derived'"))
         await conn.execute(text("ALTER TABLE workflow_groups ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'experiment'"))
         await conn.execute(text("""
@@ -98,6 +105,8 @@ async def lifespan(app: FastAPI):
             )
         """))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_master_dags_workflow_group_id ON master_dags (workflow_group_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_master_dags_promoted_from_cycle_id ON master_dags (promoted_from_cycle_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_master_dags_promoted_from_session_id ON master_dags (promoted_from_session_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_groups_project_objective ON workflow_groups (project_id, objective_key)"))
         await conn.execute(text("ALTER TABLE skills_v2 ADD COLUMN IF NOT EXISTS project_id VARCHAR"))
         # Interactive steps: decision / input node type on DAG nodes
@@ -121,6 +130,10 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS approval_wait_ms INTEGER DEFAULT 0"))
         await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS image_build_wait_ms INTEGER DEFAULT 0"))
         await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS iteration_reason VARCHAR"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS image_digest VARCHAR"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS image_version_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS build_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE task_outputs ADD COLUMN IF NOT EXISTS capability_request_id INTEGER"))
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS dag_user_requests (
                 id SERIAL PRIMARY KEY,
@@ -229,6 +242,57 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Agent images sync skipped: {exc}")
 
+    # Seed built-in skills that ship with the platform (read-only email tool).
+    # Idempotent: an existing (image_id, name) pair is left untouched.
+    try:
+        import json
+        import uuid
+        from pathlib import Path
+        from sqlalchemy import select
+        from models import AgentImage, SkillV2, SkillV2Source, SkillV2Status
+
+        skills_dir = Path(__file__).resolve().parent / "default_skills"
+        config_path = skills_dir / "email-imap.json"
+        if config_path.is_file():
+            config = json.loads(config_path.read_text())
+            driver_name = str(config.get("driver_file") or "email_imap.py")
+            driver_source = (skills_dir / driver_name).read_text()
+            async with async_session() as session:
+                seeded = 0
+                for image_id in config.get("image_ids") or []:
+                    if not await session.get(AgentImage, str(image_id)):
+                        continue
+                    existing = await session.execute(
+                        select(SkillV2).where(
+                            SkillV2.image_id == str(image_id),
+                            SkillV2.name == config.get("name"),
+                        )
+                    )
+                    if existing.scalar_one_or_none():
+                        continue
+                    session.add(
+                        SkillV2(
+                            id=f"skv2-{uuid.uuid4().hex[:8]}",
+                            image_id=str(image_id),
+                            name=str(config.get("name") or "Email IMAP (read-only)"),
+                            description=str(config.get("description") or ""),
+                            instructions=str(config.get("instructions") or ""),
+                            tags=list(config.get("tags") or []),
+                            source_type=SkillV2Source.MANUAL,
+                            status=SkillV2Status.ACTIVE,
+                            code_json={
+                                "files": {driver_name: driver_source},
+                                "entrypoint": driver_name,
+                            },
+                        )
+                    )
+                    seeded += 1
+                await session.commit()
+                if seeded:
+                    logger.info("Seeded %s default email skill(s)", seeded)
+    except Exception as exc:
+        logger.warning(f"Default skill seed skipped: {exc}")
+
     # Bootstrap the git-backed platform image catalog from the project sources.
     # Idempotent: existing definitions/versions are left untouched.
     if os.getenv("IMAGE_CATALOG_AUTO_IMPORT", "true").strip().lower() in ("1", "true", "yes", "on"):
@@ -293,6 +357,7 @@ app.include_router(projects_router.router, prefix="/api/projects", tags=["projec
 app.include_router(credentials_router.router)
 app.include_router(credential_management_router.router)
 app.include_router(blocks_router.router)
+app.include_router(workers_router.router, prefix="/api/workers", tags=["workers"])
 
 
 @app.get("/health")

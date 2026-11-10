@@ -212,6 +212,26 @@ def _pick_matching_v2_skill(node: dict, objective: str, candidates: list[SkillV2
     return best if best_score >= 2 else None
 
 
+_FETCH_IMAGE_SIGNALS = {"browser", "browser_v2", "browser_v3", "browser_v4"}
+_FETCH_DESC_KEYWORDS = [
+    # Strong research/fetch phrases. A bare "fetch" matched code tasks such as
+    # "rewrite the frontend fetch URLs" (exp-ca99e842 cycle 2).
+    "fetch from", "fetch data", "fetch the page",
+    "browse the web", "web browsing", "scrape", "download from",
+    "retrieve from", "crawl", "extract from", "read from url",
+    "visit the website", "get from the web",
+    "annual report", "investor relation", "fred", "placera",
+    "atlascopco",
+]
+
+
+def _looks_like_web_fetch(description: str, image_id: str = "") -> bool:
+    text = (description or "").lower()
+    return (image_id or "").lower() in _FETCH_IMAGE_SIGNALS or any(
+        keyword in text for keyword in _FETCH_DESC_KEYWORDS
+    )
+
+
 async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: str) -> dict:
     """Fill selected_skill_v2_id when model omits it but a matching active v2 skill exists."""
     try:
@@ -254,26 +274,20 @@ async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: 
         # Auto-set require_real_sources=true for any node whose task signals
         # a real-world fetch requirement (browsing, API, FRED, annual reports, etc.)
         # so the gate will reject hallucinated/mocked outputs.
-        _FETCH_SIGNALS = {
-            "browser", "browser_v2", "browser_v3",   # image types
-        }
-        _FETCH_DESC_KEYWORDS = [
-            "fetch", "browse", "scrape", "download", "retrieve",
-            "crawl", "extract from", "visit", "read from url", "get from",
-            "annual report", "investor relation", "fred", "placera",
-            "atlascopco", "html", "http", "https", "web page",
-        ]
         for node in dag_json.get("nodes", []):
             config = node.setdefault("config", {})
             if str(node.get("node_type") or config.get("type") or "").lower() == "block" or config.get("block"):
                 continue
             gate_cfg = config.setdefault("deliverable_gate", {})
+            # In-place nodes edit existing files; there is no web fetch to prove.
+            if config.get("deliverable_mode") == "in_place":
+                continue
             # Skip nodes that already have an explicit setting
             if "require_real_sources" in gate_cfg:
                 continue
             image_id = (config.get("base_image") or "").lower()
             desc = (node.get("description") or "").lower()
-            if image_id in _FETCH_SIGNALS or any(k in desc for k in _FETCH_DESC_KEYWORDS):
+            if _looks_like_web_fetch(desc, image_id):
                 gate_cfg["require_real_sources"] = True
                 logger.debug(
                     "Auto-set require_real_sources=true for node %s (image=%s)",
@@ -284,6 +298,177 @@ async def _apply_v2_skill_fallback(db: AsyncSession, dag_json: dict, objective: 
     except Exception as exc:
         logger.debug("Could not apply v2 skill fallback: %s", exc)
         return dag_json
+
+
+_IN_PLACE_SIGNALS = (
+    "reuse existing",
+    "no rewrite",
+    "in-place",
+    "in place",
+    "edit ",
+    "modify ",
+    "patch ",
+    "update existing",
+)
+_IN_PLACE_ANTI_SIGNALS = ("create a new", "from scratch", "build a new")
+
+
+def _normalize_deliverable_mode(dag_json: dict) -> dict:
+    """Mark nodes that modify existing files instead of producing new artifacts.
+
+    Such nodes must not be failed by the deliverable gate for having no files in
+    /workspace/<node_id>/ (exp-ca99e842 cycle 2).
+    """
+    for node in dag_json.get("nodes", []):
+        config = node.setdefault("config", {})
+        if str(node.get("node_type") or config.get("type") or "").lower() == "block" or config.get("block"):
+            continue
+        gate = config.get("deliverable_gate")
+        declared = config.get("deliverable_mode") == "in_place" or (
+            isinstance(gate, dict) and gate.get("require_deliverables") is False
+        )
+        description = " ".join(
+            str(value or "")
+            for value in (
+                node.get("description"),
+                config.get("node_objective"),
+                config.get("objective"),
+            )
+        ).lower()
+        in_place = declared or (
+            any(signal in description for signal in _IN_PLACE_SIGNALS)
+            and not any(signal in description for signal in _IN_PLACE_ANTI_SIGNALS)
+        )
+        if not in_place:
+            continue
+        config["deliverable_mode"] = "in_place"
+        gate = config.setdefault("deliverable_gate", {})
+        gate["require_deliverables"] = False
+        gate["require_real_sources"] = False
+    return dag_json
+
+
+_GITHUB_URL_RE = re.compile(
+    r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?(?=[\s\"'<>),]|$)",
+    re.IGNORECASE,
+)
+_GITHUB_PUSH_SIGNALS = (
+    "push to github",
+    "publish to github",
+    "push the repo",
+    "push the code",
+    "publish the repo",
+    "publish the code",
+    "git push",
+    "github remote",
+    "create a pull request",
+    "open a pull request",
+    "create a pr",
+    "open a pr",
+)
+
+
+def _normalize_github_push(dag_json: dict) -> dict:
+    """Mark publish and upstream repository-access nodes.
+
+    The worker leases a repository/branch-scoped GitHub credential for every
+    node that needs the checkout, not only the publishing node. The token itself
+    is never planned or written into the DAG.
+    """
+    nodes = dag_json.get("nodes", [])
+    for node in nodes:
+        config = node.setdefault("config", {})
+        if config.get("github_push"):
+            continue
+        description = " ".join(
+            str(value or "")
+            for value in (
+                node.get("description"),
+                config.get("node_objective"),
+                config.get("objective"),
+            )
+        ).lower()
+        if not any(signal in description for signal in _GITHUB_PUSH_SIGNALS):
+            continue
+        match = _GITHUB_URL_RE.search(description)
+        if not match:
+            continue
+        repository = match.group(1).strip("/").rstrip(".,);")
+        branch_match = re.search(r"\bbranch\s+([A-Za-z0-9_./-]+)", description)
+        branch = branch_match.group(1) if branch_match else "main"
+        config["github_push"] = {
+            "enabled": True,
+            "repository": repository,
+            "branch": branch,
+            "credential": "github",
+            "require_approval": True,
+        }
+
+    push_scopes = set()
+    for node in nodes:
+        push_cfg = (node.get("config") or {}).get("github_push") or {}
+        if not isinstance(push_cfg, dict) or not push_cfg.get("enabled"):
+            continue
+        repository = str(push_cfg.get("repository") or "").strip("/").lower()
+        if repository:
+            push_scopes.add((repository, str(push_cfg.get("branch") or "main").strip()))
+    if len(push_scopes) != 1:
+        return dag_json
+    repository, branch = next(iter(push_scopes))
+    if not repository:
+        return dag_json
+
+    parents: dict[str, set[str]] = {}
+    for edge in dag_json.get("edges", []):
+        source = str(edge.get("from_node") or edge.get("from") or "")
+        target = str(edge.get("to_node") or edge.get("to") or "")
+        if source and target:
+            parents.setdefault(target, set()).add(source)
+    push_nodes = {
+        str(node.get("node_id") or "")
+        for node in nodes
+        if (node.get("config") or {}).get("github_push", {}).get("enabled")
+    }
+    ancestors: set[str] = set()
+    stack = list(push_nodes)
+    while stack:
+        current = stack.pop()
+        for parent in parents.get(current, set()):
+            if parent not in ancestors:
+                ancestors.add(parent)
+                stack.append(parent)
+
+    repo_signals = (
+        "clone", "checkout", "check out", "git pull", "git fetch",
+        "repository", "repo ", "repository's",
+    )
+    for node in nodes:
+        config = node.setdefault("config", {})
+        if config.get("github_push") or config.get("github_access"):
+            continue
+        node_id = str(node.get("node_id") or "")
+        if node_id not in ancestors:
+            continue
+        description = " ".join(
+            str(value or "")
+            for value in (node.get("description"), config.get("node_objective"), config.get("objective"))
+        ).lower()
+        capabilities = config.get("required_capabilities") or {}
+        binaries = {str(x).lower() for x in (capabilities.get("binaries") or [])}
+        categories = {str(x).lower() for x in (capabilities.get("categories") or [])}
+        if not (
+            any(signal in description for signal in repo_signals)
+            or "git" in binaries
+            or "git" in categories
+        ):
+            continue
+        config["github_access"] = {
+            "repository": repository,
+            "branch": branch,
+            "credential": "github",
+        }
+        config.setdefault("repo_dir", "/workspace/repo")
+    return dag_json
 
 
 def _normalize_interactive_nodes(dag_json: dict) -> dict:
@@ -422,6 +607,8 @@ Default — executes in an isolated container using the selected base_image + sk
 11. Set each node config.llm_model to the requested execution model and do not use GPT models.
 12. MANDATORY SKILL SELECTION: For every node whose base_image appears in the "Image-Scoped Skills (v2)" section above, you MUST check if any skill listed under that image matches the node's task. If it matches, you MUST set config.selected_skill_v2_id to that skill's exact id string and config.skill_selection_reason to a one-sentence explanation. Only leave both null if absolutely no skill is relevant. Failing to reference an available matching skill is a planning error.
 13. INPUT MAPPING: Do NOT include "input_mapping" in node definitions unless you need to selectively map specific outputs. The runtime automatically passes ALL dependency outputs to a node when "input_mapping" is omitted or empty  ({{}}). Only include "input_mapping" if you need to selectively rename or pick specific fields from dependency outputs.
+14. IN-PLACE MODIFICATION: If a node edits existing files in the shared workspace (e.g. "reuse existing assets", "edit app/main.py", "copy ... into an existing app", "fix ... in <path>", "no rewrite"), set config.deliverable_mode="in_place", config.deliverable_gate.require_deliverables=false, and config.deliverable_gate.require_real_sources=false. Do not ask such a node to write a separate deliverables directory; it must modify the target files, run the specified tests, and report the exact result.
+15. GITHUB ACCESS: If a node pushes/publishes code to GitHub or creates a pull request, set config.github_push={{"enabled":true,"repository":"owner/repo","branch":"main","credential":"github","require_approval":true}}. If the DAG clones, checks out, or tests that same repository in earlier nodes, also set config.github_access={{"repository":"owner/repo","branch":"main","credential":"github"}} on those nodes and config.repo_dir="/workspace/repo"; the worker leases the repo/branch-scoped credential for every such node. Never put a token, PAT, or credential in the node description, prompt, files, or git remote URL.
 """
 
 
@@ -730,6 +917,8 @@ async def plan_dag(objective: str, llm_model: str, db: AsyncSession, base_image:
                     node["config"]["base_image"] = base_image
 
             dag_json = await _apply_v2_skill_fallback(db, dag_json, objective)
+            dag_json = _normalize_deliverable_mode(dag_json)
+            dag_json = _normalize_github_push(dag_json)
 
             dag_json["_llm_usage"] = usage_entries
             logger.info(f"Planner generated valid DAG with {len(dag_json.get('nodes', []))} nodes")

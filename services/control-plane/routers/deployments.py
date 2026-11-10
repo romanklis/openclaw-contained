@@ -13,6 +13,7 @@ import os
 logger = logging.getLogger(__name__)
 
 from database import get_db
+from explorations_deploy import normalize_uvicorn_entrypoint, resolve_task_deploy_image
 from models import Deployment, DeploymentStatus, Task
 from schemas import (
     DeploymentRequestCreate,
@@ -39,13 +40,37 @@ async def create_deployment(
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {data.task_id} not found")
 
+    resolved_image = await resolve_task_deploy_image(
+        data.task_id, db, data.agent_image, entrypoint=data.entrypoint
+    )
+    if resolved_image and resolved_image != data.agent_image:
+        logger.info(
+            "Deployment image resolved for task %s: %s -> %s",
+            data.task_id,
+            data.agent_image or "none",
+            resolved_image,
+        )
+
+    task = await db.get(Task, data.task_id)
+    workspace_root = (
+        f"/workspaces/{task.workspace_id}" if task and task.workspace_id else ""
+    )
+    entrypoint = normalize_uvicorn_entrypoint(data.entrypoint, workspace_root)
+    if entrypoint != data.entrypoint:
+        logger.info(
+            "Deployment entrypoint normalized for task %s: %s -> %s",
+            data.task_id,
+            data.entrypoint,
+            entrypoint,
+        )
+
     deployment = Deployment(
         id=f"deploy-{str(uuid.uuid4())[:8]}",
         name=data.name,
         task_id=data.task_id,
-        entrypoint=data.entrypoint,
+        entrypoint=entrypoint,
         port=data.port,
-        agent_image=data.agent_image,
+        agent_image=resolved_image or data.agent_image,
         trial_required=data.trial_required,
         status=DeploymentStatus.PENDING_APPROVAL,
     )
@@ -102,7 +127,7 @@ async def update_deployment(
     if not deployment:
         raise HTTPException(status_code=404, detail=f"Deployment {deployment_id} not found")
 
-    allowed = {"image_tag", "status", "container_id", "host_port", "url", "error", "entrypoint", "port"}
+    allowed = {"image_tag", "agent_image", "status", "container_id", "host_port", "url", "error", "entrypoint", "port"}
     for key, value in updates.items():
         if key in allowed:
             if key == "status":
@@ -151,40 +176,10 @@ async def approve_deployment(
         await db.refresh(deployment)
         return deployment
 
-    deployment.status = DeploymentStatus.APPROVED
-    deployment.approved_at = datetime.utcnow()
-    await db.commit()
+    from deployment_service import approve_deployment_record
+
+    deployment = await approve_deployment_record(deployment, db, auto_start=False)
     await db.refresh(deployment)
-
-    # Trigger deployment image build via Temporal
-    try:
-        from temporalio.client import Client
-
-        temporal_client = await Client.connect(TEMPORAL_HOST)
-        # Start a one-shot workflow for trial validation and/or building the image
-        workflow_id = f"deploy-build-{deployment_id}"
-        deployment_payload = {
-            "task_id": deployment.task_id,
-            "name": deployment.name,
-            "entrypoint": deployment.entrypoint,
-            "port": deployment.port,
-            "agent_image": deployment.agent_image,
-            "trial_required": bool(deployment.trial_required),
-        }
-        await temporal_client.start_workflow(
-            "DeploymentBuildWorkflow",
-            args=[deployment_id, deployment_payload],
-            id=workflow_id,
-            task_queue="openclaw-tasks",
-        )
-        logger.info(f"Started deployment build workflow: {workflow_id}")
-    except Exception as e:
-        logger.error(f"Failed to start deployment build workflow: {e}")
-        deployment.status = DeploymentStatus.FAILED
-        deployment.error = f"Failed to start build: {e}"
-        await db.commit()
-        await db.refresh(deployment)
-
     return deployment
 
 
