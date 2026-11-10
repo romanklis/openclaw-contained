@@ -29,6 +29,7 @@ from models import (
     CapabilityRequest,
     TaskOutput,
     DeepReview,
+    Block,
 )
 from schemas import (
     DAGCreate,
@@ -42,6 +43,7 @@ from schemas import (
     DAGPlanRequest,
     DAGNodeEnhanceRequest,
     DAGNodePatch,
+    DAGReplaceWithBlock,
     DAGNodeStateSnapshotCreate,
     DAGNodeStateSnapshotResponse,
     DAGNodeAuditEventCreate,
@@ -2367,6 +2369,12 @@ async def delete_node(dag_id: str, node_id: str, db: AsyncSession = Depends(get_
         raise HTTPException(status_code=422, detail={"errors": errors})
 
     dag.dag_json = dag_json
+    remaining_nodes = [n for n in all_nodes if n.node_id != node_id]
+    reset_ids: set[str] = set()
+    for succ in successors:
+        reset_ids.add(succ.node_id)
+        reset_ids.update(_compute_descendants(succ.node_id, remaining_nodes))
+    await _prepare_structural_edit(dag, remaining_nodes, reset_ids, db)
     await db.delete(node)
     await db.commit()
     await db.refresh(dag)
@@ -2449,6 +2457,81 @@ async def add_node(dag_id: str, payload: DAGNodeCreate, db: AsyncSession = Depen
         raise HTTPException(status_code=422, detail={"errors": errors})
     dag.dag_json = dag_json
 
+    await db.commit()
+    await db.refresh(dag)
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    return _build_dag_detail(dag, list(nodes_result.scalars().all()))
+
+
+@router.post("/{dag_id}/nodes/{node_id}/replace-with-block", response_model=DAGDetail)
+async def replace_node_with_block(
+    dag_id: str,
+    node_id: str,
+    payload: DAGReplaceWithBlock,
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace an existing step with a deterministic block, preserving graph position."""
+    dag = await _get_dag_or_404(dag_id, db)
+    _ensure_dag_editable(dag)
+
+    block_id = payload.block_id.strip()
+    block = await db.get(Block, block_id)
+    if not block:
+        raise HTTPException(status_code=404, detail=f"Block '{block_id}' not found")
+    if str(getattr(block, "status", "") or "").lower() == "archived":
+        raise HTTPException(status_code=422, detail=f"Block '{block_id}' is archived")
+    block_code = getattr(block, "code_json", None) or {}
+    if not isinstance(block_code, dict) or not block_code.get("files"):
+        raise HTTPException(status_code=422, detail=f"Block '{block_id}' has no code files")
+
+    nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
+    nodes = list(nodes_result.scalars().all())
+    node = next((n for n in nodes if n.node_id == node_id), None)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    inputs = payload.inputs if isinstance(payload.inputs, dict) else {}
+    block_name = str(getattr(block, "name", "") or block.id)
+    description = (
+        (payload.description or "").strip()
+        or str(node.description or "").strip()
+        or block_name
+    )
+
+    node.node_type = "block"
+    node.config = {"type": "block", "block": block.id, "inputs": inputs}
+    node.skill_id = None
+    node.skill_step_index = None
+    node.selected_skill_v2_id = None
+    node.skill_selection_reason = None
+    node.description = description
+
+    dag_json = deepcopy(dag.dag_json or {})
+    matched = False
+    for node_def in dag_json.get("nodes", []):
+        if node_def.get("node_id") != node_id:
+            continue
+        matched = True
+        node_def["node_type"] = "block"
+        node_def["skill_id"] = None
+        node_def["skill_step_index"] = None
+        node_def["description"] = description
+        cfg = dict(node_def.get("config") or {})
+        cfg.pop("selected_skill_v2_id", None)
+        cfg.pop("skill_selection_reason", None)
+        cfg.update({"type": "block", "block": block.id, "inputs": inputs})
+        node_def["config"] = cfg
+    if not matched:
+        raise HTTPException(status_code=500, detail=f"Node '{node_id}' missing from dag_json")
+
+    is_valid, errors = validate_dag(dag_json)
+    if not is_valid:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    dag.dag_json = dag_json
+    reset_ids = {node_id} | _compute_descendants(node_id, nodes)
+    await _prepare_structural_edit(dag, nodes, reset_ids, db)
     await db.commit()
     await db.refresh(dag)
     nodes_result = await db.execute(select(DAGNode).where(DAGNode.dag_id == dag_id))
@@ -3006,6 +3089,34 @@ def _ensure_dag_editable(dag: MasterDAG) -> None:
             status_code=400,
             detail=f"DAG is in '{dag.status.value}' state, must be 'ready', 'failed', or 'completed' for this operation",
         )
+
+
+async def _prepare_structural_edit(
+    dag: MasterDAG,
+    nodes: list[DAGNode],
+    reset_ids: set[str],
+    db: AsyncSession,
+) -> None:
+    """Reset the affected path so the next run executes the modified graph cleanly."""
+    reset_nodes = [node for node in nodes if node.node_id in reset_ids]
+    await _release_task_workflow_ids([node.task_id for node in reset_nodes], db)
+    for node in reset_nodes:
+        node.status = NodeStatus.PENDING
+        node.output_data = None
+        node.task_id = None
+        node.container_id = None
+        node.started_at = None
+        node.completed_at = None
+    if reset_nodes and dag.status in (
+        DAGStatus.COMPLETED,
+        DAGStatus.FAILED,
+        DAGStatus.CANCELLED,
+    ):
+        dag.status = DAGStatus.READY
+        dag.workflow_id = None
+        dag.workflow_run_id = None
+        dag.started_at = None
+        dag.completed_at = None
 
 
 def _dedupe_node_ids(node_ids: list[str]) -> list[str]:

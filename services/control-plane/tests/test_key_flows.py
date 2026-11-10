@@ -252,8 +252,196 @@ class KeyFlowTests(unittest.TestCase):
         block = response.json()["block"]
         self.assertEqual(block["status"], "draft")
         self.assertIn("block_main.py", block["code"]["files"])
+        self.assertIn("main.py", block["code"]["files"])
         self.assertIn(task_id, block["description"])
         self.client.delete(f"/api/blocks/{block['id']}")
+
+    def test_learn_block_from_run_accepts_top_level_block_main(self):
+        import asyncio
+
+        task_id = asyncio.run(support.seed_task_with_python_deliverable())
+        spec = {
+            "name": "learned echo top level",
+            "description": "Learned deterministic echo",
+            "block_main": (
+                "def main(inputs):\n"
+                "    return {'value': int(inputs.get('value', 0)) + 1}\n"
+            ),
+            "inputs_schema": {"type": "object", "properties": {"value": {"type": "integer"}}},
+            "outputs_schema": {"type": "object", "properties": {"value": {"type": "integer"}}},
+        }
+        with patch(
+            "routers.blocks._call_block_derive_llm", AsyncMock(return_value=spec)
+        ):
+            response = self.client.post(
+                "/api/blocks/learn-from-run", json={"task_id": task_id}
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        block = response.json()["block"]
+        self.assertIn("block_main.py", block["code"]["files"])
+        self.assertIn("main.py", block["code"]["files"])
+        self.client.delete(f"/api/blocks/{block['id']}")
+
+    def test_learn_block_from_run_returns_502_on_llm_error(self):
+        import asyncio
+
+        task_id = asyncio.run(support.seed_task_with_python_deliverable())
+        with patch(
+            "routers.blocks._call_block_derive_llm",
+            AsyncMock(return_value={"error": "LLM returned no parseable JSON block spec"}),
+        ):
+            response = self.client.post(
+                "/api/blocks/learn-from-run", json={"task_id": task_id}
+            )
+        self.assertEqual(response.status_code, 502, response.text)
+
+    def test_coerce_block_spec_merges_driver_files(self):
+        from routers.blocks import _coerce_block_spec
+
+        coerced = _coerce_block_spec(
+            {
+                "name": "merge test",
+                "block_main": "def main(inputs):\n    return {'ok': True}\n",
+                "inputs_schema": {"type": "object", "properties": {}},
+                "outputs_schema": {"type": "object", "properties": {}},
+            },
+            "merge-test",
+            driver_files={"driver.py": "def helper():\n    return 1\n"},
+        )
+        self.assertIn("driver.py", coerced["files"])
+        self.assertIn("block_main.py", coerced["files"])
+
+    def test_coerce_block_spec_requires_block_main_with_driver(self):
+        from routers.blocks import _coerce_block_spec
+
+        with self.assertRaises(ValueError):
+            _coerce_block_spec(
+                {"name": "missing wrapper"},
+                "missing-wrapper",
+                driver_files={"driver.py": "def helper():\n    return 1\n"},
+            )
+
+    def test_llm_content_text_handles_missing_choices(self):
+        from routers.blocks import _llm_content_text
+
+        self.assertEqual(_llm_content_text({"choices": []}), "")
+        self.assertEqual(
+            _llm_content_text({"choices": [{"message": {"content": '{"name":"x"}'}}]}),
+            '{"name":"x"}',
+        )
+
+    def test_parse_block_derive_response_marker_format(self):
+        from routers.blocks import _parse_block_derive_response
+
+        content = """===META===
+{"name":"x","description":"d","inputs_schema":{"type":"object","properties":{}},"outputs_schema":{"type":"object","properties":{}}}
+===BLOCK_MAIN===
+def main(inputs):
+    value = inputs.get("value", 0)
+    return {"value": value + 1, "note": "braces { } and quotes"}
+===END===
+"""
+        parsed = _parse_block_derive_response(content)
+        self.assertIsNotNone(parsed)
+        self.assertIn("def main(inputs):", parsed["block_main"])
+        self.assertIn('"value"', parsed["block_main"])
+
+    def test_parse_block_derive_response_json_fallback(self):
+        from routers.blocks import _parse_block_derive_response
+
+        content = '{"name":"x","block_main":"def main(inputs):\\n    return {}\\n"}'
+        parsed = _parse_block_derive_response(content)
+        self.assertIsNotNone(parsed)
+        self.assertIn("def main", parsed["block_main"])
+
+    def _create_manual_chain(self) -> str:
+        response = self.client.post(
+            "/api/dags/manual",
+            json={
+                "objective": f"Editable chain {uuid.uuid4().hex[:8]}",
+                "nodes": [
+                    {
+                        "node_id": "a",
+                        "description": "A",
+                        "depends_on": [],
+                        "config": {"base_image": "openclaw"},
+                    },
+                    {
+                        "node_id": "b",
+                        "description": "B",
+                        "depends_on": ["a"],
+                        "config": {"base_image": "openclaw"},
+                    },
+                    {
+                        "node_id": "c",
+                        "description": "C",
+                        "depends_on": ["b"],
+                        "config": {"base_image": "openclaw"},
+                    },
+                ],
+                "edges": [
+                    {"from_node": "a", "to_node": "b"},
+                    {"from_node": "b", "to_node": "c"},
+                ],
+                "default_image": "openclaw",
+                "default_llm": "test-model",
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        dag_id = response.json()["id"]
+        patched = self.client.patch(f"/api/dags/{dag_id}", json={"status": "completed"})
+        self.assertEqual(patched.status_code, 200, patched.text)
+        for node_id in ("a", "b", "c"):
+            node_patch = self.client.patch(
+                f"/api/dags/{dag_id}/nodes/{node_id}", json={"status": "completed"}
+            )
+            self.assertEqual(node_patch.status_code, 200, node_patch.text)
+        return dag_id
+
+    def test_replace_step_with_block_on_completed_dag(self):
+        dag_id = self._create_manual_chain()
+        block_id = self._create_block()
+        response = self.client.post(
+            f"/api/dags/{dag_id}/nodes/b/replace-with-block",
+            json={"block_id": block_id, "inputs": {"value": 7}},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        detail = response.json()
+        self.assertEqual(detail["status"], "ready")
+        nodes = {node["node_id"]: node for node in detail["nodes"]}
+        self.assertEqual(nodes["a"]["status"], "completed")
+        self.assertEqual(nodes["b"]["status"], "pending")
+        self.assertEqual(nodes["c"]["status"], "pending")
+        self.assertEqual(nodes["b"]["node_type"], "block")
+        self.assertEqual(nodes["b"]["config"]["block"], block_id)
+        self.assertEqual(nodes["b"]["config"]["inputs"], {"value": 7})
+        self.assertIsNone(nodes["b"]["task_id"])
+        self.assertIsNone(nodes["b"]["selected_skill_v2_id"])
+        self.assertEqual(nodes["c"]["depends_on"], ["b"])
+        self.client.post(f"/api/dags/{dag_id}/archive")
+        self.client.delete(f"/api/blocks/{block_id}")
+
+    def test_delete_step_on_completed_dag_resets_downstream(self):
+        dag_id = self._create_manual_chain()
+        response = self.client.delete(f"/api/dags/{dag_id}/nodes/b")
+        self.assertEqual(response.status_code, 200, response.text)
+        detail = response.json()
+        self.assertEqual(detail["status"], "ready")
+        nodes = {node["node_id"]: node for node in detail["nodes"]}
+        self.assertNotIn("b", nodes)
+        self.assertEqual(nodes["a"]["status"], "completed")
+        self.assertEqual(nodes["c"]["status"], "pending")
+        self.assertEqual(nodes["c"]["depends_on"], ["a"])
+        self.client.post(f"/api/dags/{dag_id}/archive")
+
+    def test_replace_step_with_missing_block_returns_404(self):
+        dag_id = self._create_manual_chain()
+        response = self.client.post(
+            f"/api/dags/{dag_id}/nodes/b/replace-with-block",
+            json={"block_id": "missing-block"},
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+        self.client.post(f"/api/dags/{dag_id}/archive")
 
     def test_add_block_node_to_dag(self):
         block_id = self._create_block()

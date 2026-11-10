@@ -1003,7 +1003,11 @@ async def bootstrap_status(db: AsyncSession = Depends(get_db)):
 
 @router.post("/sync-agent-images")
 async def sync_agent_images(force: bool = False, db: AsyncSession = Depends(get_db)):
-    return await image_catalog.sync_built_agent_images(db, force=force)
+    try:
+        return await image_catalog.sync_built_agent_images(db, force=force)
+    except image_catalog.CatalogRepoError as exc:
+        logger.warning("Image catalog sync failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post("/reconcile")

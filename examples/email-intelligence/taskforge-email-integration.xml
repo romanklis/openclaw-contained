@@ -1,0 +1,221 @@
+<mxfile host="app.diagrams.net" agent="TaskForge" pages="2">
+  <diagram id="infrastructure" name="Email Intelligence Infrastructure">
+    <mxGraphModel dx="1600" dy="1000" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="1050" background="#ffffff" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=30;fontStyle=1;fontColor=#10243e;" value="Email Intelligence — hard infrastructure + TaskForge self-integration" vertex="1">
+          <mxGeometry height="44" width="1400" x="60" y="24" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=14;fontColor=#64748b;" value="Mirrored mailbox • read-only IMAP through the credential gateway • planner-generated workflow • phase-1 Postgres • scheduler + monitoring dashboard" vertex="1">
+          <mxGeometry height="26" width="1500" x="60" y="66" as="geometry" />
+        </mxCell>
+
+        <mxCell id="mailbox" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff4df;strokeColor=#b45309;fontColor=#10243e;verticalAlign=top;align=left;spacingLeft=14;spacingTop=10;fontStyle=1;" value="Mirror mailbox&#10;&#10;GreenMail&#10;SMTP :3025&#10;IMAP :3143&#10;&#10;Seeded INBOX (5 emails)&#10;attachments + links" vertex="1">
+          <mxGeometry height="180" width="280" x="60" y="140" as="geometry" />
+        </mxCell>
+        <mxCell id="mailnote" parent="1" style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#92400e;" value="Demo stand-in for the&#10;enterprise mirror mailbox" vertex="1">
+          <mxGeometry height="40" width="260" x="70" y="330" as="geometry" />
+        </mxCell>
+
+        <mxCell id="gateway" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;fontColor=#10243e;verticalAlign=top;align=left;spacingLeft=14;spacingTop=10;fontStyle=1;" value="Credential Gateway :8083&#10;&#10;• read-only IMAP broker&#10;• audit log&#10;• human approval path&#10;• agent token scoped" vertex="1">
+          <mxGeometry height="150" width="240" x="390" y="155" as="geometry" />
+        </mxCell>
+
+        <mxCell id="platform" parent="1" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#f8fbff;strokeColor=#7aa7ff;fontColor=#10243e;verticalAlign=top;align=left;spacingLeft=16;spacingTop=10;fontStyle=1;fontSize=16;" value="TaskForge platform" vertex="1">
+          <mxGeometry height="350" width="680" x="690" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="frontend" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;" value="Studio frontend :3000" vertex="1">
+          <mxGeometry height="52" width="180" x="720" y="175" as="geometry" />
+        </mxCell>
+        <mxCell id="controlplane" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;" value="Control plane :8000&#10;planner + DAG API" vertex="1">
+          <mxGeometry height="52" width="190" x="930" y="175" as="geometry" />
+        </mxCell>
+        <mxCell id="temporal" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;" value="Temporal :7233 / :8088&#10;durable execution" vertex="1">
+          <mxGeometry height="52" width="200" x="1150" y="175" as="geometry" />
+        </mxCell>
+        <mxCell id="worker" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;" value="Temporal worker&#10;node orchestration" vertex="1">
+          <mxGeometry height="58" width="180" x="720" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="agent" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;" value="Sandboxed agent&#10;openclaw-agent:email&#10;psycopg2 + pypdf&#10;skill driver email_imap" vertex="1">
+          <mxGeometry height="86" width="200" x="1150" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="cpnote" parent="1" style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#475569;" value="One user command → planner builds the DAG.&#10;The scheduler never calls the planner." vertex="1">
+          <mxGeometry height="50" width="620" x="720" y="385" as="geometry" />
+        </mxCell>
+
+        <mxCell id="postgres" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eef2f7;strokeColor=#475569;fontColor=#10243e;verticalAlign=top;align=left;spacingLeft=14;spacingTop=10;fontStyle=1;" value="Phase-1 Postgres&#10;email_intelligence&#10;&#10;emails&#10;attachments&#10;extractions&#10;scheduler_runs&#10;settings&#10;&#10;roles:&#10;taskforge_writer (INSERT/UPDATE only)&#10;email_app (read + runs/settings)" vertex="1">
+          <mxGeometry height="300" width="300" x="1400" y="140" as="geometry" />
+        </mxCell>
+
+        <mxCell id="scheduler" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;fontColor=#10243e;verticalAlign=top;align=left;spacingLeft=14;spacingTop=10;fontStyle=1;" value="email-scheduler :8086&#10;&#10;• interval loop (60s)&#10;• instantiate + start target DAG&#10;• overlap guard&#10;• run history&#10;• read API for dashboard" vertex="1">
+          <mxGeometry height="150" width="300" x="720" y="520" as="geometry" />
+        </mxCell>
+        <mxCell id="dashboard" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;fontColor=#10243e;verticalAlign=top;align=left;spacingLeft=14;spacingTop=10;fontStyle=1;" value="email-dashboard :8095&#10;&#10;nginx static UI&#10;• Overview&#10;• Emails + detail&#10;• read-only Kanban&#10;• Runs&#10;• Target DAG / Run now" vertex="1">
+          <mxGeometry height="150" width="300" x="1070" y="520" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#64748b;fontSize=10;fontColor=#475569;" edge="1" source="mailbox" target="gateway">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="340" y="230" as="sourcePoint" /><mxPoint x="390" y="230" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e1l" parent="1" style="text;html=1;fontSize=10;fontColor=#475569;" value="IMAP 3143&#10;read-only" vertex="1">
+          <mxGeometry height="30" width="100" x="315" y="200" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#64748b;fontSize=10;" edge="1" source="gateway" target="agent">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="630" y="230" as="sourcePoint" /><mxPoint x="1150" y="300" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e2l" parent="1" style="text;html=1;fontSize=10;fontColor=#475569;" value="brokered access&#10;no password in agent" vertex="1">
+          <mxGeometry height="30" width="150" x="955" y="345" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#0d9488;fontSize=10;fontColor=#0f766e;" edge="1" source="agent" target="postgres">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1350" y="300" as="sourcePoint" /><mxPoint x="1400" y="300" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e3l" parent="1" style="text;html=1;fontSize=10;fontColor=#0f766e;" value="taskforge_writer&#10;INSERT/UPDATE" vertex="1">
+          <mxGeometry height="30" width="130" x="1330" y="315" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#1457d9;fontSize=10;" edge="1" source="scheduler" target="controlplane">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="870" y="520" as="sourcePoint" /><mxPoint x="1025" y="227" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e4l" parent="1" style="text;html=1;fontSize=10;fontColor=#1457d9;" value="instantiate + start&#10;(target DAG id)" vertex="1">
+          <mxGeometry height="30" width="150" x="1015" y="420" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#475569;fontSize=10;" edge="1" source="scheduler" target="postgres">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1020" y="570" as="sourcePoint" /><mxPoint x="1400" y="400" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e5l" parent="1" style="text;html=1;fontSize=10;fontColor=#475569;" value="scheduler_runs + settings" vertex="1">
+          <mxGeometry height="24" width="170" x="1190" y="430" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#0d9488;fontSize=10;" edge="1" source="dashboard" target="scheduler">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1070" y="595" as="sourcePoint" /><mxPoint x="1020" y="595" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e6l" parent="1" style="text;html=1;fontSize=10;fontColor=#0f766e;" value="read API&#10;/api/*" vertex="1">
+          <mxGeometry height="24" width="100" x="1035" y="610" as="geometry" />
+        </mxCell>
+
+        <mxCell id="footer" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fbff;strokeColor=#dbe6f1;" value="" vertex="1">
+          <mxGeometry height="120" width="1640" x="60" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="f1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;" value="1  Ingest&#10;read-only IMAP mirror" vertex="1">
+          <mxGeometry height="64" width="300" x="90" y="770" as="geometry" />
+        </mxCell>
+        <mxCell id="f2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;" value="2  Process&#10;PDF parse + LLM extract" vertex="1">
+          <mxGeometry height="64" width="300" x="430" y="770" as="geometry" />
+        </mxCell>
+        <mxCell id="f3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;" value="3  Store&#10;phase-1 Postgres" vertex="1">
+          <mxGeometry height="64" width="300" x="770" y="770" as="geometry" />
+        </mxCell>
+        <mxCell id="f4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;" value="4  Visualize&#10;dashboard + Kanban" vertex="1">
+          <mxGeometry height="64" width="300" x="1110" y="770" as="geometry" />
+        </mxCell>
+        <mxCell id="f5" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#475569;" value="Self-integration in one command: the planner builds the workflow; the scheduler only triggers it; the agent never sees the mailbox password." vertex="1">
+          <mxGeometry height="30" width="1400" x="90" y="850" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <diagram id="workflow" name="Planner-Generated Workflow">
+    <mxGraphModel dx="1600" dy="900" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="900" background="#ffffff" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title2" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=28;fontStyle=1;fontColor=#10243e;" value="Planner-generated workflow — one user command" vertex="1">
+          <mxGeometry height="40" width="1400" x="60" y="24" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle2" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=14;fontColor=#64748b;" value="TaskForge plans the DAG against pre-provisioned services; the external scheduler instantiates it periodically." vertex="1">
+          <mxGeometry height="24" width="1500" x="60" y="64" as="geometry" />
+        </mxCell>
+
+        <mxCell id="command" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff4df;strokeColor=#b45309;fontColor=#10243e;verticalAlign=top;align=left;spacingLeft=12;spacingTop=10;fontSize=11;" value="USER COMMAND&#10;&#10;“Build an email-intelligence workflow for&#10;project email-intelligence. Run every node&#10;on image email, bind the Email Intelligence&#10;Pipeline skill, ingest INBOX, parse PDFs,&#10;extract fields, store in Postgres, and update&#10;status. Do not add a scheduler node.”" vertex="1">
+          <mxGeometry height="190" width="330" x="60" y="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="planner" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;fontColor=#10243e;" value="TaskForge planner&#10;objective → DAG&#10;image + skill binding" vertex="1">
+          <mxGeometry height="90" width="230" x="440" y="175" as="geometry" />
+        </mxCell>
+        <mxCell id="eplan" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#1457d9;fontSize=10;" edge="1" source="command" target="planner">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="390" y="220" as="sourcePoint" /><mxPoint x="440" y="220" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="n1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;fontSize=11;" value="list-new-emails&#10;IMAP read + upsert" vertex="1">
+          <mxGeometry height="70" width="160" x="720" y="185" as="geometry" />
+        </mxCell>
+        <mxCell id="n2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;fontSize=11;" value="classify-intent&#10;LLM label" vertex="1">
+          <mxGeometry height="70" width="150" x="920" y="185" as="geometry" />
+        </mxCell>
+        <mxCell id="n3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;fontSize=11;" value="parse-attachments&#10;PDF text + links" vertex="1">
+          <mxGeometry height="70" width="160" x="1110" y="185" as="geometry" />
+        </mxCell>
+        <mxCell id="n4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;fontSize=11;" value="extract-structured&#10;company / stage / capital" vertex="1">
+          <mxGeometry height="70" width="170" x="1310" y="185" as="geometry" />
+        </mxCell>
+        <mxCell id="n5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;fontSize=11;" value="persist-extraction&#10;Postgres upsert" vertex="1">
+          <mxGeometry height="70" width="160" x="1520" y="185" as="geometry" />
+        </mxCell>
+        <mxCell id="eplan2" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#1457d9;" edge="1" source="planner" target="n1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="670" y="220" as="sourcePoint" /><mxPoint x="720" y="220" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="en1" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#64748b;" edge="1" source="n1" target="n2">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="880" y="220" as="sourcePoint" /><mxPoint x="920" y="220" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="en2" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#64748b;" edge="1" source="n2" target="n3">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1070" y="220" as="sourcePoint" /><mxPoint x="1110" y="220" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="en3" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#64748b;" edge="1" source="n3" target="n4">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1270" y="220" as="sourcePoint" /><mxPoint x="1310" y="220" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="en4" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#64748b;" edge="1" source="n4" target="n5">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1480" y="220" as="sourcePoint" /><mxPoint x="1520" y="220" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="n6" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;fontSize=11;" value="summarize-run&#10;email-run-summary.json" vertex="1">
+          <mxGeometry height="70" width="180" x="1500" y="320" as="geometry" />
+        </mxCell>
+        <mxCell id="en5" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#0d9488;" edge="1" source="n5" target="n6">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1600" y="255" as="sourcePoint" /><mxPoint x="1600" y="320" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="mail" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff4df;strokeColor=#b45309;fontSize=11;" value="GreenMail mirror&#10;INBOX + PDF deck" vertex="1">
+          <mxGeometry height="80" width="230" x="60" y="420" as="geometry" />
+        </mxCell>
+        <mxCell id="gw" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;fontSize=11;" value="Credential Gateway&#10;read-only IMAP" vertex="1">
+          <mxGeometry height="80" width="210" x="340" y="420" as="geometry" />
+        </mxCell>
+        <mxCell id="agentimg" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;fontSize=11;" value="openclaw-agent:email&#10;psycopg2 + pypdf&#10;skill driver email_imap" vertex="1">
+          <mxGeometry height="90" width="230" x="600" y="415" as="geometry" />
+        </mxCell>
+        <mxCell id="db" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eef2f7;strokeColor=#475569;fontSize=11;" value="email-postgres&#10;emails / attachments&#10;extractions / runs / settings" vertex="1">
+          <mxGeometry height="90" width="250" x="900" y="415" as="geometry" />
+        </mxCell>
+        <mxCell id="sched" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f0ff;strokeColor=#1457d9;fontSize=11;" value="email-scheduler&#10;interval loop&#10;target DAG id" vertex="1">
+          <mxGeometry height="90" width="210" x="1210" y="415" as="geometry" />
+        </mxCell>
+        <mxCell id="dash" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff7f2;strokeColor=#0d9488;fontSize=11;" value="email-dashboard&#10;Overview / Emails&#10;Kanban / Runs" vertex="1">
+          <mxGeometry height="90" width="200" x="1480" y="415" as="geometry" />
+        </mxCell>
+
+        <mxCell id="em1" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#b45309;dashed=1;" edge="1" source="mail" target="gw">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="290" y="460" as="sourcePoint" /><mxPoint x="340" y="460" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="em2" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#0d9488;dashed=1;" edge="1" source="gw" target="agentimg">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="550" y="460" as="sourcePoint" /><mxPoint x="600" y="460" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="em3" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#0d9488;dashed=1;" edge="1" source="agentimg" target="db">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="830" y="460" as="sourcePoint" /><mxPoint x="900" y="460" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="em4" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#1457d9;dashed=1;" edge="1" source="sched" target="db">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1210" y="460" as="sourcePoint" /><mxPoint x="1150" y="460" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="em5" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#0d9488;dashed=1;" edge="1" source="dash" target="sched">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1480" y="460" as="sourcePoint" /><mxPoint x="1420" y="460" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="loop" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fbff;strokeColor=#dbe6f1;fontSize=11;align=left;spacingLeft=12;" value="Loop: greenmail INBOX → credential gateway (read-only) → email agent → Postgres → scheduler records the run → dashboard renders status + read-only Kanban.&#10;Idempotent by message_id, (email_id, filename), and email_id on extractions. Re-running updates, never duplicates.&#10;Phase 2 (dashed): vector search + interactive Kanban." vertex="1">
+          <mxGeometry height="90" width="1620" x="60" y="570" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

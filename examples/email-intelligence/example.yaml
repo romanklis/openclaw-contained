@@ -1,0 +1,20 @@
+name: email-intelligence
+description: Mirrored mailbox → read-only IMAP → planner-generated extraction workflow → phase-1 Postgres → periodic scheduler + monitoring dashboard.
+infra: docker-compose.yml
+build: [email]
+services:
+  - name: greenmail
+    url: imap://greenmail:3143
+    description: Local mirror mailbox (SMTP 3025, IMAP 3143) with a seeded INBOX.
+  - name: email-postgres
+    url: postgres://email_app@email-postgres:5432/email_intelligence
+    description: Phase-1 structured storage for emails, attachments, extractions, runs and settings.
+  - name: email-scheduler
+    url: http://email-scheduler:8086
+    description: Periodic DAG trigger plus the read API used by the dashboard.
+  - name: email-dashboard
+    url: http://localhost:8095
+    description: Monitoring UI (Overview, Emails, read-only Kanban, Runs, Settings).
+skills:
+  - config/skills/email-pipeline.skill.json
+# No `dags:` entry: the workflow is planner-generated from planning-objective.txt.
