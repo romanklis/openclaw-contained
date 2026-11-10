@@ -1722,6 +1722,18 @@ async def start_agent_container(
             "MAX_AGENT_TURNS": str(max(1, max_agent_turns)),
         }
 
+        # Optional example-provided Postgres (email-intelligence). Agents run on
+        # DinD's bridge and cannot resolve Compose service names, so inject the
+        # resolved IP when the service is present; otherwise leave the image
+        # defaults untouched.
+        try:
+            email_db_ip = _socket.gethostbyname("email-postgres")
+        except _socket.gaierror:
+            email_db_ip = os.getenv("EMAIL_DB_IP", "")
+        if email_db_ip:
+            agent_env["EMAIL_DB_HOST"] = os.getenv("EMAIL_DB_HOST", email_db_ip)
+            agent_env["EMAIL_DB_PORT"] = os.getenv("EMAIL_DB_PORT", "5432")
+
         # Repo/branch-scoped GitHub token for an authorized github_push node.
         # The token lives only in this ephemeral container's environment.
         _github_lease = await _github_push_lease(task_id)

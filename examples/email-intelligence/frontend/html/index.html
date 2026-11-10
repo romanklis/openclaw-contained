@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Email Intelligence — Monitoring</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">EI</div>
+      <div>
+        <h1>Email Intelligence</h1>
+        <p>Mirror mailbox → planner-generated workflow → phase-1 store</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="schedulerPill" class="pill pill-muted">scheduler: manual</span>
+      <span id="healthPill" class="pill pill-muted">connecting</span>
+      <span id="refreshedAt" class="muted"></span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="emails">Emails</button>
+    <button data-tab="kanban">Kanban</button>
+    <button data-tab="runs">Runs</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+
+  <main>
+    <div id="errorBanner" class="error hidden"></div>
+
+    <section id="tab-overview" class="tab-panel">
+      <div id="summaryCards" class="cards"></div>
+
+      <div class="panel scheduler-panel">
+        <div class="panel-head">
+          <h2>Scheduler</h2>
+          <span id="overviewSchedulerPill" class="badge manual">manual</span>
+        </div>
+        <div class="scheduler-grid">
+          <div class="scheduler-item">
+            <div class="k">Mode</div>
+            <div id="overviewSchedulerMode" class="v">Manual only</div>
+          </div>
+          <div class="scheduler-item">
+            <div class="k">Target DAG</div>
+            <div id="overviewSchedulerTarget" class="v mono">not set</div>
+          </div>
+          <div class="scheduler-item">
+            <div class="k">Next run</div>
+            <div id="overviewSchedulerNext" class="v">—</div>
+          </div>
+          <div class="scheduler-item">
+            <div class="k">Last run</div>
+            <div id="overviewSchedulerLast" class="v">—</div>
+          </div>
+        </div>
+        <p id="schedulerHint" class="muted small"></p>
+        <div class="actions">
+          <button id="overviewRunNow" class="primary" type="button">Run now</button>
+          <button class="link" data-goto="settings">Scheduler settings</button>
+          <span id="overviewRunStatus" class="muted small"></span>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Recent emails</h2>
+            <button class="link" data-goto="emails">View all</button>
+          </div>
+          <div id="recentEmails" class="table-wrap"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Recent scheduler runs</h2>
+            <button class="link" data-goto="runs">View all</button>
+          </div>
+          <div id="recentRuns" class="table-wrap"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-emails" class="tab-panel hidden">
+      <div class="filters panel">
+        <label>Status
+          <select id="statusFilter">
+            <option value="">All</option>
+            <option value="new">New</option>
+            <option value="classified">Classified</option>
+            <option value="parsed">Parsed</option>
+            <option value="extracted">Extracted</option>
+            <option value="stored">Stored</option>
+            <option value="failed">Failed</option>
+          </select>
+        </label>
+        <label>Intent
+          <select id="intentFilter">
+            <option value="">All</option>
+            <option value="new_pitch">New pitch</option>
+            <option value="investor_thesis">Investor thesis</option>
+            <option value="follow_up">Follow-up</option>
+            <option value="meeting_request">Meeting request</option>
+            <option value="other">Other</option>
+          </select>
+        </label>
+        <label class="grow">Search
+          <input id="searchFilter" type="search" placeholder="Subject, sender, or company">
+        </label>
+      </div>
+      <div class="panel">
+        <div id="emailsTable" class="table-wrap"></div>
+      </div>
+    </section>
+
+    <section id="tab-kanban" class="tab-panel hidden">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Pipeline board</h2>
+          <span class="muted">Read-only phase-1 view; click a card for details</span>
+        </div>
+        <div id="kanbanBoard" class="kanban"></div>
+      </div>
+    </section>
+
+    <section id="tab-runs" class="tab-panel hidden">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Scheduler runs</h2>
+          <span class="muted">Manual and interval runs of the target DAG</span>
+        </div>
+        <div id="runsTable" class="table-wrap"></div>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="tab-panel hidden">
+      <div class="grid-2">
+        <div class="panel">
+          <h2>Scheduler</h2>
+          <p class="muted">
+            Manual only means nothing runs until you press Run now. Interval means
+            the scheduler starts the target DAG automatically every N seconds. Both
+            modes start the same DAG the backoffice dashboard runs.
+          </p>
+          <form id="schedulerForm">
+            <div class="mode-toggle">
+              <label class="mode-option">
+                <input type="radio" name="schedulerMode" value="manual" checked>
+                <span>
+                  <strong>Manual only</strong>
+                  <small>Button-triggered; no automatic runs.</small>
+                </span>
+              </label>
+              <label class="mode-option">
+                <input type="radio" name="schedulerMode" value="interval">
+                <span>
+                  <strong>Interval</strong>
+                  <small>Automatic runs on a fixed schedule.</small>
+                </span>
+              </label>
+            </div>
+            <label class="form-label">Interval (seconds)
+              <input id="intervalInput" type="number" min="10" max="86400" step="1" value="60">
+            </label>
+            <label class="form-label">Target DAG
+              <input id="targetInput" type="text" placeholder="dag-xxxxxxxx" autocomplete="off">
+            </label>
+            <div class="actions">
+              <button type="submit" class="primary">Save scheduler</button>
+              <button id="runNow" type="button">Run now</button>
+              <span id="settingsStatus" class="muted"></span>
+            </div>
+          </form>
+          <div id="schedulerDetails" class="health-grid"></div>
+        </div>
+        <div class="panel">
+          <h2>Runtime health</h2>
+          <div id="healthDetails" class="health-grid"></div>
+          <p class="muted small">
+            The scheduler retries safely: a new run is skipped while the previous
+            instance is still planning or running.
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="drawer" class="drawer hidden" role="dialog" aria-modal="true">
+    <div class="drawer-backdrop" data-close-drawer></div>
+    <aside class="drawer-panel">
+      <div class="drawer-head">
+        <h2>Email detail</h2>
+        <button class="icon-button" data-close-drawer aria-label="Close">×</button>
+      </div>
+      <div id="drawerContent" class="drawer-content"></div>
+    </aside>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

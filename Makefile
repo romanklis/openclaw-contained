@@ -2,7 +2,7 @@
 # Auditable Agent Orchestration for OpenClaw
 
 .PHONY: help up down build restart stop logs logs-service ps health clean \
-		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 build-banking build-ann2snn catalog-sync seed-images build-all-images \
+		backup restore scale-workers build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 build-banking build-email build-ann2snn catalog-sync seed-images build-all-images \
 		docker-clean-dag docker-clean-dag-dry-run dind-images dind-clean dind-prune \
 		examples example-up example-down test-ollama set-ollama-url test-key-flows smoke-block
 
@@ -25,7 +25,8 @@ help: ## Show this help
 # ─────────────────────────────────────────────────────────
 
 up: ## Start all services (first run auto-builds base agent image)
-	@mkdir -p workspaces
+	@mkdir -p workspaces image-repos
+	@chmod 0775 image-repos 2>/dev/null || true
 	@SANDBOX=$$(grep -s '^AGENT_SANDBOX_MODE=' .env 2>/dev/null | cut -d= -f2); \
 	 SANDBOX=$${SANDBOX:-insecure-dind}; \
 	 if [ "$$SANDBOX" = "insecure-dind" ]; then \
@@ -196,6 +197,15 @@ build-banking: ## Build the Banking agent image (MongoDB + PostgreSQL drivers) a
 	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:banking
 	@echo "  ✅  openclaw-agent:banking built & pushed"
 
+build-email: ## Build the Email Intelligence agent image (PostgreSQL + PDF parsing) and push to registry
+	@echo "Building Email Intelligence agent image inside DinD..."
+	@docker exec openclaw-docker-dind docker build \
+		-t registry:5000/openclaw-agent:email \
+		-f /agent-images/email/Dockerfile \
+		/agent-images/email/
+	@docker exec openclaw-docker-dind docker push registry:5000/openclaw-agent:email
+	@echo "  ✅  openclaw-agent:email built & pushed"
+
 build-ann2snn: ## Build the ANN2SNN agent image (CPU PyTorch + numpy/matplotlib + Flask/Gunicorn) and push to registry
 	@echo "Building ANN2SNN agent image inside DinD..."
 	@docker exec openclaw-docker-dind docker build \
@@ -227,13 +237,22 @@ dind-prune: ## FULL DinD wipe: docker system prune -af (removes all unused image
 
 
 catalog-sync: ## Seed/link built registry images into the platform image catalog
+	@mkdir -p image-repos
+	@test "$$(stat -c %u image-repos)" = "1000" || test "$$(stat -c %a image-repos)" = "777" || { \
+		echo ""; \
+		echo "  image-repos is not writable by the control-plane user (UID 1000)."; \
+		echo "  Fix it once with:"; \
+		echo "      sudo chown -R 1000:1000 image-repos"; \
+		echo ""; \
+		exit 1; \
+	}
 	@echo "Synchronizing built images into the platform catalog..."
 	@curl -fsS -X POST http://localhost:8000/api/image-catalog/sync-agent-images
 	@echo ""
 
 seed-images: build-all-images ## Initial bootstrap: build images and seed the platform catalog
 
-build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 build-banking build-ann2snn ## Initial bootstrap: build all agent images and seed the catalog
+build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build-zeroclaw build-browser build-browser-v2 build-browser-v3 build-browser-v4 build-banking build-email build-ann2snn ## Initial bootstrap: build all agent images and seed the catalog
 	@echo ""
 	@echo "  ✅  All agent base images built & pushed to registry:"
 	@echo "      openclaw-agent:openclaw  (Full Python)"
@@ -246,6 +265,7 @@ build-all-images: build-base build-octaveclaw build-nanobot build-picoclaw build
 	@echo "      openclaw-agent:browser_v3 (Chromium + agent-browser + lightpanda)"
 	@echo "      openclaw-agent:browser_v4 (Chromium + Camoufox)"
 	@echo "      openclaw-agent:banking   (MongoDB/PostgreSQL drivers)"
+	@echo "      openclaw-agent:email     (PostgreSQL driver + PDF parsing)"
 	@echo "      openclaw-agent:ann2snn   (CPU PyTorch/Flask/Gunicorn)"
 	@echo ""
 	@$(MAKE) catalog-sync

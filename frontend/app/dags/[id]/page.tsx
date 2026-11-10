@@ -31,6 +31,7 @@ interface DAGNode {
   completed_at: string | null
   selected_skill_v2_id: string | null
   skill_selection_reason: string | null
+  node_type?: string
 }
 
 function slugifyPurpose(text: string): string {
@@ -40,6 +41,16 @@ function slugifyPurpose(text: string): string {
       .replace(/^-+|-+$/g, '')
       .slice(0, 60)
   )
+}
+
+function sortBlockLibrary(rows: any): any[] {
+  const list = Array.isArray(rows) ? rows.filter((b: any) => b && b.status !== 'archived') : []
+  const rank = (status: string) => (status === 'active' ? 0 : status === 'draft' ? 1 : 2)
+  list.sort((a: any, b: any) =>
+    rank(String(a.status || '')) - rank(String(b.status || '')) ||
+    String(a.id || '').localeCompare(String(b.id || ''))
+  )
+  return list
 }
 
 // Used until /api/agent-images responds; keeps the picker working offline.
@@ -263,6 +274,10 @@ export default function DAGDetailPage() {
   const [blockEditInputs, setBlockEditInputs] = useState('{}')
   const [blockLibrary2, setBlockLibrary2] = useState<any[]>([])
   const [blockLearnResult, setBlockLearnResult] = useState<any>(null)
+  const [replaceStepOpen, setReplaceStepOpen] = useState(false)
+  const [replaceStepBlockId, setReplaceStepBlockId] = useState('')
+  const [replaceStepInputs, setReplaceStepInputs] = useState('{}')
+  const [replaceStepLibrary, setReplaceStepLibrary] = useState<any[]>([])
   const [agentImageOptions, setAgentImageOptions] = useState<string[]>(FALLBACK_AGENT_IMAGES)
 
   // Image picker is backed by the registered agent images (banking, ann2snn, ...).
@@ -757,9 +772,14 @@ setNodeState(prev => {
 
   const deleteSelectedNode = async () => {
     if (!dag || !selectedNode) return
-    if (!(dag.status === 'failed' || dag.status === 'ready' || dag.status === 'cancelled')) return
+    if (!(dag.status === 'failed' || dag.status === 'ready' || dag.status === 'cancelled' || dag.status === 'completed')) return
 
-    const confirmed = window.confirm(`Delete step '${selectedNode.node_id}'? Dependencies will be rewired automatically.`)
+    const alreadyRun = dag.status === 'completed'
+    const confirmed = window.confirm(
+      alreadyRun
+        ? `Delete step '${selectedNode.node_id}'? This DAG has already run; the affected downstream steps will be reset to pending and the DAG will be ready for a new run. Run history is preserved.`
+        : `Delete step '${selectedNode.node_id}'? Dependencies will be rewired automatically.`
+    )
     if (!confirmed) return
 
     setNodeActionLoading(true)
@@ -1349,8 +1369,8 @@ setNodeState(prev => {
     setBlockEditId(cfg.block || '')
     setBlockEditInputs(JSON.stringify(cfg.inputs || {}, null, 2))
     try {
-      const res = await fetch(`${API}/api/blocks?status_filter=active`)
-      if (res.ok) setBlockLibrary2(await res.json())
+      const res = await fetch(`${API}/api/blocks`)
+      if (res.ok) setBlockLibrary2(sortBlockLibrary(await res.json()))
     } catch { setBlockLibrary2([]) }
     setBlockEditOpen(true)
   }
@@ -1370,6 +1390,46 @@ setNodeState(prev => {
       setBlockEditOpen(false)
       await fetchDag()
     } catch (e: any) { alert(`Error: ${e.message}`) } finally { setNodeActionLoading(false) }
+  }
+
+  const openReplaceStepWithBlock = async () => {
+    if (!selectedNode) return
+    setReplaceStepBlockId('')
+    setReplaceStepInputs('{}')
+    try {
+      const res = await fetch(`${API}/api/blocks`)
+      if (res.ok) {
+        setReplaceStepLibrary(sortBlockLibrary(await res.json()))
+      } else {
+        setReplaceStepLibrary([])
+      }
+    } catch {
+      setReplaceStepLibrary([])
+    }
+    setReplaceStepOpen(true)
+  }
+
+  const replaceStepWithBlock = async () => {
+    if (!selectedNode) return
+    if (!replaceStepBlockId) { alert('Select a block'); return }
+    let inputs: any = {}
+    try { inputs = JSON.parse(replaceStepInputs || '{}') } catch { alert('inputs must be valid JSON'); return }
+    setNodeActionLoading(true)
+    try {
+      const res = await fetch(`${API}/api/dags/${dagId}/nodes/${selectedNode.node_id}/replace-with-block`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ block_id: replaceStepBlockId, inputs }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error((data as any).detail || `HTTP ${res.status}`)
+      setReplaceStepOpen(false)
+      await applyDagMutationResult(data as DAGDetail, true)
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setNodeActionLoading(false)
+    }
   }
 
   const deepReviewTask = async (taskId: string, nodeId: string) => {
@@ -1692,7 +1752,11 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
    const selectedFailureReason = selectedNode ? summarizeNodeFailureReason(selectedNode, selectedNodeState || undefined) : null
   // Graph-level editing (drag-to-connect / edge deletion) allowed when the DAG
   // itself is in a pre-run editable state, independent of node selection.
-  const dagEditable = !!(dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'cancelled')
+  const dagEditable = !!(
+    dag &&
+    !dag.locked &&
+    (dag.status === 'failed' || dag.status === 'ready' || dag.status === 'cancelled' || dag.status === 'completed')
+  )
   const selectedReview = deepReviews[selectedNode?.node_id || ''] || null
   // Compact per-node deep-review summaries (verdict/score/top finding) for the
   // graph nodes, so completed-but-flagged steps are visible at a glance.
@@ -1757,9 +1821,10 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
     selectedNode &&
     (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'completed' || dag?.status === 'cancelled')
   )
-  // Write actions (delete, enhance, retry) only on failed/ready DAGs
+  // Write actions (delete, enhance, retry) are available on editable DAGs, including completed runs.
   const nodeWriteActionsAllowed = !!(
-    selectedNode && (dag?.status === 'failed' || dag?.status === 'ready' || dag?.status === 'cancelled')
+    selectedNode && dag && !dag.locked &&
+    (dag.status === 'failed' || dag.status === 'ready' || dag.status === 'cancelled' || dag.status === 'completed')
   )
   // Legacy alias for backward compat (used in some places)
   const nodeActionsAllowed = nodeWriteActionsAllowed
@@ -2403,15 +2468,6 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                             >
                               🧠 Examine Logs → Learn Skill
                             </button>
-                            {(selectedNode as any).node_type === 'block' && dagEditable && (
-                              <button
-                                onClick={() => { setShowNodeActions(false); openBlockEditor() }}
-                                disabled={nodeActionLoading}
-                                className="w-full px-3 py-2 text-left text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
-                              >
-                                🔧 Change Block / Inputs
-                              </button>
-                            )}
                             {selectedNode.status === 'completed' && (
                               <button
                                 onClick={() => { setShowNodeActions(false); promoteRunToBlock(selectedNode.task_id!) }}
@@ -2483,9 +2539,28 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                             </button>
                           </>
                         )}
-                        {(nodeReadActionsAllowed || nodeWriteActionsAllowed) && (
+                        {dagEditable && (
                           <>
                             <div className="border-t border-gray-700" />
+                            {selectedNode.node_type === 'block' && (
+                              <button
+                                onClick={() => { setShowNodeActions(false); openBlockEditor() }}
+                                disabled={nodeActionLoading}
+                                className="w-full px-3 py-2 text-left text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
+                              >
+                                🔧 Change Block / Inputs
+                              </button>
+                            )}
+                            {selectedNode.node_type !== 'block' && (
+                              <button
+                                onClick={() => { setShowNodeActions(false); openReplaceStepWithBlock() }}
+                                disabled={nodeActionLoading}
+                                className="w-full px-3 py-2 text-left text-xs text-cyan-300 hover:bg-gray-800 disabled:opacity-50"
+                                title="Replace this step with a deterministic block, preserving its position and connections"
+                              >
+                                ♻️ Replace Step with Block
+                              </button>
+                            )}
                             <button
                               onClick={() => { setShowNodeActions(false); setShowAddNodeDialog(true) }}
                               disabled={nodeActionLoading}
@@ -2907,14 +2982,52 @@ const selectedNodeState = selectedNode ? nodeState[selectedNode.node_id] : null
                 <select value={blockEditId} onChange={(e) => setBlockEditId(e.target.value)}
                   className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-3">
                   <option value="">— choose block —</option>
-                  {blockLibrary2.map((b: any) => <option key={b.id} value={b.id}>{b.id}</option>)}
+                  {blockLibrary2.map((b: any) => (
+                    <option key={b.id} value={b.id}>
+                      {b.id}{b.status === 'draft' ? ' [draft]' : ''}
+                    </option>
+                  ))}
                 </select>
+                {blockLibrary2.find((b: any) => b.id === blockEditId)?.status === 'draft' && (
+                  <p className="text-[10px] text-amber-300 mb-2">This is a draft block. Review and test it before production use.</p>
+                )}
                 <label className="block text-xs text-gray-400 mb-1">Inputs (JSON)</label>
                 <textarea value={blockEditInputs} onChange={(e) => setBlockEditInputs(e.target.value)} rows={5}
                   className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 font-mono mb-3" />
                 <div className="flex justify-end gap-2">
                   <button onClick={() => setBlockEditOpen(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300">Cancel</button>
                   <button onClick={saveBlockEditor} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">Save</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {replaceStepOpen && selectedNode && (
+            <div className="fixed inset-0 bg-black/60 z-[70] flex items-center justify-center p-4" onClick={() => setReplaceStepOpen(false)}>
+              <div className="bg-[#12121a] border border-[#232333] rounded-lg p-4 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+                <div className="text-sm font-semibold text-white mb-3">♻️ Replace step with block: {selectedNode.node_id}</div>
+                <label className="block text-xs text-gray-400 mb-1">Block</label>
+                <select value={replaceStepBlockId} onChange={(e) => setReplaceStepBlockId(e.target.value)}
+                  className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2">
+                  <option value="">— choose block —</option>
+                  {replaceStepLibrary.map((b: any) => (
+                    <option key={b.id} value={b.id}>
+                      {b.id} · {b.entrypoint}{b.status === 'draft' ? ' [draft]' : ''}
+                    </option>
+                  ))}
+                </select>
+                {replaceStepLibrary.length === 0 && (
+                  <p className="text-[10px] text-gray-500 mb-2">No blocks available. Register or learn a block first.</p>
+                )}
+                {replaceStepLibrary.find((b: any) => b.id === replaceStepBlockId)?.status === 'draft' && (
+                  <p className="text-[10px] text-amber-300 mb-2">This is a draft block. Review and test it before production use.</p>
+                )}
+                <label className="block text-xs text-gray-400 mb-1">Inputs (JSON)</label>
+                <textarea value={replaceStepInputs} onChange={(e) => setReplaceStepInputs(e.target.value)} rows={5}
+                  className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-xs text-gray-200 font-mono mb-3" />
+                <div className="flex justify-end gap-2">
+                  <button onClick={() => setReplaceStepOpen(false)} className="px-3 py-1 text-xs rounded border border-gray-700 text-gray-300">Cancel</button>
+                  <button onClick={replaceStepWithBlock} disabled={nodeActionLoading} className="px-3 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">Replace Step</button>
                 </div>
               </div>
             </div>

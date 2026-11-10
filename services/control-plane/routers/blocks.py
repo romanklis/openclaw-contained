@@ -417,15 +417,13 @@ Engine contract (MUST be followed exactly):
 files written there are auto-collected as the block's deliverables), `__workspace_dir__`. \
 `main()` MUST tolerate `__node_dir__` being absent (e.g. conformance tests) and fall back to \
 a temporary/cwd directory.
-- Runtime environment = the agent runtime image the run proved (e.g. a browser_v4-derived \
-image). All packages that were available in that run are available to the block — copy the \
-proven driver verbatim, including its imports (`agent_web`, `curl_cffi`, `httpx`, stdlib, \
-etc.). If you need an import to make a proven call, use exactly the module the run used; do \
-not invent new dependencies.
+- Runtime environment = the agent runtime image the run proved. All packages available in that \
+run are available to the block; the supplied driver may import them (`agent_web`, `curl_cffi`, \
+`httpx`, stdlib, etc.). Do not invent new dependencies.
 - The block never starts subprocesses/containers, never calls an LLM, and performs no \
 re-discovery: reproduce exactly the behavior the run demonstrated.
 - The block may call the credential gateway exactly like the driver does (env-provided \
-CREDENTIAL_GATEWAY_URL / tokens) — copy that logic verbatim, do not rewrite it.
+CREDENTIAL_GATEWAY_URL / tokens); the supplied driver already contains that logic.
 - Return a small JSON-serializable dict (like the run's manifest). Do not embed file blobs \
 in the return value.
 - Do NOT write any file to the block's own working directory other than under \
@@ -451,28 +449,32 @@ dict `main` returns (e.g. a manifest: downloaded/skipped/files). File outputs wr
 `__node_dir__` become deliverables; describe them in the schema descriptions, not as fields.
 
 Source material:
-- The proven driver code the run used is provided under `sources.files`. COPY that code \
-verbatim into the block's `code.files` (same filenames where possible) and add ONE extra file \
-`block_main.py` containing `def main(inputs): ...` that calls the copied functions.
-- EXECUTION MODEL: all provided `.py` files are materialized as real modules in one directory \
-and `block_main.py` is imported and executed normally. Use STANDARD python imports to call the \
-copied driver, e.g. `from google_photos import download_album` — this works. Put ALL logic \
-needed by `main` into `block_main.py` (helpers included), importing provided files as modules. \
-`main` must be defined in `block_main.py`.
-Only fix genuine bugs or adapt the download client as stated above. Do NOT re-derive a fresh driver from the logs.
+- The server supplies the proven driver files verbatim and will attach them to the block. They \
+are listed under `sources.files`; do NOT include or repeat those files in your response.
+- Generate exactly ONE file, `block_main.py`, containing `def main(inputs): ...`. Import the \
+supplied driver modules by their filename stem and call the proven functions with standard \
+Python imports (e.g. `from google_photos import download_album`). You may add helpers inside \
+`block_main.py`.
+- `main` must tolerate `__node_dir__` being absent, write file outputs under `__node_dir__`, \
+and return a small JSON-serializable dict.
+- `block_main.py` may only import the supplied driver modules and installed packages. Do not \
+reference workspace paths or files outside `sources.files`. If the proven run used a workspace \
+script that is not supplied, reproduce its behavior from the supplied driver and note the gap \
+in `warnings`.
+- Do not re-derive a fresh driver from the logs and do not include the driver source in your \
+response.
 
-Respond with ONLY valid JSON (no markdown, no commentary), exactly this shape:
-{
-  "name": "<kebab-case block id seed, e.g. google-photos-album-download>",
-  "description": "<one-line description>",
-  "entrypoint": "main",
-  "inputs_schema": {"type": "object", "properties": {...}, "required": [...]},
-  "outputs_schema": {"type": "object", "properties": {...}},
-  "handover": {"requires_any_of": ["urls", "album_url"]} | omit when inputs_schema.required is sufficient,
-  "code": {"files": {"<filename>.py": "<full source>", "block_main.py": "<full source>"}},
-  "rationale": "<short reasoning>",
-  "warnings": ["<quality/determinism concerns, if any>"]
-}
+Respond with EXACTLY this three-part text (no other commentary, no markdown fences around the whole response):
+
+===META===
+{"name": "<kebab-case block id seed, e.g. google-photos-album-download>", "description": "<one-line description>", "entrypoint": "main", "inputs_schema": {"type": "object", "properties": {...}, "required": [...]}, "outputs_schema": {"type": "object", "properties": {...}}, "handover": {"requires_any_of": ["urls", "album_url"]} | null, "rationale": "<short reasoning>", "warnings": ["<quality/determinism concerns, if any>"]}
+===BLOCK_MAIN===
+<raw Python source for block_main.py>
+===END===
+
+The META section must be ONE valid JSON object. The BLOCK_MAIN section is raw Python source; \
+write it verbatim and do NOT JSON-escape newlines, quotes, or backslashes. Do not wrap the \
+response in markdown fences.
 """
 
 
@@ -584,27 +586,109 @@ async def _harvest_driver_sources(db: AsyncSession, task, node, dag) -> Dict[str
     return {"files": files, "origins": origins}
 
 
+def _llm_content_text(payload: Any) -> str:
+    """Extract assistant text from an OpenAI-compatible response defensively."""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "\n".join(parts)
+    return ""
+
+
+_BLOCK_META_MARKER = "===META==="
+_BLOCK_CODE_MARKER = "===BLOCK_MAIN==="
+_BLOCK_END_MARKER = "===END==="
+
+
+def _strip_code_fence(text: str) -> str:
+    value = text.strip()
+    fenced = re.match(
+        r"^```(?:python|py)?\s*\n(.*?)\n```$", value, re.DOTALL | re.IGNORECASE
+    )
+    return fenced.group(1).strip() if fenced else value
+
+
+def _parse_block_derive_response(content: str) -> Optional[Dict[str, Any]]:
+    """Parse the marker format, falling back to a JSON object for compatibility."""
+    from routers.skill_learning import _extract_json_object
+
+    if not content:
+        return None
+    text = content.strip()
+    if _BLOCK_META_MARKER in text and _BLOCK_CODE_MARKER in text:
+        meta_part = text.split(_BLOCK_META_MARKER, 1)[1]
+        meta_text, _, rest = meta_part.partition(_BLOCK_CODE_MARKER)
+        code_text = (
+            rest.split(_BLOCK_END_MARKER, 1)[0]
+            if _BLOCK_END_MARKER in rest
+            else rest
+        )
+        meta = _extract_json_object(meta_text)
+        if not isinstance(meta, dict):
+            try:
+                meta = json.loads(meta_text.strip())
+            except Exception:
+                meta = None
+        if isinstance(meta, dict):
+            meta = _unwrap_block_spec(meta)
+            code = _strip_code_fence(code_text)
+            if code:
+                meta["block_main"] = code
+                return meta
+    parsed = _extract_json_object(text)
+    if parsed is not None:
+        return _unwrap_block_spec(parsed)
+    return None
+
+
 async def _call_block_derive_llm(context: dict) -> Dict[str, Any]:
     """Call the configured review/learning model to derive the block spec."""
     import httpx
-    from routers.skill_learning import _deep_review_model, _extract_json_object
+    from routers.skill_learning import _deep_review_model
 
     model = _deep_review_model()
-    text = json.dumps(context, default=str)
+    try:
+        text = json.dumps(context, default=str)
+    except (TypeError, ValueError) as exc:
+        logger.warning("Block derive context serialization failed: %s", exc)
+        return {
+            "error": f"Could not serialize block-derive context: {exc}",
+            "model": model,
+        }
+
+    last_error = ""
     async with httpx.AsyncClient(timeout=240) as client:
         for strict in (False, True):
             if strict:
-                system = (
-                    "Output ONLY a single valid JSON object. No markdown, no code fences, "
-                    "no commentary, no trailing text. Begin with { and end with }."
+                system = _BLOCK_DERIVE_SYSTEM_PROMPT + (
+                    "\n\nSTRICT OUTPUT: Follow the ===META=== / ===BLOCK_MAIN=== / "
+                    "===END=== format exactly. The META section must be one valid JSON "
+                    "object. The BLOCK_MAIN section is raw Python and must not be "
+                    "JSON-escaped. Do not wrap the response in markdown."
                 )
-                user = f"Return the deterministic block spec as valid JSON only.\n\n{text}"
+                user = text
             else:
                 system = _BLOCK_DERIVE_SYSTEM_PROMPT
                 user = text
             payload = {
                 "model": model,
-                "max_tokens": 30000,
+                "max_tokens": 12000,
                 "thinking": {"type": "disabled"},
                 "messages": [
                     {"role": "system", "content": system},
@@ -612,25 +696,46 @@ async def _call_block_derive_llm(context: dict) -> Dict[str, Any]:
                 ],
             }
             try:
-                resp = await client.post("http://localhost:8000/api/llm/v1/chat/completions", json=payload)
+                resp = await client.post(
+                    "http://localhost:8000/api/llm/v1/chat/completions", json=payload
+                )
             except httpx.HTTPError as exc:
+                last_error = f"LLM request failed ({model}): {exc}"
                 logger.warning("Block derive LLM request failed (%s): %s", model, exc)
                 continue
             if resp.status_code != 200:
-                logger.warning("Block derive LLM returned %s for %s: %s", resp.status_code, model, resp.text[:500])
+                last_error = (
+                    f"LLM returned HTTP {resp.status_code} ({model}): "
+                    f"{resp.text[:300]}"
+                )
+                logger.warning(
+                    "Block derive LLM returned %s for %s: %s",
+                    resp.status_code,
+                    model,
+                    resp.text[:500],
+                )
                 break
-            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-            parsed = _extract_json_object(content)
+            try:
+                response_json = resp.json()
+            except Exception as exc:  # noqa: BLE001 - malformed provider body
+                last_error = f"LLM returned a non-JSON HTTP 200 body ({model}): {exc}"
+                logger.warning("Block derive LLM returned non-JSON: %s", exc)
+                continue
+            content = _llm_content_text(response_json)
+            if not content.strip():
+                last_error = f"LLM returned no text content ({model})."
+                logger.warning("Block derive LLM returned no text content for %s", model)
+                continue
+            parsed = _parse_block_derive_response(content)
             if parsed is not None:
-                parsed = _unwrap_block_spec(parsed)
                 parsed["model"] = model
                 parsed["_raw"] = content[:2000]
                 return parsed
-            logger.warning("Could not parse block derive JSON for %s (strict=%s)", model, strict)
-    return {
-        "error": f"LLM returned no parseable JSON block spec (model: {model}).",
-        "model": model,
-    }
+            last_error = f"LLM returned no parseable block spec (model: {model})."
+            logger.warning(
+                "Could not parse block derive response for %s (strict=%s)", model, strict
+            )
+    return {"error": last_error or f"LLM returned no parseable block spec (model: {model}).", "model": model}
 
 
 def _infer_inputs_schema(files: Dict[str, str]) -> Dict[str, Any]:
@@ -675,10 +780,21 @@ def _infer_inputs_schema(files: Dict[str, str]) -> Dict[str, Any]:
     return {"type": "object", "properties": properties, "required": required}
 
 
-def _coerce_block_spec(spec: dict, fallback_name: str) -> Dict[str, Any]:
-    """Validate/normalize the LLM block spec into code files + schema; raise ValueError."""
+def _coerce_block_spec(
+    spec: dict,
+    fallback_name: str,
+    driver_files: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Validate/normalize the LLM block spec into code files + schema; raise ValueError.
+
+    When ``driver_files`` is supplied, those proven files are attached by the
+    server and the LLM is only allowed to add ``block_main.py``. This keeps the
+    LLM output small and prevents it from altering the driver it is learning
+    from.
+    """
     import re
 
+    llm_files: Dict[str, str] = {}
     code = spec.get("code") or {}
     if isinstance(code, dict):
         files_src = code.get("files")
@@ -686,23 +802,53 @@ def _coerce_block_spec(spec: dict, fallback_name: str) -> Dict[str, Any]:
         files_src = None
     if not isinstance(files_src, dict):
         files_src = spec.get("files")
-    if not isinstance(files_src, dict) or not files_src:
-        raise ValueError("LLM block spec has no code.files")
+    if isinstance(files_src, dict):
+        for fname, value in files_src.items():
+            if len(llm_files) >= 8:
+                break
+            if not isinstance(fname, str) or not fname.endswith(".py"):
+                continue
+            text = value if isinstance(value, str) else str(value)
+            if not text or len(text) > 300_000:
+                continue
+            try:
+                compile(text, fname, "exec")
+            except SyntaxError:
+                continue
+            llm_files[fname] = text
 
-    files: Dict[str, str] = {}
-    for fname, value in files_src.items():
-        if len(files) >= 8:
-            break
+    block_main = spec.get("block_main")
+    if isinstance(block_main, str) and block_main.strip():
+        try:
+            compile(block_main, "block_main.py", "exec")
+        except SyntaxError as exc:
+            raise ValueError(f"LLM block_main.py has a syntax error: {exc}") from exc
+        llm_files["block_main.py"] = block_main
+
+    driver: Dict[str, str] = {}
+    for fname, value in (driver_files or {}).items():
         if not isinstance(fname, str) or not fname.endswith(".py"):
             continue
         text = value if isinstance(value, str) else str(value)
         if not text or len(text) > 300_000:
-            continue
+            raise ValueError(f"Driver file {fname} is empty or too large")
         try:
             compile(text, fname, "exec")
-        except SyntaxError:
-            continue
-        files[fname] = text
+        except SyntaxError as exc:
+            raise ValueError(f"Driver file {fname} has a syntax error: {exc}") from exc
+        driver[fname] = text
+
+    if driver:
+        block_main_only = llm_files.get("block_main.py")
+        if block_main_only is None:
+            raise ValueError(
+                "LLM block spec must define block_main.py with def main(inputs)"
+            )
+        files = dict(driver)
+        files["block_main.py"] = block_main_only
+    else:
+        files = dict(llm_files)
+
     if not files:
         raise ValueError("LLM block spec produced no valid .py code files")
 
@@ -800,14 +946,30 @@ async def _summarize_upstream_outputs(db: AsyncSession, node) -> Dict[str, Any]:
 
 
 @router.post("/learn-from-run", status_code=201)
-async def learn_block_from_run(payload: dict = Body(...), db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+async def learn_block_from_run(
+    payload: dict = Body(...), db: AsyncSession = Depends(get_db)
+) -> Dict[str, Any]:
+    try:
+        return await _learn_block_from_run_impl(payload, db)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - surface a useful error, never a bare 500
+        logger.exception("Block derivation failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Block derivation failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+async def _learn_block_from_run_impl(
+    payload: dict, db: AsyncSession
+) -> Dict[str, Any]:
     """LLM-derive a draft Block from a run, using the driver code the run actually used.
 
     Body: {task_id, dag_id?, node_id?, name?, description?, created_by?}. The captured
     driver source (recorded .py deliverables, the node's selected skill driver, and the
-    DAG workspace .skills snapshot) plus the trimmed execution summary are given to the
-    LLM, which produces the block code (verbatim driver + a main(inputs) entry) and its
-    input schema. The result is stored as a draft Block for review/activation.
+    DAG workspace .skills snapshot) is attached by the server; the LLM only generates
+    the block_main.py wrapper plus the typed input/output contract.
     """
     from models import DAGNode, MasterDAG, Task, TaskOutput
 
@@ -872,7 +1034,11 @@ async def learn_block_from_run(payload: dict = Body(...), db: AsyncSession = Dep
         "node": node_ctx,
         "upstream_outputs": upstream_outputs,
         "sources": {
-            "note": "Driver code this step actually used (verbatim source to copy).",
+            "note": (
+                "Driver code this step actually used. The server attaches these "
+                "files verbatim to the block; do not return them in the response."
+            ),
+            "driver_filenames": sorted(harvested["files"]),
             "provenance": harvested["origins"],
             "files": harvested["files"],
         },
@@ -884,9 +1050,22 @@ async def learn_block_from_run(payload: dict = Body(...), db: AsyncSession = Dep
         raise HTTPException(status_code=502, detail=spec["error"])
     fallback_name = f"{node.node_id}-block" if node else f"block-from-{task_id}"
     try:
-        coerced = _coerce_block_spec(spec, fallback_name=fallback_name)
+        coerced = _coerce_block_spec(
+            spec,
+            fallback_name=fallback_name,
+            driver_files=harvested["files"],
+        )
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail=f"{exc}. Raw LLM excerpt: {spec.get('_raw','')[:1500]}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"{exc}. Raw LLM excerpt: {(spec.get('_raw') or '')[:1500]}",
+        )
+    except Exception as exc:  # noqa: BLE001 - spec coercion must not become a 500
+        logger.exception("Block spec coercion failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Block spec coercion failed: {type(exc).__name__}: {exc}",
+        ) from exc
 
     payload_name = str(payload.get("name") or "").strip()
     display_name = payload_name or coerced["name"]
@@ -937,9 +1116,17 @@ async def learn_block_from_run(payload: dict = Body(...), db: AsyncSession = Dep
         version=1,
         author=str(payload.get("created_by") or "llm-learned"),
     )
-    db.add(b)
-    await db.commit()
-    await db.refresh(b)
+    try:
+        db.add(b)
+        await db.commit()
+        await db.refresh(b)
+    except Exception as exc:  # noqa: BLE001 - return a useful error instead of a bare 500
+        await db.rollback()
+        logger.exception("Block insert failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not store the learned block: {type(exc).__name__}: {exc}",
+        ) from exc
     logger.info(
         "🧩 LLM-learned block %s from task %s (model %s, sources: %s)",
         bid,

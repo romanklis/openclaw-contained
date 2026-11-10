@@ -102,16 +102,48 @@ def _repo_has_commits(repo: Path) -> bool:
     return result.returncode == 0
 
 
+class CatalogRepoError(RuntimeError):
+    """The catalog's bare git repositories cannot be created or written."""
+
+
+def _catalog_repo_error(repo: Path, detail: str) -> CatalogRepoError:
+    return CatalogRepoError(
+        f"cannot create catalog repo {repo}: {detail}. "
+        f"Ensure {repo.parent} (host: image-repos/) is writable by the "
+        f"control-plane user (UID 1000); on the host run: "
+        f"sudo chown -R 1000:1000 image-repos"
+    )
+
+
 def ensure_repo(definition_id: str) -> Path:
     repo = _repo_dir(definition_id)
-    repo.parent.mkdir(parents=True, exist_ok=True)
-    if not repo.exists():
-        subprocess.run(["git", "init", "--bare", "-q", str(repo)], check=True, capture_output=True)
-        subprocess.run(
-            ["git", "--git-dir", str(repo), "symbolic-ref", "HEAD", "refs/heads/main"],
-            check=True,
-            capture_output=True,
-        )
+    try:
+        repo.parent.mkdir(parents=True, exist_ok=True)
+        if not repo.exists():
+            init_result = subprocess.run(
+                ["git", "init", "--bare", "-q", str(repo)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if init_result.returncode != 0:
+                detail = (init_result.stderr or init_result.stdout or "").strip()
+                raise _catalog_repo_error(repo, detail or "git init failed")
+            head_result = subprocess.run(
+                ["git", "--git-dir", str(repo), "symbolic-ref", "HEAD", "refs/heads/main"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if head_result.returncode != 0:
+                detail = (head_result.stderr or head_result.stdout or "").strip()
+                raise _catalog_repo_error(
+                    repo, detail or "git symbolic-ref failed"
+                )
+    except CatalogRepoError:
+        raise
+    except OSError as exc:
+        raise _catalog_repo_error(repo, str(exc)) from exc
     return repo
 
 

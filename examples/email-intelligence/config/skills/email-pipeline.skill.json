@@ -1,0 +1,10 @@
+{
+  "name": "Email Intelligence Pipeline",
+  "image_id": "email",
+  "description": "Read-only IMAP ingestion, PDF parsing, link metadata capture, intent classification, structured LLM extraction, and least-privilege Postgres persistence for the email-intelligence showcase.",
+  "tags": ["email", "imap", "pdf", "postgres", "extraction", "read-only"],
+  "source_type": "manual",
+  "files": ["email-pipeline.md"],
+  "code_files": ["../../../../services/control-plane/default_skills/email_imap.py"],
+  "entrypoint": "email_imap.py"
+}

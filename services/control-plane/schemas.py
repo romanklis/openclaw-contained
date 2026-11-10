@@ -480,6 +480,13 @@ class DAGNodeCreate(BaseModel):
     node_type: str = "agent"  # agent | decision | input
 
 
+class DAGReplaceWithBlock(BaseModel):
+    """Replace an existing DAG step with a deterministic block in place."""
+    block_id: str
+    inputs: Dict[str, Any] = {}
+    description: Optional[str] = None
+
+
 class DAGNodePatch(BaseModel):
     """Editable fields for a DAG node plus runtime fields from worker updates."""
     # Runtime fields (used by worker)

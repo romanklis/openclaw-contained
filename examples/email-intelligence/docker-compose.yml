@@ -1,0 +1,123 @@
+# Email Intelligence example — hard infrastructure.
+#
+# Services:
+#   greenmail      local mirror mailbox (SMTP + IMAP) with a seeded INBOX
+#   email-postgres phase-1 structured storage (emails/attachments/extractions)
+#   email-scheduler periodic DAG trigger + read API for the dashboard
+#   email-dashboard static monitoring UI with a read-only Kanban
+#   mail-seed      one-shot demo mail injector (sentinel-protected)
+#
+# The TaskForge platform, Temporal, worker, and credential-gateway are expected
+# to already be running (make up). All services join the platform network.
+
+networks:
+  default:
+    name: ${PLATFORM_NETWORK:-openclaw-contained_openclaw-network}
+    external: true
+
+services:
+  greenmail:
+    image: greenmail/standalone:2.1.15
+    container_name: email-greenmail
+    restart: unless-stopped
+    ports:
+      - "3025:3025"   # SMTP
+      - "3143:3143"   # IMAP
+      - "8097:8080"   # GreenMail API / admin UI (optional)
+    environment:
+      # Default demo user. auth.disabled keeps the mirror frictionless; the
+      # credential-gateway still enforces read-only access and auditing.
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.setup.test.all
+        -Dgreenmail.hostname=0.0.0.0
+        -Dgreenmail.auth.disabled
+        -Dgreenmail.users.login=email
+        -Dgreenmail.users=taskforge:taskforge-demo@local.test
+      JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
+    networks:
+      - default
+
+  email-postgres:
+    image: postgres:15
+    container_name: email-postgres
+    restart: unless-stopped
+    ports:
+      - "55433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-email_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-email_admin_pwd_demo}
+      POSTGRES_DB: ${POSTGRES_DB:-email_intelligence}
+      TASKFORGE_WRITER_PASSWORD: ${TASKFORGE_WRITER_PASSWORD:-taskforge_writer_pwd_demo}
+      EMAIL_APP_PASSWORD: ${EMAIL_APP_PASSWORD:-email_app_pwd_demo}
+    volumes:
+      - email_pgdata:/var/lib/postgresql/data
+      - ./init-db:/init-db:ro
+      - ./init-db/init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - default
+
+  email-scheduler:
+    build:
+      context: ./backend
+    container_name: email-scheduler
+    restart: unless-stopped
+    ports:
+      - "8096:8086"
+    environment:
+      DATABASE_URL: postgresql://email_app:${EMAIL_APP_PASSWORD:-email_app_pwd_demo}@email-postgres:5432/${POSTGRES_DB:-email_intelligence}
+      CONTROL_PLANE_URL: http://control-plane:8000
+      SCHEDULER_MODE: ${SCHEDULER_MODE:-manual}
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-60}
+      SCHEDULER_POLL_SECONDS: ${SCHEDULER_POLL_SECONDS:-5}
+      TARGET_DAG_ID: ${TARGET_DAG_ID:-}
+    depends_on:
+      email-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/healthz', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - default
+
+  email-dashboard:
+    build:
+      context: ./frontend
+    container_name: email-dashboard
+    restart: unless-stopped
+    ports:
+      - "8095:80"
+    depends_on:
+      email-scheduler:
+        condition: service_started
+    networks:
+      - default
+
+  mail-seed:
+    build:
+      context: ./mail-seed
+    container_name: email-mail-seed
+    restart: "no"
+    environment:
+      SMTP_HOST: greenmail
+      SMTP_PORT: "3025"
+      MAIL_FROM: taskforge@local.test
+      MAIL_TO: taskforge@local.test
+      SEED_STATE: /state/seeded
+    volumes:
+      - mail_seed_state:/state
+    depends_on:
+      greenmail:
+        condition: service_started
+    networks:
+      - default
+
+volumes:
+  email_pgdata:
+  mail_seed_state:
